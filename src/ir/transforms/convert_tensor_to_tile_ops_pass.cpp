@@ -857,11 +857,13 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   if (IsOp(call, "pld.tensor.allreduce") && !call->args_.empty()) {
     return call->args_[0];
   }
-  // pld.tensor.allgather(local_data, target, signal, out): writes gathered
-  // chunks into out on every rank (Phase 3 per-peer pld.tile.get).  out (args_[3])
-  // is the primary write target; target (args_[1]) is used for staging only.
-  if (IsOp(call, "pld.tensor.allgather") && call->args_.size() >= 4) {
-    return call->args_[3];
+  // pld.tensor.allgather unified 3-arg API (see DeduceTensorAllGatherType):
+  //   arg[1] (target) is the result window for both HOST and InCore paths.
+  //   local_data (arg[0]) is read-only; signal (arg[2]) is barrier only.
+  if (IsOp(call, "pld.tensor.allgather")) {
+    if (call->args_.size() >= 3) {
+      return call->args_[1];  // target is the write target (window-as-result)
+    }
   }
   // pld.tensor.reduce_scatter(target, signal, *, op): writes the reduced
   // chunk back into target (Phase 4 store).  target (args_[0]) is the
@@ -1035,24 +1037,17 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
   }
 
   if (IsOp(call, "pld.tensor.allgather")) {
-    // pld.tensor.allgather(local_data, target, signal, out):
-    //   local_data (args_[0]) is In (read-only — staged into target).
-    //   target (args_[1]) is read (Phase 3 pld.tile.get from peers)
-    //     and written (Phase 1 store into own window).  InOut.
-    //   signal (args_[2]) is written (notify) and read (wait).  InOut.
-    //   out (args_[3]) is write-only — the intrinsic writes directly into it.
+    // Unified 3-arg InCore (AnalyzeCallAccess only fires for InCore functions).
+    //   arg[0] = local_data — Tensor [1, SIZE] (In, read-only)
+    //   arg[1] = target     — DistributedTensor window (InOut, push target + result)
+    //   arg[2] = signal     — DistributedTensor INT32 barrier (InOut)
     if (call->args_.size() >= 1) {
-      // local_data: read only
       MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
     }
-    for (size_t i = 1; i < std::min<size_t>(3, call->args_.size()); ++i) {
+    for (size_t i = 1; i < call->args_.size(); ++i) {
       auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
       MarkAccess(origins, has_read);
       MarkAccess(origins, has_write);
-    }
-    if (call->args_.size() >= 4) {
-      // out: write only
-      MarkAccess(CollectReferencedOrigins(call->args_[3], origin_map), has_write);
     }
     return;
   }
@@ -1963,9 +1958,10 @@ class CallSiteUpdateMutator : public TypePropagatingMutator {
     new_args.insert(new_args.end(), extra_args.begin(), extra_args.end());
 
     // Note: 7-arg Submit ctor order is (op, args, deps, kwargs, attrs, type, span).
-    auto new_submit = std::make_shared<Submit>(
-        submit->op_, std::move(new_args), submit->deps_, submit->kwargs_, submit->attrs_, submit->GetType(),
-        submit->span_, submit->core_num_, submit->sync_start_, submit->allow_early_resolve_);
+    auto new_submit =
+        std::make_shared<Submit>(submit->op_, std::move(new_args), submit->deps_, submit->kwargs_,
+                                 submit->attrs_, submit->GetType(), submit->span_, submit->core_num_,
+                                 submit->sync_start_, submit->allow_early_resolve_, submit->predicate_);
     auto new_assign = MutableCopy(op);
     new_assign->value_ = new_submit;
     stmts.push_back(std::move(new_assign));

@@ -342,7 +342,8 @@ def _wall_key(m: int, n: int, k: int, cfg, stat: str, dbc: bool) -> tuple:
     M, N, K = cfg.M, cfg.N, cfg.K
     load = _load_cycles(m, n, k, cfg, stat)
     kt = max(1, cfg.mad_k_fractal_bytes // cfg.bytes_a)
-    cpr = max(1, cfg.bytes_a // 2)
+    # Cube passes per K-fractal: arch-specific mad_fp32_passes for full fp32, else 1 (bf16).
+    cpr = max(1, cfg.mad_fp32_passes) if cfg.bytes_a == 4 else max(1, cfg.bytes_a // 2)
     # Tail-aware K-fractal count (mirrors C++ MadCycles): floor(K/k) full k-wide
     # blocks + a narrower peel tail (width K - floor(K/k)*k) scored at its own
     # width, not rounded up to k. For a divisor k this is (K/k)*ceil(k/kt).

@@ -18,12 +18,13 @@ implementations of:
 - :func:`validate_golden`: Compare actual outputs against golden reference.
 - :func:`ensure_pto_isa_root`: Manage PTO-ISA repository (clone/checkout).
 
-These functions eliminate all Python-level imports from Simpler. The only
-Simpler dependency remaining is:
+These functions keep orchestration in PyPTO while relying on the installed
+runtime packages for two integration surfaces:
 
-- ``pip install simpler`` → provides the ``_task_interface`` nanobind C++ module.
-- The ``runtime/`` git submodule at the repository root provides C++ headers and
-  pre-built runtime binaries.
+- ``simpler`` provides the ``_task_interface`` nanobind C++ module.
+- ``simpler_setup`` provides the kernel compiler plus packaged runtime sources,
+  binaries, and ``pto_isa.pin`` for non-source installs. In a source checkout,
+  those assets come from the ``runtime/`` git submodule instead.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from importlib import import_module
 from pathlib import Path
 from typing import Any
 
@@ -132,11 +134,42 @@ _PTO_ISA_HTTPS_FALLBACK = "https://gitcode.com/luohuan40/pto-isa.git"
 _PTO_ISA_SSH_FALLBACK = "git@gitcode.com:luohuan40/pto-isa.git"
 _PTO_ISA_PRIMARY_CLONE_TIMEOUT = 60
 _PTO_ISA_FALLBACK_CLONE_TIMEOUT = 300
+_PROJECT_ROOT = Path(__file__).parents[3]
+_PTO_ISA_PIN_PATH = _PROJECT_ROOT / "runtime" / "pto_isa.pin"
 
 
 def _get_pto_isa_clone_path() -> Path:
     """Return the default path where PTO-ISA is cloned."""
-    return Path(__file__).parent.parent.parent.parent / "build_output" / "_deps" / "pto-isa"
+    return _PROJECT_ROOT / "build_output" / "_deps" / "pto-isa"
+
+
+def _get_runtime_pto_isa_pin_path() -> Path:
+    """Locate the runtime pin in a source checkout or installed runtime package."""
+    if _PTO_ISA_PIN_PATH.parent.is_dir():
+        return _PTO_ISA_PIN_PATH
+
+    try:
+        runtime_root = getattr(import_module("simpler_setup.environment"), "PROJECT_ROOT")
+    except (ImportError, AttributeError):
+        return _PTO_ISA_PIN_PATH
+    return Path(runtime_root) / "pto_isa.pin"
+
+
+def _read_runtime_pto_isa_pin() -> str | None:
+    """Return the runtime's pinned PTO-ISA commit, or ``None`` when unavailable."""
+    pin_path = _get_runtime_pto_isa_pin_path()
+    try:
+        commit = pin_path.read_text(encoding="utf-8").strip()
+    except OSError as e:
+        logger.warning(
+            f"Failed to read runtime PTO-ISA pin at {pin_path}: {e}; falling back to the latest remote HEAD"
+        )
+        return None
+
+    if not commit:
+        logger.warning(f"Runtime PTO-ISA pin at {pin_path} is empty; falling back to the latest remote HEAD")
+        return None
+    return commit
 
 
 def _clone_pto_isa(clone_path: Path, primary_url: str, fallback_url: str) -> bool:
@@ -184,11 +217,10 @@ def _clone_pto_isa(clone_path: Path, primary_url: str, fallback_url: str) -> boo
     return True
 
 
-def ensure_pto_isa_root(commit: str | None = None, clone_protocol: str = "https") -> str | None:
+def ensure_pto_isa_root(clone_protocol: str = "https") -> str | None:
     """Ensure ``PTO_ISA_ROOT`` is available, either from env or by cloning.
 
     Args:
-        commit: If provided, checkout this specific commit.
         clone_protocol: ``"https"`` or ``"ssh"``.
 
     Returns:
@@ -196,10 +228,9 @@ def ensure_pto_isa_root(commit: str | None = None, clone_protocol: str = "https"
     """
     existing_root = os.environ.get("PTO_ISA_ROOT")
     if existing_root:
-        if commit:
-            _checkout_pto_isa_commit(Path(existing_root), commit)
         return existing_root
 
+    resolved_commit = _read_runtime_pto_isa_pin()
     clone_path = _get_pto_isa_clone_path()
     include_dir = clone_path / "include"
 
@@ -210,10 +241,11 @@ def ensure_pto_isa_root(commit: str | None = None, clone_protocol: str = "https"
             primary_url, fallback_url = _PTO_ISA_SSH, _PTO_ISA_SSH_FALLBACK
         if not _clone_pto_isa(clone_path, primary_url, fallback_url):
             return None
-        if commit:
-            _checkout_pto_isa_commit(clone_path, commit)
-    elif commit:
-        _checkout_pto_isa_commit(clone_path, commit)
+        if resolved_commit and not _checkout_pto_isa_commit(clone_path, resolved_commit):
+            return None
+    elif resolved_commit:
+        if not _checkout_pto_isa_commit(clone_path, resolved_commit):
+            return None
     else:
         _update_pto_isa_to_latest(clone_path)
 
@@ -225,19 +257,28 @@ def ensure_pto_isa_root(commit: str | None = None, clone_protocol: str = "https"
     return resolved
 
 
-def _checkout_pto_isa_commit(clone_path: Path, commit: str) -> None:
-    """Checkout the specified commit if the existing clone is at a different revision."""
+def _checkout_pto_isa_commit(clone_path: Path, commit: str) -> bool:
+    """Checkout *commit* and verify that the managed clone resolves to it."""
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(clone_path),
+            timeout=5,
+        )
+        current = result.stdout.strip()
+        target = subprocess.run(
+            ["git", "rev-parse", f"{commit}^{{commit}}"],
             check=False,
             capture_output=True,
             text=True,
             cwd=str(clone_path),
             timeout=5,
         )
-        current = result.stdout.strip() if result.returncode == 0 else ""
-        if current and not commit.startswith(current) and not current.startswith(commit):
+        target_revision = target.stdout.strip() if target.returncode == 0 else ""
+        if not target_revision or current != target_revision:
             subprocess.run(
                 ["git", "fetch", "origin"],
                 capture_output=True,
@@ -254,8 +295,29 @@ def _checkout_pto_isa_commit(clone_path: Path, commit: str) -> None:
                 timeout=30,
                 check=True,
             )
-    except Exception as e:
+            target_revision = subprocess.run(
+                ["git", "rev-parse", f"{commit}^{{commit}}"],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=str(clone_path),
+                timeout=5,
+            ).stdout.strip()
+        checked_out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(clone_path),
+            timeout=5,
+        ).stdout.strip()
+        if checked_out != target_revision:
+            logger.warning(f"Failed to verify pto-isa commit {commit}: HEAD is {checked_out or 'unknown'}")
+            return False
+        return True
+    except (OSError, subprocess.SubprocessError) as e:
         logger.warning(f"Failed to checkout pto-isa commit {commit}: {e}")
+        return False
 
 
 def _update_pto_isa_to_latest(clone_path: Path) -> None:
@@ -419,7 +481,6 @@ def compile_single_orchestration(
 def compile_and_assemble(
     work_dir: Path,
     platform: str,
-    pto_isa_commit: str | None = None,
 ) -> tuple[ChipCallable, str, dict[str, Any]]:
     """Compile kernels + orchestration from *work_dir*, assemble ``ChipCallable``.
 
@@ -430,7 +491,6 @@ def compile_and_assemble(
         work_dir: Root output directory containing ``kernels/``, ``orchestration/``,
             and ``kernel_config.py`` (produced by :func:`compile_program`).
         platform: Target execution platform.
-        pto_isa_commit: If set, pin the pto-isa clone to this commit.
 
     Returns:
         ``(chip_callable, runtime_name, runtime_config)`` — the assembled
@@ -460,7 +520,7 @@ def compile_and_assemble(
     runtime_name = runtime_config.get("runtime", "tensormap_and_ringbuffer")
 
     # Ensure PTO-ISA root
-    pto_isa_root = ensure_pto_isa_root(commit=pto_isa_commit, clone_protocol="https")
+    pto_isa_root = ensure_pto_isa_root(clone_protocol="https")
     if pto_isa_root is None:
         raise OSError(
             "PTO_ISA_ROOT could not be resolved.\n"
@@ -675,7 +735,10 @@ def execute_on_device(  # noqa: PLR0913
             active._run_chip(chip_callable, orch_args, cfg)
             return
         worker = Worker(level=level, device_id=device_id, platform=platform, runtime=runtime_name)
-        worker.init()
+        # Prewarm with this dispatch's own config so the single run below hits the
+        # prebuilt runtime-arena cache instead of paying the ~800ms cold build
+        # inside the timed dispatch. No-op without a prebuilt arena.
+        worker.init(prewarm_config=cfg)
         try:
             # Simpler's L2 ABI now dispatches by callable id (see runtime PR #710);
             # register the callable, run it, then close — close() runs finalize()
@@ -699,6 +762,14 @@ def validate_golden(
 ) -> None:
     """Compare actual outputs against golden reference using ``torch.allclose``.
 
+    Positions where the golden holds ``NaN`` are treated as *don't-care* and are
+    excluded from the comparison. Tests use this to mark output regions that the
+    kernel leaves undefined by contract — e.g. the area outside a tile's
+    ``valid_shapes``, or an oversized scratch buffer's unused tail. (The runtime
+    no longer zero-fills pure-output buffers, so such regions hold pooled-allocator
+    garbage rather than 0.) A golden with no ``NaN`` compares every element, so this
+    is fully backward-compatible.
+
     Raises:
         AssertionError: If any output tensor does not match within tolerances.
     """
@@ -707,8 +778,11 @@ def validate_golden(
         expected = golden[name].cpu()
         logger.info(f"Comparing {name}: shape={actual.shape}, dtype={actual.dtype}")
 
-        if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
-            close_mask = torch.isclose(actual, expected, rtol=rtol, atol=atol)
+        care_mask = ~torch.isnan(expected)
+        # An element passes if it is close OR the golden marked it don't-care (NaN).
+        close_mask = torch.isclose(actual, expected, rtol=rtol, atol=atol) | ~care_mask
+
+        if not bool(close_mask.all()):
             mismatch_indices = torch.where(~close_mask.flatten())[0]
             flat_actual = actual.flatten()
             flat_expected = expected.flatten()
@@ -718,15 +792,18 @@ def validate_golden(
                 f"    [{i.item()}] actual={flat_actual[i].item()}, expected={flat_expected[i].item()}"
                 for i in idx
             ]
+            n_dont_care = int((~care_mask).sum().item())
+            skipped = f" ({n_dont_care} don't-care skipped)" if n_dont_care else ""
             raise AssertionError(
                 f"Output '{name}' does not match golden.\n"
-                f"Mismatched elements: {mismatch_indices.numel()}/{actual.numel()}\n"
+                f"Mismatched elements: {mismatch_indices.numel()}/{actual.numel()}{skipped}\n"
                 f"rtol={rtol}, atol={atol}\n"
                 f"First {n_show} mismatches:\n" + "\n".join(lines)
             )
 
-        matched = torch.isclose(actual, expected, rtol=rtol, atol=atol).sum().item()
-        logger.info(f"  {name}: PASS ({matched}/{actual.numel()} elements matched)")
+        n_compared = int(care_mask.sum().item())
+        matched = int((close_mask & care_mask).sum().item())
+        logger.info(f"  {name}: PASS ({matched}/{n_compared} compared elements matched)")
 
 
 # ---------------------------------------------------------------------------

@@ -109,6 +109,7 @@ struct L0TileConfig {
   int drain_c0_bytes = 32;       // NZ fractal C0 in bytes (N0 = C0 / bytes_c; 8 fp32).
   int mad_head = 21;             // Fixed per-TMATMUL issue overhead.
   int mad_k_fractal_bytes = 32;  // Cube K-fractal width (kt = this / bytes_a).
+  int mad_fp32_passes = 2;       // Cube passes/K-fractal for full fp32 MMAD (arch-specific; a2a3=2, a5=8).
 
   // Whether the chooser may pick a tile dimension larger than the problem
   // dimension (i.e. pad M / N / K up to reach `min_m` / `min_n` / `min_k`).

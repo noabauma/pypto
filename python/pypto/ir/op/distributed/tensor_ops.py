@@ -300,35 +300,36 @@ def broadcast(
 
 def allgather(
     local_data: Expr,
-    target: Expr | None = None,
-    signal: Expr | None = None,
-    out: Expr | None = None,
+    target: Expr,
+    signal: Expr,
     *,
     span: Span | None = None,
 ) -> Call:
-    """Build a ``pld.tensor.allgather(...)`` Call.
+    """Build a ``pld.tensor.allgather(input, target, signal)`` Call.
 
-    **2-arg form (HOST builtin):** ``allgather(target, signal)`` — pre-staged
-    window data, lowered to ``builtin.tensor.allgather`` per chip.
+    Unified 3-arg push-based form for both paths.  Arg roles:
+      arg[0] = local_data — this rank's single chunk, Tensor [1, SIZE]
+                            (InCore) or [1, SIZE] staging window (HOST)
+      arg[1] = target     — DistributedTensor [NR, SIZE] result window
+      arg[2] = signal     — DistributedTensor INT32 barrier
 
-    **4-arg form (InCore composite):** ``allgather(local_data, target, signal, out)`` —
-    lowered by LowerCompositeOps into tile.load + tile.store + notify/wait +
-    per-peer remote_load into out.
+    **InCore composite:** each rank pushes its chunk into every peer's
+    ``target`` row ``my_rank`` via ``pld.tile.put``, then notify/wait barrier;
+    ``target`` becomes the gathered [NR, SIZE] result (window-as-result).
+    Lowered by LowerCompositeOps into a push decomposition.
+
+    **HOST builtin:** distinct input/target windows; lowered to
+    ``builtin.tensor.allgather`` per chip (in-kernel TPUT push + barrier).
 
     Args:
-        local_data: For 4-arg: Tensor [1, SIZE] with this rank's chunk.
-        target: DistributedTensor [NR, SIZE] staging window (or data in 2-arg form).
+        local_data: This rank's single chunk — Tensor [1, SIZE] (InCore) or
+            [1, SIZE] DistributedTensor staging window (HOST).
+        target: DistributedTensor [NR, SIZE] result window (window-as-result).
         signal: Window-bound INT32 barrier tensor.
-        out: For 4-arg: Tensor [1, NR*SIZE] output.
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    if signal is None and out is None:
-        # 2-arg HOST builtin form: allgather(data, signal)
-        _args: list[Expr] = [local_data, target]  # type: ignore[assignment]  # target is non-None here
-        return _ir_core.create_op_call("pld.tensor.allgather", _args, {}, actual_span)
-    # 4-arg InCore composite form
-    _args_4: list[Expr] = [local_data, target, signal, out]  # type: ignore[assignment]
-    return _ir_core.create_op_call("pld.tensor.allgather", _args_4, {}, actual_span)
+    _args: list[Expr] = [local_data, target, signal]
+    return _ir_core.create_op_call("pld.tensor.allgather", _args, {}, actual_span)
 
 
 def reduce_scatter(

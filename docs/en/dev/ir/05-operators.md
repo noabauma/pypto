@@ -280,7 +280,7 @@ with ib.function("tensor_example") as f:
 | - | `tile.transpose` | Swap two axes of a tile |
 | - | `tile.set_validshape` | Update valid-shape metadata without data movement |
 | - | `tile.ci` | Generate contiguous integer sequence (start + k / start - k); dtype ∈ {INT16, INT32}; innermost dim != 1 |
-| **Reduction** | `tile.sum` | Reduction along axis (axis, keepdim) |
+| **Reduction** | `tile.row_*` / `tile.col_*` | Direction-specific reduction (`row_sum`/`row_max`/`row_min`/`row_prod` collapse the last axis; `col_*` collapse axis 0). There is no axis-parameterized reduction — the ISA has only direction-specific intrinsics (`pto.trowsum`, `pto.tcolsum`, …) |
 | **Scatter** | `tile.scatter` | Row-scatter `src` into `dst` at per-row indices (`pto.tscatter` index form; DPS — `dst` is in/out, the result aliases `dst`). `src`/`dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}; `indexes` dtype ∈ {I16, I32}; element-size matching rule: 4-byte dst ↔ INT32, 2-byte dst ↔ INT16, 1-byte dst ↔ INT16. |
 | - | `tile.scatter_mask` | Mask-pattern row-scatter: write each `src` row into the mask-marked columns of `dst` (DPS — `dst` is in/out). A PyPTO codegen form lowered to a `pto.tscatter` mask emission — **not** a distinct pto-isa instruction (unlike `tile.gather_mask`). See [Mask patterns](#mask-patterns). |
 
@@ -319,7 +319,9 @@ with ib.function("tile_computation") as f:
     tile_b = ib.let("tile_b", tile.load(input_b, [0, 0], [32, 128]))
     tile_mul = ib.let("tile_mul", tile.mul(tile_a, tile_b))
     tile_sqrt = ib.let("tile_sqrt", tile.sqrt(tile_mul))
-    tile_sum = ib.let("tile_sum", tile.sum(tile_sqrt, axis=1, keepdim=True))
+    # row_sum collapses the last axis -> [32, 1]; it needs a scratch tile
+    tmp_tile = ib.let("tmp_tile", tile.create([32, 128], DataType.FP32))
+    tile_sum = ib.let("tile_sum", tile.row_sum(tile_sqrt, tmp_tile))
     result = ib.let("result", tile.store(tile_sum, [0, 0], output))
     ib.return_stmt(result)
 ```
@@ -337,6 +339,7 @@ with ib.function("tile_computation") as f:
 | `system.bar_v` | Vector barrier | None |
 | `system.bar_m` | Matrix barrier | None |
 | `system.fence` | Memory barrier over global memory (lowers to `pto.fence.barrier_all #pto.fence_scope<gm>`) | None |
+| `system.cacheinvalid` | Invalidate the cache lines backing a tensor sub-region. Args: `tensor`, `shapes` (N-D), `offsets` (N-D). All-1 `shapes` (scalar write) lowers to `pto.addptr` + `pto.cmo.cacheinvalid %write_ptr single_cache_line`; a larger region (tile store) lowers to `pto.partition_view` + `pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>` | None |
 | `system.syncall` | Cross-core all-participant barrier (`pto::SYNCALL`). `mode="hard"` (FFTS, no operands) or `mode="soft"` (GM-polling, operands) | `core_type` (`"aiv_only"` \| `"aic_only"` \| `"mix"`), `mode` (`"hard"` \| `"soft"`) |
 | `system.sync_src` | Set sync flag | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.sync_dst` | Wait sync flag | `set_pipe`, `wait_pipe`, `event_id` |
@@ -355,38 +358,22 @@ The unified `mode=` keyword API (`mode="hard"` / `mode="soft"`) is the **DSL** s
 
 `system.task_invalid` returns [`ScalarType(DataType::TASK_ID)`](02-types.md#scalartype). It is the lowering target of the Python literal `None` when `None` appears in a TaskId position (a `deps=[None]` entry or a TaskId loop iter_arg seed) inside `with pl.manual_scope():` regions. There is no `system.task_id_of` op — producer task ids are obtained from the second tuple element returned by the `pl.submit(...)` parser construct, not from a builtin. Source: `src/ir/op/sync_ops/task.cpp`.
 
-**Python Example:**
-
-```python
-from pypto.ir.op import system
-ib.emit(system.bar_all())
-ib.emit(system.sync_src(set_pipe=2, wait_pipe=4, event_id=0))
-```
-
-**C++ Registration (`src/ir/op/sync_ops/sync.cpp`):**
-
-```cpp
-REGISTER_OP("system.bar_all")
-    .set_op_category("SyncOp")
-    .no_argument()
-    .f_deduce_type(DeduceUnknownType);
-
-REGISTER_OP("system.sync_src")
-    .set_op_category("SyncOp")
-    .no_argument()
-    .set_attr<int>("set_pipe")
-    .set_attr<int>("wait_pipe")
-    .set_attr<int>("event_id")
-    .no_argument()
-    .f_deduce_type(DeduceUnknownType);
-```
-
 ## CrossCoreOp: AIC↔AIV Communication
 
-**Purpose**: Cross-core data transfer and pipe management between AIC (Cube) and AIV (Vector) kernels
-**Type**: `UnknownType` (push/init/buffer/free ops) or `TileType` passthrough (pop ops)
-**Location**: `src/ir/op/tile_ops/cross_core.cpp` (tpush/tpop) and `src/ir/op/sync_ops/cross_core.cpp` (tfree/pipe init/buffers)
+**Purpose**: Cross-core synchronization, data transfer, and pipe management between AIC (Cube) and AIV (Vector) kernels
+**Type**: `UnknownType` (sync/push/init/buffer/free ops) or `TileType` passthrough (pop ops)
+**Location**: `src/ir/op/tile_ops/cross_core.cpp` (tpush/tpop) and `src/ir/op/sync_ops/cross_core.cpp` (sync/tfree/pipe init/buffers)
 **Python API**: `import pypto.language as pl` (promoted ops) or `from pypto.ir.op import tile, system`
+
+### Explicit Event Synchronization
+
+| Operation | Args | Description | Kwargs |
+| --------- | ---- | ----------- | ------ |
+| `system.sync_set` | 0 or 1 (`event_id_dyn`) | Emit `pto.sync.set` from one core type | `pipe`, static `event_id`, optional `ffts_mode`, optional `core_type` |
+| `system.sync_wait` | 0 or 1 (`event_id_dyn`) | Emit `pto.sync.wait` on the peer core type | `pipe`, static `event_id`, optional `core_type` |
+| `system.set_ffts` | 1 (`workspace`) | Declare the A3 FFTS setup required by explicit cross-core events | — |
+
+Use `pl.system.sync_set(event_id, pipe=..., ffts_mode=...)` and `pl.system.sync_wait(event_id, pipe=...)` in explicitly typed AIC/AIV kernels. In a mixed InCore kernel, pass `core_type="aiv"` or `core_type="aic"` to retain each event operation on the intended lane when the kernel is expanded. On A3, call `pl.system.set_ffts(workspace)` in every participating AIC/AIV function before its first explicit event operation; `workspace` must be a one-dimensional `INT64` tensor with at least 256 elements and acts as the PTOAS setup operand. PyPTO's persistent runtime keeps the hardware FFTS control address installed, so generated runtime wrappers do not replace it with this operand. A5 does not require this setup. `event_id` may be an integer in the user-available range 0–13 or a dynamic `pl.Scalar[pl.INDEX]`; IDs 14 and 15 are reserved. `ffts_mode`, when supplied to `sync_set`, must be 0, 1, or 2. The author of a manual cross-core protocol is responsible for pairing event IDs and pipes. PyPTO's normal automatic intra-core dependency insertion remains enabled and uses the separate `set_flag`/`wait_flag` mechanism, so it does not allocate from these explicit cross-core event IDs.
 
 ### Data Transfer Operations
 
@@ -509,12 +496,4 @@ See [TPUSH/TPOP ISA Reference](../../reference/pto-isa/01-tpush_tpop.md) and [Bu
 
 ## References
 
-- Common constants: `include/pypto/core/common.h`
-- Type definitions: `include/pypto/ir/type.h`
-- Operator registry: `include/pypto/ir/op_registry.h`
-- Type inference utilities: `include/pypto/ir/type_inference.h`
-- Type inference implementation: `src/ir/op/type_inference.cpp`
-- Operator registry implementation: `src/ir/op_registry.cpp`
-- Tensor operator implementations: `src/ir/op/tensor_ops/`
-- Tile operator implementations: `src/ir/op/tile_ops/`
-- Sync operator implementations: `src/ir/op/sync_ops/`
+Core definitions live in `include/pypto/core/common.h` and `include/pypto/ir/`; registry and type-inference implementations are in `src/ir/`, with operator implementations grouped under `src/ir/op/{tensor_ops,tile_ops,sync_ops}/`.

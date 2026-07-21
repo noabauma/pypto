@@ -364,18 +364,6 @@ def test_tile_cmp():
     assert "(a < b)" in code
 
 
-def test_tile_reduction_with_axis():
-    """tile.sum with axis kwarg should emit .sum(dim=axis)."""
-    a = _tile_var("a", [64, 128])
-    out = _tile_var("out", [64, 1])
-
-    call = _op_call("tile.sum", [a], {"axis": -1, "keepdim": True})
-    assign = ir.AssignStmt(out, call, _span())
-    func = _simple_function("f", [a], assign)
-    code = torch_codegen(func)
-    assert ".sum(dim=-1, keepdim=True)" in code
-
-
 def test_tile_get_block_idx():
     """tile.get_block_idx should emit 0."""
     out = _scalar("idx", DataType.UINT64)
@@ -489,13 +477,25 @@ def test_if_else_with_return_vars():
 # ---------------------------------------------------------------------------
 
 
-def test_system_ops_are_noops():
+@pytest.mark.parametrize(
+    "op_name",
+    ["system.sync_src", "system.sync_set", "system.sync_wait", "system.set_ffts"],
+)
+def test_system_ops_are_noops(op_name):
     """System ops should emit no-op comments."""
-    sync_call = _op_call("system.sync_src", [], {"set_pipe": 4, "wait_pipe": 5, "event_id": 0})
-    body = ir.EvalStmt(sync_call, _span())
-    func = _simple_function("f", [], body)
+    params = []
+    if op_name == "system.sync_src":
+        call = _op_call(op_name, [], {"set_pipe": 4, "wait_pipe": 5, "event_id": 0})
+    elif op_name in ("system.sync_set", "system.sync_wait"):
+        call = _op_call(op_name, [], {"pipe": ir.PipeType.MTE2, "event_id": 0})
+    else:
+        workspace = _tensor_var("workspace", [256], DataType.INT64)
+        params = [workspace]
+        call = _op_call(op_name, [workspace])
+    body = ir.EvalStmt(call, _span())
+    func = _simple_function("f", params, body)
     code = torch_codegen(func)
-    assert "# sync_src" in code
+    assert f"# {op_name.split('.')[-1]}" in code
 
 
 # ---------------------------------------------------------------------------
@@ -1170,12 +1170,17 @@ def test_tensor_assemble_writes_source():
 
 
 def test_tensor_slice_out_of_bounds_is_padded():
-    """tensor.slice should pad to requested shape when slicing out of bounds."""
+    """tensor.slice should pad to requested shape when slicing out of bounds.
+
+    The window (rows 64..128 of a 96-row source) deliberately overhangs the
+    source, so the slice must say so with clamp=True; its valid region is then
+    the 32 rows that actually exist and the tail is padded.
+    """
     src = _tensor_var("src", [96, 64], DataType.FP32)
     result = _tensor_var("result", [64, 64], DataType.FP32)
     shapes = _make_tuple(_int(64), _int(64))
     offsets = _make_tuple(_int(64), _int(0))
-    call = _op_call("tensor.slice", [src, shapes, offsets])
+    call = _op_call("tensor.slice", [src, shapes, offsets], {"clamp": True})
     assign = ir.AssignStmt(result, call, _span())
     ret = ir.ReturnStmt([result], _span())
     body = ir.SeqStmts([assign, ret], _span())

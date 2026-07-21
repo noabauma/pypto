@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -39,6 +40,7 @@
 #include "pypto/codegen/orchestration_op_registry.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -142,6 +144,12 @@ std::string GenerateIncludes(bool include_optional, bool include_vector = false)
     oss << "#include <optional>\n";
   }
   oss << "\n";
+  // TracR instrumentation headers. Emitted unconditionally: the macros expand
+  // to zero-cost no-ops unless the orchestration unit is compiled with
+  // -DENABLE_TRACR (BUILD_TRACR=ON), and the include dirs are always on the
+  // orchestration compile path (kernel_compiler.py).
+  oss << "#include <tracr/tracr.hpp>\n";
+  oss << "#include <tracr_simpler_markers.hpp>\n\n";
   oss << "#include \"pto_orchestration_api.h\"\n\n";
   return oss.str();
 }
@@ -195,6 +203,26 @@ class CodegenEffectiveUseCollector : public var_collectors::VarDefUseCollector {
  protected:
   void VisitStmt_(const ReturnStmtPtr&) override {}
 };
+
+/// Whether `code` mentions `name` as a whole C++ identifier rather than as a
+/// substring of a longer one (`M` must not match inside `M_DYN` or `ext_M`).
+///
+/// Occurrences inside a `//` comment do not count: they are not references, and
+/// defining a symbol for one would emit an unused variable (`-Wunused-variable`).
+bool ReferencesIdentifier(const std::string& code, const std::string& name) {
+  if (name.empty()) return false;
+  auto is_ident_char = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_'; };
+  for (size_t pos = code.find(name); pos != std::string::npos; pos = code.find(name, pos + 1)) {
+    const size_t end = pos + name.size();
+    const bool left_ok = pos == 0 || !is_ident_char(code[pos - 1]);
+    const bool right_ok = end >= code.size() || !is_ident_char(code[end]);
+    if (!left_ok || !right_ok) continue;
+    const size_t line_start = code.rfind('\n', pos) + 1;  // npos + 1 == 0 for the first line
+    const size_t comment = code.find("//", line_start);
+    if (comment == std::string::npos || comment > pos) return true;
+  }
+  return false;
+}
 
 }  // namespace
 
@@ -942,6 +970,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
       // AUTO scope: emit inline. No alias hoisting needed — the outermost AUTO
       // wrapper has nothing placed after it, and for/if bodies escape values
       // through phis / iter_args rather than raw const-ref aliases.
+      //
+      // Open a TracR span for this scope on the orchestrator's channel. SET-only
+      // by design (matching the hand-written reference): the next scope's SET —
+      // or the runtime's MARK_RESET at aicpu_execute exit — closes it.
+      EmitIndentedLine("INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, PTO2_SCOPE_, " +
+                       std::to_string(scope_marker_idx_++) + ");");
       EmitIndentedLine("PTO2_SCOPE() {");
       {
         IndentGuard indent_guard(Active());
@@ -1007,6 +1041,8 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (const auto& line : hoisted) {
       Active().AppendRaw(line);
     }
+    Active().AppendRaw(parent_indent + "INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, PTO2_SCOPE_, " +
+                       std::to_string(scope_marker_idx_++) + ");\n");
     Active().AppendRaw(parent_indent + "PTO2_SCOPE(PTO2ScopeMode::MANUAL) {\n");
     Active().AppendRaw(body_emitter.GetCode());
     Active().AppendRaw(parent_indent + "}\n");
@@ -2234,6 +2270,149 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
+  // Mirrors the runtime's ``MAX_TENSOR_DIMS`` — the capacity of the fixed
+  // ``uint32_t indices[]`` array in ``L0PredicateOperand``.
+  static constexpr size_t kRuntimeMaxTensorDims = 5;
+
+  // Map an IR comparison node kind onto the runtime PredicateOp enumerator, and
+  // the flipped form used when the constant sits on the left (``0 < t[i]``).
+  // Returns nullptr for any other kind — the caller reports that as a user error.
+  static const char* RenderPredicateOp(ObjectKind kind, bool flipped) {
+    switch (kind) {
+      case ObjectKind::Eq:
+        return "EQ";
+      case ObjectKind::Ne:
+        return "NE";
+      case ObjectKind::Gt:
+        return flipped ? "LT" : "GT";
+      case ObjectKind::Lt:
+        return flipped ? "GT" : "LT";
+      case ObjectKind::Ge:
+        return flipped ? "LE" : "GE";
+      case ObjectKind::Le:
+        return flipped ? "GE" : "LE";
+      default:
+        return nullptr;
+    }
+  }
+
+  // Strip the type-promotion Cast the DSL inserts around a tensor.read whose
+  // dtype differs from the compared literal's (e.g. INT32 read vs an INDEX
+  // literal), so the pattern match sees the read itself.
+  [[nodiscard]] static ExprPtr StripCast(const ExprPtr& e) {
+    auto cur = e;
+    while (auto cast = As<Cast>(cur)) cur = cast->operand_;
+    return cur;
+  }
+
+  // Dispatch predicate (pl.spmd_submit(..., predicate=(t[i] > 0))). Surfaced as
+  // the ``predicate`` Call attr (the comparison Expr) by SubmitToCallView.
+  //
+  // This is where the IR's general comparison Expr is decomposed into the
+  // runtime's `operand OP target` triple — the runtime ABI is codegen's
+  // concern, so the IR keeps the predicate as an ordinary Expr rather than a
+  // pre-decomposed bundle. Only the shape the runtime can express is accepted:
+  // a single comparison between a `tensor.read(t, [indices])` and an integer
+  // constant, in either operand order. Anything else is a user error reported
+  // here (the DSL parser rejects it earlier with a better message; this is the
+  // backstop for IR built by other means).
+  void EmitPredicateHint(const std::string& task_var, const CallPtr& call) {
+    if (!call->HasAttr(kAttrPredicate)) return;
+    auto pred = call->GetAttr<ExprPtr>(kAttrPredicate, nullptr);
+    INTERNAL_CHECK_SPAN(pred, call->span_) << "Submit predicate attr is null";
+    auto cmp = std::dynamic_pointer_cast<const BinaryExpr>(pred);
+    CHECK_SPAN(cmp && RenderPredicateOp(pred->GetKind(), false) != nullptr, pred->span_)
+        << "Submit dispatch predicate must be a single comparison (==, !=, >, <, >=, <=) between a "
+           "tensor element and an integer literal, e.g. predicate=(t[i] > 0)";
+
+    // Orientation: `read OP const`, or the mirrored `const OP read` — the
+    // runtime always stores the tensor as the operand, so flip the operator.
+    auto lhs = StripCast(cmp->left_);
+    auto rhs = StripCast(cmp->right_);
+    auto read = As<Call>(lhs);
+    auto konst = As<ConstInt>(rhs);
+    bool flipped = false;
+    if (!(read && IsOp(read, "tensor.read") && konst)) {
+      read = As<Call>(rhs);
+      konst = As<ConstInt>(lhs);
+      flipped = true;
+    }
+    CHECK_SPAN(read && IsOp(read, "tensor.read") && konst, pred->span_)
+        << "Submit dispatch predicate must compare a tensor element (a tensor.read, e.g. t[i]) against "
+           "an integer literal; got neither side in that form";
+    CHECK_SPAN(read->args_.size() >= 2, read->span_)
+        << "tensor.read in a dispatch predicate must have a tensor and an index list";
+
+    // tensor.read(tensor, MakeTuple(i0, i1, ...)) — arg 0 is the tensor, arg 1
+    // is the per-axis index list (a MakeTuple, or a single index expression for
+    // a rank-1 read).
+    const auto& operand = read->args_[0];
+
+    // The runtime reads `elem_size` bytes at the operand address and
+    // **sign-extends** to int64 before comparing (DispatchPredicate::pass()).
+    // An unsigned operand whose value has the top bit set therefore compares as
+    // negative and silently inverts the dispatch decision — e.g. a UINT32
+    // row_count of 3'000'000'000 sign-extends to -1'294'967'296, so
+    // `row_count[e] > 0` is false and the expert is skipped with no diagnostic.
+    // Sub-byte dtypes have no addressable single-element read at all. Both are
+    // rejected here: codegen owns the runtime ABI, so it is the backstop for IR
+    // that did not come through the DSL parser.
+    auto operand_tensor_type = AsTensorTypeLike(operand->GetType());
+    CHECK_SPAN(operand_tensor_type, operand->span_) << "Submit dispatch-predicate operand must be a tensor";
+    const DataType operand_dtype = operand_tensor_type->dtype_;
+    const size_t operand_bits = operand_dtype.GetBit();
+    CHECK_SPAN(operand_dtype.IsSignedInt() &&
+                   (operand_bits == 8 || operand_bits == 16 || operand_bits == 32 || operand_bits == 64),
+               operand->span_)
+        << "Submit dispatch-predicate operand must be a signed 8/16/32/64-bit integer tensor, got "
+        << operand_dtype.ToString()
+        << ". The runtime sign-extends the value it reads, so an unsigned operand can compare as "
+           "negative and silently invert the dispatch decision; sub-byte dtypes have no addressable "
+           "single-element read.";
+
+    std::vector<ExprPtr> indices;
+    if (auto idx_tuple = As<MakeTuple>(read->args_[1])) {
+      indices = idx_tuple->elements_;
+    } else {
+      indices.push_back(read->args_[1]);
+    }
+    // ``L0PredicateOperand::indices`` is a fixed ``uint32_t[MAX_TENSOR_DIMS]``;
+    // emitting more would write past it (the next field is ``op``, so an
+    // overflow corrupts the comparison itself).
+    CHECK_SPAN(indices.size() <= kRuntimeMaxTensorDims, read->span_)
+        << "Submit dispatch-predicate operand has rank " << indices.size()
+        << ", exceeding the runtime's maximum of " << kRuntimeMaxTensorDims
+        << " indices (L0PredicateOperand::indices is a fixed-size array)";
+    const std::string var_name = TryGetVarName(operand);
+    CHECK_SPAN(!var_name.empty(), operand->span_)
+        << "Submit dispatch-predicate operand must be a named tensor (a function parameter or a variable "
+           "bound to a tensor), got an unnamed expression of kind "
+        << static_cast<int>(operand->GetKind())
+        << ". Bind the tensor to a variable first and pass that variable.";
+    const std::string tname = GetExternalTensorName(var_name);
+    const std::string pv = task_var + "_pred";
+    EmitIndentedLine("L0TaskPredicate " + pv + ";");
+    EmitIndentedLine(pv + ".operand.tensor = &" + tname + ";");
+    EmitIndentedLine(pv + ".operand.ndims = " + std::to_string(indices.size()) + ";");
+    for (size_t i = 0; i < indices.size(); ++i) {
+      // The runtime index array is ``uint32_t``, so a negative constant would
+      // wrap to a huge value and compute an out-of-bounds GM address that the
+      // scheduler then reads. Reject the statically-known case; a negative
+      // *dynamic* index cannot be caught here and stays the author's
+      // responsibility, same as any other out-of-range index in the DSL.
+      if (auto const_idx = As<ConstInt>(indices[i])) {
+        CHECK_SPAN(const_idx->value_ >= 0, indices[i]->span_)
+            << "Submit dispatch-predicate index " << i << " is negative (" << const_idx->value_
+            << "); the runtime stores indices as uint32_t, so it would wrap to an out-of-bounds address";
+      }
+      EmitIndentedLine(pv + ".operand.indices[" + std::to_string(i) +
+                       "] = " + GenerateExprString(indices[i]) + ";");
+    }
+    EmitIndentedLine(pv + ".op = PredicateOp::" + RenderPredicateOp(pred->GetKind(), flipped) + ";");
+    EmitIndentedLine(pv + ".target = " + std::to_string(konst->value_) + ";");
+    EmitIndentedLine(task_var + ".set_predicate(" + pv + ");");
+  }
+
   void EmitTaskSubmitAndBind(const std::string& submit_expr, bool capture_outputs) {
     if (capture_outputs) {
       // The caller will consume this task's producer TaskId — capture the
@@ -2423,10 +2602,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
         cg.EmitManualDeps(call, task_var);
         cg.EmitLaunchSpec(task_var, launch_core_num, launch_sync_start);
         cg.EmitEarlyResolveHint(task_var, call);
+        cg.EmitPredicateHint(task_var, call);
       } else {
         // Wrapper (Spmd/Group/Mixed) order: launch_spec -> early_resolve -> deps.
         cg.EmitLaunchSpec(task_var, launch_core_num, launch_sync_start);
         cg.EmitEarlyResolveHint(task_var, call);
+        cg.EmitPredicateHint(task_var, call);
         cg.EmitManualDeps(call, task_var);
       }
       cg.EmitTaskSubmitAndBind(submit_expr, capture_outputs);
@@ -3692,6 +3873,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
   int task_counter_ = 0;
   int phase_fence_barrier_counter_ = 0;
   int alloc_counter_ = 0;
+  /// Monotonic id handed to each emitted PTO2_SCOPE TracR marker as its
+  /// ``extraId``, so scope spans are distinguishable in the trace.
+  int scope_marker_idx_ = 0;
   /// Depth of nested ``RuntimeScopeStmt(manual=true)``. While > 0, the codegen
   /// suppresses the implicit ``PTO2_SCOPE()`` wrapper around ForStmt/IfStmt
   /// bodies (the runtime forbids nesting AUTO scope inside MANUAL).
@@ -3942,10 +4126,53 @@ OrchestrationResult GenerateOrchestration(const ir::ProgramPtr& program, const i
     }
   }
 
+  // A ``pl.dynamic("M")`` symbol names the runtime extent of whatever tensor
+  // argument declares it. In a kernel it stays a type-level placeholder, but an
+  // orchestration body may use it as a *value* — a loop bound, a
+  // ``pl.create_tensor`` extent, or a folded ``pl.tensor.dim`` — so the emitted
+  // C++ needs a definition for it: read it from the task-arg descriptor of the
+  // first parameter declaring it, the signature being what guarantees every
+  // argument carrying the symbol has that same extent.
+  //
+  // Gate on the generated text, not on an IR walk: a symbol also reaches the IR
+  // through value *types* whose shapes are never printed (an external tensor's
+  // extents), and defining those emits dead code.
+  const std::string body_code = stmt_codegen.GetGeneratedCode();
+  // Dedup by emitted *name*, not by Var: a symbol carries no emit-name mapping, so
+  // it prints as its name hint, and neither the body nor this scan can distinguish
+  // two Vars that share one. Seed with every name already spoken for at entry — a
+  // scalar param, or a local the body defines — because a symbol sharing one of
+  // those names is not what the body's occurrences refer to, and defining it would
+  // shadow the real one inside the scope.
+  std::unordered_set<std::string> defined_names;
+  for (const auto& scalar : scalar_params) defined_names.insert(scalar.emit_name);
+  CodegenEffectiveUseCollector body_vars;
+  body_vars.VisitStmt(func->body_);
+  for (const auto* def : body_vars.var_defs) defined_names.insert(GetSSABaseName(def->name_hint_));
+  std::vector<std::string> dyn_dim_defs;
+  for (const auto& var : func->params_) {
+    auto tensor_type = AsTensorTypeLike(var->GetType());
+    if (!tensor_type) continue;
+    const std::string param_name = auto_name::GetCompatibleBaseName(var->name_hint_);
+    for (size_t axis = 0; axis < tensor_type->shape_.size(); ++axis) {
+      auto extent = As<Var>(tensor_type->shape_[axis]);
+      if (!extent) continue;
+      const std::string symbol_name = stmt_codegen.GetVarName(extent);
+      if (!defined_names.insert(symbol_name).second) continue;
+      if (!ReferencesIdentifier(body_code, symbol_name)) continue;
+      dyn_dim_defs.push_back("    int64_t " + symbol_name + " = " +
+                             stmt_codegen.GetTensorShapeDim(param_name, static_cast<int64_t>(axis)) + ";\n");
+    }
+  }
+  if (!dyn_dim_defs.empty()) {
+    oss << "\n    // Dynamic-dim symbols (extent of the declaring argument)\n";
+    for (const auto& def : dyn_dim_defs) oss << def;
+  }
+
   // The outermost PTO2_SCOPE() is now an explicit RuntimeScopeStmt emitted by
   // stmt_codegen (see MaterializeRuntimeScopes); just splice its output in.
   oss << "\n";
-  oss << stmt_codegen.GetGeneratedCode();
+  oss << body_code;
 
   oss << "}\n\n";
   oss << "}  // extern \"C\"\n";

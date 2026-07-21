@@ -510,82 +510,6 @@ class TestTileUnaryOps:
 class TestTileReductionOps:
     """Test suite for tile-level reduction operators."""
 
-    def test_tile_sum_axis0(self):
-        """Test tile.sum operator - sum along axis 0 (column-wise)."""
-
-        @pl.program
-        class Program:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main(
-                self,
-                a: pl.Tensor[[128, 128], pl.FP32],
-                output: pl.Tensor[[128, 128], pl.FP32],
-            ) -> pl.Tensor[[128, 128], pl.FP32]:
-                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32], pl.FP32] = pl.sum(tile_a, axis=0)
-                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
-                return result
-
-        ir_str = str(Program)
-        assert "tile.sum" in ir_str
-
-    def test_tile_sum_axis1(self):
-        """Test tile.sum operator - sum along axis 1 (row-wise)."""
-
-        @pl.program
-        class Program:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main(
-                self,
-                a: pl.Tensor[[128, 128], pl.FP32],
-                output: pl.Tensor[[128, 128], pl.FP32],
-            ) -> pl.Tensor[[128, 128], pl.FP32]:
-                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32], pl.FP32] = pl.sum(tile_a, axis=1)
-                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
-                return result
-
-        ir_str = str(Program)
-        assert "tile.sum" in ir_str
-
-    def test_tile_max_axis0(self):
-        """Test tile.max operator - max along axis 0 (column-wise)."""
-
-        @pl.program
-        class Program:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main(
-                self,
-                a: pl.Tensor[[128, 128], pl.FP32],
-                output: pl.Tensor[[128, 128], pl.FP32],
-            ) -> pl.Tensor[[128, 128], pl.FP32]:
-                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32], pl.FP32] = pl.max(tile_a, axis=0)
-                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
-                return result
-
-        ir_str = str(Program)
-        assert "tile.max" in ir_str
-
-    def test_tile_max_axis1(self):
-        """Test tile.max operator - max along axis 1 (row-wise)."""
-
-        @pl.program
-        class Program:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main(
-                self,
-                a: pl.Tensor[[128, 128], pl.FP32],
-                output: pl.Tensor[[128, 128], pl.FP32],
-            ) -> pl.Tensor[[128, 128], pl.FP32]:
-                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32], pl.FP32] = pl.max(tile_a, axis=1)
-                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
-                return result
-
-        ir_str = str(Program)
-        assert "tile.max" in ir_str
-
     def test_tile_row_max(self, ascend_backend, default_pass_manager):
         """Test tile.row_max operation."""
 
@@ -841,44 +765,6 @@ class TestTileReductionOps:
         ir_str = str(Program)
         assert "tile.col_argmin" in ir_str
 
-    def test_tile_min_axis0(self):
-        """Test tile.min operator - min along axis 0 (column-wise)."""
-
-        @pl.program
-        class Program:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main(
-                self,
-                a: pl.Tensor[[128, 128], pl.FP32],
-                output: pl.Tensor[[128, 128], pl.FP32],
-            ) -> pl.Tensor[[128, 128], pl.FP32]:
-                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32], pl.FP32] = pl.min(tile_a, axis=0)
-                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
-                return result
-
-        ir_str = str(Program)
-        assert "tile.min" in ir_str
-
-    def test_tile_min_axis1(self):
-        """Test tile.min operator - min along axis 1 (row-wise)."""
-
-        @pl.program
-        class Program:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main(
-                self,
-                a: pl.Tensor[[128, 128], pl.FP32],
-                output: pl.Tensor[[128, 128], pl.FP32],
-            ) -> pl.Tensor[[128, 128], pl.FP32]:
-                tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_c: pl.Tile[[32], pl.FP32] = pl.min(tile_a, axis=1)
-                result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
-                return result
-
-        ir_str = str(Program)
-        assert "tile.min" in ir_str
-
     # ------------------------------------------------------------------
     # Issue #1401: reduction tile ops must inherit TileView.valid_shape
     # from their input along non-reduced dims. Without this, chains like
@@ -959,31 +845,6 @@ class TestTileReductionOps:
         valid_shape = result_type.tile_view.valid_shape
         assert isinstance(valid_shape[0], ir.ConstInt) and valid_shape[0].value == 1
         assert isinstance(valid_shape[1], ir.ConstInt) and valid_shape[1].value == 16
-
-    def test_tile_sum_axis_keepdim_inherits_input_valid_shape(self):
-        """tile.sum(axis=1, keepdim=True) must inherit valid_shape (issue #1401)."""
-        sliced = self._make_sliced_tile_with_valid_shape(valid_rows=4, valid_cols=32)
-        call = tile.sum(sliced, axis=1, keepdim=True)
-        result_type = call.type
-        assert isinstance(result_type, ir.TileType)
-        assert result_type.tile_view is not None
-        valid_shape = result_type.tile_view.valid_shape
-        # Output: [rows=4 (kept), 1 (reduced with keepdim)]
-        assert len(valid_shape) == 2
-        assert isinstance(valid_shape[0], ir.ConstInt) and valid_shape[0].value == 4
-        assert isinstance(valid_shape[1], ir.ConstInt) and valid_shape[1].value == 1
-
-    def test_tile_sum_axis_no_keepdim_inherits_input_valid_shape(self):
-        """tile.sum(axis=1, keepdim=False) drops the reduced dim; kept dim inherits valid_shape."""
-        sliced = self._make_sliced_tile_with_valid_shape(valid_rows=4, valid_cols=32)
-        call = tile.sum(sliced, axis=1, keepdim=False)
-        result_type = call.type
-        assert isinstance(result_type, ir.TileType)
-        assert result_type.tile_view is not None
-        valid_shape = result_type.tile_view.valid_shape
-        # Output: [rows=4 (kept)] — reduced dim is dropped entirely
-        assert len(valid_shape) == 1
-        assert isinstance(valid_shape[0], ir.ConstInt) and valid_shape[0].value == 4
 
 
 class TestTileBroadcastOps:
@@ -4190,6 +4051,284 @@ class TestTileTransposeView:
         src = ir.Var("src", ir.TileType([16], DataType.FP32), span)
         with pytest.raises(ValueError, match="at least 2 dimensions"):
             tile.transpose_view(src)
+
+
+class TestWindowReadValidRegion:
+    """The valid-region rule shared by tile.load, tile.slice and tile.extract.
+
+    available    = clamp(source_valid - offset, 0, window)
+    result_valid = min(requested_valid, available)
+    """
+
+    @staticmethod
+    def _partial_tile(shape, valid_shape, pad=ir.PadValue.null, name="src"):
+        """A tile Var whose tile_view narrows it to `valid_shape`."""
+        span = ir.Span.unknown()
+        view = ir.TileView(valid_shape=valid_shape, stride=[], start_offset=None, pad=pad)
+        return ir.Var(name, ir.TileType(shape, DataType.FP32, tile_view=view), span)
+
+    @staticmethod
+    def _partial_tensor(shape, valid_shape, name="a"):
+        span = ir.Span.unknown()
+        view = ir.TensorView(stride=[], layout=ir.TensorLayout.ND, valid_shape=valid_shape)
+        return ir.Var(name, ir.TensorType(shape, DataType.FP32, tensor_view=view), span)
+
+    @staticmethod
+    def _valid_of(result_type):
+        """Effective valid extents: the explicit view when set, else the shape."""
+        view = result_type.tile_view
+        if view is None or not view.valid_shape:
+            return [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)]
+        return [d.value if isinstance(d, ir.ConstInt) else d for d in view.valid_shape]
+
+    # --- tile.slice ---------------------------------------------------------
+
+    def test_slice_full_source_stays_fully_valid(self):
+        """A window inside a fully-valid source needs no valid_shape at all."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([64, 64], DataType.FP32), span)
+
+        call = tile.slice(src, [16, 32], [8, 0])
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.tile_view is None
+
+    def test_slice_partial_source_narrows_result(self):
+        """A window over padding inherits the source tile's narrower validity."""
+        src = self._partial_tile([64, 64], [40, 50])
+
+        call = tile.slice(src, [32, 32], [24, 32])
+
+        # rows: clamp(40 - 24, 0, 32) = 16;  cols: clamp(50 - 32, 0, 32) = 18
+        assert self._valid_of(call.type) == [16, 18]
+
+    def test_slice_intersects_rather_than_replaces_explicit_valid_shape(self):
+        """An explicit valid_shape narrows the result but cannot widen it."""
+        src = self._partial_tile([64, 64], [20, 64])
+
+        widening = tile.slice(src, [32, 32], [0, 0], valid_shape=[32, 32])
+        assert self._valid_of(widening.type) == [20, 32]
+
+        narrowing = tile.slice(src, [32, 32], [0, 0], valid_shape=[8, 4])
+        assert self._valid_of(narrowing.type) == [8, 4]
+
+    def test_slice_folds_constants_without_min_max_nesting(self):
+        """Static intersections fold to a plain ConstInt, not a min/max tree."""
+        src = self._partial_tile([64, 64], [40, 64])
+
+        call = tile.slice(src, [32, 64], [16, 0], valid_shape=[32, 64])
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.tile_view is not None
+        # clamp(40 - 16, 0, 32) = 24, intersected with the request 32 -> 24.
+        rows = result_type.tile_view.valid_shape[0]
+        assert isinstance(rows, ir.ConstInt)
+        assert rows.value == 24
+
+    def test_slice_rejects_static_out_of_bounds_window(self):
+        """A non-clamping slice that provably reads past the source is rejected."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([64, 64], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="reads past the end of dimension 0"):
+            tile.slice(src, [32, 64], [48, 0])
+
+    def test_slice_rejects_negative_offset(self):
+        """A provably negative offset starts outside the source."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([64, 64], DataType.FP32), span)
+        neg = ir.ConstInt(-8, DataType.INDEX, span)
+
+        with pytest.raises(ValueError, match="provably negative"):
+            tile.slice(src, [16, 64], [neg, 0])
+
+    def test_slice_has_no_clamp_escape_hatch(self):
+        """An on-chip window cannot be clamped, so an overhang stays an error.
+
+        `pto.subview` is a pure view and the Mat/Vec fold in CanonicalizeTileSlice
+        turns the window into an ISA TEXTRACT, whose bounds are hard. Nothing can
+        clamp a tile window, so `pl.slice` says so instead of offering a flag it
+        cannot honour. The tensor boundary is where a ragged read gets clamped.
+        """
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([96, 64], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="no clamping mechanism"):
+            tile.slice(src, [64, 64], [64, 0])
+
+        # And the DSL rejects the flag itself rather than silently dropping it.
+        tile_arg = pl.Tile(expr=src)
+        with pytest.raises(ValueError, match="clamp=True is not supported for a Tile"):
+            pl.slice(tile_arg, [64, 64], [64, 0], clamp=True)
+
+    def test_slice_drop_dims_rejected_when_axis_is_not_provably_valid(self):
+        """Rank reduction erases an axis, so the axis must have nothing left to say."""
+        src = self._partial_tile([64, 64], [8, 64])
+
+        with pytest.raises(ValueError, match="not provably 1"):
+            tile.slice(src, [1, 64], [16, 0], drop_dims=[0])
+
+    def test_slice_inherits_source_pad_mode(self):
+        """A read view over padded bytes keeps saying they are padded."""
+        src = self._partial_tile([64, 64], [40, 64], pad=ir.PadValue.zero)
+
+        call = tile.slice(src, [32, 64], [0, 0])
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.tile_view is not None
+        assert result_type.tile_view.pad == ir.PadValue.zero
+
+    # --- tile.load ----------------------------------------------------------
+
+    def test_load_partial_source_narrows_the_tile(self):
+        """A load can never report source padding as real data."""
+        src = self._partial_tensor([64, 128], [40, 128])
+
+        call = tile.load(src, [0, 0], [64, 128], valid_shapes=[64, 128])
+
+        # The request asked for all 64 rows; only 40 exist.
+        assert self._valid_of(call.type) == [40, 128]
+
+    def test_load_rejects_a_request_that_reads_past_the_source(self):
+        """valid_shapes is what the DMA actually reads, so it must exist."""
+        span = ir.Span.unknown()
+        tensor_var = ir.Var("a", ir.TensorType([100, 128], DataType.FP32), span)
+
+        # Claiming 64 valid rows at offset 64 reads to row 128 of a 100-row tensor.
+        with pytest.raises(ValueError, match="reads past the end of dimension 0"):
+            tile.load(tensor_var, [64, 0], [64, 128], valid_shapes=[64, 128])
+
+    def test_load_tile_may_overhang_the_source(self):
+        """The destination tile is an allocation, so only the read extent must fit."""
+        span = ir.Span.unknown()
+        tensor_var = ir.Var("a", ir.TensorType([100, 128], DataType.FP32), span)
+
+        # A 64-row tile at offset 64 overhangs, but only 36 rows are read.
+        call = tile.load(tensor_var, [64, 0], [64, 128], valid_shapes=[36, 128])
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [64, 128]
+        assert self._valid_of(result_type) == [36, 128]
+
+    def test_load_clamp_narrows_an_over_reaching_request(self):
+        """clamp=True cuts an over-reaching read back to the source edge."""
+        span = ir.Span.unknown()
+        tensor_var = ir.Var("a", ir.TensorType([100, 128], DataType.FP32), span)
+
+        call = tile.load(tensor_var, [64, 0], [64, 128], valid_shapes=[64, 128], clamp=True)
+
+        # clamp(100 - 64, 0, 64) = 36, intersected with the 64-row request -> 36.
+        assert self._valid_of(call.type) == [36, 128]
+
+    def test_load_clamp_print_parse_roundtrip(self):
+        """A clamped ragged load survives python_print -> pl.parse -> python_print."""
+        src = (
+            "import pypto.language as pl\n\n"
+            "@pl.program\n"
+            "class P:\n"
+            "    @pl.function\n"
+            "    def main(self, x: pl.Tensor[[100, 128], pl.FP32]) -> pl.Tile[[64, 128], pl.FP32]:\n"
+            "        t: pl.Tile[[64, 128], pl.FP32] = "
+            "pl.tile.load(x, [64, 0], [64, 128], [64, 128], clamp=True)\n"
+            "        return t\n"
+        )
+        prog = pl.parse(src)
+        reparsed = pl.parse(ir.python_print(prog))
+        ir.assert_structural_equal(reparsed, prog)
+
+    def test_load_lower_rank_window_keeps_its_valid_shapes(self):
+        """A 2D tile out of a 3D tensor is a reinterpreting read, not a rectangle."""
+        span = ir.Span.unknown()
+        tensor_var = ir.Var("a", ir.TensorType([4, 128, 64], DataType.FP32), span)
+
+        # Window rank 2 over a rank-3 source: the rule does not apply, so the
+        # requested valid_shapes pass through untouched rather than being
+        # intersected against the wrong axes.
+        call = tile.load(tensor_var, [0, 0], [16, 64], valid_shapes=[16, 64])
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [16, 64]
+
+    def test_load_rejects_a_request_larger_than_the_tile_that_holds_it(self):
+        """valid <= shape is the standing invariant of the type the read produces.
+
+        The source is big enough that the read stays in bounds, so only the window
+        itself catches this: asking for 128 valid rows of a 64-row tile would put a
+        valid region into the result that is larger than the shape holding it.
+        """
+        span = ir.Span.unknown()
+        tensor_var = ir.Var("a", ir.TensorType([256, 128], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="exceeds the window extent"):
+            tile.load(tensor_var, [0, 0], [64, 128], valid_shapes=[128, 128])
+
+    def test_load_keeps_the_request_when_the_source_extent_is_undecidable(self):
+        """An undecidable source extent is trusted, not folded into a runtime min.
+
+        A source valid extent lives in the *type*, and may name a symbol that has no
+        value in the reading function: a `pl.dynamic()` dim in a parameter's
+        valid_shape is bound at the call site, so a standalone (precompiled) kernel
+        never receives it. Folding it into a min would emit an operand that does not
+        exist. Since the relation to the request cannot be decided either way, the
+        request -- the only extent the operator can name -- stands.
+        """
+        span = ir.Span.unknown()
+        # `SRC_VALID` stands for the type-level symbol; `valid_len` for the value the
+        # kernel is actually handed. Nothing relates them.
+        src_valid = ir.Var("SRC_VALID", ir.ScalarType(DataType.INDEX), span)
+        valid_len = ir.Var("valid_len", ir.ScalarType(DataType.INDEX), span)
+        view = ir.TensorView(stride=[], layout=ir.TensorLayout.ND, valid_shape=[16, src_valid])
+        tensor_var = ir.Var("a", ir.TensorType([16, 128], DataType.FP32, tensor_view=view), span)
+
+        call = tile.load(tensor_var, [0, 0], [16, 128], valid_shapes=[16, valid_len])
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.tile_view is not None
+        # The request survives verbatim -- no min() wrapped around SRC_VALID.
+        assert result_type.tile_view.valid_shape[1] is valid_len
+
+    def test_load_symbolic_valid_shapes_survive_unchanged(self):
+        """A symbolic request is trusted: it is the caller's contract, not a guess."""
+        span = ir.Span.unknown()
+        tensor_var = ir.Var("a", ir.TensorType([64, 128], DataType.FP32), span)
+        m = ir.Var("M", ir.ScalarType(DataType.INT64), span)
+
+        call = tile.load(tensor_var, [0, 0], [64, 128], valid_shapes=[m, 128])
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.tile_view is not None
+        # No redundant min() wrapped around the request.
+        assert result_type.tile_view.valid_shape[0] is m
+
+    # --- tile.extract -------------------------------------------------------
+
+    def test_extract_full_source_stays_fully_valid(self):
+        """An extract out of a fully-valid source needs no valid_shape."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([64, 256], DataType.FP16), span)
+
+        call = tile.extract(src, 0, 0, shape=[64, 64], target_memory=ir.MemorySpace.Left)
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        eff = result_type.get_effective_tile_view()
+        assert [d.value for d in eff.valid_shape if isinstance(d, ir.ConstInt)] == [64, 64]
+
+    def test_extract_partial_source_narrows_result(self):
+        """TEXTRACT repacks a window, so it can only be valid where src is."""
+        src = self._partial_tile([64, 256], [40, 100])
+
+        call = tile.extract(src, 16, 64, shape=[32, 32], target_memory=ir.MemorySpace.Vec)
+
+        # rows: clamp(40 - 16, 0, 32) = 24;  cols: clamp(100 - 64, 0, 32) = 32
+        assert self._valid_of(call.type) == [24, 32]
 
 
 if __name__ == "__main__":

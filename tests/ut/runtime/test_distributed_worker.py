@@ -98,9 +98,8 @@ class TestSetupOnce:
         m["construct"].assert_called_once()
         m["register"].assert_called_once()
         m["worker"].init.assert_called_once()
-        # Hierarchy is forked eagerly so the device-memory API works before the
-        # first dispatch (comm-less programs otherwise defer the fork to run()).
-        m["worker"]._start_hierarchical.assert_called_once()
+        # Simpler's public init owns eager hierarchy startup.
+        m["worker"]._start_hierarchical.assert_not_called()
 
         a = DeviceTensor(0x1000, (128, 128), torch.float32)
         b = DeviceTensor(0x2000, (128, 128), torch.float32)
@@ -180,6 +179,43 @@ class TestPerTaskRingSizing:
         rt.close()
 
 
+class TestArenaPrewarm:
+    """``init`` prewarms the prebuilt runtime-arena cache with the ring sizing the
+    first dispatch will use, so the ~800ms cold build lands at prepare() time
+    rather than inside the first (usually timed) dispatch.
+    """
+
+    def test_prewarms_with_prepared_baseline_when_no_config(self, patched_setup):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled)
+
+        # No worker RunConfig → the program's baseline CallConfig (the same one
+        # config-less dispatches reuse) is what init prewarms with; no rebuild.
+        assert m["make_call_config"].call_count == 1
+        assert m["worker"].init.call_args.kwargs["prewarm_config"] is m["make_call_config"].return_value
+        rt.close()
+
+    def test_prewarms_with_worker_config_ring_sizing(self, patched_setup):
+        from pypto.runtime import RunConfig  # noqa: PLC0415
+
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rc = RunConfig(platform="a2a3sim", ring_heap=4 * 1024 * 1024)
+
+        rt = DistributedWorker(compiled, rc)
+
+        # A worker RunConfig builds a second CallConfig from (program
+        # DistributedConfig, rc) — the same construction a dispatch with rc uses,
+        # so the prewarmed arena's sizing key matches that dispatch's.
+        assert m["make_call_config"].call_count == 2
+        prewarm_build = m["make_call_config"].call_args
+        assert prewarm_build.args[0] is compiled._distributed_config
+        assert prewarm_build.args[1] is rc
+        assert m["worker"].init.call_args.kwargs["prewarm_config"] is m["make_call_config"].return_value
+        rt.close()
+
+
 class TestPerCallValidation:
     def test_accepts_device_tensor(self, patched_setup):
         compiled = _fake_compiled([_param("a", [128, 128]), _param("b", [128, 128])], [])
@@ -205,6 +241,44 @@ class TestPerCallValidation:
         with pytest.raises(TypeError, match="shared memory"):
             rt(torch.zeros(128, 128), DeviceTensor(0x2000, (128, 128), torch.float32))
         rt.close()
+
+    def test_releasing_registered_tensors_disables_later_uploads(self, patched_setup):
+        compiled = _fake_compiled([_param("weight", [4, 4])], [])
+        weight = torch.zeros(4, 4, dtype=torch.float32)
+        rt = DistributedWorker(compiled, inherited_host_tensors=[weight])
+
+        rt.release_inherited_host_tensor_refs()
+        rt.release_inherited_host_tensor_refs()
+
+        assert rt._inherited_host_tensors == ()
+        assert not rt._inherited_host_storage_ptrs
+        with pytest.raises(ValueError, match="inherited_host_tensors"):
+            rt.alloc_tensor(weight.shape, weight.dtype, init=weight)
+        rt.close()
+
+    def test_registered_tensor_still_requires_shared_memory_for_dispatch(self, patched_setup):
+        compiled = _fake_compiled([_param("buffer", [128, 128])], [])
+        buffer = torch.zeros(128, 128, dtype=torch.float32)
+        rt = DistributedWorker(compiled, inherited_host_tensors=[buffer])
+
+        with pytest.raises(TypeError, match="shared memory"):
+            rt(buffer)
+
+        rt.close()
+
+    @pytest.mark.parametrize(
+        ("weight", "expected_exception"),
+        [
+            (object(), TypeError),
+            (torch.zeros(128, 128, dtype=torch.float32).t(), ValueError),
+            (torch.empty(1, device="meta"), ValueError),
+        ],
+    )
+    def test_rejects_invalid_prefork_tensor_registration(self, patched_setup, weight, expected_exception):
+        compiled = _fake_compiled([_param("weight", [128, 128])], [])
+
+        with pytest.raises(expected_exception, match=r"torch\.Tensor|contiguous CPU"):
+            DistributedWorker(compiled, inherited_host_tensors=[weight])
 
     def test_scalar_param_forwarded_as_is(self, patched_setup):
         # Scalar params (shape=None, e.g. seq_len) bypass tensor validation and
@@ -321,6 +395,20 @@ class TestAllocStackedTensor:
         # Tracked per (worker_id, ptr) for auto-free.
         assert (0, 0xA000) in rt._owned_tensors
         assert (1, 0xB000) in rt._owned_tensors
+        rt.close()
+
+    def test_registered_inherited_storage_uploads_without_shared_memory(self, patched_setup):
+        patched_setup["worker"]._orch.malloc.side_effect = [0xA000, 0xB000]
+        host = torch.arange(2 * 4 * 4, dtype=torch.float32).view(2, 4, 4)
+        rt = DistributedWorker(_compiled_2cards(), inherited_host_tensors=[host])
+
+        stacked = rt.alloc_stacked_tensor(host)
+
+        assert stacked.worker_ids == (0, 1)
+        orch = patched_setup["worker"]._orch
+        nbytes = 4 * 4 * 4
+        orch.copy_to.assert_any_call(0, 0xA000, host[0].data_ptr(), nbytes)
+        orch.copy_to.assert_any_call(1, 0xB000, host[1].data_ptr(), nbytes)
         rt.close()
 
     def test_permuted_worker_ids_place_shards(self, patched_setup):
@@ -496,6 +584,18 @@ class TestLifecycle:
         rt.close()
         rt.close()  # second close is a no-op
         assert patched_setup["worker"].close.call_count == 1
+
+    def test_close_releases_inherited_refs_when_worker_close_raises(self, patched_setup):
+        compiled = _fake_compiled([_param("weight", [16, 16])], [])
+        weight = torch.zeros(16, 16, dtype=torch.float32)
+        rt = DistributedWorker(compiled, inherited_host_tensors=[weight])
+        patched_setup["worker"].close.side_effect = RuntimeError("worker close failed")
+
+        with pytest.raises(RuntimeError, match="worker close failed"):
+            rt.close()
+
+        assert rt._inherited_host_tensors == ()
+        assert not rt._inherited_host_storage_ptrs
 
     def test_context_manager_closes(self, patched_setup):
         compiled = _fake_compiled([_param("a", [16, 16])], [])

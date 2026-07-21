@@ -804,6 +804,7 @@ class l0_tile_chooser:
         drain_c0_bytes: int
         mad_head: int
         mad_k_fractal_bytes: int
+        mad_fp32_passes: int
         allow_padding: bool
         allow_k_boundary: bool
         def __init__(self) -> None: ...

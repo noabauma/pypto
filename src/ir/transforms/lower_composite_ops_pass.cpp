@@ -1004,48 +1004,50 @@ ExprPtr LowerTensorBroadcastRule(const CallPtr& call, const std::vector<ExprPtr>
 // ============================================================================
 // ``pld.tensor.allgather`` lowering rule
 //
-// All-gather: gather data from all ranks and write the concatenated result
-// into a user-provided output Tensor.  Fully N-rank general — NR is read from
-// the target's compile-time shape at lowering time.
+// All-gather: each rank pushes its single chunk to every peer's window slot
+// via pld.tile.put (TPUT-based).  After the barrier, the window itself holds
+// the full [NR, SIZE] gathered result (window-as-result).  Fully N-rank
+// general — NR is read from the target's compile-time shape at lowering time.
 //
 //   arg[0] = local_data  — Tensor [1, SIZE] (plain) or Tile [1, SIZE], this rank's chunk
-//   arg[1] = target      — DistributedTensor [NR, SIZE], staging window
+//   arg[1] = target      — DistributedTensor [NR, SIZE], staging window (also the result)
 //   arg[2] = signal      — DistributedTensor INT32, cross-rank barrier
-//   arg[3] = out         — Tensor [1, NR*SIZE], output buffer
 //
-// Phases (aligned with simpler allgather_distributed reference):
-//   0.  tile.load(local_data, [0,0], [1,SIZE])   — when local_data is a
-//       Tensor (emit a Tile from the plain input); skipped when Tile
-//   1.  tile.store(stage_tile, [0, 0], target)    — stage-in (each rank's
-//       private HCCL window starts at local row 0)
+// Phases:
+//   0.  tile.create [1, SIZE] VEC — staging tile for auto-chunking
+//   1.  for peer in 0..NR-1:
+//         pld.tile.put(target, peer, local_data, put_stage,
+//                      [my_rank, 0], [0, 0], [1, SIZE])
+//       — push this rank's chunk into every peer's window at row my_rank.
+//       Self-store (peer == my_rank) uses HCCL identity mapping (same
+//       trust model as pld.tile.get self-path).  pld.tile.put auto-chunks
+//       when SIZE exceeds the staging-tile capacity.
 //   2a. notify-all (Set 1)
 //   2b. wait-all  (Ge 1)
-//   3.  for r in 0..NR-1:
-//         pld.tile.get(out, peer=r, target, stage,
-//                      dst_offsets=[0, r*SIZE], src_offsets=[0,0], shape=[1,SIZE])
-//       — transfer each peer's chunk directly into out at column offset
-//         [0, r*SIZE]; one shared [1, SIZE] VEC staging tile, no tile.concat
-//       return out  (Tensor rebind)
+//   return target  (DistributedTensor rebind) — window IS the gathered result
 //
-// Self-read falls out of the same pld.tile.get path via HCCL identity
-// mapping (CommRemotePtr returns local ptr for peer == my_rank).
+// Compared to the original pull-based allgather, this push-based variant drops
+// the out Tensor parameter and the per-peer pld.tile.get gather loop.  Total
+// HBM drops from (NR+1)×SIZE to NR×SIZE, at the cost of the window remaining
+// occupied until the caller consumes the result.
 // ============================================================================
 
 ExprPtr LowerTensorAllGatherRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
   const Span& span = call->span_;
-  INTERNAL_CHECK_SPAN(args.size() == 4, span)
-      << "pld.tensor.allgather rule expects 4 args (local_data, target, signal, out), got " << args.size();
+  INTERNAL_CHECK_SPAN(args.size() == 3, span)
+      << "pld.tensor.allgather rule expects 3 args (local_data, target, signal), got " << args.size();
   const auto& local_data = args[0];
   const auto& target = args[1];
   const auto& signal = args[2];
-  const auto& out = args[3];
 
-  // local_data may be a Tile (pre-loaded by user) or a Tensor (intrinsic
-  // handles the load internally).  Record which so we can emit tile.load
-  // after the shared setup expressions are available.
-  bool is_tensor_input = (As<TensorType>(local_data->GetType()) != nullptr);
-  INTERNAL_CHECK_SPAN(As<TileType>(local_data->GetType()) || is_tensor_input, span)
-      << "pld.tensor.allgather local_data must be TileType or TensorType, got "
+  // local_data is user-provided (the DSL allows Tensor | DistributedTensor) and
+  // the deducer defers its validation to the lowering passes, so this is a
+  // user-facing contract check -> CHECK_SPAN.  The InCore push path only
+  // supports a plain Tensor source: pld.tile.put reads its `src` via
+  // AsTensorTypeLike; a DistributedTensor local_data would fault downstream.
+  CHECK_SPAN(As<TensorType>(local_data->GetType()), span)
+      << "pld.tensor.allgather local_data must be a plain Tensor [1, SIZE] on the "
+         "InCore path, got "
       << local_data->GetType()->TypeName();
   auto target_type = As<DistributedTensorType>(target->GetType());
   INTERNAL_CHECK_SPAN(target_type, span)
@@ -1063,28 +1065,47 @@ ExprPtr LowerTensorAllGatherRule(const CallPtr& call, const std::vector<ExprPtr>
   auto chunk_shape = std::make_shared<MakeTuple>(
       std::vector<ExprPtr>{std::make_shared<ConstInt>(1, DataType::INDEX, span), size_expr}, span);
 
-  // Per the simpler allgather reference (examples/workers/l3/allgather_distributed/),
-  // every rank stores its chunk at local offset [0, 0] of its private HCCL
-  // window.  The DistributedTensor shape [NR, SIZE] is a logical view;
-  // physically each rank holds one row at local row 0.
+  // Offsets [0, 0] for loading local_data.
   auto zero_row_offsets =
       std::make_shared<MakeTuple>(std::vector<ExprPtr>{std::make_shared<ConstInt>(0, DataType::INDEX, span),
                                                        std::make_shared<ConstInt>(0, DataType::INDEX, span)},
                                   span);
 
-  // ---- Phase 0: load (Tensor → Tile, when local_data is a Tensor) ----
-  ExprPtr stage_tile;
-  if (is_tensor_input) {
-    stage_tile = b.Bind("local_tile",
-                        reg.Create("tile.load", {local_data, zero_row_offsets, chunk_shape, chunk_shape},
-                                   {{"target_memory", MemorySpace::Vec}}, span),
-                        span);
-  } else {
-    stage_tile = local_data;
-  }
+  // No explicit tile.load here: pld.tile.put reads from a Tensor source and
+  // auto-chunks the transfer through the VEC staging tile.
 
-  // ---- Phase 1: stage-in (stage_tile → target[0, 0]) ----
-  b.Bind("stage_in", reg.Create("tile.store", {stage_tile, zero_row_offsets, target}, {}, span), span);
+  // ---- Phase 1: push — pld.tile.put this rank's chunk into every peer's window ----
+  // Each peer receives this rank's chunk at target[my_rank, 0:SIZE].
+  // Self-store (peer == my_rank) uses HCCL identity mapping — the same trust
+  // model as the pld.tile.get self-path in the original pull-based allgather.
+  // pld.tile.put auto-chunks when SIZE exceeds the staging-tile capacity, so a
+  // single [1, SIZE] VEC staging tile suffices regardless of SIZE.
+  auto put_stage =
+      b.Bind("ag_stage",
+             reg.Create("tile.create", {chunk_shape},
+                        {{"dtype", target_type->dtype_}, {"target_memory", MemorySpace::Vec}}, span),
+             span);
+
+  auto my_rank_offsets = std::make_shared<MakeTuple>(
+      std::vector<ExprPtr>{comm.my_rank, std::make_shared<ConstInt>(0, DataType::INDEX, span)}, span);
+
+  auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+  auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+  b.EmitFor(
+      "peer", zero_idx, comm.nranks_idx, one_idx,
+      [&](LoweringBuilder& body, const VarPtr& peer) {
+        // pld.tile.put(dst, peer, src, stage, dst_offsets, src_offsets, shape):
+        // push local_data contents to every peer's window at row my_rank.
+        // src is the original Tensor local_data — pld.tile.put handles
+        // tile-load/chunking internally through the stage tile.
+        body.Bind(
+            "push",
+            reg.Create("pld.tile.put",
+                       {target, peer, local_data, put_stage, my_rank_offsets, zero_row_offsets, chunk_shape},
+                       {{"atomic", static_cast<int>(AtomicType::kNone)}}, span),
+            span);
+      },
+      span);
 
   // ---- Phase 2a: notify-all ----
   b.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, NotifyOp::kSet, one_i32, "", span);
@@ -1092,45 +1113,8 @@ ExprPtr LowerTensorAllGatherRule(const CallPtr& call, const std::vector<ExprPtr>
   // ---- Phase 2b: wait-all ----
   b.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, one_i32, "", span);
 
-  // ---- Phase 3: gather — per-peer pld.tile.get directly into output Tensor ----
-  // Each peer's chunk [1, SIZE] is transferred from the window buffer directly
-  // into the output Tensor at a rank-ordered column offset [0, r*SIZE] via
-  // pld.tile.get (subregion form).  A single VEC staging tile [1, SIZE] is
-  // shared across all peers — no tile.concat, each intermediate fits in UB
-  // regardless of NR or SIZE.
-  //
-  // The loop bound is the runtime nranks (comm.nranks_idx), matching the
-  // notify/wait phases.  This keeps the gather consistent with the barrier
-  // phases regardless of the comm-group size, avoiding a mismatch between
-  // compile-time target.shape[0] and the actual world size.
-
-  auto gather_stage =
-      b.Bind("ag_stage",
-             reg.Create("tile.create", {chunk_shape},
-                        {{"dtype", target_type->dtype_}, {"target_memory", MemorySpace::Vec}}, span),
-             span);
-
-  auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
-  auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
-  b.EmitFor(
-      "r", zero_idx, comm.nranks_idx, one_idx,
-      [&](LoweringBuilder& body, const VarPtr& r_var) {
-        // Column dst offset: [0, r*SIZE] — rank-ordered placement.
-        auto col_offset_expr = MakeMul(r_var, size_expr, span);
-        auto dst_offsets = std::make_shared<MakeTuple>(
-            std::vector<ExprPtr>{std::make_shared<ConstInt>(0, DataType::INDEX, span), col_offset_expr},
-            span);
-
-        body.Bind("get",
-                  reg.Create("pld.tile.get",
-                             {out, r_var, target, gather_stage, dst_offsets, zero_row_offsets, chunk_shape},
-                             {}, span),
-                  span);
-      },
-      span);
-
-  // Return the output Tensor — the lowering writes directly into it.
-  return out;
+  // Return target — the window IS the gathered result (window-as-result).
+  return target;
 }
 
 // ============================================================================
@@ -1533,13 +1517,13 @@ class LowerCompositeOpsMutator : public IRMutator {
  private:
   [[nodiscard]] static bool ShouldSkipHostCollective(const CallPtr& call) {
     if (!call || !call->op_) return false;
-    // pld.tensor.allgather overloads: skip only the 2-arg HOST builtin form;
-    // the 4-arg InCore composite form must still be lowered by this pass.
-    if (IsOp(call, "pld.tensor.allgather")) {
-      return call->args_.size() == 2;
-    }
-    return IsOp(call, "pld.tensor.allreduce") || IsOp(call, "pld.tensor.barrier") ||
-           IsOp(call, "pld.tensor.broadcast") || IsOp(call, "pld.tensor.reduce_scatter");
+    // HOST vs InCore is a function-context property, decided authoritatively by
+    // the outer skip_host_collectives_ flag (set for HOST orchestration
+    // functions), not by arg count or arg[0] type.  Every collective is skipped
+    // uniformly here so the flag alone governs which functions defer lowering.
+    return IsOp(call, "pld.tensor.allgather") || IsOp(call, "pld.tensor.allreduce") ||
+           IsOp(call, "pld.tensor.barrier") || IsOp(call, "pld.tensor.broadcast") ||
+           IsOp(call, "pld.tensor.reduce_scatter") || IsOp(call, "pld.tensor.all_to_all");
   }
 
   [[nodiscard]] CompositeLoweringFn LookupRule(const CallPtr& call) const {

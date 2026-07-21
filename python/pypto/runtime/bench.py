@@ -793,7 +793,17 @@ def _parse_stats_from_strace(
 
     names = _span_names()
     stats = BenchmarkStats(rounds=rounds, warmup=warmup)
-    invocations = group_invocations(parse_spans(log_text.splitlines()))
+    # L3 forks one chip worker per rank, all sharing the capture fd; their
+    # concurrent writes can interleave two complete ``[STRACE]`` records onto one
+    # physical line. simpler's ``parse_spans`` reads at most one record per line
+    # (``search`` + greedy ``attrs=.*``), silently dropping the 2nd — which loses
+    # that dispatch's orch/sched spans and makes the (round, rank) read as 0.
+    # Each record's payload is intact on the wire; only the line boundary was lost,
+    # so re-split on the ``[STRACE]`` marker to give every record its own line
+    # before handing the (unmodified) simpler parser the text. Prefix text left on a
+    # line with no marker simply fails the regex and is skipped, as before.
+    lines = log_text.replace("[STRACE]", "\n[STRACE]").splitlines()
+    invocations = group_invocations(parse_spans(lines))
     if not invocations:
         return stats
 
@@ -884,7 +894,7 @@ def benchmark(
             Mutually exclusive with *config*. **L2 only** — not accepted for L3
             (device set comes from ``distributed_config.device_ids``).
         config: Optional :class:`~pypto.runtime.RunConfig`. L2: full control
-            (``block_dim`` / ``aicpu_thread_num`` / ``pto_isa_commit``); pass this
+            (``block_dim`` / ``aicpu_thread_num``); pass this
             *or* *platform*/*device_id*, not both. L3: forwarded per dispatch for
             ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
             ``ring_dep_pool``); ``None`` reuses the prepared baseline.
@@ -972,7 +982,9 @@ def benchmark(
                 # stderr too; on failure it is echoed back so diagnostics survive.
                 try:
                     with _capture_fd_stderr(log_path):
-                        with compiled.prepare() as rt:
+                        # Pass the dispatch config so prepare() prewarms the ring
+                        # sizing the loop below actually dispatches with.
+                        with compiled.prepare(config) as rt:
                             handle = rt.register(compiled)  # register once (cid=0)
                             _dispatch_loop(handle, args, rounds=rounds, warmup=warmup, dispatch_config=config)
                 except Exception:

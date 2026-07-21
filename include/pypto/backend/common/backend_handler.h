@@ -91,6 +91,12 @@ struct L0CostModel {
                                  ///< Backend-specific: a new backend should shallow-K device-spot-check
                                  ///< it (it competes with the drain floor on shallow-K/small tiles).
   int mad_k_fractal_bytes = 32;  ///< Cube K-fractal width in bytes (kt = this / bytes_a).
+  int mad_fp32_passes = 2;       ///< Cube passes per K-fractal for FULL fp32 MMAD (the fp32
+                                 ///< mantissa is decomposed into partial products). ARCH-SPECIFIC:
+                                 ///< a2a3=2; a5=8 (a5-sim: fp32 MMAD is ~4x a2a3 per fractal -- a
+                                 ///< fuller decomposition; the fractal WIDTH kt is C0-derived and
+                                 ///< arch-invariant, so this pass count is the only fp32 cube knob).
+                                 ///< bf16 and other <=2-byte inputs are 1 pass (unaffected).
 };
 
 /**

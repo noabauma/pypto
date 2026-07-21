@@ -620,6 +620,7 @@ std::optional<MatmulTiling> AnalyzeMatmul(const AssignStmtPtr& assign, std::vect
   cfg.drain_c0_bytes = cost_model.drain_c0_bytes;
   cfg.mad_head = cost_model.mad_head_cycles;
   cfg.mad_k_fractal_bytes = cost_model.mad_k_fractal_bytes;
+  cfg.mad_fp32_passes = cost_model.mad_fp32_passes;
   cfg.bytes_a = bytes_a;
   cfg.bytes_b = bytes_b;
   cfg.bytes_c = bytes_c;

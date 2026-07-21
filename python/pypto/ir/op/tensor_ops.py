@@ -27,7 +27,7 @@ from pypto.pypto_core.ir import (
     TensorLayout,
 )
 
-from ..utils import _get_span_or_capture, _normalize_expr, _to_make_tuple, resolve_cast_mode
+from ..utils import _get_span_or_capture, _normalize_expr, _to_int32_scalar, _to_make_tuple, resolve_cast_mode
 from ._pad_value import normalize_pad_value
 from .tile_ops import resolve_gather_compare_cmp_mode
 
@@ -174,15 +174,6 @@ def ci(
 arange = ci
 
 
-def _to_int32_scalar(value: int | Expr, span: Span) -> Expr:
-    """Normalize a seed value to an INT32 scalar expression."""
-    if isinstance(value, Expr):
-        if isinstance(value, ConstInt) and value.dtype != DataType.INT32:
-            return ConstInt(value.value, DataType.INT32, span)
-        return value
-    return ConstInt(value, DataType.INT32, span)
-
-
 def random(
     key0: int | Expr,
     key1: int | Expr,
@@ -295,9 +286,13 @@ def slice(
     valid_shape: list[int | Expr] | _ir_core.MakeTuple | None = None,
     drop_dims: Sequence[int | Expr] | None = None,
     pad_value: PadValue | int | float | None = None,
+    clamp: bool = False,
     span: Span | None = None,
 ) -> Call:
     """Create a slice of a tensor with new shape and offset.
+
+    The result is never valid where the source is not: its valid region is the
+    source's valid region, shifted by ``offset`` and cut to the window.
 
     Args:
         tensor: Input tensor expression
@@ -305,17 +300,25 @@ def slice(
             scalar-indexed axis contributes a unit dim here and is listed in
             ``drop_dims`` to be erased from the result type.
         offset: Offset dimensions for the slice, or a MakeTuple
-        valid_shape: Valid shape dimensions (optional, defaults to empty)
+        valid_shape: Valid shape dimensions (optional, defaults to empty). This
+            is a *request*: it narrows the result, but cannot widen it past what
+            the source actually has under the window.
         drop_dims: Optional axes to erase from the result type (numpy-style rank
-            reduction). Each listed axis must be a static unit dim of ``shape``.
+            reduction). Each listed axis must be a static unit dim of ``shape``,
+            and must still be fully valid after the intersection above.
             ``None`` / ``[]`` is fully backward compatible (drops nothing).
         pad_value: Optional padding mode for out-of-valid-shape elements.
             Accepts ``PadValue.zero`` / ``PadValue.max`` / ``PadValue.min``, or
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (normalized
             via :func:`normalize_pad_value`). ``PadValue.null`` is passed
             through unchanged and means "no padding". When omitted (``None``),
-            the kwarg is not forwarded — the deducer defaults to
-            ``PadValue.null``.
+            the source's padding mode carries through.
+        clamp: Sanction a window that runs off the end of the source. By default
+            a slice asserts that ``offset + shape`` stays inside the source and
+            is rejected when that provably fails; with ``clamp=True`` the window
+            may overhang and the valid region is cut back to the source edge
+            instead. Use it for a fixed-width tail read whose overhang is never
+            addressed.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -345,6 +348,8 @@ def slice(
         # normalize the rest via the shared helper so numeric sugar and
         # validation match tensor.fillpad exactly.
         kwargs["pad_value"] = pad_value if pad_value is PadValue.null else normalize_pad_value(pad_value)
+    if clamp:
+        kwargs["clamp"] = True
 
     return _ir_core.create_op_call("tensor.slice", args, kwargs, actual_span)
 
@@ -1927,8 +1932,9 @@ def gather(  # noqa: PLR0913
         output[b, k] = input[b, index[b, k]]
 
         MVP limitation: only rank-2 inputs with ``dim == -1`` (or ``rank - 1``).
-        ``index`` must be an INT32 tensor whose shape matches ``input`` on every
-        axis except ``dim``; output shape == ``index.shape``, dtype == ``input.dtype``.
+        ``index`` must be an INT32 tensor, or INT16 when ``input`` is a 16-bit
+        dtype (FP16/INT16); its shape matches ``input`` on every axis except
+        ``dim``. output shape == ``index.shape``, dtype == ``input.dtype``.
 
     Mask form (``mask_pattern=<int>``) → ``tensor.gather_mask``: selects columns
         of each row by a fixed hardware mask. Last-dim shrinks by 2 (P0101/P1010)

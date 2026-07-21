@@ -68,6 +68,9 @@ class TestOrchestration:
             #include <stdint.h>
             #include <stdio.h>
 
+            #include <tracr/tracr.hpp>
+            #include <tracr_simpler_markers.hpp>
+
             #include "pto_orchestration_api.h"
 
             extern "C" {
@@ -87,6 +90,7 @@ class TestOrchestration:
                 const Tensor& ext_b = orch_args.tensor(1).ref();
                 const Tensor& ext_d = orch_args.tensor(2).ref();
 
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, PTO2_SCOPE_, 0);
                 PTO2_SCOPE() {
                     uint32_t c_ci_shapes[2] = {16, 16};
                     TensorCreateInfo c_ci(c_ci_shapes, 2, DataType::FLOAT32);
@@ -515,6 +519,9 @@ class TestOrchestration:
             #include <stdint.h>
             #include <stdio.h>
 
+            #include <tracr/tracr.hpp>
+            #include <tracr_simpler_markers.hpp>
+
             #include "pto_orchestration_api.h"
 
             extern "C" {
@@ -534,6 +541,7 @@ class TestOrchestration:
                 const Tensor& ext_b = orch_args.tensor(1).ref();
                 const Tensor& ext_f = orch_args.tensor(2).ref();
 
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, PTO2_SCOPE_, 0);
                 PTO2_SCOPE() {
                     uint32_t c_ci_shapes[2] = {16, 16};
                     TensorCreateInfo c_ci(c_ci_shapes, 2, DataType::FLOAT32);
@@ -1553,6 +1561,9 @@ class TestOrchestration:
             #include <stdint.h>
             #include <stdio.h>
 
+            #include <tracr/tracr.hpp>
+            #include <tracr_simpler_markers.hpp>
+
             #include "pto_orchestration_api.h"
 
             extern "C" {
@@ -1576,6 +1587,7 @@ class TestOrchestration:
                 const Tensor& ext_oi = orch_args.tensor(5).ref();
                 const Tensor& ext_dst = orch_args.tensor(6).ref();
 
+                INSTRUMENTATION_MARK_SET(g_TraCR_thread_idx, PTO2_SCOPE_, 0);
                 PTO2_SCOPE() {
 
                     // Task 0: online_update

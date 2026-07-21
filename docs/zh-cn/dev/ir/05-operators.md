@@ -274,7 +274,7 @@ with ib.function("tensor_example") as f:
 | - | `tile.transpose` | 交换 tile 的两个轴 |
 | - | `tile.set_validshape` | 更新 valid_shape 元数据，不搬移数据 |
 | - | `tile.ci` | 生成连续整数序列（升序 start+k 或降序 start-k）；dtype ∈ {INT16, INT32}；最内维 != 1 |
-| **规约** | `tile.sum` | 沿轴规约（axis, keepdim） |
+| **规约** | `tile.row_*` / `tile.col_*` | 方向特定的规约（`row_sum`/`row_max`/`row_min`/`row_prod` 折叠最后一轴；`col_*` 折叠第 0 轴）。不存在以 axis 参数化的规约算子 —— ISA 只提供方向特定的指令（`pto.trowsum`、`pto.tcolsum` 等） |
 | **散布** | `tile.scatter` | 按行索引把 `src` 散布到 `dst`（`pto.tscatter` 索引形式；DPS：`dst` 为 in/out，结果别名为 `dst`）。`src` / `dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}；`indexes` dtype ∈ {I16, I32}；元素宽度匹配规则：4 字节 dst ↔ INT32，2 字节 dst ↔ INT16，1 字节 dst ↔ INT16。 |
 | - | `tile.scatter_mask` | 按掩码模式把 `src` 行写入 `dst` 中由掩码选中的列（DPS：`dst` 为 in/out）。这是 PyPTO codegen 层形式，下降为 `pto.tscatter` 掩码发射 —— **并非**独立的 pto-isa 指令（与 `tile.gather_mask` 不同）。掩码语义见[掩码模式](#掩码模式)。 |
 
@@ -313,7 +313,9 @@ with ib.function("tile_computation") as f:
     tile_b = ib.let("tile_b", tile.load(input_b, [0, 0], [32, 128]))
     tile_mul = ib.let("tile_mul", tile.mul(tile_a, tile_b))
     tile_sqrt = ib.let("tile_sqrt", tile.sqrt(tile_mul))
-    tile_sum = ib.let("tile_sum", tile.sum(tile_sqrt, axis=1, keepdim=True))
+    # row_sum 折叠最后一轴 -> [32, 1]；需要一块 scratch tile
+    tmp_tile = ib.let("tmp_tile", tile.create([32, 128], DataType.FP32))
+    tile_sum = ib.let("tile_sum", tile.row_sum(tile_sqrt, tmp_tile))
     result = ib.let("result", tile.store(tile_sum, [0, 0], output))
     ib.return_stmt(result)
 ```
@@ -331,6 +333,7 @@ with ib.function("tile_computation") as f:
 | `system.bar_v` | 向量屏障 | 无 |
 | `system.bar_m` | 矩阵屏障 | 无 |
 | `system.fence` | 全局内存屏障（下降为 `pto.fence.barrier_all #pto.fence_scope<gm>`） | 无 |
+| `system.cacheinvalid` | 使 tensor 某个子区域对应的 cache line 失效。参数：`tensor`、`shapes`（N 维）、`offsets`（N 维）。`shapes` 全为 1（标量写）时下降为 `pto.addptr` + `pto.cmo.cacheinvalid %write_ptr single_cache_line`；区域更大（TStore 写）时下降为 `pto.partition_view` + `pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>` | 无 |
 | `system.syncall` | 跨核全员屏障（`pto::SYNCALL`）。`mode="hard"`（FFTS，无 operand）或 `mode="soft"`（GM 轮询，带 operand） | `core_type`（`"aiv_only"` \| `"aic_only"` \| `"mix"`）、`mode`（`"hard"` \| `"soft"`） |
 | `system.sync_src` | 设置同步标志 | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.sync_dst` | 等待同步标志 | `set_pipe`, `wait_pipe`, `event_id` |
@@ -349,38 +352,22 @@ with ib.function("tile_computation") as f:
 
 `system.task_invalid` 返回类型为 [`ScalarType(DataType::TASK_ID)`](02-types.md#scalartype)。当 Python 字面量 `None` 出现在 TaskId 位置（`deps=[None]` 条目或 TaskId 循环 iter_arg 种子）时，它就是 `None` 在 `with pl.manual_scope():` 区域内的下沉目标。不存在 `system.task_id_of` op —— producer task id 由 `pl.submit(...)` parser construct 返回的二元组第二个元素获得，而非来自 builtin。源码：`src/ir/op/sync_ops/task.cpp`。
 
-**Python 示例：**
-
-```python
-from pypto.ir.op import system
-ib.emit(system.bar_all())
-ib.emit(system.sync_src(set_pipe=2, wait_pipe=4, event_id=0))
-```
-
-**C++ 注册 (`src/ir/op/sync_ops/sync.cpp`)：**
-
-```cpp
-REGISTER_OP("system.bar_all")
-    .set_op_category("SyncOp")
-    .no_argument()
-    .f_deduce_type(DeduceUnknownType);
-
-REGISTER_OP("system.sync_src")
-    .set_op_category("SyncOp")
-    .no_argument()
-    .set_attr<int>("set_pipe")
-    .set_attr<int>("wait_pipe")
-    .set_attr<int>("event_id")
-    .no_argument()
-    .f_deduce_type(DeduceUnknownType);
-```
-
 ## CrossCoreOp：AIC↔AIV 跨核通信
 
-**用途**：AIC (Cube) 和 AIV (Vector) 内核之间的跨核数据传输和管道管理
-**类型**：`UnknownType`（push/init/buffer/free 操作）或 `TileType` 透传（pop 操作）
-**位置**：`src/ir/op/tile_ops/cross_core.cpp`（tpush/tpop）和 `src/ir/op/sync_ops/cross_core.cpp`（tfree/管道初始化/缓冲区）
+**用途**：AIC (Cube) 和 AIV (Vector) 内核之间的跨核同步、数据传输和管道管理
+**类型**：`UnknownType`（sync/push/init/buffer/free 操作）或 `TileType` 透传（pop 操作）
+**位置**：`src/ir/op/tile_ops/cross_core.cpp`（tpush/tpop）和 `src/ir/op/sync_ops/cross_core.cpp`（sync/tfree/管道初始化/缓冲区）
 **Python API**：`import pypto.language as pl`（提升的操作）或 `from pypto.ir.op import tile, system`
+
+### 显式事件同步
+
+| 操作 | 参数 | 描述 | Kwargs |
+| ---- | ---- | ---- | ------ |
+| `system.sync_set` | 0 或 1（`event_id_dyn`） | 从一种核类型发出 `pto.sync.set` | `pipe`、静态 `event_id`、可选 `ffts_mode`、可选 `core_type` |
+| `system.sync_wait` | 0 或 1（`event_id_dyn`） | 在对端核类型发出 `pto.sync.wait` | `pipe`、静态 `event_id`、可选 `core_type` |
+| `system.set_ffts` | 1（`workspace`） | 声明 A3 显式跨核事件所需的 FFTS 设置 | — |
+
+在显式指定类型的 AIC/AIV kernel 中使用 `pl.system.sync_set(event_id, pipe=..., ffts_mode=...)` 和 `pl.system.sync_wait(event_id, pipe=...)`。在混合 InCore kernel 中，传入 `core_type="aiv"` 或 `core_type="aic"`，以便 kernel 展开时将各事件操作保留在目标核通道上。在 A3 上，每个参与同步的 AIC/AIV 函数都必须在首次显式事件操作前调用 `pl.system.set_ffts(workspace)`；`workspace` 必须是至少包含 256 个元素的一维 `INT64` 张量，并作为 PTOAS 的设置操作数。PyPTO 的常驻运行时会持续安装硬件 FFTS 控制地址，因此生成的运行时封装不会用该操作数覆盖此地址。A5 不需要该设置。`event_id` 可以是用户可用范围 0–13 内的整数，也可以是动态 `pl.Scalar[pl.INDEX]`；ID 14 和 15 为保留值。`sync_set` 的可选 `ffts_mode` 必须为 0、1 或 2。手写跨核协议的作者负责正确配对事件 ID 和 pipe。PyPTO 的常规核内自动依赖插入仍保持启用，并使用独立的 `set_flag`/`wait_flag` 机制，因此不会占用这些显式跨核事件 ID。
 
 ### 数据传输操作
 
@@ -503,12 +490,4 @@ class CrossCoreExample:
 
 ## 参考
 
-- 常用常量：`include/pypto/core/common.h`
-- 类型定义：`include/pypto/ir/type.h`
-- 算子注册表：`include/pypto/ir/op_registry.h`
-- 类型推断工具：`include/pypto/ir/type_inference.h`
-- 类型推断实现：`src/ir/op/type_inference.cpp`
-- 算子注册表实现：`src/ir/op_registry.cpp`
-- 张量算子实现：`src/ir/op/tensor_ops/`
-- Tile 算子实现：`src/ir/op/tile_ops/`
-- 同步算子实现：`src/ir/op/sync_ops/`
+核心定义位于 `include/pypto/core/common.h` 和 `include/pypto/ir/`；注册表与类型推断实现在 `src/ir/`，算子实现按类别位于 `src/ir/op/{tensor_ops,tile_ops,sync_ops}/`。

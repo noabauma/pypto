@@ -32,6 +32,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/pipe.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
@@ -343,6 +344,70 @@ static std::string MakeInitializePipeCodegenPTO(const char* target, const CallPt
   return "";
 }
 
+static std::string MakeCrossCoreSyncCodegenPTO(const char* action, const CallPtr& op,
+                                               codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  const std::string op_name = std::string("system.sync_") + action;
+  INTERNAL_CHECK_SPAN(op->args_.size() <= 1, op->span_)
+      << op_name << " accepts at most one dynamic event-id operand, got " << op->args_.size();
+
+  const int pipe_value = op->GetKwarg<int>("pipe", -1);
+  INTERNAL_CHECK_SPAN(
+      pipe_value >= static_cast<int>(ir::PipeType::MTE1) && pipe_value <= static_cast<int>(ir::PipeType::ALL),
+      op->span_)
+      << op_name << " requires a valid pipe attribute, got " << pipe_value;
+
+  const bool has_static_event_id = op->HasKwarg("event_id");
+  const bool has_dynamic_event_id = op->args_.size() == 1;
+  INTERNAL_CHECK_SPAN(has_static_event_id != has_dynamic_event_id, op->span_)
+      << op_name << " requires exactly one static event_id attribute or dynamic event-id operand";
+
+  std::string event_code;
+  if (has_static_event_id) {
+    const int event_id = op->GetKwarg<int>("event_id", -1);
+    INTERNAL_CHECK_SPAN(event_id >= 0 && event_id <= 13, op->span_)
+        << op_name << " event_id must be in the user-available range [0, 13], got " << event_id;
+    event_code = std::to_string(event_id);
+  } else {
+    auto event_type = ir::As<ScalarType>(op->args_[0]->GetType());
+    INTERNAL_CHECK_SPAN(event_type && event_type->dtype_ == DataType::INDEX, op->span_)
+        << op_name << " dynamic event id must have ScalarType(INDEX)";
+    event_code = codegen.GetExprAsCode(op->args_[0]);
+  }
+
+  std::ostringstream oss;
+  oss << "pto.sync." << action << " <PIPE_" << ir::PipeTypeToString(static_cast<ir::PipeType>(pipe_value))
+      << ">, " << event_code;
+  if (op->HasKwarg("ffts_mode")) {
+    INTERNAL_CHECK_SPAN(std::string_view(action) == "set", op->span_)
+        << op_name << " does not support ffts_mode";
+    const int ffts_mode = op->GetKwarg<int>("ffts_mode", -1);
+    INTERNAL_CHECK_SPAN(ffts_mode >= 0 && ffts_mode <= 2, op->span_)
+        << op_name << " ffts_mode must be in [0, 2], got " << ffts_mode;
+    oss << " {ffts_mode = " << ffts_mode << " : i32}";
+  }
+  codegen.Emit(oss.str());
+  return "";
+}
+
+static std::string MakeSetFFTSCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1, op->span_)
+      << "system.set_ffts requires one workspace tensor, got " << op->args_.size();
+  auto workspace = As<ir::Var>(op->args_[0]);
+  INTERNAL_CHECK_SPAN(workspace, op->span_) << "system.set_ffts workspace must be a tensor variable";
+  auto tensor_type = ir::AsTensorTypeLike(workspace->GetType());
+  INTERNAL_CHECK_SPAN(
+      tensor_type && tensor_type->dtype_ == DataType::INT64 && tensor_type->shape_.size() == 1, op->span_)
+      << "system.set_ffts workspace must be a one-dimensional INT64 tensor";
+  auto extent = As<ir::ConstInt>(tensor_type->shape_[0]);
+  INTERNAL_CHECK_SPAN(extent && extent->value_ >= 256, op->span_)
+      << "system.set_ffts workspace must have a static length of at least 256 INT64 elements";
+  codegen.Emit("pto.set_ffts " + codegen.GetVarName(workspace) + " : memref<" +
+               std::to_string(extent->value_) + "xi64>");
+  return "";
+}
+
 void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string>& exclude_ops) {
   // Register ops with custom codegen logic
   auto reg = [&](const char* op_name, BackendCodegenFunc fn) {
@@ -373,6 +438,15 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
   });
   reg("system.aiv_initialize_pipe", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeInitializePipeCodegenPTO("aiv", op, codegen);
+  });
+  reg("system.sync_set", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeCrossCoreSyncCodegenPTO("set", op, codegen);
+  });
+  reg("system.sync_wait", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeCrossCoreSyncCodegenPTO("wait", op, codegen);
+  });
+  reg("system.set_ffts", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeSetFFTSCodegenPTO(op, codegen);
   });
 
   reg("system.reserve_buffer", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {

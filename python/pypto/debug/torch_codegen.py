@@ -661,17 +661,6 @@ def _handle_cmp(a: list[str], kw: dict[str, Any]) -> str:
     return f"({a[0]} {op_str} {a[1]})"
 
 
-def _handle_reduction(torch_fn: str) -> OpHandler:
-    def _handler(a: list[str], kw: dict[str, Any]) -> str:
-        axis = kw.get("axis")
-        keepdim = kw.get("keepdim", False)
-        if axis is not None:
-            return f"{a[0]}.{torch_fn}(dim={axis}, keepdim={keepdim})"
-        return f"{a[0]}.{torch_fn}()"
-
-    return _handler
-
-
 def _handle_slice(a: list[str], _kw: dict[str, Any]) -> str:
     # args: [tensor, shapes, offsets] or [tensor, shapes, offsets, valid_shapes]
     if len(a) >= 4:
@@ -1029,11 +1018,6 @@ def _register_ops() -> None:  # noqa: PLR0915
     m["tile.gemv_acc"] = lambda a, _kw: f"({a[0]} + torch.matmul({a[1]}, {a[2]}).float())"
     m["tile.gemv_bias"] = lambda a, _kw: f"(torch.matmul({a[0]}, {a[1]}).float() + {a[2]})"
 
-    # tile reductions with axis kwarg
-    m["tile.sum"] = _handle_reduction("sum")
-    m["tile.max"] = _handle_reduction("amax")
-    m["tile.min"] = _handle_reduction("amin")
-
     # tile ternary ops (third arg is workspace/tmp, ignore it)
     m["tile.xor"] = lambda a, _kw: f"torch.bitwise_xor({a[0]}, {a[1]})"
     m["tile.xors"] = lambda a, _kw: f"torch.bitwise_xor({a[0]}, {a[1]})"
@@ -1061,10 +1045,14 @@ def _register_ops() -> None:  # noqa: PLR0915
     for op_name in (
         "system.sync_src",
         "system.sync_dst",
+        "system.sync_set",
+        "system.sync_wait",
+        "system.set_ffts",
         "system.bar_v",
         "system.bar_m",
         "system.bar_all",
         "system.fence",
+        "system.cacheinvalid",
         "system.aic_initialize_pipe",
         "system.aiv_initialize_pipe",
         "system.reserve_buffer",
@@ -1241,6 +1229,35 @@ class TorchCodegen(_ir.IRVisitor):
         for _gv, func in program.functions.items():
             self.visit_function(func)
 
+    def _emit_dyn_dim_symbols(self, func: _ir.Function) -> None:
+        """Define the dyn-dim symbols this signature declares.
+
+        A ``pl.dynamic("M")`` symbol names the runtime extent of the argument
+        declaring it, and an Orchestration body may use it as a *value* — a folded
+        ``pl.tensor.dim``, a loop bound, a ``pl.create_tensor`` extent. Emitted as a
+        bare name it would simply be undefined at ``exec``, so read it from the
+        first parameter declaring it.
+
+        Orchestration only: a kernel is handed partial data for boundary tiles (see
+        the shape check above), so there a parameter's runtime shape is not the
+        extent its type declares.
+        """
+        if func.func_type != _ir.FunctionType.Orchestration:
+            return
+        defined: set[str] = set()
+        for param in func.params:
+            if not isinstance(param.type, _ir.TensorType):
+                continue
+            param_name = self._name_of(param)
+            for axis, extent in enumerate(param.type.shape):
+                if not isinstance(extent, _ir.Var):
+                    continue
+                name = self._name_of(extent)
+                if name == param_name or name in defined:
+                    continue
+                defined.add(name)
+                self._emit(f"{name} = {param_name}.shape[{axis}]")
+
     def visit_function(self, func: _ir.Function) -> None:
         # Keep names function-local. IR may reuse object ids across functions;
         # sharing maps at program scope can emit stale names.
@@ -1258,6 +1275,7 @@ class TorchCodegen(_ir.IRVisitor):
                 # InCore kernel params may receive partial data (boundary tiles),
                 # so only check dtype — not shape — for all function params.
                 self._emit_shape_dtype_check(self._name_of(p), p.type, shape=False)
+        self._emit_dyn_dim_symbols(func)
         n_before = len(self._lines)
         self.visit_stmt(func.body)
         if len(self._lines) == n_before:

@@ -24,7 +24,7 @@ import re
 import pypto.language as pl
 import pytest
 from pypto import DataType, backend, codegen, ir
-from pypto.backend import BackendType
+from pypto.backend import BackendType, pto_backend
 from pypto.backend.pto_backend import (
     _emit_group_output,
     _format_error_report,
@@ -939,6 +939,18 @@ class TestPreprocessPtoasOutput:
         assert "TADDS(v2);" in result
         assert "TSTORE(v3);" in result
 
+    def test_drops_runtime_managed_ffts_base_write(self):
+        result = _preprocess_ptoas_output(
+            "AICORE void kernel(__gm__ int64_t* workspace) {\n"
+            "  uint64_t ffts_addr = (uint64_t) workspace;\n"
+            "  set_ffts_base_addr(ffts_addr);\n"
+            "  wait_flag_dev(3);\n"
+            "}\n"
+        )
+        assert "set_ffts_base_addr" not in result
+        assert "(uint64_t) workspace" in result
+        assert "wait_flag_dev(3)" in result
+
     def test_preserves_helpers(self):
         result = _preprocess_ptoas_output(SAMPLE_PTOAS_OUTPUT)
         assert "ptoas_bitcast" in result
@@ -1178,13 +1190,14 @@ class TestGenerateArgUnpacking:
         dim = ir.Neg(var, idx, span)
         ty = ir.TensorType([dim, ir.ConstInt(64, idx, span)], DataType.BF16)
 
+        # The param type alone drives the collector, so the body just hands it
+        # back: ``Neg(V_NEG)`` is provably non-positive, and any load out of it
+        # would be a read past the end of the tensor.
         ib = IRBuilder()
         with ib.function("dyn_unary_func", type=ir.FunctionType.InCore) as f:
             a = f.param("a", ty)
-            t = ib.let("t", tile.load(a, [0, 0], [16, 64]))
-            ret = ib.let("ret", t)
             f.return_type(ty)
-            ib.return_stmt(ret)
+            ib.return_stmt(a)
         func = f.get_result()
 
         with pytest.raises(ValueError, match="non-invertible"):
@@ -1619,8 +1632,15 @@ class TestGenerateSkipPtoas:
             assert not key.endswith(".cpp"), f"Unexpected .cpp extension: {key}"
 
 
-def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path):
-    """compile() should preserve generated files when some InCore functions fail."""
+def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path, monkeypatch):
+    """compile() should preserve generated files when some InCore functions fail.
+
+    The failure is injected at the per-kernel emit seam rather than provoked by a
+    real kernel body: every DSL-reachable tile op lowers, so no source-level
+    kernel reliably fails codegen. Injecting here still exercises the real
+    per-function error collection, the error report, and the PartialCodegenError
+    path that writes the kernels which did succeed.
+    """
 
     @pl.program
     class PartialFailureProgram:
@@ -1638,11 +1658,10 @@ def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path):
         def bad_kernel(
             self,
             a: pl.Tensor[[16, 16], pl.FP32],
-            output: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-        ) -> pl.Tensor[[16, 1], pl.FP32]:
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
             tile = pl.load(a, offsets=[0, 0], shapes=[16, 16])
-            result = pl.tile.sum(tile, axis=1)
-            out = pl.store(result, offsets=[0, 0], output_tensor=output)
+            out = pl.store(tile, offsets=[0, 0], output_tensor=output)
             return out
 
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -1650,6 +1669,15 @@ def test_compile_writes_orchestration_on_partial_codegen_failure(tmp_path):
             out = pl.create_tensor([16, 16], dtype=pl.FP32)
             out = self.good_kernel(a, out)
             return out
+
+    real_emit = pto_backend._emit_single_function_output
+
+    def emit_or_fail(result_files, func, *args, **kwargs):
+        if func.name == "bad_kernel":
+            raise RuntimeError("bad_kernel: injected codegen failure")
+        return real_emit(result_files, func, *args, **kwargs)
+
+    monkeypatch.setattr(pto_backend, "_emit_single_function_output", emit_or_fail)
 
     output_dir = tmp_path / "partial_codegen"
     with pytest.raises(RuntimeError, match="bad_kernel"):

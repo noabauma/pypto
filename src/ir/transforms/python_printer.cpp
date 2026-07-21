@@ -373,6 +373,14 @@ class IRPythonPrinter : public IRVisitor {
   // it must survive a print/reparse roundtrip while the scope still exists.
   bool PrintScopeAllowEarlyResolveAttr(const ScopeStmtPtr& op);
 
+  // Emit ``predicate=(<expr>)`` if the scope carries ``kAttrPredicate``;
+  // returns true when printed. Same contract as
+  // PrintScopeAllowEarlyResolveAttr — the outliner reads the predicate off the
+  // scope and threads it onto the synthesised ``Submit``, so it must survive a
+  // print/reparse roundtrip while the scope still exists. The comparison Expr
+  // prints itself, so there is no bespoke syntax.
+  bool PrintScopePredicateAttr(const ScopeStmtPtr& op);
+
   // Emit ``windowize=True`` for an explicitly opted-in InCore scope.
   bool PrintScopeWindowizeAttr(const ScopeStmtPtr& op);
 
@@ -1038,7 +1046,8 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     if (value.type() == typeid(int)) {
       int int_val = AnyCast<int>(value, "printing kwarg: " + key);
       // Print pipe kwargs as PipeType enum names for readability
-      if (key == "set_pipe" || key == "wait_pipe") {
+      if (key == "set_pipe" || key == "wait_pipe" ||
+          (key == "pipe" && (IsOp(op, "system.sync_set") || IsOp(op, "system.sync_wait")))) {
         stream_ << prefix_ << ".PipeType." << PipeTypeToString(static_cast<PipeType>(int_val));
       } else if (key == "mode") {
         stream_ << "'" << CastModeToString(int_val) << "'";
@@ -1212,6 +1221,16 @@ void IRPythonPrinter::VisitExpr_(const SubmitPtr& op) {
   // launch spec, so emit it for a plain pl.submit too (not nested above).
   if (op->allow_early_resolve_) {
     stream_ << ", allow_early_resolve=True";
+  }
+
+  // Dispatch predicate — emitted as ``predicate=(<expr>)``; the comparison Expr
+  // prints itself, and the parser recovers it by parsing the kwarg as an
+  // ordinary expression, so the round trip needs no bespoke syntax.
+  if (op->predicate_.has_value()) {
+    INTERNAL_CHECK_SPAN(*op->predicate_, op->span_) << "Submit predicate is null";
+    stream_ << ", predicate=(";
+    VisitExpr(*op->predicate_);
+    stream_ << ")";
   }
 
   // Surface the machine-only ``attrs={...}`` dict the same way Call does:
@@ -1717,6 +1736,15 @@ bool IRPythonPrinter::PrintScopeAllowEarlyResolveAttr(const ScopeStmtPtr& op) {
   return true;
 }
 
+bool IRPythonPrinter::PrintScopePredicateAttr(const ScopeStmtPtr& op) {
+  auto pred = op->GetAttr<ExprPtr>(kAttrPredicate, nullptr);
+  if (!pred) return false;
+  stream_ << ", predicate=(";
+  VisitExpr(pred);
+  stream_ << ")";
+  return true;
+}
+
 bool IRPythonPrinter::PrintScopeWindowizeAttr(const ScopeStmtPtr& op) {
   if (!op->GetAttr<bool>("windowize", false)) return false;
   stream_ << ", windowize=True";
@@ -1855,6 +1883,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     }
     PrintScopeDepsAttr(op);
     PrintScopeAllowEarlyResolveAttr(op);
+    PrintScopePredicateAttr(op);
     stream_ << ")";
     PrintScopeTaskIdVarSuffix(op);
     stream_ << ":\n";
@@ -1893,6 +1922,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
       PrintSplitOptimizations(incore->split_.value_or(SplitMode::None), incore);
     }
     PrintScopeAllowEarlyResolveAttr(op);
+    PrintScopePredicateAttr(op);
     stream_ << "):\n";
     IncreaseIndent();
     // Emit the InCore body skipping the get_block_idx binding we just
@@ -1922,6 +1952,7 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
   }
   PrintScopeAllowEarlyResolveAttr(op);
+  PrintScopePredicateAttr(op);
   stream_ << "):\n";
   IncreaseIndent();
   PrintStmtBlock(op->body_);
