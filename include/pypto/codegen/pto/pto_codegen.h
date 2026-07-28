@@ -32,6 +32,7 @@
 #include "pypto/ir/memref.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/type.h"
 
@@ -679,6 +680,8 @@ class PTOCodegen : public CodegenBase {
    * @brief Get the pointer-identity key for a variable
    */
   [[nodiscard]] const ir::Var* GetVarKey(const ir::VarPtr& var) const;
+  void CheckExprVarsBound(const std::vector<ir::ExprPtr>& exprs, const ir::Span& span,
+                          const std::string& context) const;
   void BindVarToMlir(const ir::VarPtr& var, const std::string& mlir_name);
   void BindTensorView(const ir::VarPtr& var, const std::string& tensor_view_name);
   void BindVarToMemRef(const ir::VarPtr& var, const ir::Var* base_ptr);
@@ -765,8 +768,6 @@ class PTOCodegen : public CodegenBase {
     std::map<const ir::Var*, std::string> tensor_to_base_ptr;  ///< tensor var → base ptr SSA
     std::map<std::string, std::string>
         view_ssa_to_base_ptr;  ///< tensor_view SSA → base ptr SSA (for rebinding IfStmt phi return_vars)
-    std::map<std::string, std::string>
-        view_ssa_to_comm_ctx;  ///< tensor_view SSA → CommContext SSA (for distributed IfStmt phi return_vars)
     std::map<const ir::Var*, std::string> memref_to_mlir;    ///< keyed by base_ Ptr
     std::map<const ir::Var*, const ir::Var*> var_to_memref;  ///< maps tile var → base_ Ptr
     std::map<const ir::Var*, std::shared_ptr<const ir::TileType>>
@@ -853,7 +854,6 @@ class PTOCodegen : public CodegenBase {
       tensor_to_view.clear();
       tensor_to_base_ptr.clear();
       view_ssa_to_base_ptr.clear();
-      view_ssa_to_comm_ctx.clear();
       memref_to_mlir.clear();
       var_to_memref.clear();
       memref_to_tile_type.clear();

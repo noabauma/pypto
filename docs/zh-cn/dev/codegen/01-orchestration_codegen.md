@@ -4,9 +4,9 @@
 
 编排代码生成遵循与 [PTO 代码生成](00-pto_codegen.md#设计原则严格的-1-to-1-映射)相同的原则：从 IR 到生成 C++ 代码的**严格 1-to-1 转换**。代码生成不应执行优化、分析或间接转换——此类工作属于前置 Pass。
 
-例如，返回值到参数的追踪（将被调用者返回值映射回 `Out` 参数）是分析工作，应由代码生成之前的 Pass 解决。[`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass 现在会在代码生成之前完成此规范化，使编排代码生成可以直接将 `return[i]` 映射到 `out_indices[i]`，无需追踪 `tile.store`/yield 链。
+例如，返回值到参数的追踪（将被调用者返回值映射回 `Out` 参数）是分析工作，应由代码生成之前的 Pass 解决。[`NormalizeReturnOrder`](../passes/24-normalize_return_order.md) pass 现在会在代码生成之前完成此规范化，使编排代码生成可以直接将 `return[i]` 映射到 `out_indices[i]`，无需追踪 `tile.store`/yield 链。
 
-同样，判断一个 `ForStmt` iter_arg 是否需要物化 carry 变量，过去要在循环体上跑别名等价不动点。[`ClassifyIterArgCarry`](../passes/42-classify_iter_arg_carry.md) pass 现在把该判定（以及 TaskId fence 数组的 extent）打在 `ForStmt::attrs_` 上，codegen 直接读 `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>`，不再自行推导。
+同样，判断一个 `ForStmt` iter_arg 是否需要物化 carry 变量，过去要在循环体上跑别名等价不动点。[`ClassifyIterArgCarry`](../passes/43-classify_iter_arg_carry.md) pass 现在把该判定（以及 TaskId fence 数组的 extent）打在 `ForStmt::attrs_` 上，codegen 直接读 `iter_arg_rebind_<i>` / `iter_arg_array_size_<i>`，不再自行推导。
 
 ## 概述
 
@@ -108,7 +108,7 @@ const Tensor& tmp = alloc_0.get_ref(0);
 ### 阶段 6–8：任务提交与控制流
 
 所有任务提交包裹在顶层 `PTO2_SCOPE()` 中。codegen 不再依据 `for` / `if` 结构
-决定 scope 位置：[MaterializeRuntimeScopes](../passes/41-materialize_runtime_scopes.md)
+决定 scope 位置：[MaterializeRuntimeScopes](../passes/42-materialize_runtime_scopes.md)
 pass 会向 IR 中插入显式的 AUTO `RuntimeScopeStmt` 节点（函数体以及每个
 `for` / `if` 体），codegen 从这些节点 1:1 地 emit `PTO2_SCOPE`（manual scope
 降级为 `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`）：
@@ -190,7 +190,7 @@ params_t1.add_input(ext_output);  // result -> ext_output（无别名声明）
 
 结果别名到哪个 `Out`/`InOut` 参数是查表而非启发式——也不是分析。
 `ReturnParamsExplicit` 属性
-（[`NormalizeReturnOrder`](../passes/23-normalize_return_order.md)）保证：
+（[`NormalizeReturnOrder`](../passes/24-normalize_return_order.md)）保证：
 每个"写回参数"的张量返回值**就是**该参数本身（指针同一性）。因此 codegen 直接
 从被调用者的 `ReturnStmt` 上读取"返回位置 → 参数下标"映射
 （`ir::return_lineage::ExplicitReturnedParamIndices`）：无需 SSA 遍历、无需递归
@@ -453,25 +453,27 @@ params_t1.set_dependencies(params_t1_deps, params_t1_deps_count);
 ```
 
 只有当 TaskId 可能合法地持有 `PTO2TaskId::invalid()` 哨兵时，dep 槽位才被
-`if (task_id.is_valid())` 包裹——`None` 循环 carry 种子、循环首次迭代的
-iter_arg carry，或未写入的数组槽——因为 invalid id 绝不能进入
-`set_dependencies`。而**新鲜的直接生产者** TaskId（同一直线作用域中更早的
-`pl.submit(...)` 的输出）静态上恒为有效，因此其插入不加守卫（issue #1966），
-从编排热路径上消除了这个恒真分支。
+`if (task_id.is_valid())` 包裹，因为 invalid id 绝不能进入
+`set_dependencies`；而**新鲜的直接生产者** TaskId 静态上恒为有效，因此其插入
+不加守卫（issue #1966）。完整的分类见 [TaskId 的来源](#taskid-的来源)。
 
 不再有 `params.add_dep(...)` 调用，也没有 16 条依赖上限——runtime 的
-`Arg::set_dependencies` 原语没有上限，栈数组按精确数量定长。dep 边
-用户依赖来自 parser：parser 把用户的 `pl.submit(..., deps=[tid1, tid2])`
-kwarg 写入类型化的 `Submit::deps_` 字段；codegen 通过临时的 `SubmitToCallView`
-读取它们——该 view 把 `deps_` 合成为 `attrs["manual_dep_edges"]`（一个
-`vector<VarPtr>`，每项为 `Scalar[TASK_ID]` 类型的 Var）。普通 `Call` 携带
+`Arg::set_dependencies` 原语没有上限，栈数组按精确数量定长。用户依赖来自
+parser：parser 把用户的 `pl.submit(..., deps=[tid1, tid2])` kwarg 写入类型化的
+`Submit::deps_` 字段；codegen 通过临时的 `SubmitToCallView` 读取它们——该 view
+把 `deps_` 合成为 `attrs["manual_dep_edges"]`。普通 `Call` 携带
 `manual_dep_edges` 的形态已不存在——ManualDepsOnSubmitOnly 结构性属性会校验
 任何跨函数 `Call` 都不携带它；只有 `system.task_dummy` barrier op 作为 fanin
-契约保留该 attr。编译器推导的 manual-scope 依赖来自
-[`AutoDeriveTaskDependencies`](../passes/35-auto_derive_task_dependencies.md)，
+契约保留该 attr。编译器推导的依赖边来自
+[`AutoDeriveTaskDependencies`](../passes/36-auto_derive_task_dependencies.md)，
 保存在 `Call.attrs["compiler_manual_dep_edges"]`（独立的 key，允许出现在普通
-call 上）。Codegen 会按这个顺序合并两组列表，并按 Var identity 去重后再发出
-栈数组。
+call 上）。该 pass 从不分析用户写的 MANUAL scope——在 `pl.manual_scope()` 内，
+显式的 `deps=[...]` 仍是唯一的依赖边来源。它只分析 AUTO 区域，且仅当编译期开关
+`analyze_auto_scopes_for_deps` 打开时才生效。默认模式（`auto_scope=True`）区域
+在被完整覆盖时会成为*编译器自有*的 MANUAL scope，否则保持 AUTO，其可表示的边
+叠加在 runtime 自动追踪之上发出；手工放置的 `pl.scope()` 始终保持
+`manual=false`，一旦分析回退则会剥离其部分推导边。Codegen 会按这个顺序合并两组
+列表，并按 Var identity 去重后再发出栈数组。
 
 ### TaskId 的来源
 

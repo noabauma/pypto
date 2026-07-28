@@ -8,7 +8,7 @@
 | ---- | ---- | ---- | -------- |
 | **TensorOp** | TensorType | 支持广播的 N 维张量 (Tensor) 操作 | `src/ir/op/tensor_ops/` |
 | **TileOp** | TileType | 硬件优化的 Tile 操作 | `src/ir/op/tile_ops/` |
-| **SyncOp** | UnknownType | 流水线屏障和同步 | `src/ir/op/sync_ops/sync.cpp` |
+| **SyncOp** | UnknownType（屏障）；ScalarType（task / 启动形状查询） | 流水线屏障、同步、TaskId 与 SPMD 启动形状查询 | `src/ir/op/sync_ops/` |
 | **CrossCoreOp** | UnknownType/TileType | AIC↔AIV 跨核通信 | `src/ir/op/sync_ops/cross_core.cpp` |
 
 **主要特性**：流式 API、自动类型推导、kwargs 元数据、NumPy 风格广播、类型提升、动态维度（`kDynamicDim`）
@@ -16,12 +16,6 @@
 ## 类型系统
 
 ```cpp
-// TensorType: N-dimensional tensors
-TensorType(DataType::FP32, {dim1, dim2, dim3, ...})
-
-// TileType: Hardware-optimized tiles
-TileType(DataType::FP16, {dim1, dim2})
-
 // Dynamic dimensions (pypto/core/common.h)
 constexpr int64_t kDynamicDim = -1;
 auto dynamic_dim = make_int(kDynamicDim);
@@ -224,16 +218,11 @@ UINT32 + INT32 → INT32 (signed precedence)
 **位置**：`src/ir/op/tensor_ops/`
 **Python API**：`from pypto.ir.op import tensor`
 
-**操作：** `tensor.add/sub/mul/div`（逐元素，支持完整 N 维广播），`tensor.maximum/minimum`（逐元素 max/min；rhs 可为 tensor 或 scalar — `ConvertTensorToTileOps` 根据 rhs 类型分发到 `tile.maximum/minimum` 或 `tile.maximums/minimums`），`tensor.set_validshape`（内部 API，更新 valid_shape 元数据，不搬移数据 — 仅供编译器生成代码使用），`tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2`（排序；分别对应 `tile.sort32` / `tile.mrgsort` 的 tensor 层接口，由 `ConvertTensorToTileOps` 转换为 tile 操作），`tensor.gather`（按维索引；MVP 仅支持 2D 输入 + `dim=-1`，由 `ConvertTensorToTileOps` 按行展开为 `tile.gather` 循环），`tensor.gather_mask`（掩码模式选择；对应 `tile.gather_mask`，支持可选同位宽 `output_dtype`；见[掩码模式](#掩码模式)），`tensor.scatter`（按列散布；`tensor.gather` 的按列逆操作，MVP 仅支持 2D 输入 + `dim=-1` —— `out[b, index[b, k]] = src[b, k]`，`index` 与 `src` 同形状 —— 由 `ConvertTensorToTileOps` 下降到 `tile.scatter`），`tensor.scatter_mask`（按掩码模式散布；对应 `tile.scatter_mask`，将紧凑 `input` 按掩码扩展到 `dst` 的对应列 —— 见[掩码模式](#掩码模式)），`tensor.ci` / `tensor.arange`（生成连续整数序列，下层降到 `tile.ci`；同时通过 `pl.arange` 暴露在顶层 namespace）
+**操作：** `tensor.add/sub/mul/div`（逐元素，支持完整 N 维广播），`tensor.maximum/minimum`（逐元素 max/min；rhs 可为 tensor 或 scalar — `ConvertTensorToTileOps` 根据 rhs 类型分发到 `tile.maximum/minimum` 或 `tile.maximums/minimums`），`tensor.set_validshape`（内部 API，更新 valid_shape 元数据，不搬移数据 — 仅供编译器生成代码使用），`tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2`（排序；分别对应 `tile.sort32` / `tile.mrgsort` 的 tensor 层接口，由 `ConvertTensorToTileOps` 转换为 tile 操作），`tensor.gather`（按维索引；MVP 仅支持 2D 输入 + `dim=-1`，由 `ConvertTensorToTileOps` 按后端分策略下降 —— A5（Ascend950）将末维 gather 展开为对扁平元素偏移 `flat[i, j] = i * src_cols + index[i, j]` 的单次整块 `tile.gather`，并在此之前把带 stride 的 tile 源（如 `tile.slice` 视图）物化为连续 tile，使扁平索引能正确寻址；A2A3（Ascend910B）保留 legacy 的按行 `tile.gather` 循环，此时每个单行切片内的列索引即等于扁平索引），`tensor.gather_mask`（掩码模式选择；对应 `tile.gather_mask`，支持可选同位宽 `output_dtype`；见[掩码模式](#掩码模式)），`tensor.scatter`（按列散布；`tensor.gather` 的按列逆操作，MVP 仅支持 2D 输入 + `dim=-1` —— `out[b, index[b, k]] = src[b, k]`，`index` 与 `src` 同形状 —— 由 `ConvertTensorToTileOps` 下降到 `tile.scatter`），`tensor.scatter_mask`（按掩码模式散布；对应 `tile.scatter_mask`，将紧凑 `input` 按掩码扩展到 `dst` 的对应列 —— 见[掩码模式](#掩码模式)），`tensor.ci` / `tensor.arange`（生成连续整数序列，下层降到 `tile.ci`；同时通过 `pl.arange` 暴露在顶层 namespace）
 
-`tensor.view` 是只修改元数据的零拷贝 shape/layout 重新解释操作。它注册为
-`TensorOp`，并在 `ConvertTensorToTileOps` 中作为 passthrough 处理；PTO
-in-core codegen 会将其降级为基于原始 base pointer 的 `pto.make_tensor_view`。
-目标 rank 至少为 1（DN 至少为 2）；编排层仅支持 ND shape 重新解释，且不能
-同时改变 layout。
-对部分有效的源张量进行 shape 重新解释时，仅支持把 packed ND 的 leading
-dimensions 折叠为 2D，并且必须显式提供目标 `valid_shape`；该形式会保留源张量
-类型及其底层元数据。
+`tensor.view` 是只修改元数据的零拷贝 shape/layout 重新解释操作。它注册为 `TensorOp`，并在 `ConvertTensorToTileOps` 中作为 passthrough 处理；PTO in-core codegen 会将其降级为基于原始 base pointer 的 `pto.make_tensor_view`。目标 rank 至少为 1（DN 至少为 2）；编排层仅支持 ND shape 重新解释，且不能同时改变 layout。对部分有效的源张量进行 shape 重新解释时，仅支持把 packed ND 的 leading dimensions 折叠为 2D，并且必须显式提供目标 `valid_shape`；该形式会保留源张量类型及其底层元数据。
+
+`pl.reinterpret_view(data, dtype, *, shape=None)` 会根据输入分派到等价的 `pl.tensor` 或 `pl.tile` 算子，并保持返回类型种类不变。它是覆盖完全相同字节的零拷贝视图，因此 `dtype` 必须不同，且仅支持有/无符号 8/16/32/64 位整数、FP16、BF16 与 FP32。省略 `shape` 时，ND/row-major 缩放最后一轴，DN/col-major 按源/目标字节宽度比例缩放倒数第二轴。显式 shape 必须字节数相等；除非能证明它与自动推导 shape 等价，否则必须完全静态。部分有效的 `valid_shape` 只能使用与自动推导结果等价的 shape。零值/null padding 元数据会保留，依赖 dtype 的 max/min padding 则会清除。初始可执行路径支持 packed ND in-core tensor 及 packed、flat（`none_box`）row/col-major tile；DN tensor 可做类型推导但 Tensor-to-Tile 下降会拒绝，编排层 tensor 暂不支持。
 
 **示例：**
 
@@ -266,17 +255,41 @@ with ib.function("tensor_example") as f:
 | - | `tile.load` | TensorType → TileType（DDR 到统一缓冲区） |
 | - | `tile.store` | TileType → TensorType（统一缓冲区到 DDR） |
 | **逐元素** | `tile.add/sub/mul/div` | Tile-Tile 操作 |
-| - | `tile.adds/subs/muls/divs` | Tile-Scalar 操作 |
+| - | `tile.adds/subs/muls/divs` | Tile-Scalar 操作。**常量**标量操作数会采用 tile 的元素 dtype（裸整数字面量否则会被解析为 `index`，而任何 `pto.t*s` 算子都不接受它）——但整数 tile 上的浮点字面量仍保持 FP32，以保留类型提升语义。显式的 `pl.const(v, dtype)` 属于用户的有意标注，与任何非常量表达式一样保持不变；非常量的 `index` 标量（循环变量、`pl.dim`）会被拒绝——需用 `pl.cast` 转换。`tensor.*s` 同理。 |
 | **一元** | `tile.sqrt` | 逐元素平方根 |
 | **变换** | `tile.slice` | 提取子 tile，静态 shape，可选动态 valid_shape |
 | - | `tile.extract` | 从 `src` 在 `(index_row, index_col)` 处提取子 tile —— ISA TEXTRACT Variant 1（Mat→Left/Right，Acc→Mat） |
-| - | `tile.reshape` | 重塑 tile 维度（元素总数须一致） |
+| - | `tile.reshape` | 重塑 tile 维度（元素总数须一致）。会把源的 `valid_shape` 带到结果上，且绝不扩大 —— 见[reshape 与有效区域（valid region）](#reshape-与有效区域valid-region) |
+| - | `tile.reinterpret_view` | 以不同 dtype 对完全相同的字节做零拷贝视图；可选 shape 默认按 layout 推导（仅支持紧密、非分形 tile） |
 | - | `tile.transpose` | 交换 tile 的两个轴 |
 | - | `tile.set_validshape` | 更新 valid_shape 元数据，不搬移数据 |
 | - | `tile.ci` | 生成连续整数序列（升序 start+k 或降序 start-k）；dtype ∈ {INT16, INT32}；最内维 != 1 |
 | **规约** | `tile.row_*` / `tile.col_*` | 方向特定的规约（`row_sum`/`row_max`/`row_min`/`row_prod` 折叠最后一轴；`col_*` 折叠第 0 轴）。不存在以 axis 参数化的规约算子 —— ISA 只提供方向特定的指令（`pto.trowsum`、`pto.tcolsum` 等） |
 | **散布** | `tile.scatter` | 按行索引把 `src` 散布到 `dst`（`pto.tscatter` 索引形式；DPS：`dst` 为 in/out，结果别名为 `dst`）。`src` / `dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}；`indexes` dtype ∈ {I16, I32}；元素宽度匹配规则：4 字节 dst ↔ INT32，2 字节 dst ↔ INT16，1 字节 dst ↔ INT16。 |
 | - | `tile.scatter_mask` | 按掩码模式把 `src` 行写入 `dst` 中由掩码选中的列（DPS：`dst` 为 in/out）。这是 PyPTO codegen 层形式，下降为 `pto.tscatter` 掩码发射 —— **并非**独立的 pto-isa 指令（与 `tile.gather_mask` 不同）。掩码语义见[掩码模式](#掩码模式)。 |
+
+`tile.reshape` 保持 dtype、元素总数以及源的有效区域（见下）；`tile.reinterpret_view(data, dtype, *, shape=None)` 改变 dtype，但要求前后总字节数完全相同。省略 `shape` 时，它会根据源/目标 dtype 字节宽度和 tile layout 缩放物理连续轴。在 PTOAS 内存规划下，无论 shape 是否变化，都会下降为保持别名关系的 PTO `treshape` 原语。
+
+### reshape 与有效区域（valid region）
+
+reshape 是零拷贝视图，无法凭空产生数据：`tensor.reshape` 与 `tile.reshape` 共用
+同一条规则，把源的 `valid_shape` 映射到目标 shape，且绝不扩大。有效区域只能表示为
+以原点为锚的矩形框，因此并非所有源区域都能在重新切分后保留：
+
+| 源区域 | 结果 |
+| ------ | ---- |
+| 完全有效 | `new_shape` —— 会被规范化掉，不产生 view，已有程序不受影响 |
+| 可证明为空 | 全零矩形框 |
+| 仅增删完全有效的单位轴 | 保留的轴按 1:1 映射，可精确保留任意矩形 |
+| 连续的扁平前缀 | `new_shape` 中覆盖同一批元素的矩形（若存在） |
+| 其他情况 | **拒绝** —— `valid_shape` 无法描述 reshape 后的区域 |
+
+因此 `[8, 16]` valid `[5, 16]`（80 个元素的扁平前缀）可映射为 `[16, 8]` valid
+`[10, 8]` 或 `[128]` valid `[80]`，而 `[4, 32]` 会被拒绝 —— 80 个元素不是整数行
+（每行 32）。`[1, 8, 16]` valid `[1, 8, 5]` 根本不是扁平前缀，但映射到 `[8, 16]`
+valid `[8, 5]` 是精确的，因为丢弃完全有效的单位轴不改变行列关系。
+`tensor.reshape` 可选的第三个 `valid_shape` 操作数只能*收窄*推导出的区域，
+不能声称拥有该区域之外的数据。
 
 **数据流：** `TensorType (DDR) → tile.load → TileType (Unified Buffer) → tile.{ops} → TileType → tile.store → TensorType (DDR)`
 
@@ -313,7 +326,8 @@ with ib.function("tile_computation") as f:
     tile_b = ib.let("tile_b", tile.load(input_b, [0, 0], [32, 128]))
     tile_mul = ib.let("tile_mul", tile.mul(tile_a, tile_b))
     tile_sqrt = ib.let("tile_sqrt", tile.sqrt(tile_mul))
-    # row_sum 折叠最后一轴 -> [32, 1]；需要一块 scratch tile
+    # row_sum 折叠最后一轴 -> [32, 1]。scratch tile 必须与输入 dtype 和 rank 相同，
+    # 且每一维都不小于输入的对应维度。
     tmp_tile = ib.let("tmp_tile", tile.create([32, 128], DataType.FP32))
     tile_sum = ib.let("tile_sum", tile.row_sum(tile_sqrt, tmp_tile))
     result = ib.let("result", tile.store(tile_sum, [0, 0], output))
@@ -322,9 +336,9 @@ with ib.function("tile_computation") as f:
 
 ## SyncOp：同步操作
 
-**用途**：硬件同步与屏障
-**类型**：`UnknownType`（无返回值），在 `EvalStmt` 中使用
-**位置**：`src/ir/op/sync_ops/sync.cpp`
+**用途**：硬件同步与屏障，以及共用 `system.` 命名空间的 TaskId 与 SPMD 启动形状查询
+**类型**：屏障类为 `UnknownType`（无返回值，在 `EvalStmt` 中使用）；查询类为 `ScalarType`，会绑定一个值（`task_invalid`、`task_is_valid`、`available_cluster_count`、`available_aiv_count`）
+**位置**：`src/ir/op/sync_ops/` —— `sync.cpp`（屏障）、`task.cpp`（TaskId）、`launch.cpp`（启动形状查询）
 **Python API**：`from pypto.ir.op import system`
 
 | 操作 | 描述 | Kwargs |
@@ -339,6 +353,8 @@ with ib.function("tile_computation") as f:
 | `system.sync_dst` | 等待同步标志 | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.task_invalid` | `PTO2TaskId::invalid()` 哨兵——TaskId carry 的 "暂无 producer" 种子 | 无 |
 | `system.task_is_valid` | 测试某个 `TASK_ID` 值是否为有效（非哨兵）handle | 无；唯一位置参数是 TaskId Var |
+| `system.available_cluster_count` | 本次运行的 MIX cluster（= AIC）数，由设备读回。结果为 `Scalar[INT32]` | 无 |
+| `system.available_aiv_count` | 本次运行的独立 AIV 核数，由设备读回。结果为 `Scalar[INT32]` | 无 |
 
 `system.syncall` 有两种 mode。**hard** 形态（`mode="hard"`，默认）下沉为 FFTS 屏障，等待所选 `core_type` 的**全部**物理核到达；kernel 必须以满占用方式启动（每个物理核一个 block）**且带 `sync_start=True`**（使所有 block 同时驻留——非 sync_start 启动可能分波次派发 block 而使屏障死锁），否则屏障死锁（AICore 错误 507018）。**soft** 形态（`mode="soft"`）轮询一段共享 GM workspace，因此可在**部分**占用下工作。`gm_workspace` 是共享、清零的 GM `INT32` tensor，含 `used_cores * 8` 个 slot（请作为 kernel 参数传入，使所有 block 共享同一缓冲）；暂存 tile 由编译器合成；`used_cores` 是参与核数。soft 形态对每种 `core_type` 都支持，operand 随参与核集合而不同：
 
@@ -349,6 +365,8 @@ with ib.function("tile_computation") as f:
 扁平 L1 暂存 tile 通过 `pl.tile.create(..., target_memory=pl.Mem.Mat, flat_layout=True)` 创建，保持连续的 `slayout=none_box` 布局（普通的 boxed NZ Mat tile 会错位 8 个 int32 计数槽）。
 
 统一的 `mode=` 关键字 API（`mode="hard"` / `mode="soft"`）是 **DSL** 层接口（`pl.system.syncall`）。`pypto.ir.op.system` 下的 Python IR 辅助函数则是拆开的：`syncall(core_type=...)` 构造 hard 形态，`syncall_soft(core_type, args)` 构造 soft 形态。
+
+`system.available_cluster_count` / `system.available_aiv_count` 是 SPMD **启动形状查询**：把它作为 `pl.spmd(...)` 的 `core_num` 传入，启动宽度即按本次运行落到的设备自适应。Orchestration codegen 分别下沉为 `rt_available_cluster_count()` / `rt_available_aiv_count()`。混合（AIC+AIV）或纯 cube kernel 用 cluster 数（每个 core-group 一个 block），纯 vector kernel 用 AIV 数。这是唯一能跨设备保持满占用的启动宽度，而 hard `system.syncall` 正需要满占用；`HardSyncallOccupancy` verifier 对这类宽度不再做数量比较，并会拒绝用错核类型的查询。请把调用内联传入（`pl.spmd(pl.system.available_cluster_count())`），不要先绑定到变量名——变量名会以「定义在调用方的变量」形式落到外提出的 `Spmd` 包装函数上，IR printer 无法重新解析。源码：`src/ir/op/sync_ops/launch.cpp`。
 
 `system.task_invalid` 返回类型为 [`ScalarType(DataType::TASK_ID)`](02-types.md#scalartype)。当 Python 字面量 `None` 出现在 TaskId 位置（`deps=[None]` 条目或 TaskId 循环 iter_arg 种子）时，它就是 `None` 在 `with pl.manual_scope():` 区域内的下沉目标。不存在 `system.task_id_of` op —— producer task id 由 `pl.submit(...)` parser construct 返回的二元组第二个元素获得，而非来自 builtin。源码：`src/ir/op/sync_ops/task.cpp`。
 
@@ -441,6 +459,8 @@ class CrossCoreExample:
 | `tile_ops/reduction.cpp` | TileOp: sum（含 axis, keepdim） |
 | `tile_ops/unary.cpp` | TileOp: sqrt |
 | `sync_ops/sync.cpp` | SyncOp: sync_src, sync_dst, barriers |
+| `sync_ops/task.cpp` | SyncOp：TaskId 哨兵与判定 |
+| `sync_ops/launch.cpp` | SyncOp：SPMD 启动形状查询 |
 | `sync_ops/cross_core.cpp` | CrossCoreOp: tpush, tpop, pipe init, buffers |
 
 **优势**：

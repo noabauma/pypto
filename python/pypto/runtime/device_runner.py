@@ -478,6 +478,86 @@ def compile_single_orchestration(
 # ---------------------------------------------------------------------------
 
 
+def _missing_kernel_config_error(work_dir: Path) -> FileNotFoundError:
+    """Explain why a build output has no runtime manifest."""
+    config_path = work_dir / "kernel_config.py"
+    kernels_dir = work_dir / "kernels"
+    raw_pto_count = sum(1 for _ in kernels_dir.rglob("*.pto"))
+    if raw_pto_count == 0:
+        return FileNotFoundError(
+            f"Cannot execute PyPTO artifact '{work_dir}': required '{config_path}' is missing.\n"
+            f"No raw .pto kernel files were found under '{kernels_dir}' either. This directory "
+            "cannot be loaded as a single-chip PyPTO artifact; it may be incomplete or use a "
+            "different build layout.\n"
+            "Recompile the program and inspect any earlier codegen error."
+        )
+
+    ptoas_root = os.environ.get("PTOAS_ROOT")
+    configuration_step: str | None = None
+    if ptoas_root:
+        ptoas_path = Path(ptoas_root) / "ptoas"
+        if ptoas_path.is_file() and os.access(ptoas_path, os.X_OK):
+            environment_status = (
+                f"ptoas is now available at '{ptoas_path}', but this artifact was generated "
+                "without it and must be recompiled."
+            )
+        else:
+            environment_status = (
+                f"PTOAS_ROOT is set to '{ptoas_root}', but the expected executable "
+                f"'{ptoas_path}' does not exist or is not executable."
+            )
+            configuration_step = (
+                "Correct or remove the invalid PTOAS_ROOT setting:\n"
+                "       export PTOAS_ROOT=/path/to/ptoas-bin\n"
+                "     Or use a ptoas executable from PATH instead:\n"
+                "       unset PTOAS_ROOT\n"
+                "       export PATH=/path/to/ptoas-bin:$PATH\n"
+                "     On a managed PyPTO development machine, reset the invalid override first:\n"
+                "       unset PTOAS_ROOT\n"
+                '       eval "$(pypto-setup --export)"'
+            )
+    else:
+        ptoas_path = shutil.which("ptoas")
+        if ptoas_path:
+            environment_status = (
+                f"ptoas is now available on PATH at '{ptoas_path}', but this artifact was "
+                "generated without it and must be recompiled."
+            )
+        else:
+            environment_status = "PTOAS_ROOT is not set and 'ptoas' was not found on PATH."
+            configuration_step = (
+                "Configure ptoas with one of these options:\n"
+                "       export PTOAS_ROOT=/path/to/ptoas-bin\n"
+                "     Or:\n"
+                "       export PATH=/path/to/ptoas-bin:$PATH\n"
+                "     On a managed PyPTO development machine, run:\n"
+                '       eval "$(pypto-setup --export)"'
+            )
+
+    recovery_steps = []
+    if configuration_step is not None:
+        recovery_steps.append(configuration_step)
+    recovery_steps.extend(
+        [
+            "Restart the Python process and rerun the program so the artifact is recompiled.",
+            "If calling ir.compile() directly, use skip_ptoas=False.",
+        ]
+    )
+    recovery_text = "\n".join(f"  {index}. {step}" for index, step in enumerate(recovery_steps, start=1))
+
+    return FileNotFoundError(
+        f"Cannot execute PyPTO artifact '{work_dir}': required '{config_path}' was not generated.\n"
+        "Reason:\n"
+        f"  Found {raw_pto_count} raw .pto kernel file(s) under '{kernels_dir}'.\n"
+        "  This is a compile-only artifact produced with skip_ptoas=True. That mode intentionally "
+        "omits kernel_config.py and cannot be executed. @pl.jit selects it automatically when "
+        "ptoas is unavailable.\n"
+        "PTOAS check:\n"
+        f"  {environment_status}\n"
+        f"How to fix:\n{recovery_text}"
+    )
+
+
 def compile_and_assemble(
     work_dir: Path,
     platform: str,
@@ -497,14 +577,18 @@ def compile_and_assemble(
         callable, the runtime name (e.g. ``"tensormap_and_ringbuffer"``),
         and the full ``RUNTIME_CONFIG`` dict loaded from
         ``kernel_config.py``. Callers can read defaults such as
-        ``block_dim`` / ``aicpu_thread_num`` from ``runtime_config`` —
-        keys are only present when the producer of the artifact opted
-        to bake them in.
+        ``aicpu_thread_num`` from ``runtime_config`` — keys are only
+        present when the producer of the artifact opted to bake them in.
+
+    Raises:
+        FileNotFoundError: If ``kernel_config.py`` is missing. Compile-only
+            artifacts include the detected ptoas configuration and recovery
+            steps in the error.
     """
     # Load kernel_config.py
     config_path = work_dir / "kernel_config.py"
     if not config_path.exists():
-        raise FileNotFoundError(f"kernel_config.py not found in {work_dir}")
+        raise _missing_kernel_config_error(work_dir)
 
     spec = importlib.util.spec_from_file_location("_kernel_config", str(config_path))
     if spec is None or spec.loader is None:
@@ -610,7 +694,6 @@ def execute_on_device(  # noqa: PLR0913
     device_id: int,
     *,
     level: int = 2,
-    block_dim: int | None = None,
     aicpu_thread_num: int | None = None,
     output_prefix: str | None = None,
     enable_l2_swimlane: bool = False,
@@ -639,19 +722,6 @@ def execute_on_device(  # noqa: PLR0913
             supported; passing any other value raises ``ValueError``. The
             parameter exists so callers can plumb level through ahead of L3
             user-API support.
-        block_dim: Number of logical SPMD blocks to dispatch. ``None``
-            (default) leaves the field unset on the underlying
-            ``ChipCallConfig``, so the simpler runtime's own default
-            (``ChipCallConfig::block_dim = 0``, the "auto" sentinel)
-            applies — DeviceRunner resolves it at ``run()`` time to the
-            max the AICore stream allows (``aclrtGetStreamResLimit`` on
-            onboard, ``PLATFORM_MAX_BLOCKDIM`` on sim). Any positive
-            value is taken as an explicit cap and validated against the
-            same stream-resource limits; over-capacity requests are
-            rejected with a clear error
-            (``max_block_dim=... cube=... vector=...``). Callers that
-            know the kernel's required block count should pass it
-            explicitly rather than relying on auto-resolution.
         aicpu_thread_num: Number of AICPU threads. ``None`` leaves the
             field unset and uses the simpler runtime default.
         output_prefix: Directory under which the runtime writes diagnostic
@@ -712,8 +782,6 @@ def execute_on_device(  # noqa: PLR0913
     from .worker import ChipWorker as _PyptoWorker  # noqa: PLC0415
 
     cfg = CallConfig()
-    if block_dim is not None:
-        cfg.block_dim = block_dim
     if aicpu_thread_num is not None:
         cfg.aicpu_thread_num = aicpu_thread_num
     # CallConfig nanobind setters: ``enable_l2_swimlane`` / ``enable_dep_gen``

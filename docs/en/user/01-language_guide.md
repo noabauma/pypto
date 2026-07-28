@@ -17,9 +17,10 @@ Complete reference for the `pypto.language` (`pl`) module.
 | `pl.FP16` | 16 | IEEE half-precision float |
 | `pl.BF16` | 16 | Brain float 16 |
 | `pl.FP32` | 32 | IEEE single-precision float |
-| `pl.FP4` | 4 | 4-bit float |
-| `pl.FP8E4M3FN` | 8 | 8-bit float (e4m3fn) |
-| `pl.FP8E5M2` | 8 | 8-bit float (e5m2) |
+| `pl.FP4` | 4 | 4-bit float (packed MXFP4 E2M1×2; PTOAS `!pto.f4E2M1x2`) |
+| `pl.FP8E4M3FN` | 8 | 8-bit float (e4m3fn); MXFP8 data |
+| `pl.FP8E5M2` | 8 | 8-bit float (e5m2); MXFP8 data |
+| `pl.FP8E8M0` | 8 | MX block-scale exponent (E8M0); PTOAS `!pto.f8E8M0` / pto-isa `float8_e8m0_t` |
 | `pl.HF4` / `pl.HF8` | 4/8 | Hisilicon float formats |
 | `pl.INDEX` | 64 | Index type for index computations — loop vars, dimensions |
 
@@ -166,6 +167,15 @@ c = pl.reshape(a, [16, 8])  # shape operations (also transpose, slice)
 c = pl.matmul(a, b)         # linear algebra
 c = pl.row_sum(a)            # reductions (also row_max)
 ```
+
+Not every `pl.cast` is one instruction. Whether a `(src, dst)` dtype pair maps to a
+single hardware `pto.tcvt` or is expanded into a multi-hop chain depends on the target
+architecture — for example `INT32 -> FP16` is one instruction on Ascend910B but lowers
+to `INT32 -> FP32 -> FP16` on Ascend950. The chain costs one `tcvt` per hop, and where
+an intermediate is narrower than the source it can differ from a directly rounded
+conversion by one ULP of the destination. See
+[LegalizeTileCast](../dev/passes/14-legalize_tile_cast.md) for the per-architecture
+tables of native pairs, expanded pairs and their hop counts.
 
 Tensor and Tile types also support Python subscript syntax as sugar for `slice`/`read`:
 
@@ -477,7 +487,7 @@ too; entry `True` + inline `False` is legal and just nests hand scopes
 inside compiler AUTO scopes). `.incore` / `.opaque` reject it — they
 outline into separate kernels. It specializes into
 `@pl.function(..., auto_scope=False)` — see the
-[MaterializeRuntimeScopes pass](../dev/passes/41-materialize_runtime_scopes.md)
+[MaterializeRuntimeScopes pass](../dev/passes/42-materialize_runtime_scopes.md)
 for the resulting scope-placement semantics.
 
 ### `@pl.inline`
@@ -533,6 +543,21 @@ with pl.at(level=pl.Level.CORE_GROUP,
            optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
     y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
 ```
+
+To pin the slot count (ring depth) of the automatic cross-core pipe, use
+`pl.cross_core_slot(...)`. It sizes a data channel rather than partitioning work,
+so it is independent of the split mode and the two combine freely:
+
+```python
+# Shrink the ring to 4 slots to free buffer space for a larger tile:
+with pl.at(level=pl.Level.CORE_GROUP,
+           optimizations=[pl.split(pl.SplitMode.UP_DOWN),
+                          pl.cross_core_slot(slot_num=4)]):
+    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+```
+
+Omit the entry to keep the default (8 slots when one direction is live, 4 per
+direction when both are).
 
 ## Memory and Data Movement
 

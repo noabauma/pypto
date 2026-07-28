@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from pypto.backend import BackendType
-from pypto.ir.pass_manager import OptimizationStrategy
+from pypto.ir.pass_manager import OptimizationStrategy, PassDumpLevel
 from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core.passes import DiagnosticCheckSet, DiagnosticPhase, MemoryPlanner
 
@@ -89,7 +89,10 @@ class RunConfig:
         atol: Absolute tolerance for result comparison.
         strategy: PyPTO optimisation strategy applied during compilation.
         backend_type: Code-generation backend (:attr:`BackendType.Ascend910B` by default).
-        dump_passes: If ``True``, dump intermediate IR after each pass.
+        dump_passes: Per-pass IR dump control. A :class:`~pypto.ir.PassDumpLevel`
+            (``NONE`` / ``CONCISE`` / ``EXPLICIT``) or a ``bool``
+            (``True`` -> ``CONCISE``, ``False`` -> ``NONE``). ``EXPLICIT`` resolves
+            implicit tile layouts and distributed window buffers in the dump.
         save_kernels: If ``True``, retain generated artefacts after execution.
             When ``False`` (default), a temporary directory is used and cleaned up.
         save_kernels_dir: Directory to save generated artefacts when *save_kernels*
@@ -160,15 +163,11 @@ class RunConfig:
             there.  Use a path from a previous run
             (e.g. ``build_output/<name>_<ts>/data``) to reuse existing golden
             data, or specify a new path to persist data to a fixed location.
-        block_dim: Optional per-invocation override of the logical SPMD
-            block count. ``None`` (default) defers to the value baked
+        aicpu_thread_num: Optional per-invocation override of the AICPU
+            thread count. ``None`` (default) defers to the value baked
             into ``kernel_config.py``'s ``RUNTIME_CONFIG`` at compile
             time (which itself may be unset, in which case the simpler
-            runtime default applies). Set this when running the same
-            compiled artifact on devices with different usable core
-            counts.
-        aicpu_thread_num: Optional per-invocation override of the AICPU
-            thread count. Same precedence rules as ``block_dim``.
+            runtime default applies).
         ring_task_window: Optional per-invocation override of the runtime
             ring's task-slot window (number of in-flight tasks). Forwarded to
             ``CallConfig.runtime_env.ring_task_window``. A scalar (broadcast to
@@ -223,7 +222,7 @@ class RunConfig:
     atol: float = 1e-5
     strategy: OptimizationStrategy = field(default_factory=lambda: OptimizationStrategy.Default)
     backend_type: BackendType = field(default_factory=lambda: BackendType.Ascend910B)
-    dump_passes: bool = False
+    dump_passes: bool | PassDumpLevel = False
     save_kernels: bool = False
     save_kernels_dir: str | None = None
     codegen_only: bool = False
@@ -236,7 +235,6 @@ class RunConfig:
     diagnostic_phase: DiagnosticPhase | None = None
     disabled_diagnostics: DiagnosticCheckSet | None = None
     golden_data_dir: str | None = None
-    block_dim: int | None = None
     aicpu_thread_num: int | None = None
     # Each accepts a scalar (broadcast to all scope-depth rings) or a list/tuple
     # of exactly ``_RING_DEPTH`` ints sizing rings 0..3 independently; a 0 entry
@@ -398,7 +396,7 @@ def compile_program(  # noqa: PLR0913
     *,
     strategy: OptimizationStrategy,
     backend_type: BackendType,
-    dump_passes: bool = False,
+    dump_passes: bool | PassDumpLevel = False,
     diagnostic_phase: DiagnosticPhase | None = None,
     disabled_diagnostics: DiagnosticCheckSet | None = None,
     profiling: bool = False,
@@ -416,7 +414,8 @@ def compile_program(  # noqa: PLR0913
         work_dir: Output directory for generated artefacts.
         strategy: PyPTO optimisation strategy applied during compilation.
         backend_type: Code-generation backend.
-        dump_passes: If ``True``, dump intermediate IR after each pass.
+        dump_passes: Per-pass IR dump control — a :class:`~pypto.ir.PassDumpLevel`
+            or a ``bool`` (``True`` -> ``CONCISE``, ``False`` -> ``NONE``).
         diagnostic_phase: Override the diagnostic phase gate for compilation.
         disabled_diagnostics: Set of diagnostic checks to disable.
         profiling: If ``True``, enable compile profiling.
@@ -786,15 +785,14 @@ def _build_call_config(
     run_config: "RunConfig",
     *,
     runtime_config: dict[str, Any],
-    block_dim_override: int | None = None,
     aicpu_thread_num_override: int | None = None,
     dfx_dir: Path | None = None,
 ) -> Any:
     """Translate a pypto :class:`RunConfig` into a simpler ``CallConfig``.
 
-    Precedence for ``block_dim`` and ``aicpu_thread_num``:
-    explicit *override* > ``run_config`` field > ``runtime_config`` baked
-    into ``kernel_config.py``. When all three are unset the field is left
+    Precedence for ``aicpu_thread_num``: explicit *override* >
+    ``run_config`` field > ``runtime_config`` baked into
+    ``kernel_config.py``. When all three are unset the field is left
     untouched on ``CallConfig`` so the simpler runtime's own default applies.
 
     DFX flags are copied straight from *run_config*; *dfx_dir* — when given —
@@ -807,11 +805,6 @@ def _build_call_config(
     )
 
     cfg = CallConfig()
-
-    bd = block_dim_override if block_dim_override is not None else run_config.block_dim
-    bd = bd if bd is not None else runtime_config.get("block_dim")
-    if bd is not None:
-        cfg.block_dim = bd
 
     at = aicpu_thread_num_override if aicpu_thread_num_override is not None else run_config.aicpu_thread_num
     at = at if at is not None else runtime_config.get("aicpu_thread_num")
@@ -1245,7 +1238,6 @@ def execute_compiled(  # noqa: PLR0913
     device_id: int,
     dfx: _DfxOpts = _DfxOpts(),
     level: int = 2,
-    block_dim: int | None = None,
     aicpu_thread_num: int | None = None,
     analyze_auto_scopes_for_deps: bool = False,
 ) -> None:
@@ -1272,15 +1264,11 @@ def execute_compiled(  # noqa: PLR0913
             post-run converter is invoked.
         level: Hierarchy level. Forwarded to :func:`execute_on_device`,
             which currently only supports ``2``.
-        block_dim: Optional override of the logical SPMD block count.
+        aicpu_thread_num: Optional override of the AICPU thread count.
             When ``None`` (default), the value baked into
-            ``kernel_config.py``'s ``RUNTIME_CONFIG`` is used; if that
-            is also unset, simpler's runtime default applies (simpler
-            validates against device capacity and raises a clear error
-            on over-capacity requests). A caller-supplied value takes
-            precedence over ``RUNTIME_CONFIG``.
-        aicpu_thread_num: Optional override of the AICPU thread count;
-            same precedence rules as ``block_dim``.
+            ``kernel_config.py``'s ``RUNTIME_CONFIG`` is used; if that is
+            also unset, simpler's runtime default applies. A
+            caller-supplied value takes precedence over ``RUNTIME_CONFIG``.
         analyze_auto_scopes_for_deps: Compile-side compatibility option.
             Accepted here so callers that reuse one config dictionary for
             compile and execute can pass it through safely. It has no effect
@@ -1307,7 +1295,6 @@ def execute_compiled(  # noqa: PLR0913
     # Caller-supplied values take precedence over the RUNTIME_CONFIG baked
     # into kernel_config.py. When neither is provided, the simpler runtime's
     # own default applies (and is validated against device capacity).
-    effective_block_dim = block_dim if block_dim is not None else runtime_config.get("block_dim")
     effective_aicpu_thread_num = (
         aicpu_thread_num if aicpu_thread_num is not None else runtime_config.get("aicpu_thread_num")
     )
@@ -1328,7 +1315,6 @@ def execute_compiled(  # noqa: PLR0913
             runtime_name,
             device_id,
             level=level,
-            block_dim=effective_block_dim,
             aicpu_thread_num=effective_aicpu_thread_num,
             output_prefix=str(dfx_dir) if dfx_dir is not None else None,
             enable_l2_swimlane=pass_dfx.enable_l2_swimlane,
@@ -1353,7 +1339,6 @@ def execute_compiled(  # noqa: PLR0913
                 "device_id": device_id,
                 "dfx_dir": str(dfx_dir),
                 "level": level,
-                "block_dim": effective_block_dim,
                 "aicpu_thread_num": effective_aicpu_thread_num,
             },
             dfx_dir,

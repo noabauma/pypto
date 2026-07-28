@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
@@ -31,6 +32,16 @@
 
 namespace pypto {
 namespace ir {
+
+static bool IsTDivDataType(DataType dtype) {
+  return dtype == DataType::INT16 || dtype == DataType::INT32 || dtype == DataType::FP16 ||
+         dtype == DataType::FP32;
+}
+
+static bool IsTSubsDataType(DataType dtype) {
+  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32 ||
+         dtype == DataType::FP16 || dtype == DataType::FP32 || dtype == DataType::BF16;
+}
 
 TypePtr DeduceTensorOpElementwiseBinaryType(const std::vector<ExprPtr>& args,
                                             const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -66,7 +77,7 @@ TypePtr DeduceTensorOpElementwiseBinaryType(const std::vector<ExprPtr>& args,
 
 TypePtr DeduceTensorOpElementwiseScalarType(const std::vector<ExprPtr>& args,
                                             const std::vector<std::pair<std::string, std::any>>& kwargs,
-                                            const std::string& op_name) {
+                                            const std::string& op_name, bool preserve_lhs_dtype = false) {
   CHECK(args.size() == 2) << "The operator " << op_name << " requires exactly 2 arguments, but got "
                           << args.size();
 
@@ -79,6 +90,10 @@ TypePtr DeduceTensorOpElementwiseScalarType(const std::vector<ExprPtr>& args,
   CHECK(scalar_type2) << "The operator " << op_name
                       << " requires second argument to be a ScalarType, but got "
                       << args[1]->GetType()->TypeName();
+
+  if (preserve_lhs_dtype) {
+    return std::make_shared<TensorType>(tensor_type1->shape_, tensor_type1->dtype_);
+  }
 
   // TensorType + ScalarType - result is TensorType with same shape as first argument
   auto result_dtype = PromoteDataTypes(tensor_type1->dtype_, scalar_type2->dtype_);
@@ -129,7 +144,16 @@ REGISTER_OP("tensor.subs")
     .add_argument("rhs", "Right-hand side scalar (ScalarType)")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTensorOpElementwiseScalarType(args, kwargs, "tensor.subs");
+      auto result_type = DeduceTensorOpElementwiseScalarType(args, kwargs, "tensor.subs", true);
+      auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+      auto scalar_type = As<ScalarType>(args[1]->GetType());
+      CHECK(IsTSubsDataType(tensor_type->dtype_)) << "The operator tensor.subs requires tensor dtype in "
+                                                     "{INT8, INT16, INT32, FP16, FP32, BF16}, but got "
+                                                  << tensor_type->dtype_.ToString();
+      CHECK(IsTSubsDataType(scalar_type->dtype_)) << "The operator tensor.subs requires scalar dtype in "
+                                                     "{INT8, INT16, INT32, FP16, FP32, BF16}, but got "
+                                                  << scalar_type->dtype_.ToString();
+      return result_type;
     });
 
 REGISTER_OP("tensor.mul")
@@ -157,9 +181,21 @@ REGISTER_OP("tensor.div")
     .set_description("Element-wise division of two tensors with broadcasting")
     .add_argument("lhs", "Left-hand side tensor (TensorType)")
     .add_argument("rhs", "Right-hand side tensor (TensorType)")
+    .set_attr<bool>("high_precision")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTensorOpElementwiseBinaryType(args, kwargs, "tensor.div");
+      auto result_type = DeduceTensorOpElementwiseBinaryType(args, kwargs, "tensor.div");
+      for (const auto& arg : args) {
+        auto tensor_type = AsTensorTypeLike(arg->GetType());
+        CHECK(IsTDivDataType(tensor_type->dtype_))
+            << "The operator tensor.div requires operand dtype in {INT16, INT32, FP16, FP32}, but got "
+            << tensor_type->dtype_.ToString();
+      }
+      auto result_tensor_type = As<TensorType>(result_type);
+      CHECK(!GetKwargOr<bool>(kwargs, "high_precision", false) || result_tensor_type->dtype_.IsFloat())
+          << "The operator tensor.div supports high_precision only for FP16 or FP32 because the PTOAS "
+             "high-precision template does not implement integer division";
+      return result_type;
     });
 
 REGISTER_OP("tensor.divs")

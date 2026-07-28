@@ -8,7 +8,7 @@ Type-safe operator definitions with automatic type deduction, organized into mod
 | -------- | ----- | -------- | ------------- |
 | **TensorOp** | TensorType | N-D tensor operations with broadcasting | `src/ir/op/tensor_ops/` |
 | **TileOp** | TileType | Hardware-optimized tile operations | `src/ir/op/tile_ops/` |
-| **SyncOp** | UnknownType | Pipeline barriers and synchronization | `src/ir/op/sync_ops/sync.cpp` |
+| **SyncOp** | UnknownType (barriers); ScalarType (task / launch queries) | Pipeline barriers, synchronization, TaskId and SPMD launch-shape queries | `src/ir/op/sync_ops/` |
 | **CrossCoreOp** | UnknownType/TileType | AIC↔AIV cross-core communication | `src/ir/op/sync_ops/cross_core.cpp` |
 
 **Key Features**: Fluent API, automatic type deduction, kwargs for metadata, NumPy-style broadcasting, type promotion, dynamic dimensions (`kDynamicDim`)
@@ -16,12 +16,6 @@ Type-safe operator definitions with automatic type deduction, organized into mod
 ## Type System
 
 ```cpp
-// TensorType: N-dimensional tensors
-TensorType(DataType::FP32, {dim1, dim2, dim3, ...})
-
-// TileType: Hardware-optimized tiles
-TileType(DataType::FP16, {dim1, dim2})
-
 // Dynamic dimensions (pypto/core/common.h)
 constexpr int64_t kDynamicDim = -1;
 auto dynamic_dim = make_int(kDynamicDim);
@@ -230,16 +224,11 @@ UINT32 + INT32 → INT32 (signed precedence)
 **Location**: `src/ir/op/tensor_ops/`
 **Python API**: `from pypto.ir.op import tensor`
 
-**Operations:** `tensor.add/sub/mul/div` (element-wise with full N-D broadcasting), `tensor.maximum/minimum` (element-wise max/min; rhs may be tensor or scalar — `ConvertTensorToTileOps` dispatches to `tile.maximum/minimum` or `tile.maximums/minimums` based on the rhs operand type), `tensor.set_validshape` (internal, update valid-shape metadata without data movement — compiler-generated only), `tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2` (sorting; tensor-level counterparts of `tile.sort32` / `tile.mrgsort` — converted to tile ops by `ConvertTensorToTileOps`), `tensor.gather` (per-dim indexing; MVP supports rank-2 inputs with `dim=-1` and lowers to a per-row `tile.gather` loop via `ConvertTensorToTileOps`), `tensor.gather_mask` (mask-pattern gather; tensor-level counterpart of `tile.gather_mask`, with optional same-bit-width `output_dtype` — see [Mask patterns](#mask-patterns)), `tensor.scatter` (column scatter; the column-wise inverse of `tensor.gather`, MVP supports rank-2 inputs with `dim=-1` — `out[b, index[b, k]] = src[b, k]`, `index` same shape as `src` — and lowers to `tile.scatter` via `ConvertTensorToTileOps`), `tensor.scatter_mask` (mask-pattern row-scatter; tensor-level counterpart of `tile.scatter_mask`, expands a compact `input` tensor into the mask-marked columns of `dst` — see [Mask patterns](#mask-patterns)), `tensor.ci` / `tensor.arange` (contiguous integer sequence generation; lowers to `tile.ci`; also exposed at top level as `pl.arange`)
+**Operations:** `tensor.add/sub/mul/div` (element-wise with full N-D broadcasting), `tensor.maximum/minimum` (element-wise max/min; rhs may be tensor or scalar — `ConvertTensorToTileOps` dispatches to `tile.maximum/minimum` or `tile.maximums/minimums` based on the rhs operand type), `tensor.set_validshape` (internal, update valid-shape metadata without data movement — compiler-generated only), `tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2` (sorting; tensor-level counterparts of `tile.sort32` / `tile.mrgsort` — converted to tile ops by `ConvertTensorToTileOps`), `tensor.gather` (per-dim indexing; MVP supports rank-2 inputs with `dim=-1`, lowered by `ConvertTensorToTileOps` with a backend-specific strategy — on A5 (Ascend950) a last-dim gather becomes a single full-tile `tile.gather` over flat element offsets `flat[i, j] = i * src_cols + index[i, j]`, first materializing a strided tile source (e.g. a `tile.slice` view) into a contiguous tile so the flat index addresses it correctly; on A2A3 (Ascend910B) it keeps the legacy per-row `tile.gather` loop where the column index equals the flat index within each 1-row slice), `tensor.gather_mask` (mask-pattern gather; tensor-level counterpart of `tile.gather_mask`, with optional same-bit-width `output_dtype` — see [Mask patterns](#mask-patterns)), `tensor.scatter` (column scatter; the column-wise inverse of `tensor.gather`, MVP supports rank-2 inputs with `dim=-1` — `out[b, index[b, k]] = src[b, k]`, `index` same shape as `src` — and lowers to `tile.scatter` via `ConvertTensorToTileOps`), `tensor.scatter_mask` (mask-pattern row-scatter; tensor-level counterpart of `tile.scatter_mask`, expands a compact `input` tensor into the mask-marked columns of `dst` — see [Mask patterns](#mask-patterns)), `tensor.ci` / `tensor.arange` (contiguous integer sequence generation; lowers to `tile.ci`; also exposed at top level as `pl.arange`)
 
-`tensor.view` is a metadata-only zero-copy shape/layout reinterpret. It is
-registered as a `TensorOp` passthrough in `ConvertTensorToTileOps`; PTO in-core
-codegen lowers it to `pto.make_tensor_view` over the original base pointer.
-Targets require rank at least 1 (DN requires rank at least 2); orchestration
-shape reinterpret is ND-only and cannot also change layout.
-Shape reinterpretation of a partially valid source is limited to a packed ND
-leading-dimension collapse to 2D and requires an explicit target `valid_shape`;
-this form preserves the source tensor kind and backing metadata.
+`tensor.view` is a metadata-only zero-copy shape/layout reinterpret. It is registered as a `TensorOp` passthrough in `ConvertTensorToTileOps`; PTO in-core codegen lowers it to `pto.make_tensor_view` over the original base pointer. Targets require rank at least 1 (DN requires rank at least 2); orchestration shape reinterpret is ND-only and cannot also change layout. Shape reinterpretation of a partially valid source is limited to a packed ND leading-dimension collapse to 2D and requires an explicit target `valid_shape`; this form preserves the source tensor kind and backing metadata.
+
+`pl.reinterpret_view(data, dtype, *, shape=None)` dispatches to the equivalent `pl.tensor` or `pl.tile` operator and returns the same kind. It is a zero-copy view over exactly the same bytes, so `dtype` must differ and be one of signed/unsigned 8/16/32/64-bit integers, FP16, BF16, or FP32. With no `shape`, ND/row-major scales the last axis and DN/col-major scales the penultimate axis by the source/target byte-width ratio. An explicit shape must be byte-equivalent and fully static unless it is provably identical to the auto-inferred shape; a partial `valid_shape` only permits that auto-equivalent shape. Zero/null padding metadata is preserved, while dtype-dependent max/min padding is cleared. The initial executable path supports packed ND in-core tensors and packed flat (`none_box`) row/col-major tiles; DN tensor inference is available but Tensor-to-Tile lowering rejects it, and orchestration tensors are unsupported.
 
 **Example:**
 
@@ -272,17 +261,42 @@ with ib.function("tensor_example") as f:
 | - | `tile.load` | TensorType → TileType (DDR to unified buffer) |
 | - | `tile.store` | TileType → TensorType (unified buffer to DDR) |
 | **Element-wise** | `tile.add/sub/mul/div` | Tile-Tile operations |
-| - | `tile.adds/subs/muls/divs` | Tile-Scalar operations |
+| - | `tile.adds/subs/muls/divs` | Tile-Scalar operations. A **constant** scalar operand adopts the tile's element dtype (a bare int literal is otherwise parsed as `index`, which no `pto.t*s` op accepts) — except a float literal on an integer tile, which keeps FP32 so promotion is preserved. An explicit `pl.const(v, dtype)` is a deliberate annotation and is left as-is, as is any non-constant expression; a non-constant `index` scalar (loop var, `pl.dim`) is rejected — convert it with `pl.cast`. Same rule for `tensor.*s`. |
 | **Unary** | `tile.sqrt` | Element-wise square root |
 | **Transform** | `tile.slice` | Extract a sub-tile with static shape, optional dynamic valid_shape, and optional `drop_dims` (numpy-style rank reduction over static unit axes; result clamped to a 2D minimum) |
 | - | `tile.extract` | Extract a sub-tile from `src` at `(index_row, index_col)` — ISA TEXTRACT Variant 1 (Mat→Left/Right, Acc→Mat) |
-| - | `tile.reshape` | Reshape tile to new dimensions (element count must match) |
+| - | `tile.reshape` | Reshape tile to new dimensions (element count must match). Carries the source's `valid_shape` through without widening it — see [Reshape and the valid region](#reshape-and-the-valid-region) |
+| - | `tile.reinterpret_view` | Zero-copy view with a different dtype and the same exact bytes; optional shape uses layout-aware inference (packed flat tiles only) |
 | - | `tile.transpose` | Swap two axes of a tile |
 | - | `tile.set_validshape` | Update valid-shape metadata without data movement |
 | - | `tile.ci` | Generate contiguous integer sequence (start + k / start - k); dtype ∈ {INT16, INT32}; innermost dim != 1 |
 | **Reduction** | `tile.row_*` / `tile.col_*` | Direction-specific reduction (`row_sum`/`row_max`/`row_min`/`row_prod` collapse the last axis; `col_*` collapse axis 0). There is no axis-parameterized reduction — the ISA has only direction-specific intrinsics (`pto.trowsum`, `pto.tcolsum`, …) |
 | **Scatter** | `tile.scatter` | Row-scatter `src` into `dst` at per-row indices (`pto.tscatter` index form; DPS — `dst` is in/out, the result aliases `dst`). `src`/`dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}; `indexes` dtype ∈ {I16, I32}; element-size matching rule: 4-byte dst ↔ INT32, 2-byte dst ↔ INT16, 1-byte dst ↔ INT16. |
 | - | `tile.scatter_mask` | Mask-pattern row-scatter: write each `src` row into the mask-marked columns of `dst` (DPS — `dst` is in/out). A PyPTO codegen form lowered to a `pto.tscatter` mask emission — **not** a distinct pto-isa instruction (unlike `tile.gather_mask`). See [Mask patterns](#mask-patterns). |
+
+`tile.reshape` preserves dtype, element count, and the source's valid region (see below); `tile.reinterpret_view(data, dtype, *, shape=None)` changes dtype while preserving exact byte size. Without `shape`, it scales the physically contiguous axis using the source/target dtype byte widths and tile layout. Under PTOAS memory planning, it lowers to the aliasing PTO `treshape` primitive for both same-shape and width-changing views.
+
+### Reshape and the valid region
+
+A reshape is a zero-copy view, so it cannot invent data: `tensor.reshape` and
+`tile.reshape` share one rule that carries the source's `valid_shape` into the
+target shape and never widens it. A valid region is an origin-anchored box, so
+not every source region survives a repartition — the rule maps what it can:
+
+| Source region | Result |
+| ------------- | ------ |
+| Fully valid | `new_shape` — canonicalized away, so no view survives and no existing program changes |
+| Provably empty | An all-zero box |
+| Only full unit axes added / removed | Surviving axes map 1:1; an arbitrary rectangle is preserved exactly |
+| A contiguous flat prefix | The rectangle of `new_shape` spanning those same cells, if one exists |
+| Anything else | **Rejected** — `valid_shape` cannot describe the reshaped region |
+
+So `[8, 16]` valid `[5, 16]` (a flat prefix of 80 cells) maps to `[16, 8]` valid
+`[10, 8]` and to `[128]` valid `[80]`, while `[4, 32]` is rejected — 80 cells is
+not a whole number of 32-wide rows. `[1, 8, 16]` valid `[1, 8, 5]` is not a flat
+prefix at all, yet `[8, 16]` valid `[8, 5]` is exact, because dropping a full
+unit axis keeps rows as rows. `tensor.reshape`'s optional third `valid_shape`
+operand may only *narrow* the derived region, never claim data outside it.
 
 **Data Flow:** `TensorType (DDR) → tile.load → TileType (Unified Buffer) → tile.{ops} → TileType → tile.store → TensorType (DDR)`
 
@@ -319,7 +333,8 @@ with ib.function("tile_computation") as f:
     tile_b = ib.let("tile_b", tile.load(input_b, [0, 0], [32, 128]))
     tile_mul = ib.let("tile_mul", tile.mul(tile_a, tile_b))
     tile_sqrt = ib.let("tile_sqrt", tile.sqrt(tile_mul))
-    # row_sum collapses the last axis -> [32, 1]; it needs a scratch tile
+    # row_sum collapses the last axis -> [32, 1]. Its scratch tile must have
+    # the same dtype and rank and be at least as large as the input in every dimension.
     tmp_tile = ib.let("tmp_tile", tile.create([32, 128], DataType.FP32))
     tile_sum = ib.let("tile_sum", tile.row_sum(tile_sqrt, tmp_tile))
     result = ib.let("result", tile.store(tile_sum, [0, 0], output))
@@ -328,9 +343,9 @@ with ib.function("tile_computation") as f:
 
 ## SyncOp: Synchronization Operations
 
-**Purpose**: Hardware synchronization and barriers
-**Type**: `UnknownType` (no return), use in `EvalStmt`
-**Location**: `src/ir/op/sync_ops/sync.cpp`
+**Purpose**: Hardware synchronization and barriers, plus the TaskId and SPMD launch-shape queries sharing the `system.` namespace
+**Type**: `UnknownType` (no return, used in `EvalStmt`) for barriers; `ScalarType` for the value-binding query ops (`task_invalid`, `task_is_valid`, `available_cluster_count`, `available_aiv_count`)
+**Location**: `src/ir/op/sync_ops/` — `sync.cpp` (barriers), `task.cpp` (TaskId), `launch.cpp` (launch-shape queries)
 **Python API**: `from pypto.ir.op import system`
 
 | Operation | Description | Kwargs |
@@ -345,6 +360,8 @@ with ib.function("tile_computation") as f:
 | `system.sync_dst` | Wait sync flag | `set_pipe`, `wait_pipe`, `event_id` |
 | `system.task_invalid` | Sentinel `PTO2TaskId::invalid()` — "no producer" seed for a TaskId carry | None |
 | `system.task_is_valid` | Test whether a `TASK_ID` value is a valid (non-sentinel) handle | None; sole positional arg is the TaskId Var |
+| `system.available_cluster_count` | This run's MIX cluster (= AIC) count, read from the device. Result `Scalar[INT32]` | None |
+| `system.available_aiv_count` | This run's standalone AIV core count, read from the device. Result `Scalar[INT32]` | None |
 
 `system.syncall` has two modes. The **hard** form (`mode="hard"`, default) emits an FFTS barrier that waits for **all** physical cores of the selected `core_type`; the kernel must be launched at full occupancy (one block per physical core) **and with `sync_start=True`** (so all blocks are co-resident — a non-sync_start launch may dispatch blocks in waves and deadlock the barrier), or it deadlocks (AICore error 507018). The **soft** form (`mode="soft"`) polls a shared GM workspace and so works at **partial** occupancy. `gm_workspace` is a shared, zero-initialized GM `INT32` tensor with `used_cores * 8` slots (pass it as a kernel parameter so all blocks share one buffer); the scratch tile(s) are compiler-synthesized local staging buffers; `used_cores` is the participant count. Soft mode is supported for every `core_type`, with operands that vary by participant set:
 
@@ -355,6 +372,8 @@ with ib.function("tile_computation") as f:
 The flat L1 staging tile is created via `pl.tile.create(..., target_memory=pl.Mem.Mat, flat_layout=True)`, which keeps the contiguous `slayout=none_box` layout (a normal boxed NZ Mat tile would mis-place the 8-int32 counter slots).
 
 The unified `mode=` keyword API (`mode="hard"` / `mode="soft"`) is the **DSL** surface (`pl.system.syncall`). The Python IR helpers under `pypto.ir.op.system` are split instead: `syncall(core_type=...)` builds the hard form and `syncall_soft(core_type, args)` builds the soft form.
+
+`system.available_cluster_count` / `system.available_aiv_count` are the SPMD **launch-shape queries**: pass one as `pl.spmd(...)`'s `core_num` so the launch sizes itself on the device the run lands on. Orchestration codegen lowers them to `rt_available_cluster_count()` / `rt_available_aiv_count()`. Use the cluster count for a mixed (AIC+AIV) or cube-only kernel — one block per core-group — and the AIV count for a vector-only kernel. This is the only launch width that stays at full occupancy across devices, which the hard `system.syncall` requires; the `HardSyncallOccupancy` verifier accepts these widths without a count comparison and rejects the query for the *other* core type. Pass the call inline (`pl.spmd(pl.system.available_cluster_count())`) rather than binding it to a name first — a name reaches the outlined `Spmd` wrapper as a variable defined in the caller, which the IR printer cannot re-parse. Source: `src/ir/op/sync_ops/launch.cpp`.
 
 `system.task_invalid` returns [`ScalarType(DataType::TASK_ID)`](02-types.md#scalartype). It is the lowering target of the Python literal `None` when `None` appears in a TaskId position (a `deps=[None]` entry or a TaskId loop iter_arg seed) inside `with pl.manual_scope():` regions. There is no `system.task_id_of` op — producer task ids are obtained from the second tuple element returned by the `pl.submit(...)` parser construct, not from a builtin. Source: `src/ir/op/sync_ops/task.cpp`.
 
@@ -447,6 +466,8 @@ See [TPUSH/TPOP ISA Reference](../../reference/pto-isa/01-tpush_tpop.md) and [Bu
 | `tile_ops/reduction.cpp` | TileOp: sum (with axis, keepdim) |
 | `tile_ops/unary.cpp` | TileOp: sqrt |
 | `sync_ops/sync.cpp` | SyncOp: sync_src, sync_dst, barriers |
+| `sync_ops/task.cpp` | SyncOp: TaskId sentinel and predicate |
+| `sync_ops/launch.cpp` | SyncOp: SPMD launch-shape queries |
 | `sync_ops/cross_core.cpp` | CrossCoreOp: tpush, tpop, pipe init, buffers |
 
 **Benefits**:

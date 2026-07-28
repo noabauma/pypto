@@ -313,12 +313,14 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | ---- | ---------- | ----- |
 | `pl.at(level=pl.Level.CORE_GROUP)` | `InCore` | Fixed-boundary outline at CORE_GROUP |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(MODE)])` | `InCore` | InCore + cross-core split hint |
+| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.cross_core_slot(slot_num=N)])` | `InCore` | InCore + cross-core pipe slot count |
 | `pl.at(level=pl.Level.HOST)` *(or any non-`CORE_GROUP` level)* | `Hierarchy` | Distributed hierarchy scope |
 | `pl.cluster()` | `Cluster` | Co-scheduled AIC+AIV group |
 | `with pl.spmd(N)` / `for i in pl.spmd(N)` | `Spmd` (for-form wraps inner `InCore`) | SPMD multi-block dispatch — see [pl.spmd](#plspmd-multi-block-dispatch) |
 | `pl.spmd(N, optimizations=[pl.split(MODE)])` | `Spmd(InCore(split=MODE))` | Split hint applies to the inner InCore (both forms) |
+| `pl.spmd(N, optimizations=[pl.cross_core_slot(slot_num=N)])` | `Spmd(InCore(slot_num=N))` | Slot count applies to the inner InCore (both forms); combinable with `pl.split(MODE)` |
 | `pl.scope(mode=pl.ScopeMode.MANUAL)` / `pl.manual_scope()` | `Runtime(manual=true)` | Orchestrator MANUAL scope — user manages task ordering. Allowed in either `auto_scope` mode (it is a dependency-semantics choice). See [Manual dependency primitives](#manual-dependency-primitives) |
-| `pl.scope()` | `Runtime(manual=false)` | Orchestrator AUTO scope (`PTO2_SCOPE()`). Hand-placing one requires `@pl.function(auto_scope=False)` (in the default `auto_scope=True` the compiler owns AUTO placement). See [MaterializeRuntimeScopes](../passes/41-materialize_runtime_scopes.md) |
+| `pl.scope()` | `Runtime(manual=false)` | Orchestrator AUTO scope (`PTO2_SCOPE()`). Hand-placing one requires `@pl.function(auto_scope=False)` (in the default `auto_scope=True` the compiler owns AUTO placement). See [MaterializeRuntimeScopes](../passes/42-materialize_runtime_scopes.md) |
 
 See [Language Guide](../../user/01-language_guide.md#incore-scopes) for examples.
 
@@ -326,18 +328,25 @@ See [Language Guide](../../user/01-language_guide.md#incore-scopes) for examples
 
 `pl.spmd(N)` dispatches a kernel across `N` blocks. Forms:
 
-- `with pl.spmd(N): ...` — body is **either** a single call to a pre-defined InCore kernel (direct dispatch, `SpmdScopeStmt(body=Call)`, no inner InCore wrapper) **or** an inline multi-statement block that is auto-outlined into a synthetic InCore region (like the for-form, minus the auto-bound index). An inline body must read the per-block index via `pl.tile.get_block_idx()` — without it every block runs identical work, so the parser rejects it. Captures no producer TaskId.
+- `with pl.spmd(N): ...` — body is **either** a *dispatch* body calling a pre-defined InCore kernel (`SpmdScopeStmt(body=<stmts>)`, no inner InCore wrapper) **or** an *inline* block auto-outlined into a synthetic InCore region (like the for-form, minus the auto-bound index). Decided semantically, not by statement count: a body reading `pl.tile.get_block_idx()` is inline and gets wrapped; otherwise it is a dispatch body and stays unwrapped, however many statements it holds. A body that neither reads the index nor dispatches a `self.<kernel>(...)` call is rejected. Captures no producer TaskId.
+  - An explicit `with pl.at(<CORE_GROUP level>, ...):` as the sole body statement *is* the InCore carrier: parsed as an ordinary nested scope, not wrapped a second time (positional or keyword `level`, with or without `as tid` / `name_hint=`). This is the form the printer emits for `Spmd(InCore(...))`, so it is what makes that IR round-trip. When the body provides a carrier, `optimizations=` must go on that `pl.at(...)` — putting it on the `pl.spmd(...)` line is rejected, whether or not the carrier also carries one.
+  - A dispatch body may launch **one** kernel. It is lowered via `FindFirstInnerCall`, which stops at the first call, so a second dispatch would be silently dropped rather than launched; the parser rejects it instead. Hoisted temporaries and tuple projections are not dispatches and do not count.
 - `for i in pl.spmd(N): ...` — loop variable binds the per-block index (`pl.tile.get_block_idx()`); the body is auto-outlined into a synthetic InCore region.
 - `with pl.spmd(N, deps=[...]) as tid: ...` — **capture form**: mirrors `with pl.at(...) as tid:`. Same body shapes as the plain form above, and additionally captures the dispatch's grid-wide producer `pl.Scalar[pl.TASK_ID]` in `tid` (usable as a `deps=` edge, stored into a `pl.array.create(N, pl.TASK_ID)`, or crossed into `pl.manual_scope`). TaskId capture is orthogonal to the inline body — it is the only thing this form adds over the plain form. Lowers to an `ir.Submit` whose trailing tuple element is the grid TaskId; `core_num` / `sync_start` ride on the outlined `Spmd` Function attrs. See [Manual dependency primitives](#manual-dependency-primitives).
 - `out, tid = pl.spmd_submit(kernel, *args, core_num=N)` — **submit form**: dispatches the kernel across `N` blocks *and* captures the dispatch's producer `pl.Scalar[pl.TASK_ID]` (the `pl.submit` sibling for a pre-defined kernel). See [Manual dependency primitives](#manual-dependency-primitives).
 
 All three `pl.spmd(...)` scope forms also accept `allow_early_resolve=True` (a boolean literal; same early-dispatch opt-in as `pl.submit` / `pl.at`). It forces the dispatch to lower to an `ir.Submit` even without `as tid` and lowers to `Arg::set_allow_early_resolve(true)`. Rejected on a `pl.cluster()`-nested `pl.spmd` (such a scope is unwrapped into the Group function and never produces a Submit, so the hint would be lost).
 
-Optional `optimizations=[pl.split(MODE)]`:
+Optional `optimizations=[...]`. The entries are orthogonal and may be combined
+in one list (e.g. `[pl.split(MODE), pl.cross_core_slot(slot_num=4)]`):
 
 | Entry | Form | Effect |
 | ----- | ---- | ------ |
 | `pl.split(MODE)` | both | Sets the inner InCore's `split_` field (cross-core transfer hint, consumed by `ExpandMixedKernel` / `MemoryReuse`). The with-form gains an inner `InCoreScopeStmt` wrapper around the call. |
+| `pl.cross_core_slot(slot_num=N)` | both | Sets the inner InCore's `slot_num` attr — the slot count (ring depth) of the automatic cross-core pipe, consumed by `ExpandMixedKernel`. Sizes a data channel only; it does **not** partition work, so it coexists with `pl.split_aiv` regions where `pl.split(...)` does not. Omit to keep the PTOAS default (8 one-directional, 4 per direction bidirectional). |
+
+> `pl.split(MODE, slot_num=N)` is a deprecated alias for the slot count and warns
+> — see [ExpandMixedKernel](../passes/20-expand_mixed_kernel.md#overriding-the-slot-count-slot_num).
 
 ### Manual dependency primitives
 

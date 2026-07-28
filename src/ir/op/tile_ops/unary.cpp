@@ -262,11 +262,16 @@ REGISTER_OP("tile.log")
     .set_op_category("TileOp")
     .set_description("Natural logarithm of a tile (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
+    .set_attr<bool>("high_precision")
     .set_input_memory(0, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileUnaryType(args, kwargs, "tile.log");
+      auto result_type = DeduceTileUnaryType(args, kwargs, "tile.log");
+      auto tile_type = As<TileType>(args[0]->GetType());
+      CHECK(tile_type->dtype_ == DataType::FP16 || tile_type->dtype_ == DataType::FP32)
+          << "tile.log requires an FP16 or FP32 tile operand, but got " << tile_type->dtype_.ToString();
+      return result_type;
     });
 
 REGISTER_OP("tile.abs")

@@ -644,10 +644,10 @@ class SpmdContext:
     """Context manager / loop iterator for SPMD dispatch scope.
 
     The parser recognizes ``with pl.spmd(...):`` (builds a ``ScopeStmt(Spmd)``
-    whose body must be a single function call), ``with pl.spmd(...) as tid:``
-    (captures the grid dispatch's producer ``Scalar[TASK_ID]`` and accepts an
-    inline multi-statement body), and ``for i in pl.spmd(...):`` (auto-outlines
-    the loop body into an InCore function with ``i`` bound to
+    whose body either dispatches a kernel or is an inline block auto-outlined
+    into one), ``with pl.spmd(...) as tid:`` (same body shapes, and captures the
+    grid dispatch's producer ``Scalar[TASK_ID]``), and ``for i in pl.spmd(...):``
+    (auto-outlines the loop body into an InCore function with ``i`` bound to
     ``pl.tile.get_block_idx()``).
     """
 
@@ -714,13 +714,19 @@ def spmd(
 
     Usage forms:
 
-    1. ``with pl.spmd(n):`` — body is either a single call to a pre-defined
-       InCore kernel (direct dispatch), or an inline multi-statement block that
-       is auto-outlined into a synthetic InCore kernel (like the loop form, minus
-       the auto-bound index). An inline body must read the per-block index via
-       ``pl.tile.get_block_idx()`` — without it every block runs identical work.
-       Captures no producer TaskId (use form 3 for that). Can stand alone
-       (implicit cluster) or nest inside ``pl.cluster()``.
+    1. ``with pl.spmd(n):`` — body is either a *dispatch* body calling a
+       pre-defined InCore kernel, or an *inline* block auto-outlined into a
+       synthetic InCore kernel (like the loop form, minus the auto-bound index).
+       Which one is decided semantically, not by statement count: a body reading
+       the per-block index via ``pl.tile.get_block_idx()`` is inline; otherwise it
+       is a dispatch body, however many statements it holds — though it may launch
+       only one kernel (the lowering stops at the first call). A body that neither
+       reads the index nor dispatches a kernel is rejected — every block would run
+       identical work. An explicit ``with pl.at(<CORE_GROUP level>, ...):`` as the
+       sole body statement *is* the InCore carrier and is not wrapped again; with
+       such a body ``optimizations=`` must go on that ``pl.at(...)`` rather than on
+       the ``pl.spmd(...)`` line. Captures no producer TaskId (use form 3 for
+       that). Can stand alone (implicit cluster) or nest inside ``pl.cluster()``.
 
     2. ``for i in pl.spmd(n):`` — loop-style. The iteration variable binds
        the per-block index (equivalent to ``pl.tile.get_block_idx()``); the
@@ -744,7 +750,15 @@ def spmd(
             Python ``int`` or any ``ir.Expr`` of integer type. Closure-captured
             integer constants and closure arithmetic are folded to ``ConstInt``
             by the parser and ``Simplify``; non-foldable expressions flow
-            through to codegen unchanged.
+            through to codegen unchanged. Pass
+            ``pl.system.available_cluster_count()`` (mixed / cube-only kernel)
+            or ``pl.system.available_aiv_count()`` (vector-only kernel) to size
+            the launch on the run's own device geometry — the only spelling that
+            stays at full occupancy across devices, which a hard
+            ``pl.system.syncall`` requires. Pass such a query inline as shown;
+            binding it to a name first compiles and lowers correctly, but the
+            printed IR of the outlined ``Spmd`` wrapper then references a
+            variable defined in the caller and cannot be re-parsed.
         sync_start: If True, all blocks start execution simultaneously (default: False).
         name_hint: Optional name hint for the outlined function.
         optimizations: Optional list literal containing only ``pl.split(mode)``
@@ -824,6 +838,10 @@ def spmd(
         >>> with pl.cluster():
         ...     with pl.spmd(4, sync_start=True):
         ...         out = self.kernel(a, b, out)
+        >>>
+        >>> # Device-sized launch — required for a hard pl.system.syncall
+        >>> with pl.spmd(pl.system.available_cluster_count(), sync_start=True):
+        ...     out = self.mixed_kernel(a, b, out)
         >>>
         >>> # Dispatch predicate — skip the expert entirely when its row count is 0
         >>> with pl.spmd(1) as gate_tid:

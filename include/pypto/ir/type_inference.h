@@ -21,6 +21,7 @@
 #ifndef PYPTO_IR_TYPE_INFERENCE_H_
 #define PYPTO_IR_TYPE_INFERENCE_H_
 
+#include <any>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "pypto/core/dtype.h"
+#include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
@@ -224,6 +226,37 @@ std::vector<ValidShapeBoundsError> ValidateValidShapeBounds(const std::vector<Ex
                                                             const std::string& type_kind);
 
 /**
+ * @brief Validate the operand contract of ``tile.gather_row`` / ``tensor.gather_row``
+ *
+ * Shared by the two deducers (tile and tensor level) so the contract is stated
+ * once and the user hits it at trace time rather than in a pass or the backend.
+ * Enforces, for ``args = (dst, src, dst_offset, src_offset, shapes[, valid_shape])``:
+ *
+ * - every ``shapes`` element is a ``ConstInt`` — it sizes ``pto.subview``, whose
+ *   ``sizes`` ptoas types as a static ``I64ArrayAttr``, so a dynamic window is
+ *   not expressible at all;
+ * - ``valid_shape``, when present, matches ``shapes`` in rank and violates
+ *   ``0 <= valid_shape[i] <= shapes[i]`` in no *provable* way — a symbolic extent
+ *   that cannot be decided is accepted, since that dynamic case is the whole
+ *   point of the operand;
+ * - ``valid_shape`` is fully static when ``transpose=True``, because that path
+ *   lowers through a DN2NZ ``pto.tload`` that would need a runtime column extent
+ *   on a boxed NZ tile.
+ *
+ * Note the bounds check cannot be left to ``TypeChecker``'s
+ * ``ValidateValidShapeBounds`` sweep: gather_row's ``valid_shape`` narrows only
+ * the transfer and never reaches the result ``TileType``/``TensorType``, so the
+ * verifier has nothing to inspect.
+ *
+ * @param args Operand list, 5 or 6 entries
+ * @param kwargs Operator kwargs, read for ``transpose``
+ * @param op_name Operator name used in diagnostics
+ */
+void CheckGatherRowOperands(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs,
+                            const std::string& op_name);
+
+/**
  * @brief Read the elements of a tuple-typed operand
  *
  * A ``MakeTuple`` operand yields its elements directly, which preserves the
@@ -288,6 +321,10 @@ struct WindowReadValidShapeParams {
   /// clamp, has to say so instead of naming an option it does not have.
   std::string bounds_remedy;
   Span span = Span::unknown();
+  /// Materialize ``min(requested_valid, available)`` when their ordering is
+  /// symbolic. The caller must ensure every symbol in the resulting runtime
+  /// expression is bound in the generated function.
+  bool materialize_symbolic_intersection = false;
 };
 
 /**
@@ -354,6 +391,168 @@ void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,
                                   const Span& span);
 
 /**
+ * @brief Map an origin-anchored valid box through a reshape without widening
+ *
+ * A reshape is a zero-copy view, so it cannot invent data: the result's valid
+ * region is the source's, expressed in the target shape. ``valid_shape`` can
+ * only describe an origin-anchored box, so not every source region survives the
+ * repartition, and the ones that do not are rejected rather than rounded up.
+ *
+ * ```text
+ * 1. source fully valid                  -> new_shape
+ * 2. source provably empty               -> all-zero box
+ * 3. only full unit axes added / removed -> surviving axes map 1:1
+ * 4. contiguous flat prefix              -> rectangular box under new_shape
+ * 5. otherwise                           -> reject
+ * ```
+ *
+ * Cases 2 and 3 are exact because neither repartitions data: the empty set stays
+ * empty under every reshape, and inserting or removing a provably-full physical
+ * unit axis is a coordinate-only rank change that preserves an arbitrary
+ * rectangle. Case 4 is the general rule: a region that occupies a contiguous
+ * flat prefix of the buffer maps to whatever rectangle spans that same prefix in
+ * the target shape, provided one exists. Tensor and tile reshape share this rule.
+ *
+ * Case 4 is the only one that reasons about flat positions, so it is the only
+ * one that depends on storage order. Pass @p row_major_contiguous false for a
+ * source whose elements are not laid out row-major (a ``col_major`` tile, a
+ * ``DN`` / ``NZ`` tensor) and a partial region that needs case 4 is rejected
+ * rather than mapped against the wrong flat order. Cases 1-3 relabel axes
+ * without consulting flat positions and hold under any layout.
+ *
+ * @param src_valid Effective valid shape of the source, resolved by ``GetValidShape``
+ * @param in_shape Physical shape of the source, same rank as @p src_valid
+ * @param new_shape Physical shape of the result
+ * @param row_major_contiguous Whether the source's elements are stored row-major
+ * @param span IR source location, reported when the region is rejected
+ * @param op_name Operator name, used in diagnostics
+ * @return The result valid shape, one extent per target dimension
+ * @throws pypto::ValueError when ``valid_shape`` cannot represent the reshaped
+ *         region, or when a partial region meets a dynamic extent it cannot map
+ */
+std::vector<ExprPtr> ComputeReshapeValidShape(const std::vector<ExprPtr>& src_valid,
+                                              const std::vector<ExprPtr>& in_shape,
+                                              const std::vector<ExprPtr>& new_shape,
+                                              bool row_major_contiguous, const Span& span,
+                                              const std::string& op_name);
+
+/**
+ * @brief Reject a reduction whose input is empty on some axis
+ *
+ * A reduction consumes its input's *valid* region: the backend kernels bound their loops by the
+ * source's valid_row / valid_col, so a partially valid axis reduces over exactly the real cells
+ * and never reads padding. The one input they cannot handle is an empty one — they assert that
+ * valid_row and valid_col are both non-zero — and an empty region also leaves max/min with no
+ * identity to return. Catching it here turns a hardware assert into a compile-time error.
+ *
+ * Only a provably zero extent rejects; an unproved symbolic extent is accepted, matching the
+ * standing verifier rule for unknown symbolic bounds.
+ *
+ * @param valid Effective valid shape of the reduction input
+ * @param op_name Operator name used in diagnostics
+ * @param span Source location of the reduction input, reported on failure
+ */
+void CheckReductionInputNonEmpty(const std::vector<ExprPtr>& valid, const std::string& op_name,
+                                 const Span& span);
+
+/**
+ * @brief What a write is allowed to move, and therefore what has to fit in the target
+ *
+ * The dual of ``WindowReadKind``: a read asks which extent must lie inside the
+ * source, a write asks which extent must lie inside the target. As there, this is
+ * a property of the substrate beneath the operator, not of aliasing.
+ */
+enum class WriteBoundsKind {
+  /// The whole physical source is written, so all of it must fit.
+  ///
+  /// ``tile.assemble`` lowers to ``pto.tinsert``, which copies the source subview
+  /// wholesale; nothing consults a valid extent, so a source allocation that
+  /// overhangs the target corrupts memory past the target.
+  kExactSubview,
+  /// Only the source's effective valid region is transferred, so only that has to
+  /// fit and a larger physical source allocation is harmless.
+  ///
+  /// ``tensor.assemble`` and ``tile.store`` move data by DMA over the valid
+  /// extent, which is the standard idiom for a padded fixed-width staging buffer
+  /// holding a short tail.
+  kValidRegionTransfer,
+};
+
+/**
+ * @brief Inputs to the shared write valid-region union rule
+ *
+ * All shape-like vectors are in target coordinates and must share one rank.
+ */
+struct WriteValidShapeUnionParams {
+  std::vector<ExprPtr> target_physical;  ///< Physical shape of the target
+  /// Target valid shape, already resolved by ``GetValidShape`` /
+  /// ``GetEffectiveTensorValidShape`` — never empty.
+  std::vector<ExprPtr> target_valid;
+  std::vector<ExprPtr> source_physical;  ///< Physical shape of the source
+  /// Source valid shape, already resolved — never empty. This is the extent
+  /// actually written, and the rectangle whose union with the target is proven.
+  std::vector<ExprPtr> source_valid;
+  std::vector<ExprPtr> offsets;  ///< Write origin, in target coordinates
+  WriteBoundsKind kind = WriteBoundsKind::kExactSubview;
+  std::string op_name;  ///< Operator name, used in diagnostics
+  /// Way out, appended to a physical-bounds rejection. An overhang is most often
+  /// a coordinate-system mismatch rather than an arithmetic slip — a tile read
+  /// through a transposing view and written back to an untransposed destination
+  /// overflows on one axis while under-filling the other — so each write says how
+  /// its own substrate wants to be addressed instead of only reporting the sum.
+  std::string bounds_remedy;
+  Span span = Span::unknown();
+};
+
+/**
+ * @brief Derive the valid region left behind by a write, when it is representable
+ *
+ * A valid shape names one origin-anchored rectangle, so the region after a write
+ * is expressible only when the union of the target's rectangle and the written
+ * one is itself an origin-anchored rectangle. The bounding candidate is
+ *
+ * ```text
+ * out_valid[i] = min(shape[i], max(target_valid[i], offset[i] + source_valid[i]))
+ * ```
+ *
+ * and this returns it only where that union is *provably* exactly that rectangle.
+ *
+ * **Why the proof is needed.** Returning the target's full shape after a partial
+ * write lets a later store push padding out as real data; returning only the
+ * source discards real data the target already held. Both are silent. Writing
+ * `W = ∏[o[i], o[i]+s[i])` into `T = ∏[0, t[i])`, the candidate rectangle covers
+ * `T ∪ W` exactly in these cases, which are what this accepts:
+ *
+ * - the written region is empty — the write is a no-op and the target stands;
+ * - the target is empty — the result is the source, provided it sits at the origin;
+ * - the written region lies inside the target — the target stands (a fully valid
+ *   target is this case, so it stays fully valid);
+ * - the target lies inside an origin-anchored written region — the source stands;
+ * - the write grows exactly one dimension `d` and abuts what is already there
+ *   (`offset[d] <= target_valid[d]`, so no gap opens), while every other dimension
+ *   spans the target exactly (`offset[i] == 0` and `source_valid[i] == target_valid[i]`).
+ *   Anything less on a passenger dimension leaves the new slab narrower than the
+ *   region it extends — an L-shape, which no valid shape can name.
+ *
+ * Growth in two or more dimensions at once, a gap, a mismatched passenger
+ * dimension, and any of these relations left unproven all reject rather than
+ * widen. Extents are compared with the tri-state proof vocabulary, so symbolic
+ * appends stated by structural equality (`t = [k, 128]`, `s = [m, 128]` at
+ * `[k, 0]` yields `[k + m, 128]`) are accepted while unrelated symbols are not.
+ *
+ * Expressions are built through the same proof-first helpers the window-read rule
+ * uses, so constant arithmetic folds and no redundant ``min`` / ``max`` nesting
+ * reaches a type.
+ *
+ * @param params Write description; see WriteValidShapeUnionParams
+ * @return The target's valid shape after the write, one extent per dimension
+ * @throws pypto::ValueError on rank mismatch, a provably negative offset, a
+ *         provable physical-bounds violation, or a union that is not provably an
+ *         origin-anchored rectangle
+ */
+std::vector<ExprPtr> InferWriteValidShapeUnion(const WriteValidShapeUnionParams& params);
+
+/**
  * @brief Check if a dimension is broadcastable to another
  *
  * A dimension is broadcastable if:
@@ -402,6 +601,29 @@ inline void InheritTileViewLayout(TileView& dst, const std::shared_ptr<const Til
   dst.pad = eff.pad;
 }
 
+namespace detail {
+
+/**
+ * @brief Resolve an effective valid shape: the explicit @p valid when set, else @p physical
+ *
+ * Callers index the result by physical axis, so a rank-mismatched valid_shape would read out of
+ * bounds. The bounds verifier reports this as kRankMismatch, but it only runs over an already-built
+ * program — the type is constructed long before that, so reject it here.
+ */
+inline std::vector<ExprPtr> ResolveValidShape(const std::vector<ExprPtr>& valid,
+                                              const std::vector<ExprPtr>& physical,
+                                              const std::string& type_kind) {
+  if (valid.empty()) {
+    return physical;
+  }
+  CHECK(valid.size() == physical.size())
+      << type_kind << " valid_shape rank (" << valid.size() << ") must match the physical shape rank ("
+      << physical.size() << "): valid_shape " << FormatShape(valid) << " vs shape " << FormatShape(physical);
+  return valid;
+}
+
+}  // namespace detail
+
 /**
  * @brief Return the source tile's effective valid_shape, falling back to its static shape.
  *
@@ -415,10 +637,49 @@ inline void InheritTileViewLayout(TileView& dst, const std::shared_ptr<const Til
  * @return The TileView::valid_shape if set, otherwise the static shape
  */
 inline std::vector<ExprPtr> GetValidShape(const std::shared_ptr<const TileType>& tile_type) {
-  if (tile_type->tile_view_ && !tile_type->tile_view_->valid_shape.empty()) {
-    return tile_type->tile_view_->valid_shape;
+  if (!tile_type->tile_view_) {
+    return tile_type->shape_;
   }
-  return tile_type->shape_;
+  return detail::ResolveValidShape(tile_type->tile_view_->valid_shape, tile_type->shape_, "TileType");
+}
+
+/**
+ * @brief Return the source tensor's effective valid_shape, falling back to its static shape.
+ *
+ * Tensor counterpart of the TileType overload above. An unset or empty valid_shape means
+ * "fully valid", so tensor ops resolve it to the physical shape before propagating it onto
+ * a result. A DistributedTensorType binds here too: an op that reads a window as this rank's
+ * local memory sees the same effective valid region.
+ *
+ * @param tensor_type Source TensorType
+ * @return The TensorView::valid_shape if set, otherwise the static shape
+ */
+inline std::vector<ExprPtr> GetValidShape(const std::shared_ptr<const TensorType>& tensor_type) {
+  if (!tensor_type->tensor_view_) {
+    return tensor_type->shape_;
+  }
+  return detail::ResolveValidShape(tensor_type->tensor_view_->valid_shape, tensor_type->shape_, "TensorType");
+}
+
+/**
+ * @brief Build the TensorType for a freshly computed (non-alias) tensor result.
+ *
+ * A computed tensor is a new allocation rather than a view of its source, so it carries only
+ * the metadata describing its own contents: the default layout, no stride, no padding, no
+ * source memref — and its own valid region. A valid_shape equal to the physical shape is fine:
+ * the TensorType constructor canonicalizes redundant full validity away, so a fully valid result
+ * ends up with no explicit view at all.
+ *
+ * @param shape Result physical shape
+ * @param dtype Result element type
+ * @param valid_shape Result effective valid shape
+ */
+inline TypePtr MakeFreshTensorType(std::vector<ExprPtr> shape, DataType dtype,
+                                   std::vector<ExprPtr> valid_shape) {
+  TensorView view;
+  view.valid_shape = std::move(valid_shape);
+  return std::make_shared<TensorType>(std::move(shape), dtype, std::nullopt,
+                                      std::make_optional(std::move(view)));
 }
 
 /**

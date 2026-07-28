@@ -790,6 +790,48 @@ def test_pto_codegen_tile_adds():
     assert ": f32" in mlir_code
 
 
+def test_pto_codegen_tile_int_literal_scalar_is_not_index():
+    """A bare int literal on an INT32 tile must emit an i32 operand, never index.
+
+    Regression: the DSL parses ``5`` to ``ConstInt(5, INDEX)``; ``index`` is not
+    a legal ``pto.t*s`` operand type. IR-construction unit tests stop before
+    codegen, so this checks the emitted operand type at the codegen boundary.
+    """
+
+    @pl.program
+    class IntAddsProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def adds_test(self, a: pl.Tensor[[32, 32], pl.INT32], b: pl.Tensor[[32, 32], pl.INT32]):
+            tile_a = pl.load(a, offsets=[0, 0], shapes=[32, 32])
+            tile_b = pl.add(tile_a, 5)
+            pl.store(tile_b, offsets=[0, 0], output_tensor=b)
+
+    lines = _get_mlir_lines(_generate_default_mlir(IntAddsProgram))
+    tadds = _single_line(lines, "pto.tadds")
+    assert "index" not in tadds, f"scalar operand is still index: {tadds}"
+    assert ", i32)" in tadds, f"scalar operand is not i32: {tadds}"
+
+
+def test_pto_codegen_tensor_int_literal_scalar_is_not_index():
+    """A tensor-level int literal must lower to an i32-operand tadds, never index.
+
+    The tensor path is stricter: an index scalar promotes the *result* tensor to
+    index. This guards the lowered ``tile.adds`` after ConvertTensorToTileOps.
+    """
+
+    @pl.program
+    class TensorIntAddsProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def adds_test(self, a: pl.Tensor[[32, 32], pl.INT32]) -> pl.Tensor[[32, 32], pl.INT32]:
+            return pl.tensor.adds(a, 5)
+
+    lines = _get_mlir_lines(_generate_default_mlir(TensorIntAddsProgram))
+    tadds = _find_lines(lines, "pto.tadds")
+    assert tadds, "no pto.tadds emitted"
+    assert all("index" not in ln for ln in tadds), f"a scalar operand is still index: {tadds}"
+    assert any(", i32)" in ln for ln in tadds), f"no i32 scalar operand: {tadds}"
+
+
 def test_pto_codegen_constants():
     """Test that constants are generated correctly."""
 
@@ -1833,8 +1875,8 @@ def test_pto_codegen_for_loop_tile_iter_arg_no_ddr_alloc():
             for i, (acc_iter,) in pl.range(2, init_values=(init_tile,)):
                 offset: pl.Scalar[pl.INDEX] = i * 256
                 chunk: pl.Tile[[16, 256], pl.FP32] = pl.load(data, [0, offset], [16, 256])
-                tmp: pl.Tile[[16, 1], pl.FP32] = pl.tile.create(
-                    [16, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                tmp: pl.Tile[[16, 256], pl.FP32] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
                 partial: pl.Tile[[16, 1], pl.FP32] = pl.tile.row_sum(chunk, tmp)
                 updated: pl.Tile[[16, 1], pl.FP32] = pl.tile.add(acc_iter, partial)
@@ -2168,8 +2210,8 @@ def test_pto_codegen_mixed_scalar_and_tile_iter_args():
             init_offset: pl.Scalar[pl.INDEX] = 0
             for i, (acc_iter, offset) in pl.range(2, init_values=(init_tile, init_offset)):
                 chunk: pl.Tile[[16, 256], pl.FP32] = pl.load(data, [0, offset], [16, 256])
-                tmp: pl.Tile[[16, 1], pl.FP32] = pl.tile.create(
-                    [16, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                tmp: pl.Tile[[16, 256], pl.FP32] = pl.tile.create(
+                    [16, 256], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
                 partial: pl.Tile[[16, 1], pl.FP32] = pl.tile.row_sum(chunk, tmp)
                 updated: pl.Tile[[16, 1], pl.FP32] = pl.tile.add(acc_iter, partial)
@@ -2623,13 +2665,19 @@ def test_pto_codegen_tensor_view_aliases_input_base_ptr():
     view_var = ir.Var("src_dn", view_call.type, span)
     tile_call = ir.op.tile.load(view_var, [0, 0], [16, 8])
     tile_var = ir.Var("tile", tile_call.type, span)
-    store_call = ir.op.tile.store(tile_var, [0, 0], out)
+    # The DN view transposes [8, 16] to [16, 8], so the tile is in DN coordinates.
+    # tile.store does no layout conversion (RFC #1300 P7), so the destination is
+    # addressed through the matching view rather than in its untransposed shape.
+    out_view_call = ir.op.tensor.view(out, layout=ir.TensorLayout.DN)
+    out_view_var = ir.Var("out_dn", out_view_call.type, span)
+    store_call = ir.op.tile.store(tile_var, [0, 0], out_view_var)
     result_var = ir.Var("result", store_call.type, span)
 
     body = ir.SeqStmts(
         [
             ir.AssignStmt(view_var, view_call, span),
             ir.AssignStmt(tile_var, tile_call, span),
+            ir.AssignStmt(out_view_var, out_view_call, span),
             ir.AssignStmt(result_var, store_call, span),
             ir.ReturnStmt([result_var], span),
         ],

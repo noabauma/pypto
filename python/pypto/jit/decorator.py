@@ -143,6 +143,18 @@ def _get_torch() -> Any:
                     torch.bool: DataType.BOOL,
                 }
             )
+            # Optional low-precision MX dtypes (PyTorch 2.1+/2.3+/2.7+); required
+            # for MX DSL ST. float4_e2m1fn_x2 is the packed MXFP4 weight dtype.
+            for _torch_name, _pto_dt in (
+                ("float8_e4m3fn", DataType.FP8E4M3FN),
+                ("float8_e5m2", DataType.FP8E5M2),
+                ("float8_e8m0fnu", DataType.FP8E8M0),
+                ("float4_e2m1fn_x2", DataType.FP4),
+            ):
+                _td = getattr(torch, _torch_name, None)
+                if _td is not None:
+                    _TORCH_DTYPE_MAP[_td] = _pto_dt
+
         except ImportError:
             _TORCH_CACHE.append(None)
     return _TORCH_CACHE[0]
@@ -153,7 +165,8 @@ def _torch_dtype_to_pypto(torch_dtype: Any) -> DataType:
     if torch_dtype not in _TORCH_DTYPE_MAP:
         raise TypeError(
             f"Unsupported torch dtype {torch_dtype}. "
-            "Supported: float16, float32, bfloat16, int8/16/32/64, uint8, bool."
+            "Supported: float16, float32, bfloat16, int8/16/32/64, uint8, bool, "
+            "float8_e4m3fn/e5m2/e8m0fnu, float4_e2m1fn_x2 (where torch supports them)."
         )
     return _TORCH_DTYPE_MAP[torch_dtype]
 
@@ -1234,13 +1247,6 @@ def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
     ``backend_type`` is intentionally omitted: ``ir.compile()`` derives the
     codegen backend from ``platform``, which the JIT path already forwards;
     passing ``backend_type`` as well would be redundant and could conflict.
-
-    ``block_dim`` is intentionally omitted too: although ``ir.compile()``
-    accepts it (baking it into ``kernel_config.py``), the JIT runtime path
-    always re-supplies ``RunConfig.block_dim`` at dispatch time
-    (``execute_compiled``), which overrides the baked value. Forwarding it
-    here would be redundant and would split the cache key on a value that
-    never reaches the executed artifact.
 
     ``output_dir`` is forwarded only when set, so an unset value defers to
     ``ir.compile()``'s own default.

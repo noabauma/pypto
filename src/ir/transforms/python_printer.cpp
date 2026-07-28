@@ -74,13 +74,36 @@ std::string SplitModeToPythonString(SplitMode mode) {
   throw pypto::TypeError("Unknown SplitMode");
 }
 
-/// True when a scope must emit a ``pl.split(...)`` optimization entry: it carries
-/// a concrete split mode (UP_DOWN / LEFT_RIGHT) or a ``slot_num`` ring depth.
-/// ``slot_num`` is valid with ``SplitMode.None`` too (a NONE mixed kernel still
-/// drives a cube->vector pipe), so a bare ``slot_num`` forces the entry.
-bool ScopeHasSplitInfo(const std::optional<SplitMode>& split, const ScopeStmtPtr& slot_holder) {
-  const bool has_mode = split.has_value() && split.value() != SplitMode::None;
-  return has_mode || (slot_holder && slot_holder->HasAttr("slot_num"));
+/// Detects a ``tile.get_block_idx`` read anywhere in a statement subtree.
+class BlockIdxReadDetector : public IRVisitor {
+ public:
+  void VisitExpr_(const CallPtr& op) override {
+    if (IsOp(op, "tile.get_block_idx")) found_ = true;
+    IRVisitor::VisitExpr_(op);
+  }
+
+  [[nodiscard]] bool found() const { return found_; }
+
+ private:
+  bool found_ = false;
+};
+
+/// True when re-parsing ``with pl.spmd(...):`` with ``incore``'s statements printed
+/// inline would rebuild the InCore carrier.
+///
+/// The with-form parser synthesises a carrier only for a body that carries an
+/// ``optimizations=`` entry (a concrete split mode or a ``slot_num`` slot count —
+/// the same pair ``PrintScopeOptimizations`` emits) or reads the per-block index.
+/// For any other body the sugar is lossy: the carrier must be spelled out as a
+/// nested ``pl.at(level=pl.Level.CORE_GROUP)`` instead, or the round-trip silently
+/// drops it.
+bool SpmdInlineBodyRebuildsCarrier(const InCoreScopeStmtPtr& incore) {
+  if (!incore) return false;
+  const bool has_mode = incore->split_.has_value() && incore->split_.value() != SplitMode::None;
+  if (has_mode || incore->HasAttr("slot_num")) return true;
+  BlockIdxReadDetector detector;
+  detector.VisitStmt(incore->body_);
+  return detector.found();
 }
 
 /// Convert cast round mode integer to its string name for printing.
@@ -190,8 +213,8 @@ bool IsRightAssociative(const ExprPtr& expr) {
  */
 class IRPythonPrinter : public IRVisitor {
  public:
-  explicit IRPythonPrinter(std::string prefix = "pl", bool concise = false)
-      : prefix_(std::move(prefix)), concise_(concise) {}
+  explicit IRPythonPrinter(std::string prefix = "pl", bool concise = false, bool explicit_layout = false)
+      : prefix_(std::move(prefix)), concise_(concise), explicit_layout_(explicit_layout) {}
   ~IRPythonPrinter() override = default;
 
   /**
@@ -281,8 +304,14 @@ class IRPythonPrinter : public IRVisitor {
   // redundant op-level ``split=`` kwarg on aiv_shard/aic_gather is suppressed
   // (the region's mode is the authoritative carrier; the parser re-stamps it).
   int split_aiv_scope_depth_ = 0;
-  std::string prefix_;                    // Prefix for type names (e.g., "pl" or "ir")
-  bool concise_;                          // When true, omit intermediate type annotations
+  std::string prefix_;  // Prefix for type names (e.g., "pl" or "ir")
+  bool concise_;        // When true, omit intermediate type annotations
+  // When true, print every tile's fully-resolved blayout/slayout/fractal from
+  // GetEffectiveTileView — including tiles whose canonical tile_view_ is nullopt
+  // (whose layout would otherwise be silently implicit). Makes a dump
+  // self-describing for tile layouts (opt-in debugging aid, issue #2088); the
+  // concise canonical form stays the default.
+  bool explicit_layout_;
   ProgramPtr current_program_ = nullptr;  // Track when printing within Program (for self.method() calls)
 
   // Per-function rename map: Var pointer → unique printed name.
@@ -384,15 +413,16 @@ class IRPythonPrinter : public IRVisitor {
   // Emit ``windowize=True`` for an explicitly opted-in InCore scope.
   bool PrintScopeWindowizeAttr(const ScopeStmtPtr& op);
 
-  // Emit ``pl.split(pl.SplitMode.X[, slot_num=N])`` (a single optimizations list
-  // entry, no leading comma / wrapper), reading the optional ``slot_num`` ring
-  // depth from ``slot_num_holder``'s attrs (the scope carrying it).
-  void PrintSplitCall(SplitMode split, const ScopeStmtPtr& slot_num_holder);
-
-  // Emit ``, optimizations=[pl.split(pl.SplitMode.X[, slot_num=N])]`` for a
-  // split scope. Used by the flattened spmd with-tid / for-loop forms; the
-  // nested-scope forms round-trip slot_num via the InCoreScopeStmt printer.
-  void PrintSplitOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder);
+  // Emit ``, optimizations=[...]`` for a scope carrying a concrete split mode
+  // (UP_DOWN / LEFT_RIGHT) and/or a ``slot_num`` cross-core slot count, read
+  // from ``slot_num_holder``'s attrs (the scope carrying it). The two are
+  // independent entries — ``pl.split(pl.SplitMode.X)`` and
+  // ``pl.cross_core_slot(slot_num=N)`` — so a bare slot count never fabricates
+  // a ``pl.SplitMode.NONE`` (which OutlineIncoreScopes rejects on a scope
+  // holding pl.split_aiv regions). Emits nothing when the scope carries
+  // neither. Used by the flattened spmd with-tid / for-loop forms; the
+  // nested-scope forms round-trip via the InCoreScopeStmt printer.
+  void PrintScopeOptimizations(const std::optional<SplitMode>& split, const ScopeStmtPtr& slot_num_holder);
 
   // Emit `` as <tid>`` if the scope carries ``kAttrTaskIdVar``. The caller is
   // responsible for placing the ``)`` before and the ``:\n`` after this call.
@@ -520,9 +550,10 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
   // ``As<TensorType>`` is precise-match and would not fire for the subclass,
   // so dispatch on DistributedTensorType first and pass it through the
   // TensorType base for shared field access.
+  auto dt_tensor = As<DistributedTensorType>(type);
   TensorTypePtr tensor_type;
   std::string tensor_head;
-  if (auto dt_tensor = As<DistributedTensorType>(type)) {
+  if (dt_tensor) {
     tensor_type = dt_tensor;
     tensor_head = "pld.DistributedTensor";
   } else if (auto plain_tensor = As<TensorType>(type)) {
@@ -550,6 +581,21 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
     // Add optional memref as positional arg
     if (tensor_type->memref_.has_value()) {
       oss << ", " << PrintMemRef(*tensor_type->memref_.value());
+    }
+
+    // Fully-resolved dump (issue #2088): a DistributedTensorType carries a
+    // WindowBuffer back-reference that the concise form drops, so two same
+    // shape/dtype distributed tensors viewing *different* window buffers print
+    // identically. Surface the buffer name so a dump distinguishes them. This is
+    // an informational marker (a quoted string): the subscript DSL has no
+    // window_buffer slot and Python forbids keyword subscripts, so it is emitted
+    // as a trailing string element. The parser strips it (type_resolver +
+    // DistributedTensorMeta) and re-derives the real reference from
+    // pld.tensor.window, so EXPLICIT dumps still reparse to identical IR — which
+    // validate_ir relies on (it reloads every dump). Emitted only under
+    // explicit_layout_.
+    if (explicit_layout_ && dt_tensor && dt_tensor->window_buffer_.has_value()) {
+      oss << ", \"window_buffer=" << dt_tensor->window_buffer_.value()->name_hint_ << "\"";
     }
 
     oss << "]";
@@ -585,14 +631,23 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
       oss << ", " << prefix_ << ".Mem." << mem_str;
     }
 
-    if (tile_type->tile_view_.has_value()) {
-      // PrintTileView elides every default field and returns "" when the explicit
-      // view happens to match the implicit one — possible only on incoherent IR
-      // (canonical IR stores that as nullopt and never reaches this branch).
-      // Fall back to an empty TileView() literal so the output stays parseable
-      // and TileTypeCoherence can flag the real bug.
-      auto view_str =
-          PrintTileView(tile_type->tile_view_.value(), tile_type->shape_, tile_type->memory_space_);
+    // Pick the view to render, then print once. explicit_layout_ resolves an
+    // absent canonical view (tile_view_ == nullopt) to its implicit form via
+    // GetEffectiveTileView so the annotation states its real blayout/slayout/
+    // fractal (issue #2088) — PrintTileView forces those fields in that mode, so
+    // it never returns "" for the explicit view. The concise branch only renders
+    // a present view; when a present view happens to match the implicit one
+    // (possible only on incoherent IR — canonical IR stores that as nullopt), the
+    // empty-string fallback keeps the output parseable so TileTypeCoherence can
+    // flag the real bug.
+    std::optional<TileView> view;
+    if (explicit_layout_) {
+      view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+    } else if (tile_type->tile_view_.has_value()) {
+      view = tile_type->tile_view_.value();
+    }
+    if (view.has_value()) {
+      auto view_str = PrintTileView(*view, tile_type->shape_, tile_type->memory_space_);
       oss << ", " << (view_str.empty() ? prefix_ + ".TileView()" : view_str);
     }
 
@@ -908,6 +963,58 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     stream_ << op_name << "(";
   }
 
+  // Serialize ONLY op-call attrs that genuinely need to survive print -> parse,
+  // via an explicit allowlist. Most attrs are re-derived by the parser or have
+  // bespoke syntax. ``pipeline_membership`` and the compiler-generated
+  // Tensor-to-Mat bridge provenance have neither and must survive until their
+  // downstream passes consume them. Keep this helper available to special call
+  // forms below so an early return cannot silently drop either attr.
+  auto print_serialized_attrs = [&](bool need_comma) {
+    std::vector<const std::pair<std::string, std::any>*> serialized_attrs;
+    for (const auto& kv : op->attrs_) {
+      if (kv.first == kPipelineMembershipAttr || kv.first == kCompilerTensorToTileMatBridgeAttr) {
+        serialized_attrs.push_back(&kv);
+      }
+    }
+    if (serialized_attrs.empty()) return;
+
+    stream_ << (need_comma ? ", " : "") << "attrs={";
+    bool first_key = true;
+    for (const auto* kv : serialized_attrs) {
+      stream_ << (first_key ? "" : ", ");
+      first_key = false;
+      stream_ << std::quoted(kv->first) << ": ";
+      PrintAttrValue(kv->second, op->span_);
+    }
+    stream_ << "}";
+  };
+
+  // reinterpret_view keeps dtype as the second public-API input and shape as a
+  // keyword-only optional input, while the IR stores shape positionally and
+  // dtype in kwargs. Print the public ordering explicitly so both tensor and
+  // tile forms round-trip through their DSL wrappers.
+  if ((IsOp(op, "tile.reinterpret_view") || IsOp(op, "tensor.reinterpret_view")) &&
+      (op->args_.size() == 1 || op->args_.size() == 2)) {
+    VisitExpr(op->args_[0]);
+    bool found_dtype = false;
+    for (const auto& [key, value] : op->kwargs_) {
+      if (key != "dtype") continue;
+      stream_ << ", dtype=" << prefix_ << "."
+              << DataTypeToString(AnyCast<DataType>(value, op->op_->name_ + " dtype"));
+      found_dtype = true;
+      break;
+    }
+    INTERNAL_CHECK_SPAN(found_dtype, op->span_)
+        << "Internal error: " << op->op_->name_ << " is missing its required dtype kwarg";
+    if (op->args_.size() == 2) {
+      stream_ << ", shape=";
+      VisitExpr(op->args_[1]);
+    }
+    print_serialized_attrs(/*need_comma=*/true);
+    stream_ << ")";
+    return;
+  }
+
   // Special handling for tile.full / tensor.full: print as keyword args to match Python API
   // IR stores: args_=[shape, value_expr], kwargs_={"dtype": dtype}
   // Python API: full(shape, dtype, value) — print as full(shape, dtype=.., value=..)
@@ -933,6 +1040,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     } else {
       VisitExpr(val_expr);
     }
+    print_serialized_attrs(/*need_comma=*/true);
     stream_ << ")";
     return;
   }
@@ -971,12 +1079,21 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       stream_ << ", scratch_l1=";
       VisitExpr(op->args_[2]);
     }
+    print_serialized_attrs(/*need_comma=*/true);
     stream_ << ")";
     return;
   }
 
+  // gather_row's optional 6th operand is keyword-only in the DSL: `transpose`
+  // already owned the 6th positional slot before valid_shape existed, and taking
+  // it would silently reinterpret an existing `gather_row(..., shapes, True)` as
+  // a shape. Print it as a kwarg so the round-trip matches the Python signature.
+  const bool gather_row_kw_valid =
+      (IsOp(op, "tile.gather_row") || IsOp(op, "tensor.gather_row")) && op->args_.size() == 6;
+
   // Print positional arguments
   for (size_t i = 0; i < op->args_.size(); ++i) {
+    if (gather_row_kw_valid && i == 5) continue;
     if (i > 0) stream_ << ", ";
 
     // Special handling for tile.alloc/tensor.alloc first argument (memory_space)
@@ -995,6 +1112,11 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
 
   // Print kwargs as keyword arguments
   bool need_comma = !op->args_.empty();
+  if (gather_row_kw_valid) {
+    stream_ << ", valid_shape=";
+    VisitExpr(op->args_[5]);
+    need_comma = true;
+  }
   if (IsOp(op, "system.task_dummy")) {
     const std::vector<VarPtr>* deps_to_print = nullptr;
     for (const auto& [k, v] : op->attrs_) {
@@ -1105,32 +1227,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     }
   }
 
-  // Serialize ONLY op-call attrs that genuinely need to survive print -> parse,
-  // via an explicit allowlist. Most op-call attrs are either re-derived by the
-  // parser (e.g. ``dummy_task`` on ``system.task_dummy``) or surfaced through a
-  // bespoke kwarg (``deps=`` / ``device=``), so emitting them generically would
-  // either duplicate that surface or expose an internal marker the round-trip
-  // tests don't expect. ``pipeline_membership`` (set by LowerPipelineLoops, read
-  // by MemoryReuse) has no such surface and MUST round-trip, else the structural
-  // equality check after those passes fails. The matching reader is
-  // ``ast_parser`` (``_parse_op_attrs`` -> ``set_call_attrs``).
-  {
-    std::vector<const std::pair<std::string, std::any>*> serialized_attrs;
-    for (const auto& kv : op->attrs_) {
-      if (kv.first == kPipelineMembershipAttr) serialized_attrs.push_back(&kv);
-    }
-    if (!serialized_attrs.empty()) {
-      stream_ << (need_comma ? ", " : "") << "attrs={";
-      bool first_key = true;
-      for (const auto* kv : serialized_attrs) {
-        stream_ << (first_key ? "" : ", ");
-        first_key = false;
-        stream_ << std::quoted(kv->first) << ": ";
-        PrintAttrValue(kv->second, op->span_);
-      }
-      stream_ << "}";
-    }
-  }
+  print_serialized_attrs(need_comma);
 
   stream_ << ")";
 }
@@ -1712,17 +1809,20 @@ bool IRPythonPrinter::PrintScopeDepsAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrManualDepEdges, "deps");
 }
 
-void IRPythonPrinter::PrintSplitCall(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
-  stream_ << prefix_ << ".split(" << prefix_ << ".SplitMode." << SplitModeToPythonString(split);
-  if (slot_num_holder && slot_num_holder->HasAttr("slot_num")) {
-    stream_ << ", slot_num=" << slot_num_holder->GetAttr<int>("slot_num", 0);
-  }
-  stream_ << ")";
-}
-
-void IRPythonPrinter::PrintSplitOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
+void IRPythonPrinter::PrintScopeOptimizations(const std::optional<SplitMode>& split,
+                                              const ScopeStmtPtr& slot_num_holder) {
+  const bool has_mode = split.has_value() && split.value() != SplitMode::None;
+  const bool has_slot_num = slot_num_holder && slot_num_holder->HasAttr("slot_num");
+  if (!has_mode && !has_slot_num) return;
   stream_ << ", optimizations=[";
-  PrintSplitCall(split, slot_num_holder);
+  if (has_mode) {
+    stream_ << prefix_ << ".split(" << prefix_ << ".SplitMode." << SplitModeToPythonString(split.value())
+            << ")";
+  }
+  if (has_slot_num) {
+    if (has_mode) stream_ << ", ";
+    stream_ << prefix_ << ".cross_core_slot(slot_num=" << slot_num_holder->GetAttr<int>("slot_num", 0) << ")";
+  }
   stream_ << "]";
 }
 
@@ -1817,14 +1917,11 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
 
 void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   stream_ << "with " << prefix_ << ".at(level=" << prefix_ << ".Level.CORE_GROUP";
-  // Emit the surviving ``optimizations=[pl.split(mode[, slot_num=N])]`` form
-  // whenever there is a slot_num (a NONE mixed kernel still drives a
-  // cube->vector pipe and carries a ring depth) or a non-None split mode. A
-  // plain InCore with no split prints as ``pl.at(level=...)`` with no
+  // Emit ``optimizations=[...]`` for a non-None split mode and/or a slot_num
+  // (a NONE mixed kernel still drives a cross-core pipe and carries a slot
+  // count). A plain InCore with neither prints as ``pl.at(level=...)`` with no
   // optimizations list.
-  if (op->HasAttr("slot_num") || (op->split_.has_value() && op->split_.value() != SplitMode::None)) {
-    PrintSplitOptimizations(op->split_.value_or(SplitMode::None), op);
-  }
+  PrintScopeOptimizations(op->split_, op);
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
   }
@@ -1855,10 +1952,8 @@ void IRPythonPrinter::VisitStmt_(const ClusterScopeStmtPtr& op) {
 void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
   // Detect the ``for i in pl.spmd(...):`` desugaring emitted by the parser:
   // SpmdScopeStmt(body=InCoreScopeStmt(body=<AssignStmt(i, Call(tile.get_block_idx)), ...>)).
-  // Printing it back as a for-loop keeps round-trips stable (the
-  // with-form parser enforces a single kernel call, so printing a
-  // multi-statement InCore-wrapped body as `with pl.spmd():` would fail
-  // to reparse).
+  // Printing it back as a for-loop keeps round-trips stable: the for-form binds the
+  // loop variable to the leading get_block_idx read, which the with-form does not.
   auto incore = As<InCoreScopeStmt>(op->body_);
   auto incore_seq = incore ? As<SeqStmts>(incore->body_) : nullptr;
 
@@ -1878,8 +1973,8 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
     }
-    if (incore && ScopeHasSplitInfo(incore->split_, incore)) {
-      PrintSplitOptimizations(incore->split_.value_or(SplitMode::None), incore);
+    if (incore) {
+      PrintScopeOptimizations(incore->split_, incore);
     }
     PrintScopeDepsAttr(op);
     PrintScopeAllowEarlyResolveAttr(op);
@@ -1888,17 +1983,23 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     PrintScopeTaskIdVarSuffix(op);
     stream_ << ":\n";
     IncreaseIndent();
-    if (incore_seq && !incore_seq->stmts_.empty()) {
+    if (!SpmdInlineBodyRebuildsCarrier(incore)) {
+      // Print the body as-is. Either inlining would drop the carrier — the parser
+      // re-synthesises an InCore only for a body that carries a split or reads the
+      // per-block index, so the carrier must be spelled out as a nested
+      // ``pl.at(level=pl.Level.CORE_GROUP)``, the same shape the plain with-form
+      // prints — or (defensively) there is no InCore wrapper at all, which an
+      // `as tid` Spmd scope should never be missing.
+      PrintStmtBlock(op->body_);
+    } else if (incore_seq && !incore_seq->stmts_.empty()) {
       for (size_t i = 0; i < incore_seq->stmts_.size(); ++i) {
         if (ShouldSuppressPlaceholder(incore_seq->stmts_, i)) continue;
         PrintStmtBlock(incore_seq->stmts_[i]);
         if (i + 1 < incore_seq->stmts_.size()) stream_ << "\n";
       }
-    } else if (incore) {
-      PrintStmtBlock(incore->body_);
     } else {
-      // Defensive: an `as tid` Spmd scope should always wrap its body in InCore.
-      PrintStmtBlock(op->body_);
+      // Non-null: SpmdInlineBodyRebuildsCarrier only returns true for a real InCore.
+      PrintStmtBlock(incore->body_);
     }
     DecreaseIndent();
     return;
@@ -1918,8 +2019,8 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (!op->name_hint_.empty()) {
       stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
     }
-    if (incore && ScopeHasSplitInfo(incore->split_, incore)) {
-      PrintSplitOptimizations(incore->split_.value_or(SplitMode::None), incore);
+    if (incore) {
+      PrintScopeOptimizations(incore->split_, incore);
     }
     PrintScopeAllowEarlyResolveAttr(op);
     PrintScopePredicateAttr(op);
@@ -2746,8 +2847,9 @@ std::string IRPythonPrinter::PrintMemRef(const MemRef& memref) {
 
 std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std::vector<ExprPtr>& tile_shape,
                                            const std::optional<MemorySpace>& memory_space) {
-  // Caller already gated on has_value(); a present view is non-implicit by the
-  // TileType canonical-encoding invariant, so always render the explicit form.
+  // Caller already gated on has_value() (or passed the resolved effective view in
+  // explicit_layout_ mode); a present view is non-implicit by the TileType
+  // canonical-encoding invariant, so always render the explicit form.
   std::ostringstream oss;
   oss << prefix_ << ".TileView(";
 
@@ -2757,8 +2859,15 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
     first = false;
   };
 
-  // Compute the implicit view so we can elide fields that match it.
-  TileView implicit_view = tile_view_semantics::GetImplicitTileView(tile_shape, memory_space);
+  // Compute the implicit view so we can elide layout fields that match it — but
+  // only in concise mode. Under explicit_layout_ the blayout/slayout/fractal
+  // guards short-circuit on `explicit_layout_ ||` and never read it, so skipping
+  // it avoids a wasted GetImplicitTileView (already folded into the effective
+  // view the caller resolved for absent-view tiles).
+  TileView implicit_view;
+  if (!explicit_layout_) {
+    implicit_view = tile_view_semantics::GetImplicitTileView(tile_shape, memory_space);
+  }
 
   // valid_shape — omit if it matches the parent tile's shape
   bool valid_shape_matches = tile_view.valid_shape.empty() ||
@@ -2792,7 +2901,8 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
   }
 
   // blayout — omit if matches the implicit view for this shape+memory_space
-  if (tile_view.blayout != implicit_view.blayout) {
+  // (kept in explicit_layout_ mode so every tile self-describes its layout).
+  if (explicit_layout_ || tile_view.blayout != implicit_view.blayout) {
     maybe_comma();
     oss << "blayout=" << prefix_ << ".TileLayout.";
     switch (tile_view.blayout) {
@@ -2809,7 +2919,8 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
   }
 
   // slayout — omit if matches the implicit view for this shape+memory_space
-  if (tile_view.slayout != implicit_view.slayout) {
+  // (kept in explicit_layout_ mode so every tile self-describes its layout).
+  if (explicit_layout_ || tile_view.slayout != implicit_view.slayout) {
     maybe_comma();
     oss << "slayout=" << prefix_ << ".TileLayout.";
     switch (tile_view.slayout) {
@@ -2826,7 +2937,8 @@ std::string IRPythonPrinter::PrintTileView(const TileView& tile_view, const std:
   }
 
   // fractal — omit if matches the implicit view for this shape+memory_space
-  if (tile_view.fractal != implicit_view.fractal) {
+  // (kept in explicit_layout_ mode so every tile self-describes its layout).
+  if (explicit_layout_ || tile_view.fractal != implicit_view.fractal) {
     maybe_comma();
     oss << "fractal=" << tile_view.fractal;
   }
@@ -2943,13 +3055,14 @@ std::string IRPythonPrinter::PrintTensorView(const TensorView& tensor_view,
 // ================================
 // Public API
 // ================================
-std::string PythonPrint(const IRNodePtr& node, const std::string& prefix, bool concise) {
-  IRPythonPrinter printer(prefix, concise);
+std::string PythonPrint(const IRNodePtr& node, const std::string& prefix, bool concise,
+                        bool explicit_layout) {
+  IRPythonPrinter printer(prefix, concise, explicit_layout);
   return printer.Print(node);
 }
 
-std::string PythonPrint(const TypePtr& type, const std::string& prefix) {
-  IRPythonPrinter printer(prefix);
+std::string PythonPrint(const TypePtr& type, const std::string& prefix, bool explicit_layout) {
+  IRPythonPrinter printer(prefix, /*concise=*/false, explicit_layout);
   return printer.Print(type);
 }
 

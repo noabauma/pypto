@@ -246,8 +246,9 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
       << args[2]->GetType()->TypeName();
 
   // Optional fourth argument (when 4 args total) must be a shapes tuple
+  MakeTuplePtr shapes_tuple;
   if (args.size() == 4) {
-    auto shapes_tuple = As<MakeTuple>(args[3]);
+    shapes_tuple = As<MakeTuple>(args[3]);
     CHECK(shapes_tuple) << "The operator " << op_name
                         << " requires optional 4th argument to be a shapes tuple (MakeTuple)";
     CHECK(!shapes_tuple->elements_.empty())
@@ -279,8 +280,75 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
         << dt.ToString();
   }
 
-  // store returns the output tensor (same type)
-  return output_tensor_type;
+  // ---- Valid-region union -------------------------------------------------
+  // A store writes into the destination tensor, so the tensor it returns holds
+  // what that tensor already held plus the region just written.
+  const std::vector<ExprPtr>& dest_shape = output_tensor_type->shape_;
+  const size_t dest_rank = dest_shape.size();
+
+  // The optional ``shapes`` operand carries FlattenTileNdTo2D's ND partition,
+  // which is a *collapsed-dims* descriptor rather than a rectangle in
+  // destination coordinates: it is built as leading 1s followed by the
+  // pre-flatten tile shape, whose leading extent may be the product of several
+  // destination axes. A [2, 3, 8] gather, for one, stores its collapsed [6, 8]
+  // tile as partition [1, 6, 8], where 6 spans two axes of a destination whose
+  // own axis 1 is only 3. Codegen consumes that through pto.partition_view,
+  // which understands the collapse; reading it as an origin-anchored rectangle
+  // here would both mis-bound the write and place the union on the wrong axes.
+  // So the ND form keeps the destination type it had — recovering the written
+  // region on ND axes is the ND-to-2D mapping problem, not this rule's.
+  if (shapes_tuple) {
+    return output_tensor_type;
+  }
+  std::vector<ExprPtr> transfer_physical = tile_type->shape_;
+  std::vector<ExprPtr> transfer_valid = GetValidShape(tile_type);
+
+  // As for assemble, the union is derivable only when the transfer, the offsets,
+  // and the destination share one rank. A store whose tile addresses the
+  // destination through a reinterpreting view — a lower-rank window, or a DN
+  // layout that permutes the axes — is not a rectangle on these axes, so it keeps
+  // the destination type it returned before this rule existed.
+  if (transfer_physical.size() != dest_rank || offsets_tuple->elements_.size() != dest_rank) {
+    return output_tensor_type;
+  }
+
+  // Only the tile's valid extent is moved by the DMA, so a tile whose physical
+  // allocation is larger than its real contents is bounded by what it actually
+  // transfers rather than by its allocation.
+  std::vector<ExprPtr> dest_valid = GetValidShape(output_tensor_type);
+  std::vector<ExprPtr> result_valid = InferWriteValidShapeUnion({
+      /*target_physical=*/dest_shape,
+      /*target_valid=*/dest_valid,
+      /*source_physical=*/std::move(transfer_physical),
+      /*source_valid=*/std::move(transfer_valid),
+      /*offsets=*/offsets_tuple->elements_,
+      /*kind=*/WriteBoundsKind::kValidRegionTransfer,
+      /*op_name=*/op_name,
+      /*bounds_remedy=*/
+      "A store performs no layout conversion (RFC #1300 P7): the offsets and the tile extent must "
+      "already be in the destination's coordinate system. If the tile was read through a view whose "
+      "layout differs from the destination's -- a DN view transposes it -- take the matching view of "
+      "the destination, pl.view(out, layout=...), and store into that",
+      /*span=*/args[2]->span_,
+  });
+
+  // A store that leaves the destination's valid region exactly as it found it —
+  // which every store into a fully valid destination does — returns the
+  // destination type itself, so the common case keeps the very type, and the
+  // memref and comm-group binding on it, that it carried before this rule existed.
+  if (AreExprVectorsEqual(result_valid, dest_valid)) {
+    return output_tensor_type;
+  }
+
+  TensorView result_view = output_tensor_type->tensor_view_.value_or(TensorView{});
+  result_view.valid_shape = std::move(result_valid);
+  if (auto dt = As<DistributedTensorType>(args[2]->GetType())) {
+    return std::make_shared<DistributedTensorType>(dest_shape, output_tensor_type->dtype_,
+                                                   output_tensor_type->memref_,
+                                                   std::make_optional(result_view), dt->window_buffer_);
+  }
+  return std::make_shared<TensorType>(dest_shape, output_tensor_type->dtype_, output_tensor_type->memref_,
+                                      std::make_optional(result_view));
 }
 
 TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,

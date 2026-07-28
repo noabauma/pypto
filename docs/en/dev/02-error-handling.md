@@ -30,6 +30,21 @@ std::runtime_error
 
 `Error::GetFullMessage()` returns the error message plus a formatted C++ stack trace.
 
+### Platform support for stack traces
+
+`3rdparty/libbacktrace` tracks upstream [ianlancetaylor/libbacktrace](https://github.com/ianlancetaylor/libbacktrace).
+Upstream's Mach-O reader accepts only `MH_EXECUTE`, `MH_DYLIB` and `MH_DSYM`, but a CPython
+extension module is an `MH_BUNDLE` — so on **macOS** symbolization fails and `GetFullMessage()`
+falls back to `No stack trace available`. No build mode changes this; it is a filetype gate, not
+missing debug info. Linux (ELF) is unaffected, but still needs debug info: `Debug` or
+`RelWithDebInfo` (the default) pass `-g` and produce full traces, while a plain `Release` build is
+`-O2 -DNDEBUG` with no `-g`, so frames carry no source location and the same fallback appears.
+
+`Backtrace::ErrorCallback` reports each distinct `(message, errno)` pair only once. Without that,
+macOS would emit one `no debug info in Mach-O executable` line per stack frame of every captured
+trace, since the dyld init path succeeds overall and installs `macho_nodebug` as the fileline
+handler.
+
 ## Assertion Macros
 
 ### User-facing checks — `CHECK` / `CHECK_SPAN`

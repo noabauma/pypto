@@ -14,7 +14,7 @@ Codegen must be a **strict 1-to-1 translation** from IR to generated code. Each 
 
 **Why:** Codegen that embeds analysis becomes fragile — it duplicates logic that passes already handle, and it's harder to test in isolation. Keeping codegen a straightforward translation ensures it stays predictable and maintainable.
 
-**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/23-normalize_return_order.md) pass.
+**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/24-normalize_return_order.md) pass.
 
 ## Overview
 
@@ -590,7 +590,6 @@ The orchestration codegen generates identical orchestration C++ code using the P
 | --- | ------------ | ----- |
 | `runtime` | Always | Currently `"tensormap_and_ringbuffer"` — the runtime requires 4 AICPU threads (3 schedulers + 1 orchestrator on thread 3). |
 | `aicpu_thread_num` | Always (`4`) | Dictated by the chosen runtime. |
-| `block_dim` | Only when `compile(..., block_dim=N)` is set | Number of logical SPMD blocks to dispatch. Omitted by default; the simpler runtime then applies its own default and validates it against device capacity — over-capacity values raise a clear error (`max_block_dim=...`) instead of hanging. Pass `compile(block_dim=...)` or `RunConfig(block_dim=...)` (per-invocation override) when targeting devices whose usable core count is below the runtime default. |
 
 ### Argument Unpacking
 

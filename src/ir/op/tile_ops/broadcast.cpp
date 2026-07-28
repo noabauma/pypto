@@ -18,22 +18,31 @@
  */
 
 #include <any>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
+
+static bool IsTRowExpandAddDataType(DataType dtype) {
+  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32 ||
+         dtype == DataType::FP16 || dtype == DataType::FP32;
+}
 
 TypePtr DeduceTileRowExpandType(const std::vector<ExprPtr>& args,
                                 const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -67,7 +76,7 @@ TypePtr DeduceTileRowExpandType(const std::vector<ExprPtr>& args,
   auto row_col_const = As<ConstInt>(row_shape[row_shape.size() - 1]);
   CHECK(row_col_const && row_col_const->value_ == 1)
       << "The operator " << op_name << " requires second argument's last dimension to be 1, but got "
-      << row_shape[row_shape.size() - 1];
+      << FormatShape(row_shape);
 
   // Second-to-last dimension (rows) must match
   auto tile_rows_const = As<ConstInt>(tile_shape[tile_shape.size() - 2]);
@@ -91,6 +100,69 @@ TypePtr DeduceTileRowExpandType(const std::vector<ExprPtr>& args,
   tile_view.valid_shape = GetValidShape(tile_type);
   InheritTileViewLayout(tile_view, tile_type);
   return std::make_shared<TileType>(tile_shape, *result_dtype, std::nullopt, tile_view);
+}
+
+TypePtr DeduceTileRowExpandAddType(const std::vector<ExprPtr>& args,
+                                   const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                   const std::string& op_name) {
+  CHECK(args.size() == 2 || args.size() == 3)
+      << "The operator " << op_name << " requires 2 or 3 arguments, but got " << args.size();
+
+  auto tile_type = As<TileType>(args[0]->GetType());
+  CHECK(tile_type) << "The operator " << op_name << " requires first argument to be a TileType, but got "
+                   << args[0]->GetType()->TypeName();
+  auto row_type = As<TileType>(args[1]->GetType());
+  CHECK(row_type) << "The operator " << op_name << " requires second argument to be a TileType, but got "
+                  << args[1]->GetType()->TypeName();
+  if (args.size() == 3) {
+    CHECK(As<TileType>(args[2]->GetType()))
+        << "The operator " << op_name << " requires optional third argument tmp to be a TileType, but got "
+        << args[2]->GetType()->TypeName();
+  }
+
+  CHECK(tile_type->shape_.size() >= 2)
+      << "The operator " << op_name << " requires first argument to have at least 2 dimensions, but got "
+      << tile_type->shape_.size() << " dimensions";
+  CHECK(row_type->shape_.size() >= 2)
+      << "The operator " << op_name << " requires second argument to have at least 2 dimensions, but got "
+      << row_type->shape_.size() << " dimensions";
+
+  const TileView tile_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+  CHECK(tile_view.blayout == TileLayout::row_major)
+      << "The operator " << op_name << " requires src0 effective blayout to be row_major";
+  CHECK(tile_type->dtype_ == row_type->dtype_)
+      << "The operator " << op_name << " requires src0 and src1 to have the same dtype, but got "
+      << tile_type->dtype_.ToString() << " and " << row_type->dtype_.ToString();
+  CHECK(IsTRowExpandAddDataType(tile_type->dtype_))
+      << "The operator " << op_name << " requires dtype in {INT8, INT16, INT32, FP16, FP32}, but got "
+      << tile_type->dtype_.ToString();
+
+  const auto tile_valid_shape = GetValidShape(tile_type);
+  const auto row_valid_shape = GetValidShape(row_type);
+  CHECK(ProveValidExtentEqual(tile_valid_shape[tile_valid_shape.size() - 2],
+                              row_valid_shape[row_valid_shape.size() - 2]) == ProofResult::kTrue)
+      << "The operator " << op_name
+      << " requires src1 valid row extent to match src0/dst, but got src0 valid_shape "
+      << FormatShape(tile_valid_shape) << " and src1 valid_shape " << FormatShape(row_valid_shape);
+
+  const TileView row_view = tile_view_semantics::GetEffectiveTileView(*row_type);
+  const bool packed_row_major = row_view.blayout == TileLayout::row_major;
+  const size_t elem_bytes = row_type->dtype_.GetByte();
+  CHECK(elem_bytes != 0 && 32 % elem_bytes == 0)
+      << "The operator " << op_name << " requires a byte-addressable src1 dtype, but got "
+      << row_type->dtype_.ToString();
+  const int64_t expected_cols = packed_row_major ? static_cast<int64_t>(32 / elem_bytes) : 1;
+  const auto expected_valid_col = std::make_shared<ConstInt>(expected_cols, DataType::INDEX, args[1]->span_);
+  CHECK(ProveValidExtentEqual(row_valid_shape[row_valid_shape.size() - 1], expected_valid_col) ==
+        ProofResult::kTrue)
+      << "The operator " << op_name << " requires " << (packed_row_major ? "row-major" : "non-row-major")
+      << " src1 valid last dimension to be " << expected_cols << ", but got valid_shape "
+      << FormatShape(row_valid_shape);
+
+  TileView result_view;
+  result_view.valid_shape = tile_valid_shape;
+  InheritTileViewLayout(result_view, tile_type);
+  return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, result_view);
 }
 
 // Type deduction for column expand operations
@@ -219,18 +291,23 @@ REGISTER_OP("tile.row_expand_mul")
 
 REGISTER_OP("tile.row_expand_add")
     .set_op_category("TileOp")
-    .set_description("Row-wise broadcast addition: tile + row_vec (broadcasted)")
+    .set_description("Row-wise scalar or packed-block expansion addition, with optional PTOAS tmp workspace")
     .add_argument("tile", "Input tile (TileType, 2D [M, N])")
-    .add_argument("row_vec", "Row vector (TileType, 2D [M, 1])")
+    .add_argument("row_vec", "DN [M, 1] scalar carrier or row-major packed 32-byte carrier")
+    .add_argument("tmp", "Optional scratch tile (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
+    .set_input_memory(2, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     // The broadcast vector (arg 1) is re-read for every output row/col, so the
     // output must not alias its buffer (it would clobber the vector mid-op).
     .forbid_output_alias(1)
+    // On A2/A3 PTOAS writes tmp while writing dst; keep those allocations
+    // distinct. On A5 tmp is a placeholder, and the stricter rule is safe.
+    .forbid_output_alias(2)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileRowExpandType(args, kwargs, "tile.row_expand_add");
+      return DeduceTileRowExpandAddType(args, kwargs, "tile.row_expand_add");
     });
 
 REGISTER_OP("tile.row_expand_max")

@@ -110,6 +110,7 @@ __all__ = [
     "min",
     "slice",
     "reshape",
+    "reinterpret_view",
     "transpose",
     "transpose_view",
     "set_validshape",
@@ -465,13 +466,15 @@ def assemble(target: Tile, source: Tile, offset: Sequence[IntLike]) -> Tile:
     return Tile(expr=call_expr)
 
 
-def gather_row(
+def gather_row(  # noqa: PLR0913
     dst: Tile,
     src: Tensor,
     dst_offset: Sequence[IntLike],
     src_offset: Sequence[IntLike],
     shapes: Sequence[IntLike],
     transpose: bool = False,
+    *,
+    valid_shape: Sequence[IntLike] | None = None,
 ) -> Tile:
     """Load one GM row directly into a sub-region of an on-chip tile (DPS).
 
@@ -490,6 +493,11 @@ def gather_row(
         dst_offset: ``[row, col]`` slot within ``dst`` to write.
         src_offset: ``[row, col]`` physical offset within the GM ``src``.
         shapes: GM row window shape ``[r, c]`` (typically ``[1, size]``).
+            Must be compile-time constant.
+        valid_shape: How much of that window to actually transfer, defaulting to
+            all of it. May hold runtime ``Scalar`` values, so a dynamic row count
+            leaves the tile's allocation and layout untouched. Not supported
+            together with ``transpose=True``.
         transpose: Place the GM row ``[r, c]`` as an on-chip column ``[c, r]`` —
             fills a matmul ``b_trans`` B-operand without a GM round-trip
             (Mat/L1 only).
@@ -504,6 +512,7 @@ def gather_row(
         _normalize_intlike(src_offset),
         _normalize_intlike(shapes),
         transpose,
+        valid_shape=_normalize_intlike(valid_shape) if valid_shape is not None else None,
     )
     return Tile(expr=call_expr)
 
@@ -885,17 +894,23 @@ def mul(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
     return Tile(expr=call_expr)
 
 
-def div(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
+def div(
+    lhs: Tile,
+    rhs: Tile | int | float | Scalar | Expr,
+    high_precision: bool = False,
+) -> Tile:
     """Element-wise division of tile and tile or scalar.
 
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile or scalar
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` is a Tile.
 
     Returns:
         Tile wrapping the div operation
     """
-    call_expr = _ir_ops.div(lhs.unwrap(), _unwrap_rhs(rhs))
+    call_expr = _ir_ops.div(lhs.unwrap(), _unwrap_rhs(rhs), high_precision=high_precision)
     return Tile(expr=call_expr)
 
 
@@ -1049,16 +1064,17 @@ def recip(tile: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def log(tile: Tile) -> Tile:
+def log(tile: Tile, high_precision: bool = False) -> Tile:
     """Element-wise natural logarithm.
 
     Args:
         tile: Input tile
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Tile wrapping the log operation
     """
-    call_expr = _ir_ops.log(tile.unwrap())
+    call_expr = _ir_ops.log(tile.unwrap(), high_precision=high_precision)
     return Tile(expr=call_expr)
 
 
@@ -1234,7 +1250,8 @@ def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
 
     Returns:
         Tile wrapping the row_max operation
@@ -1248,7 +1265,8 @@ def row_sum(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
 
     Returns:
         Tile wrapping the row_sum operation
@@ -1262,7 +1280,8 @@ def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
 
     Returns:
         Tile wrapping the row_min operation
@@ -1276,7 +1295,8 @@ def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
 
     Returns:
         Tile wrapping the row_prod operation
@@ -1348,7 +1368,7 @@ def row_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
 
     Returns:
         Tile wrapping the row_argmax operation
@@ -1362,7 +1382,7 @@ def row_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
 
     Returns:
         Tile wrapping the row_argmin operation
@@ -1469,17 +1489,19 @@ def row_expand_mul(tile: Tile, row_vec: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def row_expand_add(tile: Tile, row_vec: Tile) -> Tile:
-    """Row-wise broadcast addition.
+def row_expand_add(tile: Tile, row_vec: Tile, tmp: Tile | None = None) -> Tile:
+    """Row-wise scalar or packed-block expansion addition.
 
     Args:
         tile: Input tile [M, N]
-        row_vec: Row vector [M, 1]
+        row_vec: DN ``[M, 1]`` scalar carrier or row-major packed 32-byte carrier
+        tmp: Optional PTOAS scratch tile
 
     Returns:
         Tile wrapping the row_expand_add operation
     """
-    call_expr = _ir_ops.row_expand_add(tile.unwrap(), row_vec.unwrap())
+    tmp_expr = None if tmp is None else tmp.unwrap()
+    call_expr = _ir_ops.row_expand_add(tile.unwrap(), row_vec.unwrap(), tmp=tmp_expr)
     return Tile(expr=call_expr)
 
 
@@ -1805,15 +1827,48 @@ def slice(
 def reshape(tile: Tile, shape: Sequence[IntLike]) -> Tile:
     """Reshape tile to new shape.
 
+    The valid region is carried through, never widened: the result holds real
+    data in exactly the cells the input did. See ``pl.reshape`` for the cases
+    that always map.
+
     Args:
         tile: Input tile
-        shape: New shape dimensions (at most 2 for TileType)
+        shape: New shape dimensions. A tile is physically 2D, so a higher-rank
+            result is an intermediate that ``FlattenTileNdTo2D`` later collapses.
 
     Returns:
         Tile wrapping the reshape operation
+
+    Raises:
+        ValueError: If the element count changes, or if the input holds real
+            data in only part of its buffer and no origin-anchored region of
+            ``shape`` describes those same cells.
     """
     tile_expr = tile.unwrap()
     call_expr = _ir_ops.reshape(tile_expr, _normalize_intlike(shape))
+    return Tile(expr=call_expr)
+
+
+def reinterpret_view(
+    data: Tile,
+    dtype: DataType,
+    *,
+    shape: Sequence[IntLike] | None = None,
+) -> Tile:
+    """Reinterpret a tile over the same bytes with a different dtype.
+
+    Args:
+        data: Input tile.
+        dtype: Target element dtype, which must differ from the source dtype.
+        shape: Optional byte-equivalent target shape. When omitted, the
+            physically contiguous dimension is scaled according to the
+            source/target dtype byte ratio.
+
+    Returns:
+        Tile wrapping the zero-copy reinterpret-view operation.
+    """
+    normalized_shape = None if shape is None else _normalize_intlike(shape)
+    call_expr = _ir_ops.reinterpret_view(data.unwrap(), dtype, shape=normalized_shape)
     return Tile(expr=call_expr)
 
 

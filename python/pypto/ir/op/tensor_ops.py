@@ -27,7 +27,14 @@ from pypto.pypto_core.ir import (
     TensorLayout,
 )
 
-from ..utils import _get_span_or_capture, _normalize_expr, _to_int32_scalar, _to_make_tuple, resolve_cast_mode
+from ..utils import (
+    _get_span_or_capture,
+    _normalize_expr,
+    _normalize_scalar_operand,
+    _to_int32_scalar,
+    _to_make_tuple,
+    resolve_cast_mode,
+)
 from ._pad_value import normalize_pad_value
 from .tile_ops import resolve_gather_compare_cmp_mode
 
@@ -487,11 +494,7 @@ def mul(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise multiplication
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
@@ -512,11 +515,7 @@ def muls(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise multiplication with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.muls", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -535,11 +534,7 @@ def add(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise addition
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
@@ -560,11 +555,7 @@ def adds(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise addition with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.adds", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -583,11 +574,7 @@ def sub(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise subtraction
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
@@ -608,15 +595,17 @@ def subs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise subtraction with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.subs", [lhs, rhs_expr], {}, actual_span)
 
 
-def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+def div(
+    lhs: Expr,
+    rhs: int | float | Expr,
+    span: Span | None = None,
+    *,
+    high_precision: bool = False,
+) -> Call:
     """Element-wise division of tensor and tensor or scalar.
 
     Automatically selects between tensor.div (tensor / tensor) and
@@ -626,22 +615,22 @@ def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Expr)
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` has TensorType.
 
     Returns:
         Call expression for element-wise division
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
+        if high_precision:
+            raise ValueError("tensor.div(high_precision=True) requires a Tensor rhs")
         return _ir_core.create_op_call("tensor.divs", [lhs, rhs_expr], {}, actual_span)
-    else:
-        return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], kwargs, actual_span)
 
 
 def divs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -656,11 +645,7 @@ def divs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise division with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.divs", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -740,11 +725,7 @@ def fmod(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise floating-point remainder
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
 
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
@@ -765,11 +746,7 @@ def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise floating-point remainder with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.fmods", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -789,11 +766,7 @@ def maximum(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Cal
         Call expression for element-wise maximum
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.maximum", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -813,11 +786,7 @@ def minimum(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Cal
         Call expression for element-wise minimum
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.minimum", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -838,11 +807,7 @@ def cmp(lhs: Expr, rhs: int | float | Expr, cmp_type: int = 0, span: Span | None
         Call expression for element-wise comparison (0/1 tensor)
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.cmp", [lhs, rhs_expr], {"cmp_type": cmp_type}, actual_span)
 
 
@@ -1320,11 +1285,7 @@ def expands(target: Expr, scalar: int | float | Expr, span: Span | None = None) 
         Call expression for scalar expansion
     """
     actual_span = _get_span_or_capture(span)
-    scalar_expr = (
-        _normalize_expr(scalar, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(scalar, Expr)
-        else scalar
-    )
+    scalar_expr = _normalize_scalar_operand(target, scalar, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tensor.expands", [target, scalar_expr], {}, actual_span)
 
 
@@ -1361,18 +1322,20 @@ def exp(input: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tensor.exp", [input], {}, actual_span)
 
 
-def log(input: Expr, span: Span | None = None) -> Call:
+def log(input: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
     """Element-wise natural logarithm operation.
 
     Args:
         input: Input tensor
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Call expression for element-wise natural logarithm
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tensor.log", [input], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tensor.log", [input], kwargs, actual_span)
 
 
 def sin(input: Expr, span: Span | None = None) -> Call:
@@ -1582,6 +1545,32 @@ def reshape(
     if valid_shape is not None:
         args.append(_to_make_tuple(valid_shape, actual_span))
     return _ir_core.create_op_call("tensor.reshape", args, {}, actual_span)
+
+
+def reinterpret_view(
+    data: Expr,
+    dtype: DataType,
+    *,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Reinterpret a tensor over the same bytes with a different dtype.
+
+    Args:
+        data: Input tensor expression
+        dtype: Target element dtype
+        shape: Optional target shape. When omitted, the physically contiguous
+            dimension is scaled according to the source/target dtype byte ratio
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for a byte-preserving tensor reinterpret view
+    """
+    actual_span = _get_span_or_capture(span)
+    args = [data]
+    if shape is not None:
+        args.append(_to_make_tuple(shape, actual_span))
+    return _ir_core.create_op_call("tensor.reinterpret_view", args, {"dtype": dtype}, actual_span)
 
 
 def transpose(
@@ -2164,6 +2153,8 @@ def gather_row(  # noqa: PLR0913
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
     transpose: bool = False,
     span: Span | None = None,
+    *,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
 ) -> Call:
     """Gather one GM row into a sub-region of an on-chip accumulator (tensor-level, DPS).
 
@@ -2179,7 +2170,10 @@ def gather_row(  # noqa: PLR0913
         src: Source tensor in GM.
         dst_offset: ``[row, col]`` offset within ``acc``, or a MakeTuple.
         src_offset: ``[row, col]`` offset within the GM ``src``, or a MakeTuple.
-        shapes: GM row window shape ``[r, c]`` (typically ``[1, size]``), or a MakeTuple.
+        shapes: GM row window shape ``[r, c]``, or a MakeTuple. Must be
+            compile-time constant.
+        valid_shape: Runtime transfer extent within ``shapes``, or a MakeTuple.
+            May hold runtime ``Scalar[INDEX]`` values. Defaults to ``shapes``.
         transpose: Place the GM row ``[r, c]`` as an L1 column ``[c, r]`` (for a
             matmul B-operand the consumer reads with ``b_trans``).
         span: Optional source span (auto-captured if not provided).
@@ -2191,9 +2185,10 @@ def gather_row(  # noqa: PLR0913
     dst_off = _to_make_tuple(dst_offset, actual_span)
     src_off = _to_make_tuple(src_offset, actual_span)
     shapes_tuple = _to_make_tuple(shapes, actual_span)
-    return _ir_core.create_op_call(
-        "tensor.gather_row", [acc, src, dst_off, src_off, shapes_tuple], {"transpose": transpose}, actual_span
-    )
+    args: list[Any] = [acc, src, dst_off, src_off, shapes_tuple]
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
+    return _ir_core.create_op_call("tensor.gather_row", args, {"transpose": transpose}, actual_span)
 
 
 # ============================================================================

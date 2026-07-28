@@ -31,7 +31,15 @@ from pypto.pypto_core.ir import (
     TileLayout,
 )
 
-from ..utils import _get_span_or_capture, _normalize_expr, _to_int32_scalar, _to_make_tuple, resolve_cast_mode
+from ..utils import (
+    _get_span_or_capture,
+    _normalize_const_to_dtype,
+    _normalize_expr,
+    _normalize_scalar_operand,
+    _to_int32_scalar,
+    _to_make_tuple,
+    resolve_cast_mode,
+)
 from ._pad_value import normalize_pad_value
 
 
@@ -54,15 +62,6 @@ def _validate_offsets_shapes(offsets_tuple: _ir_core.MakeTuple, shapes_tuple: _i
         raise ValueError("offsets and shapes must have at least one dimension")
 
 
-def _normalize_tile_binary_rhs(rhs: int | float | Expr, span: Span) -> Expr:
-    """Normalize a tile binary-op rhs into an IR expression."""
-    return (
-        _normalize_expr(rhs, span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
-
-
 def _create_tile_binary_call(
     tile_op_name: str,
     scalar_op_name: str,
@@ -71,7 +70,7 @@ def _create_tile_binary_call(
     span: Span,
 ) -> Call:
     """Create a tile binary call with scalar auto-dispatch."""
-    rhs_expr = _normalize_tile_binary_rhs(rhs, span)
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, span)
     if isinstance(rhs_expr.type, ScalarType):
         return _ir_core.create_op_call(scalar_op_name, [lhs, rhs_expr], {}, span)
     return _ir_core.create_op_call(tile_op_name, [lhs, rhs_expr], {}, span)
@@ -291,7 +290,7 @@ def assemble(
     return _ir_core.create_op_call("tile.assemble", [target, source, offset_tuple], {}, actual_span)
 
 
-def gather_row(
+def gather_row(  # noqa: PLR0913
     dst: Expr,
     src: Expr,
     dst_offset: Sequence[int | Expr] | _ir_core.MakeTuple,
@@ -299,6 +298,8 @@ def gather_row(
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
     transpose: bool = False,
     span: Span | None = None,
+    *,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
 ) -> Call:
     """Load one GM row directly into a sub-region of an on-chip (Mat/Vec) tile.
 
@@ -312,7 +313,10 @@ def gather_row(
         src: Source tensor in GM (TensorType).
         dst_offset: ``[row, col]`` offset within ``dst``, or a MakeTuple.
         src_offset: ``[row, col]`` offset within the GM ``src``, or a MakeTuple.
-        shapes: GM row window shape ``[r, c]``, or a MakeTuple.
+        shapes: GM row window shape ``[r, c]``, or a MakeTuple. Must be
+            compile-time constant.
+        valid_shape: Runtime transfer extent within ``shapes``, or a MakeTuple.
+            May hold runtime ``Scalar[INDEX]`` values. Defaults to ``shapes``.
         transpose: Place the GM row ``[r, c]`` as an L1 column ``[c, r]``.
         span: Optional source span for debugging (auto-captured if not provided).
 
@@ -323,9 +327,10 @@ def gather_row(
     dst_off = _to_make_tuple(dst_offset, actual_span)
     src_off = _to_make_tuple(src_offset, actual_span)
     shapes_tuple = _to_make_tuple(shapes, actual_span)
-    return _ir_core.create_op_call(
-        "tile.gather_row", [dst, src, dst_off, src_off, shapes_tuple], {"transpose": transpose}, actual_span
-    )
+    args: list[Any] = [dst, src, dst_off, src_off, shapes_tuple]
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
+    return _ir_core.create_op_call("tile.gather_row", args, {"transpose": transpose}, actual_span)
 
 
 def scatter_update(
@@ -772,21 +777,36 @@ def add(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     return _create_tile_binary_call("tile.add", "tile.adds", lhs, rhs, actual_span)
 
 
-def div(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
+def div(
+    lhs: Expr,
+    rhs: int | float | Expr,
+    span: Span | None = None,
+    *,
+    high_precision: bool = False,
+) -> Call:
     """Element-wise division of tile and tile or scalar.
 
-    Supports broadcasting for two tiles. Scalar rhs canonicalizes to tile.divs.
+    Tile-tile division requires identical physical and valid shapes. Scalar rhs
+    canonicalizes to tile.divs, which does not expose the tdiv precision mode.
 
     Args:
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile or scalar
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` has TileType.
 
     Returns:
         Call expression for element-wise division
     """
     actual_span = _get_span_or_capture(span)
-    return _create_tile_binary_call("tile.div", "tile.divs", lhs, rhs, actual_span)
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    if isinstance(rhs_expr.type, ScalarType):
+        if high_precision:
+            raise ValueError("tile.div(high_precision=True) requires a Tile rhs")
+        return _ir_core.create_op_call("tile.divs", [lhs, rhs_expr], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tile.div", [lhs, rhs_expr], kwargs, actual_span)
 
 
 def sub(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -839,11 +859,7 @@ def rems(lhs: Expr, rhs: int | float | Expr, tmp: Expr, span: Span | None = None
         Call expression for element-wise remainder with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.rems", [lhs, rhs_expr, tmp], {}, actual_span)
 
 
@@ -952,11 +968,7 @@ def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise floating-point remainder with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.fmods", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -988,16 +1000,16 @@ def shls(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
 
     Args:
         lhs: Tile (TileType)
-        rhs: Scalar shift amount (int/Expr with INT32 ScalarType); must be >= 0
+        rhs: Scalar shift amount; must be >= 0. A constant literal is re-stamped
+            to the lhs element dtype (the IR permits any integer width -- codegen
+            casts the shift count to i32); a typed Expr is used as-is
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise bitwise left shift with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.shls", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1029,16 +1041,16 @@ def shrs(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
 
     Args:
         lhs: Tile (TileType)
-        rhs: Scalar shift amount (int/Expr with INT32 ScalarType); must be >= 0
+        rhs: Scalar shift amount; must be >= 0. A constant literal is re-stamped
+            to the lhs element dtype (the IR permits any integer width -- codegen
+            casts the shift count to i32); a typed Expr is used as-is
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise bitwise right shift with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.shrs", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1073,9 +1085,7 @@ def ands(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise bitwise AND with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.ands", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1110,9 +1120,7 @@ def ors(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise bitwise OR with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.ors", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1149,9 +1157,7 @@ def xors(lhs: Expr, rhs: int | Expr, tmp: Expr, span: Span | None = None) -> Cal
         Call expression for element-wise bitwise XOR with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32) if not isinstance(rhs, Expr) else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.xors", [lhs, rhs_expr, tmp], {}, actual_span)
 
 
@@ -1224,11 +1230,7 @@ def addsc(lhs: Expr, rhs: int | float | Expr, rhs2: Expr, span: Span | None = No
         Call expression for element-wise tile-scalar-tile addition
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.addsc", [lhs, rhs_expr, rhs2], {}, actual_span)
 
 
@@ -1247,11 +1249,7 @@ def subsc(lhs: Expr, rhs: int | float | Expr, rhs2: Expr, span: Span | None = No
         Call expression for element-wise tile-scalar-tile subtraction
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.subsc", [lhs, rhs_expr, rhs2], {}, actual_span)
 
 
@@ -1269,11 +1267,8 @@ def lrelu(tile: Expr, slope: int | float | Expr, span: Span | None = None) -> Ca
         Call expression for element-wise leaky ReLU
     """
     actual_span = _get_span_or_capture(span)
-    slope_expr = (
-        _normalize_expr(slope, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(slope, Expr)
-        else slope
-    )
+    # The slope is a float coefficient fixed by the op, not a tile element value.
+    slope_expr = _normalize_const_to_dtype(slope, DataType.FP32, actual_span)
     return _ir_core.create_op_call("tile.lrelu", [tile, slope_expr], {}, actual_span)
 
 
@@ -1313,11 +1308,8 @@ def sels(lhs: Expr, rhs: Expr, select_mode: int | float | Expr, span: Span | Non
         Call expression for tile select
     """
     actual_span = _get_span_or_capture(span)
-    select_mode_expr = (
-        _normalize_expr(select_mode, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(select_mode, Expr)
-        else select_mode
-    )
+    # select_mode is a mode flag interpreted by codegen, not a tile element value.
+    select_mode_expr = _normalize_const_to_dtype(select_mode, DataType.INT32, actual_span)
     return _ir_core.create_op_call("tile.sels", [lhs, rhs, select_mode_expr], {}, actual_span)
 
 
@@ -1333,11 +1325,7 @@ def muls(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise multiplication with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.muls", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1353,11 +1341,7 @@ def adds(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise addition with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.adds", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1373,11 +1357,7 @@ def divs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise division with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.divs", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1393,11 +1373,7 @@ def subs(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         Call expression for element-wise subtraction with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.subs", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1443,11 +1419,7 @@ def cmps(
         Use tile.sel with an explicit tmp tile to materialize values.
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     kwargs: dict[str, Any] = {"cmp_type": cmp_type}
     return _ir_core.create_op_call("tile.cmps", [lhs, rhs_expr], kwargs, actual_span)
 
@@ -1593,18 +1565,20 @@ def cast(
     return _ir_core.create_op_call("tile.cast", [tile], kwargs, actual_span)
 
 
-def log(tile: Expr, span: Span | None = None) -> Call:
+def log(tile: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
     """Element-wise natural logarithm of a tile.
 
     Args:
         tile: Input tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Call expression for element-wise natural logarithm
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.log", [tile], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tile.log", [tile], kwargs, actual_span)
 
 
 def abs(tile: Expr, span: Span | None = None) -> Call:
@@ -1875,22 +1849,31 @@ def row_expand_mul(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.row_expand_mul", [tile, row_vec], {}, actual_span)
 
 
-def row_expand_add(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
+def row_expand_add(
+    tile: Expr,
+    row_vec: Expr,
+    span: Span | None = None,
+    *,
+    tmp: Expr | None = None,
+) -> Call:
     """Row-wise broadcast addition.
 
-    Adds a row vector to each row of the tile.
-    tile[i, :] + row_vec[i, 0] for all i.
+    A non-row-major ``[M, 1]`` carrier broadcasts one scalar per row. A
+    row-major carrier holds one 32-byte lane block per row and repeats that
+    block across the destination columns.
 
     Args:
         tile: Input tile (TileType [M, N])
-        row_vec: Row vector (TileType [M, 1])
+        row_vec: DN row scalar carrier or row-major packed 32-byte carrier
         span: Optional source span for debugging (auto-captured if not provided)
+        tmp: Optional PTOAS scratch tile
 
     Returns:
         Call expression for row-wise broadcast addition
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.row_expand_add", [tile, row_vec], {}, actual_span)
+    args = [tile, row_vec] if tmp is None else [tile, row_vec, tmp]
+    return _ir_core.create_op_call("tile.row_expand_add", args, {}, actual_span)
 
 
 def row_expand_max(tile: Expr, row_vec: Expr, span: Span | None = None) -> Call:
@@ -2098,11 +2081,7 @@ def expands(target: Expr, scalar: int | float | Expr, span: Span | None = None) 
         Call expression for scalar expansion
     """
     actual_span = _get_span_or_capture(span)
-    scalar_expr = (
-        _normalize_expr(scalar, actual_span, int_dtype=DataType.FP32, float_dtype=DataType.FP32)
-        if not isinstance(scalar, Expr)
-        else scalar
-    )
+    scalar_expr = _normalize_scalar_operand(target, scalar, actual_span, fallback_int_dtype=DataType.FP32)
     return _ir_core.create_op_call("tile.expands", [target, scalar_expr], {}, actual_span)
 
 
@@ -2154,11 +2133,7 @@ def maximums(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Ca
         Call expression for element-wise maximum with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.maximums", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -2176,11 +2151,7 @@ def minimums(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Ca
         Call expression for element-wise minimum with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = (
-        _normalize_expr(rhs, actual_span, int_dtype=DataType.INT32, float_dtype=DataType.FP32)
-        if not isinstance(rhs, Expr)
-        else rhs
-    )
+    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.minimums", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -2197,7 +2168,8 @@ def row_max(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType)
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2215,7 +2187,8 @@ def row_sum(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType)
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2233,7 +2206,8 @@ def row_min(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType, e.g. [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2251,7 +2225,8 @@ def row_prod(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType, e.g. [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
+            every dimension at least as large as the corresponding input dimension
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2338,7 +2313,7 @@ def row_argmax(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2355,7 +2330,7 @@ def row_argmin(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2604,6 +2579,32 @@ def reshape(
 
     args = [tile, shape_tuple]
     return _ir_core.create_op_call("tile.reshape", args, {}, actual_span)
+
+
+def reinterpret_view(
+    data: Expr,
+    dtype: DataType,
+    *,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Reinterpret a tile over the same bytes with a different dtype.
+
+    Args:
+        data: Input tile expression
+        dtype: Target element dtype
+        shape: Optional target shape. When omitted, the physically contiguous
+            dimension is scaled according to the source/target dtype byte ratio
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for a byte-preserving tile reinterpret view
+    """
+    actual_span = _get_span_or_capture(span)
+    args = [data]
+    if shape is not None:
+        args.append(_to_make_tuple(shape, actual_span))
+    return _ir_core.create_op_call("tile.reinterpret_view", args, {"dtype": dtype}, actual_span)
 
 
 def _normalize_axis_const(axis: int | ConstInt, span: Span, name: str) -> ConstInt:

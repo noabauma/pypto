@@ -36,6 +36,7 @@
 #include "pypto/ir/transforms/op_conversion_registry.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/tile_conversion_utils.h"
@@ -65,8 +66,31 @@ std::string MakeStoreResultName(size_t index) {
   return auto_name::BuildName("ret" + std::to_string(index), "", "store");
 }
 
+CallPtr MarkCompilerMatBridge(const CallPtr& call, MemorySpace space) {
+  if (!call || space != MemorySpace::Mat) return call;
+  auto marked = MutableCopy(call);
+  marked->attrs_.emplace_back(kCompilerTensorToTileMatBridgeAttr, true);
+  return marked;
+}
+
 bool IsPassthroughTensorOp(const CallPtr& call) {
   return IsOp(call, "tensor.dim") || IsOp(call, "tensor.view");
+}
+
+void CheckReinterpretViewIncoreLayout(const CallPtr& call) {
+  if (!IsOp(call, "tensor.reinterpret_view")) return;
+
+  INTERNAL_CHECK_SPAN(!call->args_.empty(), call->span_)
+      << "Internal error: tensor.reinterpret_view reached conversion without a data argument";
+  auto source_type = As<TensorType>(call->args_[0]->GetType());
+  INTERNAL_CHECK_SPAN(source_type, call->span_)
+      << "Internal error: tensor.reinterpret_view source must be TensorType before tile conversion";
+  const TensorLayout source_layout =
+      source_type->tensor_view_.has_value() ? source_type->tensor_view_->layout : TensorLayout::ND;
+  CHECK_SPAN(source_layout == TensorLayout::ND, call->span_)
+      << "tensor.reinterpret_view in an InCore function currently supports only packed ND tensors; "
+         "DN layout changes which logical axis is physically contiguous, and that information cannot "
+         "yet be preserved by tensor-to-tile lowering";
 }
 
 /**
@@ -521,6 +545,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
     // Pin this Var's address for the pass so a freed-then-reused address cannot
     // alias a stale var_remap_ entry (see TypePropagatingMutator::RetainVar).
     RetainVar(op->var_);
+    CheckReinterpretViewIncoreLayout(As<Call>(op->value_));
     auto new_value = VisitExpr(op->value_);
     auto call = As<Call>(new_value);
 
@@ -592,6 +617,7 @@ class TensorToTileMutator : public TypePropagatingMutator {
   }
 
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    CheckReinterpretViewIncoreLayout(As<Call>(op->expr_));
     auto new_expr = VisitExpr(op->expr_);
     // Helper: return updated EvalStmt only when the expression actually changed.
     auto maybe_update = [&]() -> StmtPtr {
@@ -636,8 +662,10 @@ class TensorToTileMutator : public TypePropagatingMutator {
     // The consumer-driven load is always natural; a transposed (b_trans/a_trans)
     // operand gets a zero-copy tile.transpose_view at the matmul site instead.
     std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space}};
-    auto load_call = op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shapes},
-                                         load_kwargs, call->span_);
+    auto load_call =
+        MarkCompilerMatBridge(op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shapes},
+                                                  load_kwargs, call->span_),
+                              req.space);
 
     auto tile_name = MakeTileValueName(op->var_->name_hint_);
     auto tile_var = std::make_shared<Var>(tile_name, load_call->GetType(), op->var_->span_);
@@ -673,7 +701,8 @@ class TensorToTileMutator : public TypePropagatingMutator {
       auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), call->span_);
       auto shapes = MakeShapeTuple(tensor_type->shape_, call->span_);
       std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space}};
-      auto load = op_registry_.Create("tile.load", {arg, offsets, shapes, shapes}, load_kw, call->span_);
+      auto load = MarkCompilerMatBridge(
+          op_registry_.Create("tile.load", {arg, offsets, shapes, shapes}, load_kw, call->span_), space);
       std::string var_name;
       if (auto var = As<Var>(arg)) {
         auto space_str = MemorySpaceToString(space);
@@ -850,7 +879,7 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   // pld.tensor.allreduce(target, signal, *, op): the composite collective
   // writes the reduced value back into `target` (args_[0]) — the in-place
   // rebind idiom shared with `pl.store`. `signal` (args_[1]) is also
-  // written (Phase 2a/3.5a notify), but the marker below for
+  // written (ready and per-chunk notify), but the marker below for
   // ``pld.tensor.allreduce`` already records both args as InOut; this
   // entry just identifies the primary data target for any downstream
   // consumer that walks GetWriteTargetExpr.
@@ -1023,8 +1052,8 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
   if (IsOp(call, "pld.tensor.allreduce")) {
     // pld.tensor.allreduce(target, signal, *, op): both target (args_[0])
     // and signal (args_[1]) are InOut — read AND written across the
-    // 4-phase decomposition (target read in Phase 3, written in Phase 4;
-    // signal written in Phase 2a/3.5a notify, read in Phase 2b/3.5b wait).
+    // ready-plus-per-chunk decomposition (target read and written per chunk;
+    // signal written by notify and read by wait at both barriers).
     // Marking both args on both sides makes the enclosing window params
     // surface as InOut without needing LowerCompositeOps to have run yet
     // (this pass is upstream of LowerCompositeOps).

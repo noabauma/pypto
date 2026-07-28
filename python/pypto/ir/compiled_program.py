@@ -71,6 +71,19 @@ for _name in ("uint16", "uint32", "uint64"):
     if _torch_dtype is not None:
         _DATATYPE_TO_TORCH[_name] = _torch_dtype
 del _name, _torch_dtype
+# Float8 / MX scale dtypes (PyTorch 2.1+ / 2.3+ / 2.7+); map IR string → torch.dtype.
+# Packed MXFP4 (fp4 ↔ float4_e2m1fn_x2) must be here so return-style execution
+# can allocate FP4 outputs after JIT specialization accepts the torch dtype.
+for _ir_name, _torch_name in (
+    ("fp8e4m3fn", "float8_e4m3fn"),
+    ("fp8e5m2", "float8_e5m2"),
+    ("fp8e8m0", "float8_e8m0fnu"),
+    ("fp4", "float4_e2m1fn_x2"),
+):
+    _torch_dtype = getattr(torch, _torch_name, None)
+    if _torch_dtype is not None:
+        _DATATYPE_TO_TORCH[_ir_name] = _torch_dtype
+del _ir_name, _torch_name, _torch_dtype
 
 # IR DataType -> ctypes scalar constructor mapping.
 # Used to wrap Python int/float/bool values into the correct ctypes scalar
@@ -117,7 +130,7 @@ class _ParamInfo:
 _STR_TO_DATATYPE: dict[str, DataType] = {}
 for _dt_name in (
     "BOOL", "INT4", "INT8", "INT16", "INT32", "INT64", "UINT4", "UINT8", "UINT16",
-    "UINT32", "UINT64", "FP4", "FP8E4M3FN", "FP8E5M2", "FP16", "FP32", "BF16",
+    "UINT32", "UINT64", "FP4", "FP8E4M3FN", "FP8E5M2", "FP8E8M0", "FP16", "FP32", "BF16",
     "HF4", "HF8", "INDEX", "TASK_ID",
 ):  # fmt: skip
     _dt = getattr(DataType, _dt_name, None)
@@ -417,7 +430,6 @@ def _invoke_compiled(
         platform=platform,
         device_id=config.device_id,
         dfx=_DfxOpts.from_run_config(config),
-        block_dim=config.block_dim,
         aicpu_thread_num=config.aicpu_thread_num,
     )
 
@@ -530,7 +542,7 @@ class _RuntimeFacade:
 
     @property
     def runtime_config(self) -> dict[str, Any]:
-        """``RUNTIME_CONFIG`` dict from ``kernel_config.py`` (e.g. ``block_dim``, ``aicpu_thread_num``)."""
+        """``RUNTIME_CONFIG`` dict from ``kernel_config.py`` (e.g. ``aicpu_thread_num``)."""
         self._ensure_runtime_loaded()
         assert self._runtime_config is not None
         return self._runtime_config
@@ -746,16 +758,14 @@ class CompiledProgram(_RuntimeFacade):
         self,
         config: Any = None,
         *,
-        block_dim: int | None = None,
         aicpu_thread_num: int | None = None,
         dfx_dir: "Path | None" = None,
     ) -> Any:
         """Translate a pypto :class:`RunConfig` into a simpler ``CallConfig``.
 
-        Precedence for ``block_dim`` / ``aicpu_thread_num``: explicit kwarg
-        > ``config`` field > ``runtime_config`` baked into
-        ``kernel_config.py``. When all three are unset, the simpler
-        runtime's own default applies.
+        Precedence for ``aicpu_thread_num``: explicit kwarg > ``config``
+        field > ``runtime_config`` baked into ``kernel_config.py``. When
+        all three are unset, the simpler runtime's own default applies.
 
         DFX flags are copied straight from ``config``; ``dfx_dir`` (when
         given) becomes ``output_prefix``. Callers that enable DFX flags
@@ -773,7 +783,6 @@ class CompiledProgram(_RuntimeFacade):
         return _build_call_config(
             run_config,
             runtime_config=self.runtime_config,
-            block_dim_override=block_dim,
             aicpu_thread_num_override=aicpu_thread_num,
             dfx_dir=dfx_dir,
         )
@@ -973,7 +982,6 @@ class _SubChipCallable(_RuntimeFacade):
         self,
         config: Any = None,
         *,
-        block_dim: int | None = None,
         aicpu_thread_num: int | None = None,
         dfx_dir: "Path | None" = None,
     ) -> Any:
@@ -983,7 +991,6 @@ class _SubChipCallable(_RuntimeFacade):
         return _build_call_config(
             run_config,
             runtime_config=self.runtime_config,
-            block_dim_override=block_dim,
             aicpu_thread_num_override=aicpu_thread_num,
             dfx_dir=dfx_dir,
         )

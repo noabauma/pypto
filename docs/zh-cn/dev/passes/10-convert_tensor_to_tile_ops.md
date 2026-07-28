@@ -157,9 +157,25 @@ for i in [0, rows):                                    # ForStmt，iter_arg = ac
 | 算子 | 下降到 | 作用 |
 | ---- | ------ | ---- |
 | `tensor.create_l1(shape, dtype, transpose=...)` | `tile.create(target_memory=Mat, transpose=...)` | 初始化循环携带的 L1 累加器 |
-| `tensor.gather_row(acc, src, dst_off, src_off, shapes, transpose=...)` | `tile.gather_row`（DPS） | 把一条**调用方寻址**的 GM 行 DMA 进 `acc` |
+| `tensor.gather_row(acc, src, dst_off, src_off, shapes, valid_shape=..., transpose=...)` | `tile.gather_row`（DPS） | 把一条**调用方寻址**的 GM 行 DMA 进 `acc` |
 
 两者都推导出 `TensorType`，因此聚合结果可与张量级 `tensor.matmul` / softmax 组合；两者都注册为 self-loading（`src` 保持为 GM）。调用方自行计算 `src_off` 与 `dst_off` 槽位，在自己的循环里逐行填充累加器。
+
+**动态传输长度（`valid_shape`）。** `shapes` 必须是编译期常量：它会成为 `pto.subview` 的 `sizes`，而 PTO 方言把该字段定义为静态的 `I64ArrayAttr`（`PTOOps.td` 中的 `SubViewOp`）。可选的 `valid_shape` 承载*运行期*范围——它填入 subview 的 `valid_row` / `valid_col`（声明为 `Optional<Index>` SSA 操作数），以及 GM 侧 `pto.partition_view` 的 sizes（接受动态 `?` 维）。因此动态行数既不改变内存分配，也不影响下文的 box 对齐：子区域仍然按 `shapes` 静态定尺寸，只有拷贝长度可变。省略 `valid_shape` 即传输整个窗口，与既有行为一致。
+
+这样一来，长度只有运行期才知道的连续行区间只需一次调用，而不必写成带条件的逐行循环：
+
+```python
+kv = pl.create_l1([128, HEAD_DIM], pl.BF16)
+# r1 是运行期 Scalar[INDEX]——例如页边界的切分点
+kv = pl.gather_row(kv, pool, [0, 0],  [b0, 0], [128, HEAD_DIM], valid_shape=[r1, HEAD_DIM])
+kv = pl.gather_row(kv, pool, [r1, 0], [b1, 0], [128, HEAD_DIM], valid_shape=[128 - r1, HEAD_DIM])
+oi = pl.matmul(q, kv, b_trans=True)
+```
+
+**边界约束的是被写区域，而非窗口。** `shapes` 决定静态 `pto.subview` 的尺寸，因此当 `dst_offset` 为运行期值时，声明出的窗口可能越过目标末尾——上例中 run 2 在 128 行的 tile 上声明了 `[r1, r1 + 128)`。这之所以成立，是因为传输长度由 `valid_shape` 而非 `shapes` 界定：实际写入的行是 `[r1, r1 + (128 - r1))`，仍在范围内。因此调用方的义务是逐维满足 `dst_offset + valid_shape <= dst.shape`，而 `dst_offset + shapes` 无需成立。上述两段式写法已由 `test_gather_row_two_run_split` 在设备上覆盖。
+
+`valid_shape` 在 DSL 中是仅关键字参数——第 6 个位置参数早已属于 `transpose`，占用它会静默改变既有 `gather_row(..., shapes, True)` 调用的含义。在 IR 层它是位置操作数而非 attr，正是因为它可能是运行期值：它必须留在 use-def 链上，SSA / 活跃性分析才会保住这个标量。它与 `transpose=True` 互斥（见下文）——那条路径需要在 boxed NZ tile 上给出运行期*列*范围，尚未在设备上验证。类型推导会拒绝任何*可证明*违反 `0 <= valid_shape[i] <= shapes[i]` 的情形；无法判定的符号范围则予以接受，而这正是该操作数存在的意义。
 
 **转置（ZN）以构造 `b_trans` matmul 操作数。** `transpose=True` 让聚合后的 tile 直接成为转置的 matmul B 操作数，无需 GM 往返：
 
@@ -179,7 +195,7 @@ for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
 oi = pl.matmul(full, v, out_dtype=pl.FP32)               # Tensor，位于区域外
 ```
 
-本 pass 将两者**各自 1:1**下降为对应的 tile 算子（`tensor.aiv_shard` → `tile.aiv_shard`,`tensor.aic_gather` → `tile.aic_gather`）；此后 IR 与 AUTO `pl.split` 路径经 [`LowerAutoVectorSplit`](18-lower_auto_vector_split.md)（pass 18）产出的结果逐字节一致。随后 `ExpandMixedKernel`（pass 19）将两者折叠进跨核 `tpush`/`tpop` 机制。
+本 pass 将两者**各自 1:1**下降为对应的 tile 算子（`tensor.aiv_shard` → `tile.aiv_shard`,`tensor.aic_gather` → `tile.aic_gather`）；此后 IR 与 AUTO `pl.split` 路径经 [`LowerAutoVectorSplit`](19-lower_auto_vector_split.md)（pass 19）产出的结果逐字节一致。随后 `ExpandMixedKernel`（pass 20）将两者折叠进跨核 `tpush`/`tpop` 机制。
 
 **约束**（由张量级类型推导器与 DSL 解析器施加,而非本 pass）：
 
@@ -190,7 +206,7 @@ oi = pl.matmul(full, v, out_dtype=pl.FP32)               # Tensor，位于区域
 **转换细节：**
 
 - **split 关键字透传。** `split` 整型属性（`1` = `UP_DOWN`/axis0,`2` = `LEFT_RIGHT`/axis1,即 tpush/tpop 编码）原样透传给 tile 算子,由其对切分轴长度做减半（shard）或加倍（gather）。
-- **Vec 内存重新附着。** tile 级切分推导器有意丢弃边界内存空间（推导定点不得继承输入侧布局）。AUTO 路径在 `ReshapeTypeWithMemory` 中恢复之；本转换器与之对齐,将 `MemorySpace::Vec` 重新附着到推导出的半块/整块 `TileType` —— C→V shard 目的端与 V→C gather 源端都解析为 Vec。
+- **边界内存。** tile 级切分推导器有意让边界内存空间保持为空（推导定点不得继承输入侧布局）；随后 `OpRegistry::Create` 会用该 tile 算子 `set_output_memory` 的声明填充它,因此本转换器无需自行重新附着。`LowerAutoVectorSplit` 也通过同一个 `Create` 构造 `aiv_shard` / `aic_gather`,这正是两条路径逐字节一致的原因——一处声明,读取一次。该空间是**消费侧 lane** 的：`tile.aiv_shard` → `Vec`（AIV 将半块 pop 进 UB）,`tile.aic_gather` → `Mat`（AIC 将整块 pop 进 L1,即 `ExpandMixedKernel` 构造 V→C tpop 所用的空间）。操作数侧则相反——shard 为 `Acc`,gather 为 `Vec`——它由 `AivSplitValid` 验证器强制,而非声明为输入约束：输入约束一旦被违反,`InferTileMemorySpace` 会*插入一次 move* 去满足它,而不是报告作者的错误。
 - **不合成 load。** 现实（仅区域内）操作数在转换器运行时已是片上 tile（其生产者——`aiv_shard` 对应 cube matmul,`aic_gather` 对应 Vec 向量算子——已在本 pass 更早处下降）,因此不注入 `tile.load`；`aiv_shard` / `aic_gather` **本身**即是跨核传输。
 
 **本 pass 之前即被识别。** 由于 `tensor.*` 形式从 `OutlineIncoreScopes` 一直存活到本 pass 运行,更早的阶段已将其视为 AIV 切分边界：`ClassifyCallAffinity` 把 `tensor.*` 与 `tile.*` 的 shard/gather 都归为 `MIXED`（使 cube/vector 外联正确切分）,`SplitAivStructuralVerifier` 要求两种形式都必须位于区域内。

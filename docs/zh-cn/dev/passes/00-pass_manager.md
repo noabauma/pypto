@@ -71,6 +71,7 @@ struct PassProperties {
 | ConvertTensorToTileOps | SplitIncoreOrch | IncoreTileOps | — |
 | LowerCompositeOps | — | — | — |
 | FlattenTileNdTo2D | SSAForm, IncoreTileOps | SSAForm, TileOps2D | — |
+| LegalizeTileCast | — | — | — |
 | AutoTileMatmulL0 | SSAForm, IncoreTileOps, TileOps2D | SSAForm, IncoreTileOps, TileOps2D | — |
 | CanonicalizeTileSlice | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | — |
 | ResolveBackendOpLayouts | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, NormalizedStmtStructure | — |
@@ -178,27 +179,45 @@ with passes.PassContext([passes.CallbackInstrument(after_pass=after_pass)]):
 
 `run_passes(dump_ir=True)` 内部使用 `CallbackInstrument` 在每个 Pass 后转储 IR，将验证委托给 C++ 流水线。在已有 `PassContext` 内调用时，转储模式会保留外层上下文的插桩（如用户提供的 `VerificationInstrument`）和验证级别，将转储插桩追加到组合列表中。
 
+**转储详细级别（`PassDumpLevel`）。** `dump_passes` 开关（位于 `ir.compile`、`RunConfig` 以及 `run_passes` 的 `dump_ir`）接受一个 `PassDumpLevel` 枚举——为向后兼容也接受 `bool`（`True` → `CONCISE`，`False` → `NONE`）：
+
+| 级别 | 含义 |
+| ---- | ---- |
+| `NONE` | 不进行逐 Pass 转储。 |
+| `CONCISE` | 简洁规范 IR（默认）；最利于逐 Pass 对比 diff。 |
+| `EXPLICIT` | 完全解析的转储——对布局自描述（issue #2088）。 |
+
+默认（`CONCISE`）下，转储的 `pl.Tile` 注解在其 `blayout`/`slayout`/`fractal` 与所属内存空间的*隐式*视图相同时会将其省略，而规范 IR 将隐式视图存储为 `nullopt`——因此即便某个 tile 的真实布局并不平凡，它也可能完全不打印 `TileView`（例如一个 `pl.Mem.Acc` tile 实际上是 `blayout=col_major, slayout=row_major, fractal=1024`）。`EXPLICIT` 让每个转储的 tile 从 `GetEffectiveTileView` 打印其完全解析的布局，并展示 `pld.DistributedTensor` 携带、但简洁形式会丢弃的 `window_buffer` 反向引用——从而仅凭打印出的 IR 即可定位布局/别名缺陷。`EXPLICIT` 转储仍能重新解析为完全相同的 IR：tile 布局会规范化回 `nullopt`（与隐式视图相同的显式视图），而 window buffer 标记是一个信息性的尾随字符串,解析器在重新加载时会将其剥离(真实引用会从 `pld.tensor.window` 重新推导)。这样 `compiled.validate_ir()`(会重新加载每个转储)仍能正常工作。以编程方式使用时，向 `python_print(...)` 传入 `explicit_layout=True`。
+
+```python
+from pypto.ir import PassDumpLevel
+from pypto.runtime import RunConfig
+
+RunConfig(dump_passes=PassDumpLevel.EXPLICIT)   # 完全解析的转储
+RunConfig(dump_passes=True)                     # == PassDumpLevel.CONCISE
+```
+
 ### ReportInstrument
 
-在指定 Pass 执行后生成报告文件的插桩。使用 `ReportGeneratorRegistry` 分发报告生成：
+承载流水线落盘产物所在的目录。它自身不观察任何 Pass —— `DiagnosticInstrument` 读取它的 `output_dir` 来决定把 `perf_hints.log` 追加到哪里：
 
 ```cpp
 class ReportInstrument : public PassInstrument {
   explicit ReportInstrument(std::string output_dir);
-  void EnableReport(ReportType type, std::string trigger_pass);
+  const std::string& GetOutputDir() const;
 };
 ```
 
 ```python
-# Python: 在 AllocateMemoryAddr 后生成内存报告
 instrument = passes.ReportInstrument("/path/to/report")
-instrument.enable_report(passes.ReportType.Memory, "AllocateMemoryAddr")
 
 with passes.PassContext([instrument]):
     pipeline.run(program)
 ```
 
-`compile()` 会自动创建 `ReportInstrument`，在 `build_output/<name>/report/` 目录中生成内存报告。
+`compile()` 会自动创建一个指向 `build_output/<name>/report/` 的实例。
+
+内存占用不再由这里生成，改为用 `python -m pypto.tools.memory_map` 从 pass dump 渲染 —— 见[内存地图](../07-memory-map.md)。
 
 ### RoundtripInstrument
 
@@ -381,48 +400,49 @@ with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.A
 
 1. [`LowerCompositeOps`](12-lower_composite_ops.md)
 2. [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md)
-3. [`AutoTileMatmulL0`](14-auto_tile_matmul_l0.md)
-4. [`CanonicalizeTileSlice`](15-canonicalize_tile_slice.md)
-5. `InferTileMemorySpace`
-6. [`ResolveBackendOpLayouts`](17-resolve_backend_op_layouts.md)（pass 内部已自动归一化语句结构）
-7. [`LowerAutoVectorSplit`](18-lower_auto_vector_split.md)（在用自动拆分下降路径；在 ExpandMixedKernel 之前把 AUTO `pl.split` 混合 InCore 函数转换为显式 `split_aiv` 形态）
-8. `ExpandMixedKernel`
-9. [`InjectGMPipeBuffer`](20-inject_gm_pipe_buffer.md)
-10. [`SplitVectorKernel`](21-split_vector_kernel.md)（仅为 split_aiv 函数打属性 + 处理无拆分双 AIV 路径）
-11. [`StampTfreeSplit`](22-stamp_tfree_split.md)（把每个跨核 tpop 的 split/pipe-id 复制到与之配对的 tfree 算子上）
-12. `NormalizeReturnOrder`
-13. [`SkewCrossCorePipeline`](24-skew_cross_core_pipeline.md)（cube/vector 跨核软流水 skew；紧接在 LowerPipelineLoops 之前运行）
-14. [`LowerPipelineLoops`](25-lower_pipeline_loops.md)
-15. [`CanonicalizeIOOrder`](26-canonicalize_io_order.md)
-16. [`MaterializeTensorStrides`](27-materialize_tensor_strides.md) —— 自 RFC #1300 P6 起接入默认 pipeline
-17. `InitMemRef`
-18. [`MaterializeSemanticAliases`](29-materialize_semantic_aliases.md)（语义强制别名：循环 carry / 原地；总是运行）
-19. `MemoryReuse`
-20. `AllocateMemoryAddr`
-21. [`FoldNoOpReshape`](32-fold_no_op_reshape.md)
-22. [`FuseCreateAssembleToSlice`](33-fuse_create_assemble_to_slice.md)
-23. [`DeriveCallDirections`](34-derive_call_directions.md)
-24. [`AutoDeriveTaskDependencies`](35-auto_derive_task_dependencies.md)（runtime scope 编译器依赖；AUTO-scope 分析需要显式开启）
-25. [`ExpandManualPhaseFence`](36-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
-26. [`SynthesizeAllReduceSignals`](37-synthesize_allreduce_signals.md)（分布式：host allreduce optional signal -> explicit internal signal IR）
-27. [`MaterializeCommDomainScopes`](38-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
-28. [`LowerHostTensorCollectives`](39-lower_host_tensor_collectives.md)（host-level tensor collectives -> internal builtin chip dispatches）
-29. [`MaterializeDistTensorCtx`](40-materialize_dist_tensor_ctx.md)（为 DistributedTensor 参数显式物化 CommCtx 参数/实参）
-30. `Simplify`
-31. [`MaterializeRuntimeScopes`](41-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
-32. [`ClassifyIterArgCarry`](42-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
+3. [`LegalizeTileCast`](14-legalize_tile_cast.md)（把目标 ISA 无法用单条 `pto.tcvt` 表达的 `tile.cast` 展开为原生 cast 链）
+4. [`AutoTileMatmulL0`](15-auto_tile_matmul_l0.md)
+5. [`CanonicalizeTileSlice`](16-canonicalize_tile_slice.md)
+6. `InferTileMemorySpace`
+7. [`ResolveBackendOpLayouts`](18-resolve_backend_op_layouts.md)（pass 内部已自动归一化语句结构）
+8. [`LowerAutoVectorSplit`](19-lower_auto_vector_split.md)（在用自动拆分下降路径；在 ExpandMixedKernel 之前把 AUTO `pl.split` 混合 InCore 函数转换为显式 `split_aiv` 形态）
+9. `ExpandMixedKernel`
+10. [`InjectGMPipeBuffer`](21-inject_gm_pipe_buffer.md)
+11. [`SplitVectorKernel`](22-split_vector_kernel.md)（仅为 split_aiv 函数打属性 + 处理无拆分双 AIV 路径）
+12. [`StampTfreeSplit`](23-stamp_tfree_split.md)（把每个跨核 tpop 的 split/pipe-id 复制到与之配对的 tfree 算子上）
+13. `NormalizeReturnOrder`
+14. [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md)（cube/vector 跨核软流水 skew；紧接在 LowerPipelineLoops 之前运行）
+15. [`LowerPipelineLoops`](26-lower_pipeline_loops.md)
+16. [`CanonicalizeIOOrder`](27-canonicalize_io_order.md)
+17. [`MaterializeTensorStrides`](28-materialize_tensor_strides.md) —— 自 RFC #1300 P6 起接入默认 pipeline
+18. `InitMemRef`
+19. [`MaterializeSemanticAliases`](30-materialize_semantic_aliases.md)（语义强制别名：循环 carry / 原地；总是运行）
+20. `MemoryReuse`
+21. `AllocateMemoryAddr`
+22. [`FoldNoOpReshape`](33-fold_no_op_reshape.md)
+23. [`FuseCreateAssembleToSlice`](34-fuse_create_assemble_to_slice.md)
+24. [`DeriveCallDirections`](35-derive_call_directions.md)
+25. [`AutoDeriveTaskDependencies`](36-auto_derive_task_dependencies.md)（runtime scope 编译器依赖；AUTO-scope 分析需要显式开启）
+26. [`ExpandManualPhaseFence`](37-expand_manual_phase_fence.md)（manual-scope phase-fence TaskId 依赖压缩）
+27. [`SynthesizeAllReduceSignals`](38-synthesize_allreduce_signals.md)（分布式：host allreduce optional signal -> explicit internal signal IR）
+28. [`MaterializeCommDomainScopes`](39-materialize_comm_domain_scopes.md)（分布式：构造 WindowBuffer 并写 CommDomainScopeStmt wrappers in each host_orch body；无通信程序为 no-op）
+29. [`LowerHostTensorCollectives`](40-lower_host_tensor_collectives.md)（host-level tensor collectives -> internal builtin chip dispatches）
+30. [`MaterializeDistTensorCtx`](41-materialize_dist_tensor_ctx.md)（为 DistributedTensor 参数显式物化 CommCtx 参数/实参）
+31. `Simplify`
+32. [`MaterializeRuntimeScopes`](42-materialize_runtime_scopes.md)（插入 AUTO RuntimeScopeStmt，使 orchestration codegen 1:1 emit PTO2_SCOPE）
+33. [`ClassifyIterArgCarry`](43-classify_iter_arg_carry.md)（把每个 ForStmt iter_arg 标注为平凡别名 / 重绑定 carry，并为 manual-scope TaskId fence 数组定尺）
 
 `DebugTileOptimization` 只是用于排查 PTO tile 阶段的调试策略，会跳过
 tensor-only 前缀 pass。正常编译和非 strategy 专项测试都应优先使用
 `Default`，以保证主维护流水线持续被覆盖。
 
-[`ResolveBackendOpLayouts`](17-resolve_backend_op_layouts.md) 会根据
+[`ResolveBackendOpLayouts`](18-resolve_backend_op_layouts.md) 会根据
 backend 注册的 layout 元数据修复受约束的逐元素 tile 操作。对于当前 PTO
 上要求 `row_major` 的逐元素算子，它会在受约束 use-site 把 `[N, 1]`
 向量操作数改写成 `[1, N]` 的 `tile.reshape`，其 layout 由目标 shape
 自动推导为 `row_major`，并在需要时把结果 reshape 回原始向量 shape。
 
-[`NormalizeReturnOrder`](23-normalize_return_order.md) 对 InCore 函数的 `ReturnStmt::value_` 重新排序，使
+[`NormalizeReturnOrder`](24-normalize_return_order.md) 对 InCore 函数的 `ReturnStmt::value_` 重新排序，使
 `return[i]` 对应声明顺序中第 i 个 `Out`/`InOut` 参数，并同步更新调用点的
 `TupleGetItemExpr` 索引。这样编排代码生成可以直接通过
 `out_indices[i]` 查找输出参数，而不需要追踪 `tile.store`/yield 链。该 pass

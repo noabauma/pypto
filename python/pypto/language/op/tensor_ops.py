@@ -94,6 +94,7 @@ __all__ = [
     "assemble",
     "concat",
     "reshape",
+    "reinterpret_view",
     "transpose",
     "view",
     "scatter_update",
@@ -756,7 +757,11 @@ def subs(lhs: Tensor, rhs: int | float | Expr | Scalar) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def div(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
+def div(
+    lhs: Tensor,
+    rhs: int | float | Tensor | Scalar | Expr,
+    high_precision: bool = False,
+) -> Tensor:
     """Element-wise division of tensor and tensor or scalar.
 
     Automatically selects between tensor.div (tensor / tensor) and
@@ -765,12 +770,14 @@ def div(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor or scalar (int/float/Tensor/Scalar)
+        high_precision: Whether to select PTOAS's high-precision division mode.
+            Only available when ``rhs`` is a Tensor.
 
     Returns:
         Tensor wrapping the div operation
     """
     lhs_expr = lhs.unwrap()
-    call_expr = _ir_ops.div(lhs_expr, _unwrap_rhs(rhs))
+    call_expr = _ir_ops.div(lhs_expr, _unwrap_rhs(rhs), high_precision=high_precision)
     return Tensor(expr=call_expr)
 
 
@@ -1420,17 +1427,18 @@ def exp(input: Tensor) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def log(input: Tensor) -> Tensor:
+def log(input: Tensor, high_precision: bool = False) -> Tensor:
     """Element-wise natural logarithm operation.
 
     Args:
         input: Input tensor
+        high_precision: Whether to select PTOAS's high-precision logarithm mode
 
     Returns:
         Tensor wrapping the log operation
     """
     input_expr = input.unwrap()
-    call_expr = _ir_ops.log(input_expr)
+    call_expr = _ir_ops.log(input_expr, high_precision=high_precision)
     return Tensor(expr=call_expr)
 
 
@@ -1610,15 +1618,47 @@ def concat(src0: Tensor, src1: Tensor) -> Tensor:
 def reshape(tensor: Tensor, shape: Sequence[IntLike]) -> Tensor:
     """Reshape tensor to new shape.
 
+    The valid region is carried through, never widened: the result holds real
+    data in exactly the cells the input did. See ``pl.reshape`` for the cases
+    that always map.
+
     Args:
         tensor: Input tensor
         shape: New shape dimensions
 
     Returns:
         Tensor wrapping the reshape operation
+
+    Raises:
+        ValueError: If the element count changes, or if the input holds real
+            data in only part of its buffer and no origin-anchored region of
+            ``shape`` describes those same cells.
     """
     tensor_expr = tensor.unwrap()
     call_expr = _ir_ops.reshape(tensor_expr, _normalize_intlike(shape))
+    return Tensor(expr=call_expr)
+
+
+def reinterpret_view(
+    data: Tensor,
+    dtype: DataType,
+    *,
+    shape: Sequence[IntLike] | None = None,
+) -> Tensor:
+    """Reinterpret a tensor over the same bytes with a different dtype.
+
+    Args:
+        data: Input tensor.
+        dtype: Target element dtype, which must differ from the source dtype.
+        shape: Optional byte-equivalent target shape. When omitted, the
+            physically contiguous dimension is scaled according to the
+            source/target dtype byte ratio.
+
+    Returns:
+        Tensor wrapping the zero-copy reinterpret-view operation.
+    """
+    normalized_shape = None if shape is None else _normalize_intlike(shape)
+    call_expr = _ir_ops.reinterpret_view(data.unwrap(), dtype, shape=normalized_shape)
     return Tensor(expr=call_expr)
 
 
@@ -2015,13 +2055,15 @@ def create_l1(shape: Sequence[IntLike], dtype: DataType, transpose: bool = False
     return Tensor(expr=call_expr)
 
 
-def gather_row(
+def gather_row(  # noqa: PLR0913
     acc: Tensor,
     src: Tensor,
     dst_offset: Sequence[IntLike],
     src_offset: Sequence[IntLike],
     shapes: Sequence[IntLike],
     transpose: bool = False,
+    *,
+    valid_shape: Sequence[IntLike] | None = None,
 ) -> Tensor:
     """Gather one GM row into a sub-region of an on-chip accumulator (DPS).
 
@@ -2038,11 +2080,17 @@ def gather_row(
         dst_offset: ``[row, col]`` slot within ``acc`` to write.
         src_offset: ``[row, col]`` physical offset within the GM ``src``.
         shapes: GM row window ``[r, c]`` (typically ``[1, size]``).
+            Must be compile-time constant.
+        valid_shape: How much of that window to actually transfer, defaulting to
+            all of it. May hold runtime ``Scalar`` values, so a dynamic row count
+            leaves the accumulator's allocation and layout untouched. Not
+            supported together with ``transpose=True``.
         transpose: Place the GM row ``[r, c]`` as an L1 column ``[c, r]`` — use
             for a matmul B-operand whose consumer would otherwise need ``b_trans``.
 
     Returns:
         Tensor aliasing ``acc`` (written in place).
+
     """
     call_expr = _ir_ops.gather_row(
         acc.unwrap(),
@@ -2051,6 +2099,7 @@ def gather_row(
         _normalize_intlike(src_offset),
         _normalize_intlike(shapes),
         transpose,
+        valid_shape=_normalize_intlike(valid_shape) if valid_shape is not None else None,
     )
     return Tensor(expr=call_expr)
 

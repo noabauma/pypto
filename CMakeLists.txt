@@ -111,6 +111,7 @@ set(PYPTO_SOURCES
     src/ir/op/sync_ops/sync.cpp
     src/ir/op/sync_ops/cross_core.cpp
     src/ir/op/sync_ops/task.cpp
+    src/ir/op/sync_ops/launch.cpp
     src/ir/op/distributed/memory.cpp
     src/ir/op/distributed/world_size.cpp
     src/ir/op/distributed/remote_load.cpp
@@ -171,6 +172,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/ctrl_flow_transform_pass.cpp
     src/ir/transforms/flatten_call_expr_pass.cpp
     src/ir/transforms/infer_tile_memory_space_pass.cpp
+    src/ir/transforms/loop_invariant_mat_residency.cpp
     src/ir/transforms/inline_functions_pass.cpp
     src/ir/transforms/init_memref.cpp
     src/ir/transforms/lower_composite_ops_pass.cpp
@@ -193,6 +195,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/flatten_tile_nd_to_2d/rewrite_utils.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/transpose.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/verification.cpp
+    src/ir/transforms/legalize_tile_cast_pass.cpp
     src/ir/transforms/pass_context.cpp
     src/ir/transforms/passes.cpp
     src/ir/transforms/resolve_backend_op_layouts_pass.cpp
@@ -224,11 +227,6 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/wrapper_call_utils.cpp
     src/ir/transforms/utils/window_externalization.cpp
     src/ir/transforms/visitor.cpp
-
-    # IR - Reporter
-    src/ir/reporter/report.cpp
-    src/ir/reporter/memory_report_generator.cpp
-    src/ir/reporter/report_generator_registry.cpp
 
     # IR - Verifier
     src/ir/verifier/verifier.cpp

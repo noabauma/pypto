@@ -17,9 +17,10 @@
 | `pl.FP16` | 16 | IEEE 半精度浮点 |
 | `pl.BF16` | 16 | Brain Float 16 |
 | `pl.FP32` | 32 | IEEE 单精度浮点 |
-| `pl.FP4` | 4 | 4 位浮点 |
-| `pl.FP8E4M3FN` | 8 | 8 位浮点（e4m3fn） |
-| `pl.FP8E5M2` | 8 | 8 位浮点（e5m2） |
+| `pl.FP4` | 4 | 4 位浮点（打包 MXFP4 E2M1×2；PTOAS `!pto.f4E2M1x2`） |
+| `pl.FP8E4M3FN` | 8 | 8 位浮点（e4m3fn）；MXFP8 数据 |
+| `pl.FP8E5M2` | 8 | 8 位浮点（e5m2）；MXFP8 数据 |
+| `pl.FP8E8M0` | 8 | MX 块缩放指数（E8M0）；PTOAS `!pto.f8E8M0` / pto-isa `float8_e8m0_t` |
 | `pl.HF4` / `pl.HF8` | 4/8 | 昇腾浮点格式 |
 | `pl.INDEX` | 64 | 索引计算类型 —— 循环变量、维度 |
 
@@ -152,6 +153,13 @@ c = pl.reshape(a, [16, 8])  # 形状操作（还有 transpose、slice）
 c = pl.matmul(a, b)         # 线性代数
 c = pl.row_sum(a)            # 归约（还有 row_max）
 ```
+
+并非每个 `pl.cast` 都是一条指令。某个 `(src, dst)` 组合是映射到一条硬件 `pto.tcvt`，
+还是被展开成多跳链，取决于目标架构——例如 `INT32 -> FP16` 在 Ascend910B 上是一条指令，
+在 Ascend950 上则下降为 `INT32 -> FP32 -> FP16`。展开链每跳一条 `tcvt`；当中转类型比源
+类型更窄时，结果可能与直接舍入的转换相差目标类型的 1 个 ULP。各架构的原生组合、展开组
+合及其跳数见
+[LegalizeTileCast](../dev/passes/14-legalize_tile_cast.md)。
 
 Tensor 和 Tile 类型支持 Python 下标语法作为 `slice`/`read` 的语法糖：
 
@@ -459,7 +467,7 @@ orchestrator（`@pl.jit.host`）和 inline 子函数（`@pl.jit.inline`）上
 只是手放 scope 会嵌套在编译器 AUTO scope 之内）。`.incore` / `.opaque`
 仍会拒绝它——它们外提为独立 kernel。它会 specialize 成
 `@pl.function(..., auto_scope=False)`——具体的 scope 放置语义见
-[MaterializeRuntimeScopes pass](../dev/passes/41-materialize_runtime_scopes.md)。
+[MaterializeRuntimeScopes pass](../dev/passes/42-materialize_runtime_scopes.md)。
 
 ### `@pl.inline`
 
@@ -513,6 +521,19 @@ with pl.at(level=pl.Level.CORE_GROUP,
            optimizations=[pl.split(pl.SplitMode.UP_DOWN)]):
     y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
 ```
+
+如需指定自动跨核 pipe 的槽位数（环深），使用 `pl.cross_core_slot(...)`。它只决定数据
+通道的大小，而不划分计算，因此与 split 模式相互独立，二者可自由组合：
+
+```python
+# 把环收缩到 4 槽，以腾出 buffer 空间给更大的 tile：
+with pl.at(level=pl.Level.CORE_GROUP,
+           optimizations=[pl.split(pl.SplitMode.UP_DOWN),
+                          pl.cross_core_slot(slot_num=4)]):
+    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+```
+
+省略该条目时沿用默认值（单向生效时 8 槽，双向时每方向 4 槽）。
 
 ## 内存与数据搬运
 

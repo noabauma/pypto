@@ -15,11 +15,14 @@ import ctypes
 import importlib.util
 import inspect
 import json
+import queue
 import sys
+import threading
 import types
 import warnings
 import weakref
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +53,59 @@ _DTYPE_MAP: dict[str, tuple[type, torch.dtype]] = {
     "INT64": (ctypes.c_int64, torch.int64),
     "UINT8": (ctypes.c_uint8, torch.uint8),
 }
+
+
+_PERSISTENT_ZERO_CHUNK_BYTES = 1 << 20
+_PERSISTENT_STOP = object()
+
+
+def _resolve_persistent_window_reset(persistent: bool, reset_persistent_windows: bool | None) -> bool:
+    """Resolve the retained-window reset policy.
+
+    Args:
+        persistent: Whether CommDomains are retained across dispatches.
+        reset_persistent_windows: Explicit reset override. ``None`` enables
+            reset only when persistent execution is enabled.
+
+    Returns:
+        Whether retained windows should be reset before reuse.
+
+    Raises:
+        ValueError: If reset is explicitly enabled without persistent execution.
+    """
+    if reset_persistent_windows is None:
+        return persistent
+    if reset_persistent_windows and not persistent:
+        raise ValueError("DistributedWorker reset_persistent_windows=True requires persistent=True")
+    return reset_persistent_windows
+
+
+@dataclass
+class _PersistentRequest:
+    """One caller-visible dispatch handled by the persistent L3 dispatcher."""
+
+    state: dict[str, Any]
+    tensors: dict[str, Any]
+    call_config: Any
+    keepalive: list[Any] = field(default_factory=list)
+    done: threading.Event = field(default_factory=threading.Event)
+    error: BaseException | None = None
+
+
+class _RetainedDomainLease:
+    """Context-manager view that keeps its physical CommDomain alive."""
+
+    def __init__(self, handle: Any) -> None:
+        """Wrap a retained CommDomain handle without taking release ownership."""
+        self._handle = handle
+
+    def __enter__(self) -> Any:
+        """Return the retained CommDomain handle to generated orchestration."""
+        return self._handle
+
+    def __exit__(self, *_exc: Any) -> bool:
+        """Leave the generated scope without releasing the retained handle."""
+        return False
 
 
 def _tensor_from_continuous(ct) -> torch.Tensor:
@@ -370,7 +426,7 @@ def _make_call_config(
 ) -> Any:
     """Build a simpler ``CallConfig`` from the distributed config.
 
-    The ``block_dim`` / ``aicpu_thread_num`` baseline always comes from the
+    The ``aicpu_thread_num`` baseline always comes from the
     program's :class:`DistributedConfig`. When *run_config* is given, its
     per-task ring-sizing overrides (``ring_task_window`` / ``ring_heap`` /
     ``ring_dep_pool``, each a scalar or a per-ring list of 4 ints) are overlaid
@@ -406,8 +462,6 @@ def _make_call_config(
     )
 
     call_config = CallConfig()
-    if dc.block_dim is not None:
-        call_config.block_dim = dc.block_dim
     call_config.aicpu_thread_num = dc.aicpu_thread_num
     if run_config is not None:
         from .runner import _apply_ring_overrides, _DfxOpts  # noqa: PLC0415
@@ -444,7 +498,53 @@ def _make_call_config(
     return call_config
 
 
-def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int) -> Any:
+# A dispatch's DFX artifacts live at ``<dfx_base>/<rank label>/d{k}``. The
+# producer (``_submit_chip``) and the consumers (``_clear_dfx_dispatch_dirs``,
+# ``_collect_l3_swimlane``) must agree on that scheme, and drift between them is
+# *silent* — a glob that no longer matches simply clears/converts nothing rather
+# than raising. The globs below are what the two consumers share; the label
+# builder names the producer's half of the contract in one place.
+_RANK_DIR_GLOB = "rank*"
+_DISPATCH_DIR_GLOB = "d[0-9]*"
+
+
+def _dfx_rank_label(worker: int) -> str:
+    """Directory name namespacing one card's DFX artifacts.
+
+    Every dispatch names a concrete chip by the time it reaches here (see
+    :func:`_resolve_chip_worker`), so the label is always the chip's own rank
+    and matches :data:`_RANK_DIR_GLOB`.
+    """
+    return f"rank{worker}"
+
+
+def _resolve_chip_worker(orch: Any, worker: int | None) -> int:
+    """Pick the chip a dispatch runs on.
+
+    A ``device=``-pinned dispatch arrives with its rank and is returned as is.
+    A comm-less dispatch arrives as ``None``: it expresses no affinity, but the
+    runtime requires an exact target — simpler #1436 made ``worker`` a required,
+    non-negative NEXT_LEVEL id and removed the "unconstrained" mode where the
+    scheduler picked an idle worker itself. Those dispatches are handed out
+    round-robin over the program's chips in submit order, so a host_orch with
+    one comm-less dispatch per chip still spreads across them (and does so
+    deterministically, unlike the old idle-pool pick).
+
+    The chip count is stamped on ``orch`` by ``_dispatch.orch_fn``; without it
+    (a caller that bypassed ``orch_fn``) every comm-less dispatch falls back to
+    chip 0, which always exists.
+    """
+    if worker is not None:
+        return worker
+    chip_count = max(1, int(getattr(orch, "_pypto_chip_count", 1)))
+    seq = getattr(orch, "_pypto_commless_seq", None)
+    if seq is None:
+        seq = 0
+    orch._pypto_commless_seq = seq + 1
+    return seq % chip_count
+
+
+def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int | None) -> Any:
     """``orch.submit_next_level`` with per-dispatch DFX ``output_prefix`` isolation.
 
     The runtime path helpers root every diagnostic artifact at a fixed filename
@@ -464,23 +564,27 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
     run (see ``_dispatch.orch_fn``), so the numbering is deterministic and
     matches across the swimlane two-pass.
 
-    When DFX is off (``output_prefix`` unset) or the dispatch is unconstrained
-    (``worker < 0``) the call is forwarded unchanged.
+    Every dispatch is namespaced ``rank{worker}/d{k}`` by the chip it runs on.
+    When DFX is off (``output_prefix`` unset) the call is forwarded unchanged.
 
-    The codegen emits this for every rank-pinned chip dispatch; the comm-less
-    single-dispatch path keeps the bare ``orch.submit_next_level(...)`` call.
+    The codegen routes every chip dispatch through this wrapper — a rank-pinned
+    dispatch passes its rank, a comm-less one passes ``None`` and is resolved by
+    :func:`_resolve_chip_worker`. Resolution happens before the DFX namespacing
+    so the artifacts land under the chip that actually ran the dispatch.
     """
+    worker = _resolve_chip_worker(orch, worker)
     base = config.output_prefix
-    if not base or worker < 0:
+    if not base:
         return orch.submit_next_level(callable_id, task_args, config, worker=worker)
     idx_map = getattr(orch, "_dfx_dispatch_idx", None)
     if idx_map is None:
         # Defensive: a caller that bypassed ``orch_fn`` (no reset) still gets
         # per-card isolation, just without a guaranteed two-pass match.
         idx_map = orch._dfx_dispatch_idx = {}
-    k = idx_map.get(worker, 0)
-    idx_map[worker] = k + 1
-    config.output_prefix = f"{base}/rank{worker}/d{k}"
+    rank_label = _dfx_rank_label(worker)
+    k = idx_map.get(rank_label, 0)
+    idx_map[rank_label] = k + 1
+    config.output_prefix = f"{base}/{rank_label}/d{k}"
     try:
         return orch.submit_next_level(callable_id, task_args, config, worker=worker)
     finally:
@@ -503,26 +607,29 @@ def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
         return
     import shutil  # noqa: PLC0415
 
-    for rank_dir in dfx_base.glob("rank*"):
+    for rank_dir in dfx_base.glob(_RANK_DIR_GLOB):
         if not rank_dir.is_dir():
             continue
-        for disp_dir in rank_dir.glob("d[0-9]*"):
+        for disp_dir in rank_dir.glob(_DISPATCH_DIR_GLOB):
             if disp_dir.is_dir():
                 shutil.rmtree(disp_dir, ignore_errors=True)
 
 
-def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
+def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
     """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
 
     The runtime writes ``rank{r}/d{k}/l2_swimlane_records.json`` +
     ``rank{r}/d{k}/deps.json`` per dispatch (``_submit_chip`` namespaced the dir
     by card *and* the card's k-th dispatch; dep_gen is co-enabled with
-    swimlane). This best-effort post-pass runs the offline ``swimlane_converter``
-    once per dispatch dir, resolving kernel names from a merged map of every
-    chip callable's ``kernel_config.py`` (``next_levels/*/``). Each dispatch's
-    records are single-chip, so the L2 converter applies unchanged — and a card
-    that ran several (possibly different) programs keeps one swimlane per
-    dispatch instead of overwriting down to the last.
+    swimlane). Globbing ``rank*`` — rather than iterating a rank count — picks up
+    whichever cards actually ran, so a comm-less / single-card L3 program (which never
+    creates ``rank{0..n}``) still has its records converted. This best-effort
+    post-pass runs the offline ``swimlane_converter`` once per dispatch dir,
+    resolving kernel names from a merged map of every chip callable's
+    ``kernel_config.py`` (``next_levels/*/``). Each dispatch's records are
+    single-chip, so the L2 converter applies unchanged — and a card that ran
+    several (possibly different) programs keeps one swimlane per dispatch instead
+    of overwriting down to the last.
 
     Onboard-only: the simulator emits records but not the task metadata the
     converter joins against, so conversion is skipped there (mirrors the L2
@@ -555,15 +662,14 @@ def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
         print(f"Skipping L3 swimlane name_map ({type(e).__name__}: {e}); labels fall back to defaults")
 
     dfx_base = output_dir / "dfx_outputs"
-    for r in range(n_ranks):
-        rank_dir = dfx_base / f"rank{r}"
-        if not rank_dir.is_dir():
-            continue
-        # One card may have run several dispatches: ``rank{r}/d0``, ``d1``, ...
+    # See the docstring for why we glob rather than iterate a rank count.
+    # 3.10-safe dir filter (``glob`` directory filtering is only reliable on 3.11+).
+    rank_dirs = sorted(d for d in dfx_base.glob(_RANK_DIR_GLOB) if d.is_dir())
+    for rank_dir in rank_dirs:
+        # One card may have run several dispatches: ``<rank>/d0``, ``d1``, ...
         # Match only ``d`` + digits (the names ``_submit_chip`` emits) so an
-        # unrelated diagnostic dir under rank_dir is never picked up. 3.10-safe
-        # dir filter (``glob`` directory filtering is only reliable on 3.11+).
-        dispatch_dirs = sorted(d for d in rank_dir.glob("d[0-9]*") if d.is_dir())
+        # unrelated diagnostic dir under rank_dir is never picked up.
+        dispatch_dirs = sorted(d for d in rank_dir.glob(_DISPATCH_DIR_GLOB) if d.is_dir())
         for disp_dir in dispatch_dirs:
             records = disp_dir / "l2_swimlane_records.json"
             if not records.exists():
@@ -588,7 +694,7 @@ def _collect_l3_swimlane(output_dir: Path, n_ranks: int, platform: str) -> None:
                 _generate_swimlane(work_dir, disp_dir, records, func_names=name_map_path)
             except Exception as e:  # noqa: BLE001 - best-effort post-pass, never fatal
                 print(
-                    f"Skipping L3 swimlane conversion for {disp_dir.name} of rank {r} "
+                    f"Skipping L3 swimlane conversion for {disp_dir.name} of {rank_dir.name} "
                     f"({type(e).__name__}: {e}); raw records kept"
                 )
 
@@ -636,6 +742,13 @@ def _dispatch(
         # (deps.json) and pass 2 (records) land the same dispatch in the same
         # ``rank{w}/d{k}`` dir — letting the converter join them.
         orch._dfx_dispatch_idx = {}
+        # Comm-less dispatches carry no rank, so ``_resolve_chip_worker`` hands
+        # them out round-robin over the program's chips; both the count and the
+        # sequence live on ``orch`` so the wrapper stays a pure function of the
+        # dispatch. Resetting the sequence per run keeps placement identical
+        # across the swimlane two-pass, exactly like the DFX counter above.
+        orch._pypto_chip_count = device_nums
+        orch._pypto_commless_seq = 0
         entry_fn(
             orch,
             _unused_args,
@@ -789,7 +902,7 @@ def execute_distributed(
 
     # Offline post-pass (reads the per-dispatch deps.json + records on disk).
     if swimlane:
-        _collect_l3_swimlane(output_dir, len(dc.device_ids), compiled.platform)
+        _collect_l3_swimlane(output_dir, compiled.platform)
 
 
 def execute_distributed_compiled(
@@ -916,12 +1029,15 @@ class DistributedWorker(Worker):
         compiled: DistributedCompiledProgram | Sequence[DistributedCompiledProgram],
         config: RunConfig | None = None,
         *,
+        persistent: bool = False,
+        reset_persistent_windows: bool | None = None,
         callbacks: dict[str, Callable[..., Any]] | None = None,
         sub_worker_overrides: dict[str, Callable[..., Any]] | None = None,
         inherited_host_tensors: Sequence[torch.Tensor] | None = None,
     ) -> None:
         super().__init__()  # initialize Worker ABC state (_owned_tensors)
         callbacks = _coalesce_callbacks(callbacks, sub_worker_overrides)
+        reset_persistent_windows = _resolve_persistent_window_reset(persistent, reset_persistent_windows)
         inherited = tuple(inherited_host_tensors) if inherited_host_tensors is not None else ()
         for tensor in inherited:
             if not isinstance(tensor, torch.Tensor):
@@ -936,6 +1052,23 @@ class DistributedWorker(Worker):
                 )
         self._inherited_host_tensors = inherited
         self._inherited_host_storage_ptrs = {tensor.untyped_storage().data_ptr() for tensor in inherited}
+        self._persistent = bool(persistent)
+        self._reset_persistent_windows = reset_persistent_windows
+        # ``orch.copy_to`` runs in each forked chip child and dereferences the
+        # source host pointer there. Keep a read-only zero chunk allocated
+        # before ``Worker.init()`` forks, then reuse it to restore retained
+        # CommDomain windows in bounded-size copies between requests.
+        self._persistent_zero = (
+            torch.zeros(_PERSISTENT_ZERO_CHUNK_BYTES, dtype=torch.uint8).share_memory_()
+            if self._persistent and self._reset_persistent_windows
+            else None
+        )
+        self._persistent_requests: queue.Queue[_PersistentRequest | object] | None = None
+        self._persistent_thread: threading.Thread | None = None
+        self._persistent_ready: threading.Event | None = None
+        self._persistent_error: BaseException | None = None
+        self._persistent_error_reported = False
+        self._persistent_terminal_request: _PersistentRequest | None = None
 
         programs = list(compiled) if isinstance(compiled, Sequence) else [compiled]
         if not programs:
@@ -975,7 +1108,7 @@ class DistributedWorker(Worker):
             # required-callback manifest is enforced per program.
             callbacks = callbacks or {}
             consumed: set[str] = set()
-            for prog in programs:
+            for program_index, prog in enumerate(programs):
                 self._check_compatible(prog, primary)
                 chip_callables, prog_runtime = _assemble_chip_callables(prog)
                 runtime_name = self._unify_runtime(runtime_name, prog_runtime)
@@ -996,7 +1129,13 @@ class DistributedWorker(Worker):
                     "call_config": _make_call_config(prog._distributed_config),
                     "param_infos": tuple(prog._get_metadata()[0]),
                     "device_nums": len(prog._distributed_config.device_ids),
+                    "persistent_id": f"p{program_index}",
                 }
+                if self._persistent and "_domain_provider" not in inspect.signature(entry_fn).parameters:
+                    raise ValueError(
+                        "persistent distributed execution requires regenerated host orchestration "
+                        "with the internal _domain_provider hook"
+                    )
                 loaded.append((prog, chip_callables, sub_worker_fns))
 
             unconsumed = sorted(set(callbacks) - consumed)
@@ -1010,6 +1149,7 @@ class DistributedWorker(Worker):
             # callables before ``init()`` so the L3 fork inherits the whole
             # registry via COW; each program keeps its own cids in its state.
             self._w = _construct_worker(self.dc, primary.platform, runtime_name, num_sub)
+            self._validate_persistent_runtime_hooks()
             for prog, chip_callables, sub_worker_fns in loaded:
                 sub_ids, chip_cids = _register_callables(self._w, sub_worker_fns, chip_callables)
                 self._states[prog]["sub_ids"] = sub_ids
@@ -1026,6 +1166,12 @@ class DistributedWorker(Worker):
                     primary._distributed_config, config, dfx_base=primary.output_dir / "dfx_outputs"
                 )
             self._w.init(prewarm_config=prewarm_cc)
+
+            # ``Worker.init()`` eagerly starts the chip/sub-worker hierarchy, so
+            # the device-memory API is ready before the first dispatch without a
+            # separate call into Simpler's private startup implementation.
+            if self._persistent:
+                self._start_persistent_dispatcher()
         except Exception:
             if self._w is not None:
                 try:
@@ -1065,6 +1211,244 @@ class DistributedWorker(Worker):
                 f"{runtime_name!r} != {prog_runtime!r}"
             )
         return runtime_name
+
+    @staticmethod
+    def _persistent_domain_spec(kwargs: dict[str, Any]) -> tuple[Any, ...]:
+        """Build a stable identity tuple for one generated CommDomain request."""
+        buffers = tuple(
+            (buffer.name, buffer.dtype, int(buffer.count), int(buffer.nbytes))
+            for buffer in kwargs.get("buffers", ())
+        )
+        return (
+            tuple(int(worker) for worker in kwargs["workers"]),
+            int(kwargs["window_size"]),
+            buffers,
+        )
+
+    def _validate_persistent_runtime_hooks(self) -> None:
+        """Fail before worker initialization when Simpler cannot retain domains."""
+        if not self._persistent:
+            return
+        live_domains = getattr(self._w, "_live_domains", None)
+        execute_pending = getattr(self._w, "_execute_pending_domain_releases", None)
+        missing = []
+        if not isinstance(live_domains, dict):
+            missing.append("_live_domains")
+        if not callable(execute_pending):
+            missing.append("_execute_pending_domain_releases")
+        if missing:
+            raise RuntimeError(
+                "persistent distributed execution requires Simpler's private retention hooks: "
+                + ", ".join(missing)
+            )
+
+    def _reset_persistent_domains(self, orch: Any, domains: dict[str, tuple[tuple[Any, ...], Any]]) -> None:
+        """Restore retained windows to the zero-filled fresh-allocation state."""
+        assert self._persistent_zero is not None
+        zero_ptr = int(self._persistent_zero.data_ptr())
+        chunk_size = int(self._persistent_zero.numel())
+        for _spec, handle in domains.values():
+            for worker_id in handle.workers:
+                context = handle[worker_id]
+                window_size = int(context.actual_window_size)
+                for offset in range(0, window_size, chunk_size):
+                    nbytes = min(chunk_size, window_size - offset)
+                    orch.copy_to(
+                        int(worker_id),
+                        int(context.local_window_base) + offset,
+                        zero_ptr,
+                        nbytes,
+                    )
+
+    def _detach_persistent_domain(self, handle: Any) -> None:
+        """Exclude a retained CommDomain from simpler's per-run release sweep."""
+        live_domains = getattr(self._w, "_live_domains", None)
+        if not isinstance(live_domains, dict) or live_domains.get(handle.name) is not handle:
+            raise RuntimeError(
+                "persistent distributed execution requires Simpler's live-domain retention hook"
+            )
+        del live_domains[handle.name]
+
+    def _release_persistent_domains(
+        self,
+        domains_by_program: dict[str, dict[str, tuple[tuple[Any, ...], Any]]],
+    ) -> None:
+        """Release retained domains after the last request run-fence."""
+        execute_pending = getattr(self._w, "_execute_pending_domain_releases", None)
+        if not callable(execute_pending):
+            raise RuntimeError(
+                "persistent distributed execution requires Simpler's deferred domain-release hook"
+            )
+        handles = [
+            handle
+            for program_domains in reversed(tuple(domains_by_program.values()))
+            for _spec, handle in reversed(tuple(program_domains.values()))
+        ]
+        for handle in handles:
+            handle.release()
+        execute_pending()
+        not_freed = [handle for handle in handles if not bool(getattr(handle, "freed", False))]
+        if not_freed:
+            names = ", ".join(repr(handle.name) for handle in not_freed)
+            raise RuntimeError(f"persistent CommDomain release did not free: {names}")
+
+    def _persistent_worker_main(self) -> None:
+        """Fence each request with ``Worker.run`` while retaining CommDomains."""
+        assert self._persistent_requests is not None
+        assert self._persistent_ready is not None
+        domains_by_program: dict[str, dict[str, tuple[tuple[Any, ...], Any]]] = {}
+        self._persistent_ready.set()
+        try:
+            while True:
+                item = self._persistent_requests.get()
+                if item is _PERSISTENT_STOP:
+                    break
+                assert isinstance(item, _PersistentRequest)
+                request = item
+                program_id = str(request.state["persistent_id"])
+
+                def run_request(orch: Any, _args: Any, _config: Any) -> None:
+                    def domain_provider(**kwargs: Any) -> _RetainedDomainLease:
+                        generated_name = str(kwargs["name"])
+                        program_domains = domains_by_program.setdefault(program_id, {})
+                        spec = self._persistent_domain_spec(kwargs)
+                        existing = program_domains.get(generated_name)
+                        if existing is None:
+                            runtime_kwargs = dict(kwargs)
+                            runtime_kwargs["name"] = f"{program_id}:{generated_name}"
+                            handle = orch.allocate_domain(**runtime_kwargs)
+                            self._detach_persistent_domain(handle)
+                            program_domains[generated_name] = (spec, handle)
+                        else:
+                            prior_spec, handle = existing
+                            if spec != prior_spec:
+                                raise ValueError(
+                                    f"persistent CommDomain {generated_name!r} changed specification "
+                                    f"for program {program_id}"
+                                )
+                        return _RetainedDomainLease(handle)
+
+                    program_domains = domains_by_program.get(program_id)
+                    if program_domains and self._reset_persistent_windows:
+                        self._reset_persistent_domains(orch, program_domains)
+                    orch._dfx_dispatch_idx = {}
+                    request.state["entry_fn"](
+                        orch,
+                        None,
+                        request.call_config,
+                        tensors=request.tensors,
+                        callables=request.state["chip_cids"],
+                        sub_ids=request.state["sub_ids"],
+                        _keep=request.keepalive,
+                        world_size=request.state["device_nums"],
+                        _domain_provider=domain_provider,
+                    )
+
+                try:
+                    self._w.run(run_request)
+                except BaseException as exc:  # noqa: BLE001 - rethrown on caller thread
+                    request.error = exc
+                    self._persistent_error = exc
+                    self._persistent_error_reported = False
+                    self._persistent_terminal_request = request
+                else:
+                    request.keepalive.clear()
+                    request.done.set()
+                if request.error is not None:
+                    break
+        except BaseException as exc:  # noqa: BLE001 - observed by start/run/close
+            self._persistent_error = exc
+            self._persistent_error_reported = False
+            terminal = self._persistent_terminal_request
+            if terminal is not None and terminal.error is None:
+                terminal.error = exc
+        finally:
+            try:
+                self._release_persistent_domains(domains_by_program)
+            except BaseException as exc:  # noqa: BLE001 - surfaced by run/close
+                if self._persistent_error is None:
+                    self._persistent_error = exc
+                    self._persistent_error_reported = False
+                elif self._persistent_error.__context__ is None:
+                    self._persistent_error.__context__ = exc
+                else:
+                    print(
+                        f"persistent CommDomain teardown also failed: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+            terminal = self._persistent_terminal_request
+            if terminal is not None:
+                terminal.keepalive.clear()
+                terminal.done.set()
+
+    def _raise_persistent_error(self) -> None:
+        """Raise the background failure and mark it as delivered to a caller."""
+        if self._persistent_error is not None:
+            self._persistent_error_reported = True
+            raise self._persistent_error
+
+    def _start_persistent_dispatcher(self) -> None:
+        """Start the background request dispatcher and wait until it is ready."""
+        self._persistent_requests = queue.Queue(maxsize=1)
+        self._persistent_ready = threading.Event()
+        self._persistent_thread = threading.Thread(
+            target=self._persistent_worker_main,
+            name="pypto-persistent-l3",
+        )
+        self._persistent_thread.start()
+        self._persistent_ready.wait()
+        if self._persistent_error is not None:
+            self._persistent_thread.join()
+            self._raise_persistent_error()
+
+    def _dispatch_persistent(self, state: dict[str, Any], tensors: dict[str, Any], call_config: Any) -> None:
+        """Submit one request and synchronously propagate its completion status."""
+        requests = self._persistent_requests
+        thread = self._persistent_thread
+        if requests is None or thread is None:
+            raise RuntimeError("persistent distributed dispatcher is not running")
+        self._raise_persistent_error()
+        request = _PersistentRequest(state=state, tensors=tensors, call_config=call_config)
+        requests.put(request)
+        while not request.done.wait(timeout=0.1):
+            if not thread.is_alive():
+                self._raise_persistent_error()
+                raise RuntimeError("persistent distributed dispatcher exited before completing the request")
+        if request.error is not None:
+            if request.error is self._persistent_error:
+                self._persistent_error_reported = True
+            raise request.error
+        self._raise_persistent_error()
+
+    def _stop_persistent_dispatcher(self) -> None:
+        """Stop the background run and raise an unreported terminal failure."""
+        requests = self._persistent_requests
+        thread = self._persistent_thread
+        if requests is None or thread is None:
+            return
+        if thread.is_alive():
+            requests.put(_PERSISTENT_STOP)
+        thread.join()
+        self._persistent_requests = None
+        self._persistent_thread = None
+        if self._persistent_error is not None and not self._persistent_error_reported:
+            self._persistent_error_reported = True
+            raise self._persistent_error
+
+    def _dispatch_prepared(self, state: dict[str, Any], tensors: dict[str, Any], call_config: Any) -> None:
+        """Dispatch through either the ordinary or persistent prepared path."""
+        if self._persistent:
+            self._dispatch_persistent(state, tensors, call_config)
+            return
+        _dispatch(
+            self._w,
+            state["entry_fn"],
+            tensors,
+            state["chip_cids"],
+            state["sub_ids"],
+            call_config,
+            state["device_nums"],
+        )
 
     # ------------------------------------------------------------------
     # Device memory primitives
@@ -1346,7 +1730,7 @@ class DistributedWorker(Worker):
         ``config`` is an optional per-dispatch :class:`RunConfig` whose per-task
         ring-sizing overrides size this dispatch's runtime ring buffers. When
         given, a fresh ``CallConfig`` is built for this dispatch only (from the
-        program's ``block_dim`` / ``aicpu_thread_num`` baseline plus the ring
+        program's ``aicpu_thread_num`` baseline plus the ring
         overrides), leaving the prepared, shared ``call_config`` untouched. When
         ``None``, the prepared baseline is reused with zero extra allocation.
         """
@@ -1411,15 +1795,7 @@ class DistributedWorker(Worker):
                 )
             tensors[info.name] = arg
 
-        _dispatch(
-            self._w,
-            state["entry_fn"],
-            tensors,
-            state["chip_cids"],
-            state["sub_ids"],
-            call_config,
-            state["device_nums"],
-        )
+        self._dispatch_prepared(state, tensors, call_config)
 
         # Offline post-pass (reads the per-dispatch records on disk; no worker needed).
         # Note: unlike the one-shot ``execute_distributed`` path, the prepared
@@ -1430,7 +1806,7 @@ class DistributedWorker(Worker):
         # dep_gen collection overhead. Use ``execute_distributed`` (one-shot) for
         # clean two-pass swimlane timing.
         if config is not None and config.enable_l2_swimlane:
-            _collect_l3_swimlane(compiled.output_dir, state["device_nums"], compiled.platform)
+            _collect_l3_swimlane(compiled.output_dir, compiled.platform)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -1456,10 +1832,14 @@ class DistributedWorker(Worker):
             handle._mark_closed()
         self._handles.clear()
         try:
-            self._w.close()
+            self._stop_persistent_dispatcher()
         finally:
-            self._inherited_host_tensors = ()
-            self._inherited_host_storage_ptrs.clear()
+            try:
+                self._w.close()
+            finally:
+                self._inherited_host_tensors = ()
+                self._inherited_host_storage_ptrs.clear()
+                self._persistent_zero = None
 
     def __enter__(self) -> DistributedWorker:
         return self

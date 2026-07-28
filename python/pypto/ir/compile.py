@@ -22,7 +22,7 @@ from pypto.pypto_core import backend as _backend_core
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core import passes as _passes
 
-from .pass_manager import OptimizationStrategy, PassManager
+from .pass_manager import OptimizationStrategy, PassDumpLevel, PassManager
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ def compile(  # noqa: PLR0913
     program: _ir_core.Program,
     output_dir: str | None = None,
     strategy: OptimizationStrategy = OptimizationStrategy.Default,
-    dump_passes: bool = True,
+    dump_passes: bool | PassDumpLevel = True,
     backend_type: BackendType = BackendType.Ascend910B,
     skip_ptoas: bool = False,
     verification_level: _passes.VerificationLevel | None = None,
@@ -68,7 +68,6 @@ def compile(  # noqa: PLR0913
     profiling: bool = False,
     platform: str | None = None,
     distributed_config: Any = None,
-    block_dim: int | None = None,
     analyze_auto_scopes_for_deps: bool = False,
 ) -> "CompiledProgram | DistributedCompiledProgram":
     """Compile a Program through passes and codegen.
@@ -86,7 +85,11 @@ def compile(  # noqa: PLR0913
             ``PYPTO_PROG_BUILD_DIR`` environment variable if set (and
             non-empty), else ``build_output``.
         strategy: Optimization strategy to use (default: Default)
-        dump_passes: Whether to dump IR after each pass (default: True)
+        dump_passes: Per-pass IR dump control. A ``PassDumpLevel``
+            (``NONE`` / ``CONCISE`` / ``EXPLICIT``) or a ``bool``
+            (``True`` -> ``CONCISE``, ``False`` -> ``NONE``). ``EXPLICIT`` makes
+            each dump self-describing for tile layouts and distributed window
+            buffers (issue #2088). Default: ``True`` (``CONCISE``).
         backend_type: Backend type for passes and codegen (default: Ascend910B)
         skip_ptoas: Skip the ptoas compilation step and emit raw MLIR (.pto) files
             instead of compiled C++ kernel wrappers.
@@ -124,15 +127,6 @@ def compile(  # noqa: PLR0913
             distributed programs.  When ``None`` (default), auto-detected
             from the program: if L3+ functions are found, a default
             ``DistributedConfig()`` is used.
-        block_dim: Optional logical SPMD block count to bake into the
-            generated ``kernel_config.py``'s ``RUNTIME_CONFIG``. ``None``
-            (default) omits the key so the runtime's own default applies
-            at dispatch time; simpler validates the value against device
-            capacity. Set this when targeting devices whose usable core
-            count is below simpler's default of 24, or when the kernel
-            needs a specific block count. Ignored for L3+ distributed
-            programs — set ``DistributedConfig.block_dim`` instead.
-
         analyze_auto_scopes_for_deps: If True, let
             ``AutoDeriveTaskDependencies`` analyze AUTO runtime scopes. The
             default is False to preserve the existing TensorMap-fallback
@@ -194,7 +188,6 @@ def compile(  # noqa: PLR0913
     report_dir = os.path.join(output_dir, "report")
     os.makedirs(report_dir, exist_ok=True)
     report_instrument = _passes.ReportInstrument(report_dir)
-    report_instrument.enable_report(_passes.ReportType.Memory, "AllocateMemoryAddr")
 
     instruments: list[_passes.PassInstrument] = [report_instrument]
     # Resolve effective settings: explicit arg > outer context > global default.
@@ -256,7 +249,6 @@ def compile(  # noqa: PLR0913
                     transformed_program,
                     output_dir,
                     skip_ptoas=skip_ptoas,
-                    block_dim=block_dim,
                     memory_planner=mplan,
                 )
         except PartialCodegenError as exc:

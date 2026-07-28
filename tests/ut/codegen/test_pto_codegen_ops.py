@@ -622,6 +622,122 @@ class TestRsqrtHighPrecisionCodegen:
         )
 
 
+class TestB01PrecisionAndRowExpandAddCodegen:
+    """Exact PTOAS forms added for the first op batch."""
+
+    def _generate_mlir(self, program_cls) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    @staticmethod
+    def _op_line(mlir: str, op_name: str) -> str:
+        line = next((line for line in mlir.splitlines() if op_name in line), "")
+        assert line, f"{op_name} not found in MLIR:\n{mlir}"
+        return line
+
+    @staticmethod
+    def _ins_operand_count(line: str) -> int:
+        ins_start = line.find("ins(")
+        ins_end = line.find(")", ins_start)
+        assert ins_start != -1 and ins_end != -1, f"ins(...) clause not found in: {line}"
+        operands = line[ins_start + len("ins(") : ins_end].split(":", 1)[0]
+        return operands.count(",") + 1
+
+    def test_tdiv_default_omits_and_high_precision_appends_exact_attr(self):
+        @pl.program
+        class DefaultProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, 0], [16, 16])
+                rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.div(lhs_tile, rhs_tile)
+                return pl.store(result, [0, 0], out)
+
+        @pl.program
+        class HighPrecisionProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, 0], [16, 16])
+                rhs_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [0, 0], [16, 16])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.div(lhs_tile, rhs_tile, high_precision=True)
+                return pl.store(result, [0, 0], out)
+
+        default_line = self._op_line(self._generate_mlir(DefaultProg), "pto.tdiv")
+        high_precision_line = self._op_line(self._generate_mlir(HighPrecisionProg), "pto.tdiv")
+        assert "precisionType" not in default_line
+        assert high_precision_line.endswith("{precisionType = #pto<div_precision high_precision>}")
+        assert ") outs(" in high_precision_line
+        assert high_precision_line.index("outs(") < high_precision_line.index("precisionType")
+
+    def test_tlog_emits_exact_high_precision_attr(self):
+        @pl.program
+        class LogProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result: pl.Tensor[[16, 16], pl.FP32] = pl.log(src, high_precision=True)
+                return result
+
+        log_line = self._op_line(self._generate_mlir(LogProg), "pto.tlog")
+        assert log_line.endswith("{precisionType = #pto<log_precision high_precision>}")
+
+    def test_trowexpandadd_emits_two_and_three_operand_forms(self):
+        @pl.program
+        class WithoutTmpProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                row: pl.Tensor[[16, 1], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                row_tile: pl.Tile[[16, 1], pl.FP32] = pl.load(row, [0, 0], [16, 1])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.row_expand_add(src_tile, row_tile)
+                return pl.store(result, [0, 0], out)
+
+        @pl.program
+        class WithTmpProg:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                row: pl.Tensor[[16, 1], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                row_tile: pl.Tile[[16, 1], pl.FP32] = pl.load(row, [0, 0], [16, 1])
+                tmp: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
+                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.row_expand_add(src_tile, row_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        two_operand_line = self._op_line(self._generate_mlir(WithoutTmpProg), "pto.trowexpandadd")
+        three_operand_line = self._op_line(self._generate_mlir(WithTmpProg), "pto.trowexpandadd")
+        assert self._ins_operand_count(two_operand_line) == 2
+        assert self._ins_operand_count(three_operand_line) == 3
+
+
 class TestTileReadWriteOffsetCodegen:
     """Tests verifying tile.read/write multi-dimensional indices generate correct flat offsets."""
 
@@ -2401,6 +2517,97 @@ class TestTileMoveAccNoopElision:
         assert not self._has_acc_to_acc_tmov(mlir), (
             f"Generated MLIR contains invalid pto.tmov acc→acc (regression #1352):\n{mlir}"
         )
+
+
+class TestTileMoveLayoutNoopElision:
+    """Same-addr tile.move must keep pto.tmov when layouts differ.
+
+    Complements #1310 (acc→acc same-layout elision): A5 V→C may co-locate an ND
+    cast result and an NZ ``*_nz`` adapt at one Vec address. Eliding that tmov
+    drops the fractal adapt and leaves TPUSH RowMajor vs AIC ColMajor.
+    Build IR with a shared MemRef so codegen sees same space+addr without relying
+    on MemoryReuse (which now gates layout coalescing).
+    """
+
+    @staticmethod
+    def _vec_tile_move_program(*, dst_view: ir.TileView | None, name: str) -> ir.Program:
+        span = ir.Span.unknown()
+        size = 64
+        nbytes = size * size * 2  # BF16
+        byte_offset_zero = ir.ConstInt(0, DataType.INT64, span)
+        shared = ir.MemRef(ir.MemorySpace.Vec, byte_offset_zero, nbytes, 0)
+
+        inp = ir.Var("inp", ir.TensorType([size, size], DataType.BF16), span)
+        out = ir.Var("out", ir.TensorType([size, size], DataType.BF16), span)
+
+        src_ty = ir.TileType([size, size], DataType.BF16, shared, None, ir.MemorySpace.Vec)
+        dst_ty = ir.TileType([size, size], DataType.BF16, shared, dst_view, ir.MemorySpace.Vec)
+        src = ir.Var("src_nd", src_ty, span)
+        dst = ir.Var("dst_layout", dst_ty, span)
+        result = ir.Var("result", ir.TensorType([size, size], DataType.BF16), span)
+
+        zero = ir.ConstInt(0, DataType.INDEX, span)
+        dim = ir.ConstInt(size, DataType.INDEX, span)
+        offsets = ir.MakeTuple([zero, zero], span)
+        shapes = ir.MakeTuple([dim, dim], span)
+
+        load = ir.Call(ir.Op("tile.load"), [inp, offsets, shapes], {}, src_ty, span)
+        move = ir.Call(
+            ir.Op("tile.move"),
+            [src],
+            {"target_memory": ir.MemorySpace.Vec},
+            dst_ty,
+            span,
+        )
+        store = ir.Call(ir.Op("tile.store"), [dst, offsets, out], result.type, span)
+
+        body = ir.SeqStmts(
+            [
+                ir.SeqStmts(
+                    [
+                        ir.AssignStmt(src, load, span),
+                        ir.AssignStmt(dst, move, span),
+                        ir.AssignStmt(result, store, span),
+                    ],
+                    span,
+                ),
+                ir.ReturnStmt([result], span),
+            ],
+            span,
+        )
+        func = ir.Function(
+            name,
+            [(inp, ir.ParamDirection.In), (out, ir.ParamDirection.Out)],
+            [ir.TensorType([size, size], DataType.BF16)],
+            body,
+            span,
+            ir.FunctionType.InCore,
+        )
+        return ir.Program([func], f"{name}_program", span)
+
+    @staticmethod
+    def _generate_mlir(program: ir.Program) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        return codegen.PTOCodegen().generate(program)
+
+    def test_same_addr_different_layout_emits_tmov(self):
+        """ND→NZ at one Vec address must still emit pto.tmov (not elide)."""
+        nz = ir.TileView(
+            blayout=ir.TileLayout.col_major,
+            slayout=ir.TileLayout.row_major,
+            fractal=1024,
+        )
+        mlir = self._generate_mlir(self._vec_tile_move_program(dst_view=nz, name="move_nd_to_nz_same_addr"))
+        tmovs = [ln for ln in mlir.splitlines() if "pto.tmov" in ln]
+        assert tmovs, f"same-addr ND→NZ tile.move must emit pto.tmov (layout adapt); got none in:\n{mlir}"
+        assert any("loc=vec" in ln for ln in tmovs), f"expected vec→vec tmov, got:\n{tmovs}"
+
+    def test_same_addr_same_layout_elides_tmov(self):
+        """Same space+addr+layout tile.move remains a no-op (elide pto.tmov)."""
+        mlir = self._generate_mlir(self._vec_tile_move_program(dst_view=None, name="move_nd_to_nd_same_addr"))
+        tmovs = [ln for ln in mlir.splitlines() if "pto.tmov" in ln]
+        assert not tmovs, f"same-addr same-layout tile.move must elide pto.tmov; got:\n{tmovs}\nfull:\n{mlir}"
 
 
 class TestTileStoreAtomicCodegen:

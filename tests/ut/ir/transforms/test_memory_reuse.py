@@ -873,6 +873,55 @@ def _collect_tile_memref_bases(program: ir.Program) -> dict[str, str]:
 class TestViewOps:
     """Tests for view operations (reshape) with memory reuse."""
 
+    def test_reinterpret_view_chain_shares_exact_byte_memref(self):
+        """Cross-dtype reinterpret views keep one exact-byte MemRef alias chain."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_a: pl.Tensor[[8, 16], pl.FP32],
+                output: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+            ) -> pl.Tensor[[8, 16], pl.FP32]:
+                source: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(input_a, [0, 0], [8, 16])
+                as_int16: pl.Tile[[8, 32], pl.INT16, pl.MemorySpace.Vec] = pl.tile.reinterpret_view(
+                    source, pl.INT16
+                )
+                round_trip: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.reinterpret_view(
+                    as_int16, pl.FP32
+                )
+                result: pl.Tensor[[8, 16], pl.FP32] = pl.store(round_trip, [0, 0], output)
+                return result
+
+        After = _run_pipeline(Before)
+        func = After.get_function("main")
+        assert func is not None
+        body = func.body
+        assert isinstance(body, ir.SeqStmts)
+
+        memrefs = {}
+        for stmt in body.stmts:
+            if isinstance(stmt, ir.AssignStmt) and stmt.var.name_hint in {
+                "source",
+                "as_int16",
+                "round_trip",
+            }:
+                tile_type = stmt.var.type
+                assert isinstance(tile_type, ir.TileType)
+                assert tile_type.memref is not None
+                memrefs[stmt.var.name_hint] = tile_type.memref
+
+        assert set(memrefs) == {"source", "as_int16", "round_trip"}
+        source_memref = memrefs["source"]
+        for name in ("as_int16", "round_trip"):
+            view_memref = memrefs[name]
+            assert view_memref.base_.name_hint == source_memref.base_.name_hint
+            assert isinstance(view_memref.byte_offset_, ir.ConstInt)
+            assert isinstance(source_memref.byte_offset_, ir.ConstInt)
+            assert view_memref.byte_offset_.value == source_memref.byte_offset_.value == 0
+            assert view_memref.size_ == source_memref.size_ == 8 * 16 * 4
+
     def test_subview_group_keeps_offsets_on_reuse(self):
         """Retargeting a sharing group must preserve per-member subview offsets (issue #1723).
 
@@ -3522,6 +3571,127 @@ class TestL0CrossShapeReuse:
         assert bases["la"] is bases["lc"], (
             "la ([16,64]) should reuse lc's ([16,128]) larger L0A buffer under global "
             f"packing; got la@{bases['la'].name_hint} vs lc@{bases['lc'].name_hint}"
+        )
+
+
+class TestStorageLayoutReuseGate:
+    """Vec ND↔NZ tiles must not share a MemRef; other layout diffs may.
+
+    A5 V→C inserts an ND→NZ ``*_nz`` adapt before tpush (NZ: col_major blayout).
+    Colocating that NZ tile with the ND source at one Vec address makes even a
+    kept ``pto.tmov`` an in-place layout rewrite that silently mis-transfers.
+    Gate only Vec ND↔NZ — same-family fractal quirks and non-Vec spaces stay
+    eligible for reuse (#1788).
+    """
+
+    def test_nd_and_nz_vec_tiles_do_not_reuse(self):
+        """Disjoint-lifetime ND and NZ Vec tiles of equal size keep separate buffers."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[64, 64], pl.BF16],
+                out_nd: pl.Out[pl.Tensor[[64, 64], pl.BF16]],
+                out_nz: pl.Out[pl.Tensor[[64, 64], pl.BF16]],
+            ) -> pl.Tensor[[64, 64], pl.BF16]:
+                tile_nd: pl.Tile[[64, 64], pl.BF16, pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                _a: pl.Tensor[[64, 64], pl.BF16] = pl.tile.store(tile_nd, [0, 0], out_nd)
+                tile_nz: pl.Tile[
+                    [64, 64],
+                    pl.BF16,
+                    pl.Mem.Vec,
+                    pl.TileView(
+                        blayout=pl.TileLayout.col_major,
+                        slayout=pl.TileLayout.row_major,
+                        fractal=1024,
+                    ),
+                ] = pl.tile.load(inp, [0, 0], [64, 64], target_memory=pl.Mem.Vec)
+                result: pl.Tensor[[64, 64], pl.BF16] = pl.tile.store(tile_nz, [0, 0], out_nz)
+                return result
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        assert "tile_nd" in bases and "tile_nz" in bases, f"missing tiles in {bases}"
+        assert bases["tile_nd"] != bases["tile_nz"], (
+            f"ND and NZ Vec tiles must not share a MemRef; both bound to {bases['tile_nd']}"
+        )
+
+    def test_same_nz_family_different_fractal_vec_tiles_can_reuse(self):
+        """Same NZ family (col_major) with fractal-only difference may coalesce."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[64, 64], pl.BF16],
+                out_a: pl.Out[pl.Tensor[[64, 64], pl.BF16]],
+                out_b: pl.Out[pl.Tensor[[64, 64], pl.BF16]],
+            ) -> pl.Tensor[[64, 64], pl.BF16]:
+                tile_a: pl.Tile[
+                    [64, 64],
+                    pl.BF16,
+                    pl.Mem.Vec,
+                    pl.TileView(
+                        blayout=pl.TileLayout.col_major,
+                        slayout=pl.TileLayout.row_major,
+                        fractal=512,
+                    ),
+                ] = pl.tile.load(inp, [0, 0], [64, 64], target_memory=pl.Mem.Vec)
+                _a: pl.Tensor[[64, 64], pl.BF16] = pl.tile.store(tile_a, [0, 0], out_a)
+                tile_b: pl.Tile[
+                    [64, 64],
+                    pl.BF16,
+                    pl.Mem.Vec,
+                    pl.TileView(
+                        blayout=pl.TileLayout.col_major,
+                        slayout=pl.TileLayout.row_major,
+                        fractal=1024,
+                    ),
+                ] = pl.tile.load(inp, [0, 0], [64, 64], target_memory=pl.Mem.Vec)
+                result: pl.Tensor[[64, 64], pl.BF16] = pl.tile.store(tile_b, [0, 0], out_b)
+                return result
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        assert "tile_a" in bases and "tile_b" in bases, f"missing tiles in {bases}"
+        assert bases["tile_a"] == bases["tile_b"], (
+            "same NZ-family Vec tiles should still share a MemRef; "
+            f"got {bases['tile_a']} vs {bases['tile_b']}"
+        )
+
+    def test_same_layout_nd_vec_tiles_can_reuse(self):
+        """Equal-size ND Vec tiles with matching layout still coalesce (#1788)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[64, 64], pl.BF16],
+                out_a: pl.Out[pl.Tensor[[64, 64], pl.BF16]],
+                out_b: pl.Out[pl.Tensor[[64, 64], pl.BF16]],
+            ) -> pl.Tensor[[64, 64], pl.BF16]:
+                tile_a: pl.Tile[[64, 64], pl.BF16, pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                _a: pl.Tensor[[64, 64], pl.BF16] = pl.tile.store(tile_a, [0, 0], out_a)
+                tile_b: pl.Tile[[64, 64], pl.BF16, pl.Mem.Vec] = pl.tile.load(
+                    inp, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                result: pl.Tensor[[64, 64], pl.BF16] = pl.tile.store(tile_b, [0, 0], out_b)
+                return result
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        assert "tile_a" in bases and "tile_b" in bases, f"missing tiles in {bases}"
+        assert bases["tile_a"] == bases["tile_b"], (
+            "matching-layout ND Vec tiles should still share a MemRef; "
+            f"got {bases['tile_a']} vs {bases['tile_b']}"
         )
 
 

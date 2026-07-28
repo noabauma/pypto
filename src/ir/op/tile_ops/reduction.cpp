@@ -22,6 +22,7 @@
  */
 
 #include <any>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -36,11 +37,21 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
+
+namespace {
+
+bool IsPtoRowMinDtype(const DataType& dtype) {
+  return dtype == DataType::INT16 || dtype == DataType::INT32 || dtype == DataType::FP16 ||
+         dtype == DataType::FP32;
+}
+
+}  // namespace
 
 // Type deduction for row reduction operations (reduces along last axis with keepdim=True).
 // `out_dtype` overrides the output element type — used by argmax/argmin, whose index output
@@ -48,8 +59,9 @@ namespace ir {
 TypePtr DeduceTileRowReductionType(const std::vector<ExprPtr>& args,
                                    const std::vector<std::pair<std::string, std::any>>& kwargs,
                                    const std::string& op_name,
-                                   std::optional<DataType> out_dtype = std::nullopt) {
-  // tile.row_max and tile.row_sum require 2 arguments (tile and tmp_tile)
+                                   std::optional<DataType> out_dtype = std::nullopt,
+                                   bool require_exact_tmp_shape = false) {
+  // Tile row reductions require 2 arguments (tile and tmp_tile).
   CHECK(args.size() == 2) << "The operator " << op_name << " requires 2 arguments, but got " << args.size();
 
   // First argument must be TileType
@@ -65,14 +77,56 @@ TypePtr DeduceTileRowReductionType(const std::vector<ExprPtr>& args,
   CHECK(input_ndim >= 2) << "The operator " << op_name << " requires at least a 2D tile, but got "
                          << input_ndim << " dimensions";
 
+  // The PTO row-reduction instructions use tmp_tile as full-size scratch.
+  // An undersized scratch tile compiles but produces silently incorrect
+  // results, so reject it while constructing the op. Larger extents remain
+  // valid because tensor-to-tile lowering intentionally pads short rows.
+  auto tmp_type = As<TileType>(args[1]->GetType());
+  CHECK_SPAN(tmp_type, args[1]->span_)
+      << "The operator " << op_name << " requires tmp_tile to be a TileType, but got "
+      << args[1]->GetType()->TypeName();
+  CHECK_SPAN(tmp_type->dtype_ == tile_type->dtype_, args[1]->span_)
+      << "The operator " << op_name
+      << " requires tmp_tile dtype to match input dtype, but got tmp_tile dtype "
+      << tmp_type->dtype_.ToString() << " and input dtype " << tile_type->dtype_.ToString();
+  CHECK_SPAN(tmp_type->shape_.size() == input_shape.size(), args[1]->span_)
+      << "The operator " << op_name << " requires tmp_tile to have the same rank as the input, but got "
+      << "tmp_tile shape " << FormatShape(tmp_type->shape_) << " and input shape "
+      << FormatShape(input_shape);
+  for (size_t i = 0; i < input_shape.size(); ++i) {
+    if (require_exact_tmp_shape) {
+      CHECK_SPAN(ProveValidExtentEqual(input_shape[i], tmp_type->shape_[i]) == ProofResult::kTrue,
+                 args[1]->span_)
+          << "The operator " << op_name
+          << " requires tmp_tile shape to exactly match the input shape, but dimension " << i
+          << " differs; got tmp_tile shape " << FormatShape(tmp_type->shape_) << " and input shape "
+          << FormatShape(input_shape);
+      continue;
+    }
+    const auto input_extent = GetConstantDimension(input_shape[i]);
+    const auto tmp_extent = GetConstantDimension(tmp_type->shape_[i]);
+    const bool provably_undersized =
+        input_extent && tmp_extent
+            ? *tmp_extent < *input_extent
+            : ProveValidExtentLessEqual(input_shape[i], tmp_type->shape_[i]) == ProofResult::kFalse;
+    CHECK_SPAN(!provably_undersized, args[1]->span_)
+        << "The operator " << op_name
+        << " requires tmp_tile shape to be at least the input shape in every dimension, but tmp_tile "
+           "dimension "
+        << i << " is undersized; got tmp_tile shape " << FormatShape(tmp_type->shape_) << " and input shape "
+        << FormatShape(input_shape);
+  }
+
   // Output shape is [...batch_dims, rows, 1] - reduce along last axis with keepdim=True
   std::vector<ExprPtr> output_shape(input_shape.begin(), input_shape.end() - 1);
   output_shape.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown()));
 
   // Inherit valid_shape from the input along the non-reduced dims so that
   // downstream codegen emits trowsum with the correct valid_row (issue #1401).
-  // The reduced (last) dim collapses to 1 in the output.
+  // The reduced (last) dim collapses to 1 in the output: the kernel bounds its loop by the
+  // source's valid_col, so it folds exactly the real cells into a single valid output cell.
   const auto input_valid = GetValidShape(tile_type);
+  CheckReductionInputNonEmpty(input_valid, op_name, args[0]->span_);
   std::vector<ExprPtr> output_valid(input_valid.begin(), input_valid.end() - 1);
   output_valid.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown()));
 
@@ -108,8 +162,10 @@ TypePtr DeduceTileColReductionType(const std::vector<ExprPtr>& args,
 
   // Inherit valid_shape from the input along the non-reduced dims so that
   // downstream codegen emits tcolsum with the correct valid_col (issue #1401).
-  // The reduced (first) dim is always 1 in the output.
+  // The reduced (first) dim is always 1 in the output: the kernel bounds its loop by the
+  // source's valid_row, so it folds exactly the real cells into a single valid output cell.
   const auto input_valid = GetValidShape(tile_type);
+  CheckReductionInputNonEmpty(input_valid, op_name, args[0]->span_);
   std::vector<ExprPtr> output_valid;
   output_valid.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown()));
   output_valid.insert(output_valid.end(), input_valid.begin() + 1, input_valid.end());
@@ -129,7 +185,7 @@ REGISTER_OP("tile.row_sum")
     .set_op_category("TileOp")
     .set_description("Row-wise sum reduction (reduces along axis=1, maps to TROWSUM)")
     .add_argument("tile", "Input tile (TileType)")
-    .add_argument("tmp_tile", "Temporary tile (TileType)")
+    .add_argument("tmp_tile", "Same-dtype scratch tile at least as large as the input (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
@@ -145,7 +201,7 @@ REGISTER_OP("tile.row_max")
     .set_op_category("TileOp")
     .set_description("Row-wise max reduction (reduces along axis=1, maps to TROWMAX)")
     .add_argument("tile", "Input tile (TileType)")
-    .add_argument("tmp_tile", "Temporary tile (TileType)")
+    .add_argument("tmp_tile", "Same-dtype scratch tile at least as large as the input (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
@@ -161,7 +217,7 @@ REGISTER_OP("tile.row_min")
     .set_op_category("TileOp")
     .set_description("Row-wise min reduction (reduces along axis=1, maps to TROWMIN)")
     .add_argument("tile", "Input tile (TileType)")
-    .add_argument("tmp_tile", "Temporary tile (TileType)")
+    .add_argument("tmp_tile", "Same-dtype scratch tile at least as large as the input (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
@@ -170,14 +226,25 @@ REGISTER_OP("tile.row_min")
     .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileRowReductionType(args, kwargs, "tile.row_min");
+      auto result_type = DeduceTileRowReductionType(args, kwargs, "tile.row_min");
+      auto input_type = As<TileType>(args[0]->GetType());
+      CHECK_SPAN(IsPtoRowMinDtype(input_type->dtype_), args[0]->span_)
+          << "The operator tile.row_min requires input dtype in {INT16, INT32, FP16, FP32}, but got "
+          << input_type->dtype_.ToString();
+      const TileView input_view = tile_view_semantics::GetEffectiveTileView(*input_type);
+      CHECK_SPAN(input_view.blayout == TileLayout::row_major && input_view.slayout == TileLayout::none_box,
+                 args[0]->span_)
+          << "The operator tile.row_min requires an ND input layout (blayout=row_major, "
+             "slayout=none_box), but got blayout="
+          << TileLayoutToString(input_view.blayout) << ", slayout=" << TileLayoutToString(input_view.slayout);
+      return result_type;
     });
 
 REGISTER_OP("tile.row_prod")
     .set_op_category("TileOp")
     .set_description("Row-wise product reduction (reduces along axis=1, maps to TROWPROD)")
     .add_argument("tile", "Input tile (TileType)")
-    .add_argument("tmp_tile", "Temporary tile (TileType)")
+    .add_argument("tmp_tile", "Same-dtype scratch tile at least as large as the input (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
@@ -264,7 +331,7 @@ REGISTER_OP("tile.row_argmax")
     .set_op_category("TileOp")
     .set_description("Row-wise argmax: column index of the per-row maximum (maps to TROWARGMAX)")
     .add_argument("tile", "Input tile (TileType)")
-    .add_argument("tmp_tile", "Temporary tile (TileType)")
+    .add_argument("tmp_tile", "Scratch tile with exactly the same shape and dtype as the input (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
@@ -273,21 +340,21 @@ REGISTER_OP("tile.row_argmax")
     .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileRowReductionType(args, kwargs, "tile.row_argmax", DataType(DataType::INT32));
+      return DeduceTileRowReductionType(args, kwargs, "tile.row_argmax", DataType(DataType::INT32), true);
     });
 
 REGISTER_OP("tile.row_argmin")
     .set_op_category("TileOp")
     .set_description("Row-wise argmin: column index of the per-row minimum (maps to TROWARGMIN)")
     .add_argument("tile", "Input tile (TileType)")
-    .add_argument("tmp_tile", "Temporary tile (TileType)")
+    .add_argument("tmp_tile", "Scratch tile with exactly the same shape and dtype as the input (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileRowReductionType(args, kwargs, "tile.row_argmin", DataType(DataType::INT32));
+      return DeduceTileRowReductionType(args, kwargs, "tile.row_argmin", DataType(DataType::INT32), true);
     });
 
 REGISTER_OP("tile.col_argmax")

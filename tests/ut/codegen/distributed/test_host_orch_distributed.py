@@ -26,9 +26,10 @@ Plus regressions:
 
 * ``pld.system.world_size()`` lowers to the ``world_size`` kwarg in any expr
   context (e.g. ``pl.range(...)``).
-* Comm-less L3 dispatch (no ``device=``) still emits ``submit_next_level(...,
-  config)`` without the ``worker=`` kwarg AND without an ``allocate_domain``
-  wrapper, preserving binary compatibility with existing L3 demos.
+* Comm-less L3 dispatch (no ``device=``) routes through
+  ``_submit_chip(orch, ..., config, None)`` — the ``None`` defers chip placement
+  to dispatch time — without a ``worker=`` kwarg AND without an
+  ``allocate_domain`` wrapper.
 """
 
 import re
@@ -241,11 +242,12 @@ def test_const_device_kwarg_renders_literal_worker():
     assert "__comm_d0[0].device_ctx" in code, code
 
 
-def test_comm_group_program_emits_allocate_domain_with_block():
+def test_comm_group_program_emits_domain_provider_with_block():
     """Programs with ``pld.alloc_window_buffer`` emit a
-    ``with orch.allocate_domain(...)`` wrapping the for-loop body, with the
-    same ``__comm_d0`` handle used for all ``buffer_ptrs`` / ``device_ctx``
-    accesses below."""
+    ``with (_domain_provider or orch.allocate_domain)(...)`` wrapping the
+    for-loop body. The optional provider lets persistent execution retain a
+    domain, while the fallback preserves one-shot behavior. Both paths bind
+    the same ``__comm_d0`` handle used below."""
 
     @pl.program
     class Prog:
@@ -263,7 +265,8 @@ def test_comm_group_program_emits_allocate_domain_with_block():
 
     code = _lower(Prog)
     # The with-block opens with the literal spec list and binds the handle.
-    assert re.search(r"with orch\.allocate_domain\(", code), code
+    assert "_domain_provider=None" in code, code
+    assert re.search(r"with \(_domain_provider or orch\.allocate_domain\)\(", code), code
     assert re.search(r'name="comm_d0",', code), code
     # Empty CommDomainScopeStmt.devices_ (this program declares no explicit subset on
     # the alloc) lowers to `workers=[*range(world_size)]` — resolved at
@@ -289,11 +292,12 @@ def test_comm_group_program_emits_allocate_domain_with_block():
 # ---------------------------------------------------------------------------
 
 
-def test_comm_less_dispatch_omits_worker_kwarg():
-    """Comm-less L3 dispatch (no ``device=`` attr) still emits ``submit_next_level(...,
-    config)`` without trailing ``worker=`` and without an ``allocate_domain``
-    wrapper — byte-compatible with existing L3 demos (test_l3_distributed.py /
-    test_l3_parallel_reduce.py)."""
+def test_comm_less_dispatch_routes_through_submit_chip_unplaced():
+    """Comm-less L3 dispatch (no ``device=`` attr) routes through
+    ``_submit_chip(orch, ..., config, None)``. The chip count is a run-time
+    property, so the ``None`` defers placement to ``_resolve_chip_worker``
+    rather than baking a chip id here. No trailing ``worker=`` kwarg and no
+    ``allocate_domain`` wrapper."""
 
     @pl.program
     class Prog:
@@ -313,9 +317,10 @@ def test_comm_less_dispatch_omits_worker_kwarg():
             return y
 
     code = _lower(Prog)
-    # The dispatch shape stays intact; the comm-less path emits no wrapper
-    # and no ctx-scalar / Tensor.make / handle subscript.
-    assert "submit_next_level(" in code, code
+    # The dispatch shape stays intact; the comm-less path routes through
+    # ``_submit_chip(..., None)`` and emits no wrapper, no ctx-scalar /
+    # Tensor.make / handle subscript, and no ``worker=`` kwarg.
+    assert re.search(r"_submit_chip\(orch, callables\[\"chip_orch\"\],.*config, None\)", code), code
     assert "worker=" not in code, code
     assert "Tensor.make" not in code, code
     assert "__comm_d0[" not in code, code
@@ -390,7 +395,9 @@ def test_hoisted_world_size_temp_in_alloc_size_lowers_to_kwarg():
     code = _lower(Prog)
     assert re.search(r"window_size=\(.*\bworld_size\b.*\),", code), code
     assert re.search(r"CommBufferSpec\(.*\bworld_size\b.*\),", code), code
-    alloc_block = code.split("with orch.allocate_domain(")[1].split(") as __comm_d0:")[0]
+    alloc_block = code.split("with (_domain_provider or orch.allocate_domain)(")[1].split(") as __comm_d0:")[
+        0
+    ]
     assert "n__ssa_v0" not in alloc_block and " n " not in alloc_block and " n*" not in alloc_block, code
 
 
@@ -437,11 +444,11 @@ def test_two_groups_emit_nested_allocate_domain():
 
     # Both groups emit their own allocate_domain block, in source order.
     d0_match = re.search(
-        r'with orch\.allocate_domain\(\s*name="comm_d0",\s*workers=\[0, 1\],',
+        r'with \(_domain_provider or orch\.allocate_domain\)\(\s*name="comm_d0",\s*workers=\[0, 1\],',
         code,
     )
     d1_match = re.search(
-        r'with orch\.allocate_domain\(\s*name="comm_d1",\s*workers=\[2, 3\],',
+        r'with \(_domain_provider or orch\.allocate_domain\)\(\s*name="comm_d1",\s*workers=\[2, 3\],',
         code,
     )
     assert d0_match is not None, code
@@ -549,7 +556,6 @@ def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
     assert 'callables["builtin.tensor.allreduce__sum__fp32"]' in generated, generated
     assert "orch.submit_next_level" in generated, generated
     assert "_ta_1_config = CallConfig()" in generated, generated
-    assert "_ta_1_config.block_dim = 1" in generated, generated
     assert "_ta_1_config.aicpu_thread_num = config.aicpu_thread_num" in generated, generated
     assert (
         'orch.submit_next_level(callables["builtin.tensor.allreduce__sum__fp32"], _ta_1, _ta_1_config'
@@ -665,7 +671,6 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     kernel_config = files[f"{base}/kernel_config.py"]
     assert '"function_name": "aicpu_orchestration_entry"' in kernel_config
     assert '"signature": [_D.INOUT, _D.INOUT]' in kernel_config
-    assert '"block_dim": 1' in kernel_config
 
     kernel_cpp = files[f"{base}/kernels/aiv/builtin_tensor_allreduce__sum__fp32_kernel.cpp"]
     assert "platform_comm/comm_context.h" in kernel_cpp
@@ -918,7 +923,6 @@ def _assert_host_collective_next_level_files(program_cls, tmp_path, variant, sig
 
     kernel_config = files[f"{base}/kernel_config.py"]
     assert signature in kernel_config
-    assert '"block_dim": 1' in kernel_config
 
     kernel_cpp = files[f"{base}/kernels/aiv/{entry}_kernel.cpp"]
     assert kernel_snippet in kernel_cpp

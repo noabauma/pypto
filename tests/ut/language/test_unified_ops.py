@@ -15,10 +15,11 @@ they produce structurally equal IR.
 """
 
 import pypto.language as pl
+import pypto.language.op as language_op
 import pytest
 from pypto import DataType, ir
 from pypto.language.op import unified_ops
-from pypto.language.typing import Tensor, Tile
+from pypto.language.typing import Scalar, Tensor, Tile
 
 
 class TestUnifiedTensorDispatch:
@@ -114,15 +115,29 @@ class TestUnifiedTensorDispatch:
 
         ir.assert_structural_equal(unified, explicit)
 
-    def test_div(self):
+    @pytest.mark.parametrize("high_precision", [False, True])
+    def test_div(self, high_precision):
         @pl.function
         def unified(a: pl.Tensor[[64], pl.FP32], b: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            c: pl.Tensor[[64], pl.FP32] = pl.div(a, b)
+            c: pl.Tensor[[64], pl.FP32] = pl.div(a, b, high_precision=high_precision)
             return c
 
         @pl.function
         def explicit(a: pl.Tensor[[64], pl.FP32], b: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
-            c: pl.Tensor[[64], pl.FP32] = pl.tensor.div(a, b)
+            c: pl.Tensor[[64], pl.FP32] = pl.tensor.div(a, b, high_precision=high_precision)
+            return c
+
+        ir.assert_structural_equal(unified, explicit)
+
+    def test_log_high_precision_uses_unified_export(self):
+        @pl.function
+        def unified(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            c: pl.Tensor[[64], pl.FP32] = pl.log(a, high_precision=True)
+            return c
+
+        @pl.function
+        def explicit(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+            c: pl.Tensor[[64], pl.FP32] = pl.tensor.log(a, high_precision=True)
             return c
 
         ir.assert_structural_equal(unified, explicit)
@@ -255,6 +270,17 @@ class TestUnifiedTensorDispatch:
             return c
 
         ir.assert_structural_equal(unified, explicit)
+
+    def test_reinterpret_view(self):
+        """Tensor dispatch preserves the input kind and optional shape."""
+        span = ir.Span.unknown()
+        data = Tensor(expr=ir.Var("data", ir.TensorType([8, 16], DataType.FP32), span))
+
+        unified = pl.reinterpret_view(data, pl.INT16, shape=[4, 64])
+        explicit = pl.tensor.reinterpret_view(data, pl.INT16, shape=[4, 64])
+
+        assert isinstance(unified, Tensor)
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
 
     def test_row_min(self):
         @pl.function
@@ -431,6 +457,17 @@ class TestUnifiedTensorDispatch:
 class TestUnifiedBlockDispatch:
     """pl.X with Tile args produces the same IR as pl.tile.X."""
 
+    def test_reinterpret_view(self):
+        """Tile dispatch preserves the input kind and auto-detected shape."""
+        span = ir.Span.unknown()
+        data = Tile(expr=ir.Var("data", ir.TileType([8, 16], DataType.FP32), span))
+
+        unified = pl.reinterpret_view(data, pl.INT16)
+        explicit = pl.tile.reinterpret_view(data, pl.INT16)
+
+        assert isinstance(unified, Tile)
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
+
     def test_add(self):
         @pl.function
         def unified(
@@ -600,8 +637,8 @@ class TestUnifiedBlockDispatch:
             t: pl.Tensor[[64, 64], pl.FP32], out: pl.Tensor[[64, 64], pl.FP32]
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
-            tmp: pl.Tile[[64, 16], pl.FP32] = pl.tile.create(
-                [64, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            tmp: pl.Tile[[64, 64], pl.FP32] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
             )
             b: pl.Tile[[64, 1], pl.FP32] = pl.row_sum(a, tmp)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
@@ -612,8 +649,8 @@ class TestUnifiedBlockDispatch:
             t: pl.Tensor[[64, 64], pl.FP32], out: pl.Tensor[[64, 64], pl.FP32]
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
-            tmp: pl.Tile[[64, 16], pl.FP32] = pl.tile.create(
-                [64, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            tmp: pl.Tile[[64, 64], pl.FP32] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
             )
             b: pl.Tile[[64, 1], pl.FP32] = pl.tile.row_sum(a, tmp)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
@@ -627,8 +664,8 @@ class TestUnifiedBlockDispatch:
             t: pl.Tensor[[64, 64], pl.FP32], out: pl.Tensor[[64, 64], pl.FP32]
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
-            tmp: pl.Tile[[64, 16], pl.FP32] = pl.tile.create(
-                [64, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            tmp: pl.Tile[[64, 64], pl.FP32] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
             )
             b: pl.Tile[[64, 1], pl.FP32] = pl.row_min(a, tmp)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
@@ -639,8 +676,8 @@ class TestUnifiedBlockDispatch:
             t: pl.Tensor[[64, 64], pl.FP32], out: pl.Tensor[[64, 64], pl.FP32]
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
-            tmp: pl.Tile[[64, 16], pl.FP32] = pl.tile.create(
-                [64, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            tmp: pl.Tile[[64, 64], pl.FP32] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
             )
             b: pl.Tile[[64, 1], pl.FP32] = pl.tile.row_min(a, tmp)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
@@ -675,14 +712,17 @@ class TestUnifiedBlockDispatch:
 
         ir.assert_structural_equal(unified, explicit)
 
-    def test_row_expand_add(self):
+    def test_row_expand_add_with_tmp(self):
         @pl.function
         def unified(
             t: pl.Tensor[[64, 64], pl.FP32], out: pl.Tensor[[64, 64], pl.FP32]
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
             rv: pl.Tile[[64, 1], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 1])
-            b: pl.Tile[[64, 64], pl.FP32] = pl.row_expand_add(a, rv)
+            tmp: pl.Tile[[64, 64], pl.FP32] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            )
+            b: pl.Tile[[64, 64], pl.FP32] = pl.row_expand_add(a, rv, tmp)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
             return result
 
@@ -692,11 +732,25 @@ class TestUnifiedBlockDispatch:
         ) -> pl.Tensor[[64, 64], pl.FP32]:
             a: pl.Tile[[64, 64], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 64])
             rv: pl.Tile[[64, 1], pl.FP32] = pl.tile.load(t, offsets=[0, 0], shapes=[64, 1])
-            b: pl.Tile[[64, 64], pl.FP32] = pl.tile.row_expand_add(a, rv)
+            tmp: pl.Tile[[64, 64], pl.FP32] = pl.tile.create(
+                [64, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+            )
+            b: pl.Tile[[64, 64], pl.FP32] = pl.tile.row_expand_add(a, rv, tmp)
             result: pl.Tensor[[64, 64], pl.FP32] = pl.tile.store(b, offsets=[0, 0], output_tensor=out)
             return result
 
         ir.assert_structural_equal(unified, explicit)
+
+    def test_row_expand_add_without_tmp(self):
+        """The Tile overload keeps the original two-operand dispatch."""
+        span = ir.Span.unknown()
+        lhs = Tile(expr=ir.Var("lhs", ir.TileType([8, 8], DataType.FP32), span))
+        rhs = Tile(expr=ir.Var("rhs", ir.TileType([8, 1], DataType.FP32), span))
+
+        unified = pl.row_expand_add(lhs, rhs)
+        explicit = pl.tile.row_expand_add(lhs, rhs)
+
+        ir.assert_structural_equal(unified.unwrap(), explicit.unwrap())
 
     def test_row_expand_sub(self):
         @pl.function
@@ -1017,6 +1071,12 @@ class TestScalarAutoDispatch:
 class TestPromotedOps:
     """Promoted single-module ops produce the same IR as their explicit form."""
 
+    def test_reinterpret_view_exports(self):
+        assert pl.reinterpret_view is unified_ops.reinterpret_view
+        assert language_op.reinterpret_view is unified_ops.reinterpret_view
+        assert "reinterpret_view" in pl.__all__
+        assert "reinterpret_view" in language_op.__all__
+
     def test_promoted_create(self):
         @pl.function
         def unified(a: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
@@ -1211,6 +1271,40 @@ class TestUnifiedOpsTypeErrors:
     def test_reshape_invalid_input(self):
         with pytest.raises(TypeError, match="expected Tensor or Tile"):
             unified_ops.reshape(123, [4, 4])  # type: ignore
+
+    def test_reinterpret_view_invalid_input(self):
+        with pytest.raises(TypeError, match="expected Tensor or Tile"):
+            unified_ops.reinterpret_view(123, DataType.INT16)  # type: ignore
+
+    def test_row_expand_add_rejects_tmp_for_tensor_inputs(self):
+        span = ir.Span.unknown()
+        lhs = Tensor(expr=ir.Var("lhs", ir.TensorType([8, 8], DataType.FP32), span))
+        rhs = Tensor(expr=ir.Var("rhs", ir.TensorType([8, 1], DataType.FP32), span))
+        tmp = Tile(expr=ir.Var("tmp", ir.TileType([8, 8], DataType.FP32), span))
+
+        with pytest.raises(ValueError, match="tmp is only supported for Tile"):
+            unified_ops.row_expand_add(lhs, rhs, tmp)  # type: ignore[call-overload]
+
+    def test_div_rejects_high_precision_for_scalar_paths(self):
+        span = ir.Span.unknown()
+        cases = [
+            (
+                Tensor(expr=ir.Var("tensor", ir.TensorType([8], DataType.FP32), span)),
+                2.0,
+            ),
+            (
+                Tile(expr=ir.Var("tile", ir.TileType([8], DataType.FP32), span)),
+                2.0,
+            ),
+            (
+                Scalar(expr=ir.Var("lhs", ir.ScalarType(DataType.FP32), span)),
+                Scalar(expr=ir.Var("rhs", ir.ScalarType(DataType.FP32), span)),
+            ),
+        ]
+
+        for lhs, rhs in cases:
+            with pytest.raises(ValueError, match="high_precision"):
+                unified_ops.div(lhs, rhs, high_precision=True)  # type: ignore[call-overload]
 
     def test_matmul_invalid_lhs(self):
         with pytest.raises(TypeError, match="expected Tensor or Tile operands"):

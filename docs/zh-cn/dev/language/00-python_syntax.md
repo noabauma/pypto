@@ -311,29 +311,38 @@ for (x,) in pl.while_(init_values=(x_init,)):
 | ---- | ---------- | ---- |
 | `pl.at(level=pl.Level.CORE_GROUP)` | `InCore` | CORE_GROUP 级固定边界 outline |
 | `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(MODE)])` | `InCore` | InCore + 跨核 split 提示 |
+| `pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.cross_core_slot(slot_num=N)])` | `InCore` | InCore + 跨核 pipe 槽位数 |
 | `pl.at(level=pl.Level.HOST)`（或任意非 `CORE_GROUP` 级别） | `Hierarchy` | 分布式层级作用域 |
 | `pl.cluster()` | `Cluster` | AIC+AIV 协同调度组 |
 | `with pl.spmd(N)` / `for i in pl.spmd(N)` | `Spmd`（for-form 内嵌 `InCore`） | SPMD 多 block 派发——见 [pl.spmd](#plspmd-多-block-派发) |
 | `pl.spmd(N, optimizations=[pl.split(MODE)])` | `Spmd(InCore(split=MODE))` | split 提示作用于内层 InCore（两种形式均适用） |
+| `pl.spmd(N, optimizations=[pl.cross_core_slot(slot_num=N)])` | `Spmd(InCore(slot_num=N))` | 槽位数作用于内层 InCore（两种形式均适用），可与 `pl.split(MODE)` 组合 |
 | `pl.scope(mode=pl.ScopeMode.MANUAL)` / `pl.manual_scope()` | `Runtime(manual=true)` | orchestrator 的 MANUAL scope——由用户管理任务排序。两种 `auto_scope` 模式下都可用（它是依赖语义选择）。见[手工依赖原语](#手工依赖原语) |
-| `pl.scope()` | `Runtime(manual=false)` | orchestrator 的 AUTO scope（`PTO2_SCOPE()`）。手写它需要 `@pl.function(auto_scope=False)`（默认 `auto_scope=True` 下由编译器决定 AUTO 放置）。见 [MaterializeRuntimeScopes](../passes/41-materialize_runtime_scopes.md) |
+| `pl.scope()` | `Runtime(manual=false)` | orchestrator 的 AUTO scope（`PTO2_SCOPE()`）。手写它需要 `@pl.function(auto_scope=False)`（默认 `auto_scope=True` 下由编译器决定 AUTO 放置）。见 [MaterializeRuntimeScopes](../passes/42-materialize_runtime_scopes.md) |
 
 #### `pl.spmd` 多 block 派发
 
 `pl.spmd(N)` 把一个 kernel 派发到 `N` 个 block。形式：
 
-- `with pl.spmd(N): ...` —— body **既可以**是对一个已声明 InCore kernel 的单次调用（直接派发，`SpmdScopeStmt(body=Call)`，无内层 InCore 包裹），**也可以**是一段内联多语句块，自动外包成一段隐式 InCore 区域（与 for-form 相同，只是不自动绑定索引）。内联 body 必须通过 `pl.tile.get_block_idx()` 读取每个 block 的索引——否则所有 block 执行完全相同的工作，parser 会拒绝。不捕获 producer TaskId。
+- `with pl.spmd(N): ...` —— body **既可以**是调用已声明 InCore kernel 的*派发型* body（`SpmdScopeStmt(body=<stmts>)`，无内层 InCore 包裹），**也可以**是一段*内联*块，自动外包成一段隐式 InCore 区域（与 for-form 相同，只是不自动绑定索引）。区分依据是语义而非语句数量：body 若读取 `pl.tile.get_block_idx()`，即为内联 body 并被包裹；否则即为派发型 body，无论包含多少条语句都不加包裹。若 body 既不读取索引、也不派发 `self.<kernel>(...)` 调用，则会被拒绝。不捕获 producer TaskId。
+  - 当 body 唯一的语句是显式的 `with pl.at(<CORE_GROUP level>, ...):` 时，该嵌套 scope 本身*就是* InCore 载体：它会被当作普通嵌套 scope 解析，而不会被二次包裹（`level` 可用位置或关键字形式，也可带 `as tid` / `name_hint=`）。printer 正是以这种形式输出 `Spmd(InCore(...))`，因此这也是该 IR 能够 round-trip 的原因。当 body 已提供载体时，`optimizations=` 必须写在该 `pl.at(...)` 上；写在 `pl.spmd(...)` 行会被拒绝，无论载体自身是否也带有该项。
+  - 派发型 body 只能启动**一个** kernel。它经由 `FindFirstInnerCall` 下降，而后者在第一个调用处即停止，因此第二个派发不会被启动而是被静默丢弃；parser 会直接拒绝这种写法。提升出的临时变量与 tuple 投影不算派发，不计入数量。
 - `for i in pl.spmd(N): ...` —— 循环变量绑定到每个 block 的索引（`pl.tile.get_block_idx()`）；body 自动外包成一段隐式 InCore 区域。
 - `with pl.spmd(N, deps=[...]) as tid: ...` —— **捕获形式**：与 `with pl.at(...) as tid:` 对称。body 形态与上面的普通形式相同，并额外在 `tid` 中捕获该分发的 grid 级 producer `pl.Scalar[pl.TASK_ID]`（可用作 `deps=` 边、存入 `pl.array.create(N, pl.TASK_ID)`、或跨入 `pl.manual_scope`）。TaskId 捕获与内联 body 正交——这是该形式相比普通形式唯一多出来的能力。lower 成一个 `ir.Submit`，其尾部 tuple 元素即 grid TaskId；`core_num` / `sync_start` 记录在外包出的 `Spmd` Function attrs 上。参见下文“手动依赖原语”小节。
 - `out, tid = pl.spmd_submit(kernel, *args, core_num=N)` —— **submit 形式**：将 kernel 在 `N` 个 block 上分发，同时捕获该分发的 producer `pl.Scalar[pl.TASK_ID]`（针对已声明 kernel 的 `pl.submit` 版本）。参见下文“手动依赖原语”小节。
 
 以上三种形式也都接受 `allow_early_resolve=True`（布尔字面量；与 `pl.submit` / `pl.at` 相同的 early-dispatch 选项）。即使不写 `as tid` 也会强制走 `ir.Submit` 形态，并 lower 为 `Arg::set_allow_early_resolve(true)`。在嵌套于 `pl.cluster()` 内的 `pl.spmd` 上会被拒绝（此类 scope 会被 unwrap 进 Group 函数、永远不会产生 Submit，提示会丢失）。
 
-可选 `optimizations=[pl.split(MODE)]`：
+可选 `optimizations=[...]`。各条目彼此正交，可在同一列表中组合
+（例如 `[pl.split(MODE), pl.cross_core_slot(slot_num=4)]`）：
 
 | 条目 | 适用形式 | 作用 |
 | ---- | -------- | ---- |
 | `pl.split(MODE)` | 两种均适用 | 给内层 InCore 设置 `split_` 字段（跨核数据搬运提示，由 `ExpandMixedKernel` / `MemoryReuse` 消费）。with-form 会在原 call 外多包一层 `InCoreScopeStmt` 来承载该字段。 |
+| `pl.cross_core_slot(slot_num=N)` | 两种均适用 | 给内层 InCore 设置 `slot_num` 属性——自动跨核 pipe 的槽位数（环深），由 `ExpandMixedKernel` 消费。它只决定数据通道大小，**不**划分计算，因此可与 `pl.split_aiv` 区域共存（而 `pl.split(...)` 不能）。省略时沿用 PTOAS 默认值（单向 8，双向每方向 4）。 |
+
+> `pl.split(MODE, slot_num=N)` 是该槽位数的已废弃别名，会发出警告——参见
+> [ExpandMixedKernel](../passes/20-expand_mixed_kernel.md#覆盖槽位数slot_num)。
 
 示例参见 [语言指南](../../user/01-language_guide.md#incore-作用域)。
 

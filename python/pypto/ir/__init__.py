@@ -54,7 +54,7 @@ from .instruments import make_roundtrip_instrument
 from .op_conversion import ConversionContext, op_conversion, register_op_conversion
 
 # Import PassManager and OptimizationStrategy
-from .pass_manager import OptimizationStrategy, PassManager
+from .pass_manager import OptimizationStrategy, PassDumpLevel, PassManager
 
 # Import python_print utility
 from .printer import python_print
@@ -72,6 +72,7 @@ from .type import (  # also shadows C++ TensorView/TileView with Python subclass
 FP4 = DataType.FP4
 FP8E4M3FN = DataType.FP8E4M3FN
 FP8E5M2 = DataType.FP8E5M2
+FP8E8M0 = DataType.FP8E8M0  # MX block-scale exponent
 FP16 = DataType.FP16
 FP32 = DataType.FP32
 BF16 = DataType.BF16
@@ -105,6 +106,7 @@ __all__ = [
     "CompiledProgram",
     "PassManager",
     "OptimizationStrategy",
+    "PassDumpLevel",
     "VerificationMode",
     "VerificationLevel",
     "PassContext",

@@ -39,6 +39,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_context.h"
@@ -1390,15 +1391,34 @@ LifetimeAnalysisResult ComputeLifetimes(const StmtPtr& func_body) {
           std::move(pipeline_load_tiles)};
 }
 
-// NOTE: The former tile-type reuse-compatibility gate (AreTileTypesCompatible)
-// has been removed.  PTO codegen binds a per-var alloc_tile to each tile, so two
-// tiles that share a physical MemRef can legally carry different shapes, dtypes,
-// or TileView attributes (each alloc_tile aliases the same base with its own
-// static signature).  The only genuine hazard was an op that reads an operand
-// while writing its output in place onto that operand's buffer; that is now
-// handled precisely by not_inplace_safe() and the per-operand
-// forbid_output_alias() markers (see ForbidAliasCollector below), rather than by
-// a coarse whole-tile shape/dtype match.
+// NOTE: The former whole-tile reuse-compatibility gate (AreTileTypesCompatible:
+// shape + dtype + full TileView) was removed in #1788.  PTO codegen binds a
+// per-var alloc_tile, so tiles that share a MemRef may legally carry different
+// shapes/dtypes (each alloc_tile aliases the same base with its own static
+// signature).  In-place read/write hazards are handled by not_inplace_safe() and
+// forbid_output_alias() (see ForbidAliasCollector below).
+//
+// Vec ND↔NZ is still a hazard: A5 V→C inserts an ND→NZ ``tile.move`` (*_nz)
+// before tpush (NZ signal: effective blayout == col_major, matching
+// expand_mixed_kernel CreateMove).  If MemoryReuse colocates that NZ tile with
+// the ND cast result at one Vec address, even a kept ``pto.tmov`` is an
+// in-place layout adapt that silently mis-transfers (prefill_indexer Hadamard /
+// §3.0 family).  Gate *only* Vec ND↔NZ — allow Left/Right/Mat freely, and allow
+// same-family Vec layout quirks (e.g. fractal-only differences).  Keep
+// cross-shape / cross-dtype L0 reuse (#1595 / #1788).
+static bool IsNzLikeBlayout(TileLayout blayout) { return blayout == TileLayout::col_major; }
+
+static bool AreVecNdNzCompatible(const VarPtr& var1, const VarPtr& var2) {
+  auto t1 = As<TileType>(var1->GetType());
+  auto t2 = As<TileType>(var2->GetType());
+  if (!t1 || !t2) return true;
+  const auto s1 = t1->GetMemorySpace();
+  const auto s2 = t2->GetMemorySpace();
+  if (!s1 || !s2 || *s1 != MemorySpace::Vec || *s2 != MemorySpace::Vec) return true;
+  const TileView v1 = tile_view_semantics::GetEffectiveTileView(*t1);
+  const TileView v2 = tile_view_semantics::GetEffectiveTileView(*t2);
+  return IsNzLikeBlayout(v1.blayout) == IsNzLikeBlayout(v2.blayout);
+}
 
 /**
  * @brief Check if two lifetimes overlap.
@@ -1439,7 +1459,7 @@ static bool LifetimesOverlap(const LifetimeInterval& a, const LifetimeInterval& 
 static bool IsLegalTileViewOp(const OpPtr& op) {
   return IsOp(op, "tile.reshape") || IsOp(op, "tile.extract") || IsOp(op, "tile.slice") ||
          IsOp(op, "tile.fillpad") || IsOp(op, "tile.fillpad_inplace") || IsOp(op, "tile.transpose_view") ||
-         IsOp(op, "tensor.slice");
+         IsOp(op, "tile.reinterpret_view") || IsOp(op, "tensor.slice");
 }
 
 struct HazardInputs {
@@ -1918,10 +1938,10 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   // Can `cand` join a single physical buffer that already holds `member`?
   // Lifetimes must not overlap (touching is allowed: a buffer's reader is
   // consumed before the writer at the same statement produces its output), and
-  // neither directional gate may block.  No tile-type / size check is needed:
-  // PTO binds a per-var alloc_tile so differing shapes/dtypes legally alias one
-  // base, and largest-first ordering guarantees the buffer is sized to its
-  // representative (no member is ever larger than the buffer it joins).
+  // neither directional gate may block.  Shape/dtype need not match: PTO binds a
+  // per-var alloc_tile so differing shapes/dtypes legally alias one base, and
+  // largest-first ordering guarantees the buffer is sized to its representative.
+  // On Vec only, ND and NZ must not share — see AreVecNdNzCompatible.
   auto can_share = [&](const LifetimeInterval& cand, const LifetimeInterval& member) {
     // Group-interval overlap is a fast reject; when it fires, fall back to the
     // precise per-var check so mutually-exclusive / same-value phi-family tiles
@@ -1931,6 +1951,7 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     if (hazard_blocks(cand, member) || hazard_blocks(member, cand)) return false;
     if (forbid_blocks(cand, member) || forbid_blocks(member, cand)) return false;
     if (pipeline_blocks(cand, member)) return false;  // symmetric — one call suffices
+    if (!AreVecNdNzCompatible(cand.variable, member.variable)) return false;
     return true;
   };
 
@@ -1951,9 +1972,12 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     auto& indices = indices_binding;
     // Largest-first; ties broken by definition order for determinism and so that
     // equal-size workloads reproduce the prior definition-order grouping.
-    std::stable_sort(indices.begin(), indices.end(), [&lifetimes](size_t a, size_t b) {
+    std::sort(indices.begin(), indices.end(), [&lifetimes](size_t a, size_t b) {
       if (lifetimes[a].size != lifetimes[b].size) return lifetimes[a].size > lifetimes[b].size;
-      return lifetimes[a].def_point < lifetimes[b].def_point;
+      if (lifetimes[a].def_point != lifetimes[b].def_point) {
+        return lifetimes[a].def_point < lifetimes[b].def_point;
+      }
+      return a < b;
     });
 
     // First-fit-decreasing pack with the current per-group residue counts (pipeline_blocks reads the

@@ -14,7 +14,8 @@ from collections.abc import Callable
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
-from pypto import DataType, ir, passes
+from pypto import DataType, InternalError, backend, ir, passes
+from pypto.backend import BackendType
 from pypto.ir import IRBuilder
 from pypto.ir.op import tensor as tensor_ops
 from pypto.ir.op import tile as tile_ops
@@ -195,10 +196,39 @@ def _make_pair(
     return before, expected
 
 
+_MAT_BRIDGE_ATTR = "__compiler_tensor_to_tile_mat_bridge"
+
+
+class _StampExpectedMatBridgeLoads(ir.IRMutator):
+    """Mirror ConvertTensorToTileOps' private provenance in expected IR.
+
+    The marker is intentionally absent from the public tile-load builder.  It
+    is compiler evidence consumed by InferTileMemorySpace, so expected programs
+    in this conversion-specific suite attach it only to Mat bridge loads.
+    """
+
+    def visit_call(self, op: ir.Call) -> ir.Expr:
+        expr = super().visit_call(op)
+        call = expr if isinstance(expr, ir.Call) else op
+        if (
+            call.op.name == "tile.load"
+            and isinstance(call.type, ir.TileType)
+            and call.type.memory_space == MemorySpace.Mat
+        ):
+            attrs = dict(call.attrs)
+            attrs[_MAT_BRIDGE_ATTR] = True
+            return ir.Call(call.op, list(call.args), dict(call.kwargs), attrs, call.type, call.span)
+        return expr
+
+
+def _assert_convert_output_equal(after: ir.Program, expected: ir.Program) -> None:
+    """Compare converted IR after stamping expected compiler Mat bridges."""
+    ir.assert_structural_equal(after, _StampExpectedMatBridgeLoads().visit_program(expected))
+
+
 def _assert_convert_equal(before: ir.Program, expected: ir.Program) -> None:
     """Run ConvertTensorToTileOps on ``before`` and assert the result matches ``expected``."""
-    after = passes.convert_tensor_to_tile_ops()(before)
-    ir.assert_structural_equal(after, expected)
+    _assert_convert_output_equal(passes.convert_tensor_to_tile_ops()(before), expected)
 
 
 class _FirstCallFinder(ir.IRVisitor):
@@ -225,6 +255,26 @@ def _find_first_call_to(func: ir.Function, op_name: str) -> ir.Call | None:
     ``op_name``. Used by wrapper-propagation tests to inspect per-call arg
     counts after the pass rewrites them."""
     finder = _FirstCallFinder(op_name)
+    finder.visit_stmt(func.body)
+    return finder.found
+
+
+class _AllCallsFinder(ir.IRVisitor):
+    """Collect all ``Call`` nodes whose callee has the requested name."""
+
+    def __init__(self, op_name: str) -> None:
+        super().__init__()
+        self.op_name = ir.get_op(op_name).name
+        self.found: list[ir.Call] = []
+
+    def visit_call(self, op: ir.Call) -> None:
+        if op.op.name == self.op_name:
+            self.found.append(op)
+        super().visit_call(op)
+
+
+def _find_calls_to(func: ir.Function, op_name: str) -> list[ir.Call]:
+    finder = _AllCallsFinder(op_name)
     finder.visit_stmt(func.body)
     return finder.found
 
@@ -481,6 +531,59 @@ class TestConvertTensorToTileOps:
         with pytest.raises(ValueError, match="result of an op lowered to Tile"):
             passes.convert_tensor_to_tile_ops()(program)
 
+    def test_reinterpret_view_auto_shape_lowers_to_tile(self):
+        """Packed ND tensor reinterpret lowers 1:1 and keeps auto-shape semantics."""
+        before, expected = _make_pair(
+            in_specs=[("x", [8, 16], DataType.FP32)],
+            out_shape=[8, 32],
+            out_dtype=DataType.INT16,
+            tensor_op=lambda ins: tensor_ops.reinterpret_view(ins[0], DataType.INT16),
+            tile_op=lambda tiles: tile_ops.reinterpret_view(tiles[0], DataType.INT16),
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_rank_one_reinterpret_view_lowers_to_tile(self):
+        """Rank-one ND tensors remain valid when lowered to physical 1xN tiles."""
+        before, expected = _make_pair(
+            in_specs=[("x", [16], DataType.FP32)],
+            out_shape=[32],
+            out_dtype=DataType.INT16,
+            tensor_op=lambda ins: tensor_ops.reinterpret_view(ins[0], DataType.INT16),
+            tile_op=lambda tiles: tile_ops.reinterpret_view(tiles[0], DataType.INT16),
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_reinterpret_view_explicit_shape_lowers_to_tile(self):
+        """An explicit byte-equivalent shape is preserved by tensor-to-tile lowering."""
+        before, expected = _make_pair(
+            in_specs=[("x", [2, 3], DataType.FP32)],
+            out_shape=[3, 4],
+            out_dtype=DataType.INT16,
+            tensor_op=lambda ins: tensor_ops.reinterpret_view(ins[0], DataType.INT16, shape=[3, 4]),
+            tile_op=lambda tiles: tile_ops.reinterpret_view(tiles[0], DataType.INT16, shape=[3, 4]),
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_reinterpret_view_rejects_dn_incore_lowering(self):
+        """DN tensor reinterpret is rejected before conversion loses its contiguous axis."""
+        span = ir.Span.unknown()
+        source_type = ir.TensorType(
+            [8, 16],
+            DataType.FP32,
+            None,
+            ir.TensorView([], ir.TensorLayout.DN),
+        )
+        ib = IRBuilder()
+        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+            x = f.param("x", source_type)
+            viewed = ib.let("viewed", tensor_ops.reinterpret_view(x, DataType.INT16))
+            f.return_type(viewed.type)
+            ib.return_stmt(viewed)
+        program = ir.Program([f.get_result()], "DnReinterpretView", span)
+
+        with pytest.raises(ValueError, match="only packed ND tensors"):
+            passes.convert_tensor_to_tile_ops()(program)
+
     def test_2d_tensor(self):
         """2D tensor -> correct offsets and shapes for load/store."""
         before, expected = _make_pair(
@@ -691,7 +794,7 @@ class TestConvertTensorToTileOps:
 
         ConvertTensorToTileOps runs upstream of LowerCompositeOps (pass 14),
         so it sees ``pld.tensor.allreduce`` as a single composite Call before
-        the 4-phase decomposition exists. Without the explicit
+        the ready-plus-per-chunk decomposition exists. Without the explicit
         ``has_read | has_write`` marking, the param-direction analysis
         would leave the window params as In and a downstream reader of
         the same window slot would miss the RAW edge (issue #1732), same
@@ -801,6 +904,288 @@ class TestConvertTensorToTileOps:
         )
         expected = _make_expected(
             in_specs=in_specs, out_shape=[64], out_dtype=DataType.FP32, body=expected_body
+        )
+        _assert_convert_equal(before, expected)
+
+    @pytest.mark.parametrize(
+        ("op_name", "in_specs", "body", "tile_op_name"),
+        [
+            (
+                "div",
+                [("x", [64], DataType.FP32), ("y", [64], DataType.FP32)],
+                lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1], high_precision=True)),
+                "tile.div",
+            ),
+            (
+                "log",
+                [("x", [64], DataType.FP32)],
+                lambda ib, ins: ib.let("z", tensor_ops.log(ins[0], high_precision=True)),
+                "tile.log",
+            ),
+        ],
+    )
+    def test_precision_kwargs_survive_tensor_to_tile_conversion(self, op_name, in_specs, body, tile_op_name):
+        """Non-broadcast tdiv and tlog conversions preserve high_precision."""
+        before = _make_before(
+            in_specs=in_specs,
+            out_shape=[64],
+            out_dtype=DataType.FP32,
+            body=body,
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        converted = _find_first_call_to(kernel, tile_op_name)
+        assert converted is not None, f"{op_name} did not lower to {tile_op_name}"
+        assert dict(converted.kwargs) == {"high_precision": True}
+
+    def test_high_precision_div_rejects_row_broadcast_conversion(self):
+        """Do not silently drop precision when tensor.div selects row-expand lowering."""
+        before = _make_before(
+            in_specs=[
+                ("x", [32, 64], DataType.FP32),
+                ("row", [32, 1], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1], high_precision=True)),
+        )
+
+        with pytest.raises(InternalError, match=r"does not support row broadcasting"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_equal_shape_mixed_dtype_inserts_explicit_cast(self):
+        """Exact-shape tensor.div casts operands to one PTOAS tdiv dtype before lowering."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [8, 16], DataType.INT16),
+                ("rhs", [8, 16], DataType.FP32),
+            ],
+            out_shape=[8, 16],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        div = _find_first_call_to(kernel, "tile.div")
+        assert div is not None
+        assert isinstance(div.type, ir.TileType)
+        assert div.type.dtype == DataType.FP32
+        for arg in div.args:
+            assert isinstance(arg.type, ir.TileType)
+            assert arg.type.dtype == DataType.FP32
+
+    def test_div_default_row_broadcast_routes_to_row_expand_div(self):
+        """The supported [M, N] / [M, 1] tensor broadcast never reaches exact tile.div."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [32, 64], DataType.FP32),
+                ("row", [32, 1], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        assert _find_first_call_to(kernel, "tile.div") is None
+        assert _find_first_call_to(kernel, "tile.row_expand_div") is not None
+
+    def test_div_row_broadcast_requires_divisor_valid_rows_to_cover_dividend(self):
+        """The row-expand template reads one divisor scalar for every valid output row."""
+        span = ir.Span.unknown()
+        lhs_type = ir.TensorType(
+            [8, 16],
+            DataType.FP32,
+            None,
+            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[7, 16]),
+        )
+        rhs_type = ir.TensorType(
+            [8, 1],
+            DataType.FP32,
+            None,
+            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[6, 1]),
+        )
+        ib = IRBuilder()
+        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+            lhs = f.param("lhs", lhs_type)
+            rhs = f.param("rhs", rhs_type)
+            result = ib.let("result", tensor_ops.div(lhs, rhs))
+            f.return_type(result.type)
+            ib.return_stmt(result)
+        before = ir.Program([f.get_result()], "ShortDivisorValidRows", span)
+
+        with pytest.raises(ValueError, match=r"divisor valid rows to cover the dividend"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_row_broadcast_dynamic_valid_rows_must_be_provably_covered(self):
+        """A shared runtime extent is safe, while unrelated extents need a runtime guard."""
+        span = ir.Span.unknown()
+        shared_rows = ir.Var("shared_rows", ir.ScalarType(DataType.INDEX), span)
+        unrelated_rows = ir.Var("unrelated_rows", ir.ScalarType(DataType.INDEX), span)
+
+        def make_program(rhs_rows: ir.Expr, name: str) -> ir.Program:
+            lhs_type = ir.TensorType(
+                [8, 16],
+                DataType.FP32,
+                None,
+                ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[shared_rows, 16]),
+            )
+            rhs_type = ir.TensorType(
+                [8, 1],
+                DataType.FP32,
+                None,
+                ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[rhs_rows, 1]),
+            )
+            ib = IRBuilder()
+            with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+                lhs = f.param("lhs", lhs_type)
+                rhs = f.param("rhs", rhs_type)
+                result = ib.let("result", tensor_ops.div(lhs, rhs))
+                f.return_type(result.type)
+                ib.return_stmt(result)
+            return ir.Program([f.get_result()], name, span)
+
+        converted = passes.convert_tensor_to_tile_ops()(make_program(shared_rows, "SharedDivValidRows"))
+        kernel = _require_function(converted, "kernel")
+        assert _find_first_call_to(kernel, "tile.row_expand_div") is not None
+
+        with pytest.raises(ValueError, match=r"divisor valid rows to cover the dividend"):
+            passes.convert_tensor_to_tile_ops()(make_program(unrelated_rows, "UnknownDivValidRows"))
+
+    def test_div_mixed_float_row_broadcast_inserts_explicit_cast(self):
+        """Row-expand division receives one exact floating dtype after tensor promotion."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [32, 64], DataType.FP16),
+                ("row", [32, 1], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        div = _find_first_call_to(kernel, "tile.row_expand_div")
+        assert div is not None
+        for arg in div.args:
+            assert isinstance(arg.type, ir.TileType)
+            assert arg.type.dtype == DataType.FP32
+
+    def test_div_rejects_integer_row_broadcast_conversion(self):
+        """Verifier-only integer trowexpanddiv has no executable PTOAS template."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [32, 64], DataType.INT16),
+                ("row", [32, 1], DataType.INT16),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.INT16,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        with pytest.raises(InternalError, match=r"row broadcasting supports only FP16 or FP32"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_rejects_row_vector_lhs_broadcast_conversion(self):
+        """pto.trowexpanddiv cannot represent row-vector / matrix operand order."""
+        before = _make_before(
+            in_specs=[
+                ("row", [32, 1], DataType.FP32),
+                ("rhs", [32, 64], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        with pytest.raises(InternalError, match=r"row-vector lhs broadcast"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_rejects_non_row_broadcast_conversion(self):
+        """PTOAS tdiv cannot implement a general broadcast such as [1, N] / [M, N]."""
+        before = _make_before(
+            in_specs=[
+                ("lhs", [1, 64], DataType.FP32),
+                ("rhs", [32, 64], DataType.FP32),
+            ],
+            out_shape=[32, 64],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("z", tensor_ops.div(ins[0], ins[1])),
+        )
+
+        with pytest.raises(ValueError, match=r"requires src0, src1, and dst to have the same physical shape"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_div_rejects_mismatched_valid_shapes_conversion(self):
+        """Equal physical shapes with different source valid regions cannot lower to tdiv."""
+        span = ir.Span.unknown()
+        lhs_type = ir.TensorType(
+            [8, 16],
+            DataType.FP32,
+            None,
+            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[7, 16]),
+        )
+        rhs_type = ir.TensorType(
+            [8, 16],
+            DataType.FP32,
+            None,
+            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[8, 16]),
+        )
+        ib = IRBuilder()
+        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
+            lhs = f.param("lhs", lhs_type)
+            rhs = f.param("rhs", rhs_type)
+            result = ib.let("result", tensor_ops.div(lhs, rhs))
+            f.return_type(result.type)
+            ib.return_stmt(result)
+        before = ir.Program([f.get_result()], "MismatchedDivValidShapes", span)
+
+        with pytest.raises(ValueError, match=r"requires src0, src1, and dst to have the same valid_shape"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_subs_mixed_dtype_conversion_preserves_lhs_dtype(self):
+        """An explicit FP32 scalar stays FP32 while the i16 tsubs result stays i16."""
+        before = _make_before(
+            in_specs=[("lhs", [8, 16], DataType.INT16)],
+            extra_specs=[("scalar", ir.ScalarType(DataType.FP32))],
+            out_shape=[8, 16],
+            out_dtype=DataType.INT16,
+            body=lambda ib, ins, extras: ib.let("z", tensor_ops.subs(ins[0], extras[0])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        converted = _find_first_call_to(kernel, "tile.subs")
+        assert converted is not None
+        assert isinstance(converted.args[0].type, ir.TileType)
+        assert converted.args[0].type.dtype == DataType.INT16
+        assert isinstance(converted.args[1].type, ir.ScalarType)
+        assert converted.args[1].type.dtype == DataType.FP32
+        assert isinstance(converted.type, ir.TileType)
+        assert converted.type.dtype == DataType.INT16
+
+    def test_row_min_conversion_injects_padded_tmp(self):
+        """tensor.row_min lowers to an ND tile.row_min with a safe padded scratch tile."""
+
+        def expected_body(ib, tiles):
+            tmp = ib.let("tmp_tile", tile_ops.create([32, 128], DataType.FP32))
+            return ib.let("y_tile", tile_ops.row_min(tiles[0], tmp))
+
+        before = _make_before(
+            in_specs=[("x", [32, 64], DataType.FP32)],
+            out_shape=[32, 1],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("y", tensor_ops.row_min(ins[0])),
+        )
+        expected = _make_expected(
+            in_specs=[("x", [32, 64], DataType.FP32)],
+            out_shape=[32, 1],
+            out_dtype=DataType.FP32,
+            body=expected_body,
         )
         _assert_convert_equal(before, expected)
 
@@ -981,7 +1366,7 @@ class TestConvertTensorToTileOps:
                 return y
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
 
     def test_shared_kv_one_load_two_matmuls_b_trans(self):
         """A single sliced KV feeding a b_trans=True and a b_trans=False matmul lowers
@@ -1059,7 +1444,7 @@ class TestConvertTensorToTileOps:
                 return out
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
 
     def test_matmul_acc_conversion(self):
         """tensor.matmul + tensor.matmul_acc -> tile.matmul + tile.matmul_acc.
@@ -1118,7 +1503,7 @@ class TestConvertTensorToTileOps:
                 return result
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
 
     def test_dump_vars_attr_preserved_through_call_site_update(self):
         """Regression: ``pl.dump_tag`` on an orchestration call must survive the
@@ -1235,7 +1620,7 @@ class TestConvertTensorToTileOps:
                 return result
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
 
     def test_nd_batch_matmul_b_trans_slice_uses_transpose_view(self):
         """A SLICE of a 3D tensor fed to a b_trans matmul (-> tile.batch_matmul) lowers
@@ -1363,7 +1748,7 @@ class TestConvertTensorToTileOps:
                 return result
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
 
     def test_assemble_tile_tile_then_cast_conversion(self):
         """tensor.create + tensor.assemble(tile,tile) + tensor.cast must not crash.
@@ -2512,7 +2897,63 @@ class TestSliceMatmulConversion:
                 return self.main_incore_0(a, b, out_0)
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
+
+    def test_slice_reshape_then_matmul_routes_load_to_mat(self):
+        """tensor.slice → tensor.reshape → tensor.matmul emits tile.load(Mat).
+
+        A singleton leading dimension is common when selecting one attention
+        work item from a stacked rank-3 tensor.  The reshape is a zero-copy view,
+        so the matmul's Mat demand must reach the rank-3 slice.  Otherwise the
+        slice lowers to Vec and the compiler inserts an unnecessary AIV→AIC
+        transfer for the entire operand.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                query: pl.Tensor[[128, 16, 128], pl.BF16],
+                key: pl.Tensor[[128, 512, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                query_3d = pl.slice(query, [1, 16, 128], [0, 0, 0])
+                query_2d = pl.reshape(query_3d, [16, 128])
+                key_3d = pl.slice(key, [1, 512, 128], [0, 0, 0])
+                key_2d = pl.reshape(key_3d, [512, 128])
+                scores = pl.matmul(query_2d, key_2d, b_trans=True, out_dtype=pl.FP32)
+                out = pl.assemble(out, scores, [0, 0])
+                return out
+
+            @pl.function
+            def main(
+                self,
+                query: pl.Tensor[[128, 16, 128], pl.BF16],
+                key: pl.Tensor[[128, 512, 128], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                return self.main_incore_0(query, key, out)
+
+        after = passes.convert_tensor_to_tile_ops()(Before)
+        incore = after.get_function("main_incore_0")
+        assert incore is not None
+
+        loads = _find_calls_to(incore, "tile.load")
+        assert len(loads) == 2
+        for load in loads:
+            result_type = load.type
+            assert isinstance(result_type, ir.TileType)
+            assert result_type.memory_space == pl.Mem.Mat
+
+        reshapes = _find_calls_to(incore, "tile.reshape")
+        assert len(reshapes) == 2
+        for reshape in reshapes:
+            result_type = reshape.type
+            assert isinstance(result_type, ir.TileType)
+            assert result_type.memory_space == pl.Mem.Mat
+
+        assert not _find_calls_to(incore, "tile.move")
 
     def test_slice_chain_of_aliases_then_matmul(self):
         """Demand propagates through a chain of SSA aliases, not just one hop.
@@ -2574,7 +3015,7 @@ class TestSliceMatmulConversion:
                 return self.main_incore_0(a, b, out_0)
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
 
 
 class TestScatterUpdateConversion:
@@ -2962,10 +3403,15 @@ class TestConvertSortOps:
 
 
 class TestConvertGatherOp:
-    """Test conversion of tensor.gather (MVP: 2D + dim=-1)."""
+    """Test conversion of tensor.gather (MVP: 2D + dim=-1).
+
+    UT transforms conftest pins Ascend950 (A5), so the default path is the
+    full-tile flat-index lowering. A separate test switches to Ascend910B to
+    lock the legacy per-row loop.
+    """
 
     def test_gather_conversion(self):
-        """tensor.gather -> per-row loop of tile.load + tile.gather + tile.store."""
+        """A5: tensor.gather -> full-tile load + flat index + one tile.gather."""
 
         @pl.program
         class Before:
@@ -2987,10 +3433,7 @@ class TestConvertGatherOp:
                 out: pl.Tensor[[4, 3], pl.FP32] = self.main_incore_0(inp, idx)
                 return out
 
-        # tensor.gather is fully lowered into a per-row loop: each iteration loads a
-        # [1, 16] input row and a [1, 3] index row, runs the index-form tile.gather
-        # (which needs a [1, 3] INT32 scratch tile), and assembles the row into the
-        # accumulator. Phase 3 adds the Out tensor param for the result.
+        # Odd K (=3) uses row_expand_add fallback; one full-tile gather, no per-row loop.
         @pl.program
         class Expected:
             @pl.function(type=pl.FunctionType.InCore)
@@ -3000,16 +3443,16 @@ class TestConvertGatherOp:
                 idx: pl.Tensor[[4, 3], pl.INT32],
                 ret0__out: pl.Out[pl.Tensor[[4, 3], pl.FP32]],
             ) -> pl.Tensor[[4, 3], pl.FP32]:
-                gather_acc_init = pl.tile.create([4, 3], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-                for gather_lv, (gather_ia,) in pl.range(4, init_values=(gather_acc_init,)):
-                    gather_inp_row = pl.load(inp, [gather_lv, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec)
-                    gather_idx_row = pl.load(idx, [gather_lv, 0], [1, 3], [1, 3], target_memory=pl.Mem.Vec)
-                    gather_row_tmp = pl.tile.create([1, 3], dtype=pl.INT32, target_memory=pl.Mem.Vec)
-                    gather_row = pl.tile.gather(gather_inp_row, gather_idx_row, gather_row_tmp)
-                    gather_asmbl = pl.tile.assemble(gather_ia, gather_row, [gather_lv, 0])
-                    gather_rv = pl.yield_(gather_asmbl)
-                out__tile: pl.Tile[[4, 3], pl.FP32, pl.Mem.Vec] = gather_rv
-                ret0__store = pl.store(out__tile, [0, 0], ret0__out)
+                gather_inp = pl.tile.load(inp, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec)
+                gather_idx = pl.tile.load(idx, [0, 0], [4, 3], [4, 3], target_memory=pl.Mem.Vec)
+                gather_ci_rows = pl.tile.ci(pl.const(0, pl.INT32), [1, 4], dtype=pl.INT32, descending=False)
+                gather_row_arange = pl.tile.reshape(gather_ci_rows, [4, 1])
+                gather_row_base = pl.tile.muls(gather_row_arange, pl.const(16, pl.INT32))
+                gather_flat_idx = pl.tile.row_expand_add(gather_idx, gather_row_base)
+                gather_tmp = pl.tile.create([4, 3], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                gather = pl.tile.gather(gather_inp, gather_flat_idx, gather_tmp)
+                out__tile: pl.Tile[[4, 3], pl.FP32, pl.Mem.Vec] = gather
+                ret0__store = pl.tile.store(out__tile, [0, 0], ret0__out)
                 return ret0__store
 
             @pl.function
@@ -3018,12 +3461,138 @@ class TestConvertGatherOp:
                 inp: pl.Tensor[[4, 16], pl.FP32],
                 idx: pl.Tensor[[4, 3], pl.INT32],
             ) -> pl.Tensor[[4, 3], pl.FP32]:
-                ret0__out = pl.create_tensor([4, 3], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                ret0__out = pl.tensor.create([4, 3], dtype=pl.FP32, layout=pl.TensorLayout.ND)
                 out = self.main_incore_0(inp, idx, ret0__out)
                 return out
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_gather_conversion_expand(self):
+        """A5 expand gather (K > S1): flat uses src cols, not output cols."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                inp: pl.Tensor[[4, 32], pl.FP32],
+                idx: pl.Tensor[[4, 64], pl.INT32],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                out: pl.Tensor[[4, 64], pl.FP32] = pl.tensor.gather(inp, dim=-1, index=idx)
+                return out
+
+            @pl.function
+            def main(
+                self,
+                inp: pl.Tensor[[4, 32], pl.FP32],
+                idx: pl.Tensor[[4, 64], pl.INT32],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                out: pl.Tensor[[4, 64], pl.FP32] = self.main_incore_0(inp, idx)
+                return out
+
+        # Aligned K (=64): linear arange → divs → muls(src_cols=32) → add.
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                inp: pl.Tensor[[4, 32], pl.FP32],
+                idx: pl.Tensor[[4, 64], pl.INT32],
+                ret0__out: pl.Out[pl.Tensor[[4, 64], pl.FP32]],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                gather_inp = pl.tile.load(inp, [0, 0], [4, 32], [4, 32], target_memory=pl.Mem.Vec)
+                gather_idx = pl.tile.load(idx, [0, 0], [4, 64], [4, 64], target_memory=pl.Mem.Vec)
+                gather_lin = pl.tile.ci(pl.const(0, pl.INT32), [1, 256], dtype=pl.INT32, descending=False)
+                gather_lin2d = pl.tile.reshape(gather_lin, [4, 64])
+                gather_row_ids = pl.tile.divs(gather_lin2d, pl.const(64, pl.INT32))
+                gather_row_base = pl.tile.muls(gather_row_ids, pl.const(32, pl.INT32))
+                gather_flat_idx = pl.tile.add(gather_idx, gather_row_base)
+                gather_tmp = pl.tile.create([4, 64], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                gather = pl.tile.gather(gather_inp, gather_flat_idx, gather_tmp)
+                out__tile: pl.Tile[[4, 64], pl.FP32, pl.Mem.Vec] = gather
+                ret0__store = pl.tile.store(out__tile, [0, 0], ret0__out)
+                return ret0__store
+
+            @pl.function
+            def main(
+                self,
+                inp: pl.Tensor[[4, 32], pl.FP32],
+                idx: pl.Tensor[[4, 64], pl.INT32],
+            ) -> pl.Tensor[[4, 64], pl.FP32]:
+                ret0__out = pl.tensor.create([4, 64], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                out = self.main_incore_0(inp, idx, ret0__out)
+                return out
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_gather_conversion_a2a3_per_row(self):
+        """Non-A5 keeps the legacy per-row single-row gather loop."""
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+
+            @pl.program
+            class Before:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main_incore_0(
+                    self,
+                    inp: pl.Tensor[[4, 16], pl.FP32],
+                    idx: pl.Tensor[[4, 3], pl.INT32],
+                ) -> pl.Tensor[[4, 3], pl.FP32]:
+                    out: pl.Tensor[[4, 3], pl.FP32] = pl.tensor.gather(inp, dim=-1, index=idx)
+                    return out
+
+                @pl.function
+                def main(
+                    self,
+                    inp: pl.Tensor[[4, 16], pl.FP32],
+                    idx: pl.Tensor[[4, 3], pl.INT32],
+                ) -> pl.Tensor[[4, 3], pl.FP32]:
+                    out: pl.Tensor[[4, 3], pl.FP32] = self.main_incore_0(inp, idx)
+                    return out
+
+            @pl.program
+            class Expected:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main_incore_0(
+                    self,
+                    inp: pl.Tensor[[4, 16], pl.FP32],
+                    idx: pl.Tensor[[4, 3], pl.INT32],
+                    ret0__out: pl.Out[pl.Tensor[[4, 3], pl.FP32]],
+                ) -> pl.Tensor[[4, 3], pl.FP32]:
+                    gather_acc_init = pl.tile.create([4, 3], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                    for gather_lv, (gather_ia,) in pl.range(4, init_values=(gather_acc_init,)):
+                        gather_inp_row = pl.tile.load(
+                            inp, [gather_lv, 0], [1, 16], [1, 16], target_memory=pl.Mem.Vec
+                        )
+                        gather_idx_row = pl.tile.load(
+                            idx, [gather_lv, 0], [1, 3], [1, 3], target_memory=pl.Mem.Vec
+                        )
+                        gather_row_tmp = pl.tile.create([1, 3], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                        gather_row = pl.tile.gather(gather_inp_row, gather_idx_row, gather_row_tmp)
+                        gather_asmbl = pl.tile.assemble(gather_ia, gather_row, [gather_lv, 0])
+                        gather_rv = pl.yield_(gather_asmbl)
+                    out__tile: pl.Tile[[4, 3], pl.FP32, pl.Mem.Vec] = gather_rv
+                    ret0__store = pl.tile.store(out__tile, [0, 0], ret0__out)
+                    return ret0__store
+
+                @pl.function
+                def main(
+                    self,
+                    inp: pl.Tensor[[4, 16], pl.FP32],
+                    idx: pl.Tensor[[4, 3], pl.INT32],
+                ) -> pl.Tensor[[4, 3], pl.FP32]:
+                    ret0__out = pl.tensor.create([4, 3], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                    out = self.main_incore_0(inp, idx, ret0__out)
+                    return out
+
+            After = passes.convert_tensor_to_tile_ops()(Before)
+            ir.assert_structural_equal(After, Expected)
+        finally:
+            backend.reset_for_testing()
+            backend.set_backend_type(BackendType.Ascend950)
 
     def test_gather_conversion_with_tile_input(self):
         """tensor.gather whose input was already demoted to a tile by an upstream conversion.
@@ -3031,8 +3600,7 @@ class TestConvertGatherOp:
         Regression test for the case the converter previously crashed with
         CHECK(input_tensor_type): a local tensor.create + tensor.assemble feeds
         tensor.gather, so by the time gather is visited its `input` arg is a
-        TileType. The converter now emits tile.slice per row for the tile input
-        and keeps tile.load for the tensor index in the same call.
+        TileType. On A5 the converter emits a full-tile slice + flat gather.
         """
 
         @pl.program
@@ -3067,18 +3635,20 @@ class TestConvertGatherOp:
                 ret0__out: pl.Out[pl.Tensor[[4, 3], pl.FP32]],
             ) -> pl.Tensor[[4, 3], pl.FP32]:
                 tmp__tile = pl.tile.create([4, 16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-                assemble_src = pl.load(src, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec)
+                assemble_src = pl.tile.load(src, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec)
                 tmp_1__tile = pl.tile.assemble(tmp__tile, assemble_src, [0, 0])
-                gather_acc_init = pl.tile.create([4, 3], dtype=pl.FP32, target_memory=pl.Mem.Vec)
-                for gather_lv, (gather_ia,) in pl.range(4, init_values=(gather_acc_init,)):
-                    gather_inp_row = pl.tile.slice(tmp_1__tile, [1, 16], [gather_lv, 0], [1, 16])
-                    gather_idx_row = pl.load(idx, [gather_lv, 0], [1, 3], [1, 3], target_memory=pl.Mem.Vec)
-                    gather_row_tmp = pl.tile.create([1, 3], dtype=pl.INT32, target_memory=pl.Mem.Vec)
-                    gather_row = pl.tile.gather(gather_inp_row, gather_idx_row, gather_row_tmp)
-                    gather_asmbl = pl.tile.assemble(gather_ia, gather_row, [gather_lv, 0])
-                    gather_rv = pl.yield_(gather_asmbl)
-                out__tile: pl.Tile[[4, 3], pl.FP32, pl.Mem.Vec] = gather_rv
-                ret0__store = pl.store(out__tile, [0, 0], ret0__out)
+                gather_inp = pl.tile.slice(tmp_1__tile, [4, 16], [0, 0], [4, 16])
+                gather_src_alloc = pl.tile.create([4, 16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                gather_src_copy = pl.tile.assemble(gather_src_alloc, gather_inp, [0, 0])
+                gather_idx = pl.tile.load(idx, [0, 0], [4, 3], [4, 3], target_memory=pl.Mem.Vec)
+                gather_ci_rows = pl.tile.ci(pl.const(0, pl.INT32), [1, 4], dtype=pl.INT32, descending=False)
+                gather_row_arange = pl.tile.reshape(gather_ci_rows, [4, 1])
+                gather_row_base = pl.tile.muls(gather_row_arange, pl.const(16, pl.INT32))
+                gather_flat_idx = pl.tile.row_expand_add(gather_idx, gather_row_base)
+                gather_tmp = pl.tile.create([4, 3], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                gather = pl.tile.gather(gather_src_copy, gather_flat_idx, gather_tmp)
+                out__tile: pl.Tile[[4, 3], pl.FP32, pl.Mem.Vec] = gather
+                ret0__store = pl.tile.store(out__tile, [0, 0], ret0__out)
                 return ret0__store
 
             @pl.function
@@ -3087,7 +3657,85 @@ class TestConvertGatherOp:
                 src: pl.Tensor[[4, 16], pl.FP32],
                 idx: pl.Tensor[[4, 3], pl.INT32],
             ) -> pl.Tensor[[4, 3], pl.FP32]:
-                ret0__out = pl.create_tensor([4, 3], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                ret0__out = pl.tensor.create([4, 3], dtype=pl.FP32, layout=pl.TensorLayout.ND)
+                out = self.main_incore_0(src, idx, ret0__out)
+                return out
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_gather_conversion_strided_tile_source_materializes(self):
+        """A5 flat-index gather materializes a strided tile.slice source.
+
+        Regression for the strided-source corruption (DeepSeek sparse_attn
+        inverse-RoPE): flat[i,j] = i*src_cols + idx assumes the source is stored
+        row-major with stride == src_cols, but a tile.slice view of a wider tile
+        (rope = full[:, nope:head]) keeps the parent's wider stride, so every row
+        past the first is misaddressed. The converter now copies the TileType
+        source into a fresh contiguous tile (tile.create + tile.assemble) before
+        the flat-index tile.gather. The contiguous TensorType path
+        (test_gather_conversion) already materializes via tile.load and is not
+        copied.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[4, 16], pl.FP32],
+                idx: pl.Tensor[[4, 8], pl.INT32],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                full: pl.Tensor[[4, 16], pl.FP32] = pl.create_tensor([4, 16], dtype=pl.FP32)
+                full_1: pl.Tensor[[4, 16], pl.FP32] = pl.assemble(full, src, [0, 0])
+                rope = full_1[:, 8:16]
+                out: pl.Tensor[[4, 8], pl.FP32] = pl.tensor.gather(rope, dim=-1, index=idx)
+                return out
+
+            @pl.function
+            def main(
+                self,
+                src: pl.Tensor[[4, 16], pl.FP32],
+                idx: pl.Tensor[[4, 8], pl.INT32],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                out: pl.Tensor[[4, 8], pl.FP32] = self.main_incore_0(src, idx)
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                src: pl.Tensor[[4, 16], pl.FP32],
+                idx: pl.Tensor[[4, 8], pl.INT32],
+                ret0__out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                full__tile = pl.tile.create([4, 16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                assemble_src = pl.tile.load(src, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec)
+                full_1__tile = pl.tile.assemble(full__tile, assemble_src, [0, 0])
+                rope__tile = pl.tile.slice(full_1__tile, [4, 8], [0, 8])
+                gather_inp = pl.tile.slice(rope__tile, [4, 8], [0, 0], [4, 8])
+                gather_src_alloc = pl.tile.create([4, 8], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                gather_src_copy = pl.tile.assemble(gather_src_alloc, gather_inp, [0, 0])
+                gather_idx = pl.tile.load(idx, [0, 0], [4, 8], [4, 8], target_memory=pl.Mem.Vec)
+                gather_lin = pl.tile.ci(pl.const(0, pl.INT32), [1, 32], dtype=pl.INT32, descending=False)
+                gather_lin2d = pl.tile.reshape(gather_lin, [4, 8])
+                gather_row_ids = pl.tile.divs(gather_lin2d, pl.const(8, pl.INT32))
+                gather_row_base = pl.tile.muls(gather_row_ids, pl.const(8, pl.INT32))
+                gather_flat_idx = pl.tile.add(gather_idx, gather_row_base)
+                gather_tmp = pl.tile.create([4, 8], dtype=pl.INT32, target_memory=pl.Mem.Vec)
+                gather = pl.tile.gather(gather_src_copy, gather_flat_idx, gather_tmp)
+                out__tile: pl.Tile[[4, 8], pl.FP32, pl.Mem.Vec] = gather
+                ret0__store = pl.tile.store(out__tile, [0, 0], ret0__out)
+                return ret0__store
+
+            @pl.function
+            def main(
+                self,
+                src: pl.Tensor[[4, 16], pl.FP32],
+                idx: pl.Tensor[[4, 8], pl.INT32],
+            ) -> pl.Tensor[[4, 8], pl.FP32]:
+                ret0__out = pl.tensor.create([4, 8], dtype=pl.FP32, layout=pl.TensorLayout.ND)
                 out = self.main_incore_0(src, idx, ret0__out)
                 return out
 
@@ -3470,7 +4118,8 @@ class TestSpmdBlockIdentityConversion:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 idx: pl.Scalar[pl.INDEX] = pl.tensor.get_block_idx()
-                y: pl.Tensor[[64], pl.FP32] = pl.add(x, idx)
+                # ``idx`` is INDEX; cast before use as a tensor scalar operand.
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, pl.cast(idx, pl.INT32))
                 return y
 
             @pl.function
@@ -3488,7 +4137,7 @@ class TestSpmdBlockIdentityConversion:
             ) -> pl.Tensor[[64], pl.FP32]:
                 x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 idx = pl.tile.get_block_idx()
-                y__tile = pl.tile.adds(x__tile, idx)
+                y__tile = pl.tile.adds(x__tile, pl.cast(idx, pl.INT32))
                 ret0__store = pl.store(y__tile, [0], ret0__out)
                 return ret0__store
 
@@ -3507,7 +4156,8 @@ class TestSpmdBlockIdentityConversion:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 idx: pl.Scalar[pl.INDEX] = pl.tensor.get_subblock_idx()
-                y: pl.Tensor[[64], pl.FP32] = pl.add(x, idx)
+                # ``idx`` is INDEX; cast before use as a tensor scalar operand.
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, pl.cast(idx, pl.INT32))
                 return y
 
             @pl.function
@@ -3525,7 +4175,7 @@ class TestSpmdBlockIdentityConversion:
             ) -> pl.Tensor[[64], pl.FP32]:
                 x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 idx = pl.tile.get_subblock_idx()
-                y__tile = pl.tile.adds(x__tile, idx)
+                y__tile = pl.tile.adds(x__tile, pl.cast(idx, pl.INT32))
                 ret0__store = pl.store(y__tile, [0], ret0__out)
                 return ret0__store
 
@@ -3544,7 +4194,8 @@ class TestSpmdBlockIdentityConversion:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
                 n: pl.Scalar[pl.INDEX] = pl.tensor.get_block_num()
-                y: pl.Tensor[[64], pl.FP32] = pl.add(x, n)
+                # ``n`` is INDEX; cast before use as a tensor scalar operand.
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, pl.cast(n, pl.INT32))
                 return y
 
             @pl.function
@@ -3562,7 +4213,7 @@ class TestSpmdBlockIdentityConversion:
             ) -> pl.Tensor[[64], pl.FP32]:
                 x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
                 n = pl.tile.get_block_num()
-                y__tile = pl.tile.adds(x__tile, n)
+                y__tile = pl.tile.adds(x__tile, pl.cast(n, pl.INT32))
                 ret0__store = pl.store(y__tile, [0], ret0__out)
                 return ret0__store
 
@@ -3586,7 +4237,8 @@ class TestSpmdBlockIdentityConversion:
                 i: pl.Scalar[pl.INDEX] = pl.get_block_idx()
                 s: pl.Scalar[pl.INDEX] = pl.get_subblock_idx()
                 n: pl.Scalar[pl.INDEX] = pl.get_block_num()
-                y: pl.Tensor[[64], pl.FP32] = pl.add(x, i + s + n)
+                # ``i + s + n`` is an INDEX scalar; cast before use as an operand.
+                y: pl.Tensor[[64], pl.FP32] = pl.add(x, pl.cast(i + s + n, pl.INT32))
                 return y
 
             @pl.function
@@ -3606,7 +4258,7 @@ class TestSpmdBlockIdentityConversion:
                 i = pl.tile.get_block_idx()
                 s = pl.tile.get_subblock_idx()
                 n = pl.tile.get_block_num()
-                y__tile = pl.tile.adds(x__tile, i + s + n)
+                y__tile = pl.tile.adds(x__tile, pl.cast(i + s + n, pl.INT32))
                 ret0__store = pl.store(y__tile, [0], ret0__out)
                 return ret0__store
 
@@ -3970,13 +4622,22 @@ class TestConvertCrossCoreSplitOps:
         function's Tensor return shape. The producer mirrors the realistic boundary
         each op sees: a cube ``pl.matmul`` for the shard, a Vec ``pl.exp`` for the
         gather.
+
+        The shard's ``pl.matmul`` is emitted OUTSIDE the region: each AIV lane holds
+        only half the tile, so a cube op inside a data-parallel region cannot be
+        vector-split (rejected by AivSplitValid check (a)). Producing the full cube
+        tile first and sharding it inside the region is the authoring shape real
+        kernels use. The gather's ``pl.exp`` is a vector op and belongs inside.
         """
         if op == "aiv_shard":
             params = "a: pl.Tensor[[128, 128], pl.FP32], b: pl.Tensor[[128, 128], pl.FP32]"
-            body = "qk = pl.matmul(a, b)\n                res = pl.aiv_shard(qk)"
+            pre_region = "qk = pl.matmul(a, b)\n"
+            body = "res = pl.aiv_shard(qk)"
         else:
             params = "x: pl.Tensor[[128, 128], pl.FP32]"
+            pre_region = ""
             body = "h = pl.exp(x)\n                res = pl.aic_gather(h)"
+        pre_region_line = f"            {pre_region}" if pre_region else ""
         text = (
             "import pypto.language as pl\n\n\n"
             "@pl.program\n"
@@ -3984,6 +4645,7 @@ class TestConvertCrossCoreSplitOps:
             "    @pl.function(type=pl.FunctionType.InCore)\n"
             f"    def main_incore_0(self, {params}) -> pl.Tensor[{out_shape}, pl.FP32]:\n"
             "        with pl.at(level=pl.Level.CORE_GROUP):\n"
+            f"{pre_region_line}"
             f"            for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.{mode}):\n"
             f"                {body}\n"
             "        return res\n"
@@ -4015,8 +4677,9 @@ class TestConvertCrossCoreSplitOps:
                 self, a: pl.Tensor[[128, 128], pl.FP32], b: pl.Tensor[[128, 128], pl.FP32]
             ) -> pl.Tensor[[64, 128], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP):
+                    # Cube op OUTSIDE the region: a matmul cannot be vector-split.
+                    qk = pl.matmul(a, b)
                     for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                        qk = pl.matmul(a, b)
                         res = pl.aiv_shard(qk)
                 return res
 
@@ -4030,21 +4693,21 @@ class TestConvertCrossCoreSplitOps:
                 ret0__out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
             ) -> pl.Tensor[[64, 128], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP):
+                    a_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                        a, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
+                    )
+                    b_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                        b, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
+                    )
+                    qk__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_mat, b_mat)
                     for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
-                        a_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.load(
-                            a, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
-                        )
-                        b_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.load(
-                            b, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
-                        )
-                        qk__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_mat, b_mat)
                         # split= suppressed inside the region; re-stamped from the mode.
                         res__tile: pl.Tile[[64, 128], pl.FP32, pl.Mem.Vec] = pl.tile.aiv_shard(qk__tile)
                 ret0__store: pl.Tensor[[64, 128], pl.FP32] = pl.tile.store(res__tile, [0, 0], ret0__out)
                 return ret0__store
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
 
     def test_aiv_shard_left_right_lowers_to_tile_aiv_shard(self):
         """``pl.aiv_shard(cube_tensor)`` in a LEFT_RIGHT ``split_aiv`` region lowers to
@@ -4058,8 +4721,9 @@ class TestConvertCrossCoreSplitOps:
                 self, a: pl.Tensor[[128, 128], pl.FP32], b: pl.Tensor[[128, 128], pl.FP32]
             ) -> pl.Tensor[[128, 64], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP):
+                    # Cube op OUTSIDE the region: a matmul cannot be vector-split.
+                    qk = pl.matmul(a, b)
                     for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
-                        qk = pl.matmul(a, b)
                         res = pl.aiv_shard(qk)
                 return res
 
@@ -4073,25 +4737,28 @@ class TestConvertCrossCoreSplitOps:
                 ret0__out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
             ) -> pl.Tensor[[128, 64], pl.FP32]:
                 with pl.at(level=pl.Level.CORE_GROUP):
+                    a_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                        a, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
+                    )
+                    b_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                        b, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
+                    )
+                    qk__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_mat, b_mat)
                     for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
-                        a_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.load(
-                            a, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
-                        )
-                        b_mat: pl.Tile[[128, 128], pl.FP32, pl.Mem.Mat] = pl.tile.load(
-                            b, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Mat
-                        )
-                        qk__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_mat, b_mat)
                         res__tile: pl.Tile[[128, 64], pl.FP32, pl.Mem.Vec] = pl.tile.aiv_shard(qk__tile)
                 ret0__store: pl.Tensor[[128, 64], pl.FP32] = pl.tile.store(res__tile, [0, 0], ret0__out)
                 return ret0__store
 
         After = passes.convert_tensor_to_tile_ops()(Before)
-        ir.assert_structural_equal(After, Expected)
+        _assert_convert_output_equal(After, Expected)
 
     def test_aic_gather_up_down_lowers_to_tile_aic_gather(self):
         """``pl.aic_gather(vec_tensor)`` in an UP_DOWN ``split_aiv`` region lowers to
-        ``tile.aic_gather`` with split axis 0 doubled ([128, 128] -> [256, 128]) and Vec
-        memory re-attached; the exp producer loads its operand to Vec."""
+        ``tile.aic_gather`` with split axis 0 doubled ([128, 128] -> [256, 128]) and Mat
+        memory re-attached; the exp producer loads its operand to Vec.
+
+        The gather's declared memory is the CONSUMING (cube) lane's space: it carries a
+        vector-produced half to AIC, where ExpandMixedKernel pops it into Mat."""
 
         @pl.program
         class Before:
@@ -4117,7 +4784,7 @@ class TestConvertCrossCoreSplitOps:
                 with pl.at(level=pl.Level.CORE_GROUP):
                     for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                         h__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec] = pl.tile.exp(x__tile)
-                        res__tile: pl.Tile[[256, 128], pl.FP32, pl.Mem.Vec] = pl.tile.aic_gather(h__tile)
+                        res__tile: pl.Tile[[256, 128], pl.FP32, pl.Mem.Mat] = pl.tile.aic_gather(h__tile)
                 ret0__store: pl.Tensor[[256, 128], pl.FP32] = pl.tile.store(res__tile, [0, 0], ret0__out)
                 return ret0__store
 
@@ -4126,8 +4793,8 @@ class TestConvertCrossCoreSplitOps:
 
     def test_aic_gather_left_right_lowers_to_tile_aic_gather(self):
         """``pl.aic_gather(vec_tensor)`` in a LEFT_RIGHT ``split_aiv`` region lowers to
-        ``tile.aic_gather`` with split axis 1 doubled ([128, 128] -> [128, 256]) and Vec
-        memory re-attached."""
+        ``tile.aic_gather`` with split axis 1 doubled ([128, 128] -> [128, 256]) and Mat
+        memory re-attached (the consuming cube lane's space)."""
 
         @pl.program
         class Before:
@@ -4153,7 +4820,7 @@ class TestConvertCrossCoreSplitOps:
                 with pl.at(level=pl.Level.CORE_GROUP):
                     for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
                         h__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec] = pl.tile.exp(x__tile)
-                        res__tile: pl.Tile[[128, 256], pl.FP32, pl.Mem.Vec] = pl.tile.aic_gather(h__tile)
+                        res__tile: pl.Tile[[128, 256], pl.FP32, pl.Mem.Mat] = pl.tile.aic_gather(h__tile)
                 ret0__store: pl.Tensor[[128, 256], pl.FP32] = pl.tile.store(res__tile, [0, 0], ret0__out)
                 return ret0__store
 
@@ -4217,6 +4884,89 @@ class TestConvertCrossCoreSplitOps:
         assert auto_call is not None
 
         # The two aiv_shard result types must be structurally identical.
+        ir.assert_structural_equal(explicit_call.type, auto_call.type)
+
+    def test_explicit_gather_type_matches_auto_path(self):
+        """AUTO oracle for the mirror direction: the ``tile.aic_gather`` result type
+        from the explicit ``tensor.aic_gather`` conversion is structurally identical
+        to the one LowerAutoVectorSplit synthesizes (same doubled shape, Mat memory).
+
+        This is the direction the boundary memory contract actually flipped
+        (producer-side Vec -> consuming-lane Mat), so it is what guards the
+        "the two lowering paths cannot drift apart" claim.
+        """
+        span = ir.Span.unknown()
+
+        # Explicit path: pl.aic_gather(vector value) → tile.aic_gather (Mat full).
+        explicit = passes.convert_tensor_to_tile_ops()(
+            self._parse_split_kernel("aic_gather", "UP_DOWN", [256, 128])
+        )
+        explicit_call = self._find_split_op(explicit, ir.get_op("tile.aic_gather").name)
+
+        # AUTO path: a mixed InCore function whose V->C tile.move boundary
+        # LowerAutoVectorSplit rewrites into tile.aic_gather. Built at the tile
+        # level for the same reason as the shard oracle above.
+        #
+        # The gather source is VECTOR-PRODUCED (tile.add), not a parameter: the
+        # pass's precondition is that the V->C boundary source has already been
+        # halved by the affinity gate, so the gather doubles HALF -> FULL. Sourcing
+        # it from a param instead would leave it full-width and over-double
+        # ([256, 128] -> [512, 128]) while the placement move kept its original
+        # [256, 128] result type — an ill-typed move that misrepresents the pass.
+        # Hence the [256, 128] param: add halves it to the [128, 128] per-lane
+        # half, and the gather doubles that back to the [256, 128] FULL tile the
+        # explicit path also produces.
+        #
+        # The gathered tile is then CONSUMED (move -> Left, matmul, store of the
+        # Acc result — tile.store takes only {Vec, Acc}, never Mat). Leaving it
+        # dead would let a future DCE drop the synthesized gather.
+        vec = ir.Var("vec", ir.TileType([256, 128], DataType.FP32, None, None, MemorySpace.Vec), span)
+        rhs = ir.Var("rhs", ir.TileType([128, 128], DataType.FP32, None, None, MemorySpace.Right), span)
+        out_0 = ir.Var("out_0", ir.TensorType([256, 128], DataType.FP32), span)
+        add = tile_ops.add(vec, vec, span)
+        vec_h = ir.Var("vec_h", add.type, span)
+        move = tile_ops.move(vec_h, MemorySpace.Mat, span=span)
+        assert isinstance(move.type, ir.TileType)
+        gathered = ir.Var("gathered", move.type, span)
+        to_left = tile_ops.move(gathered, MemorySpace.Left, span=span)
+        left = ir.Var("left", to_left.type, span)
+        matmul = tile_ops.matmul(left, rhs, span)
+        acc = ir.Var("acc", matmul.type, span)
+        store = tile_ops.store(acc, [0, 0], out_0, span=span)
+        out_store = ir.Var("out_store", store.type, span)
+        auto_func = ir.Function(
+            "split_auto",
+            [
+                (vec, ir.ParamDirection.In),
+                (rhs, ir.ParamDirection.In),
+                (out_0, ir.ParamDirection.Out),
+            ],
+            [out_0.type],
+            ir.SeqStmts(
+                [
+                    ir.AssignStmt(vec_h, add, span),
+                    ir.AssignStmt(gathered, move, span),
+                    ir.AssignStmt(left, to_left, span),
+                    ir.AssignStmt(acc, matmul, span),
+                    ir.AssignStmt(out_store, store, span),
+                    ir.ReturnStmt([out_store], span),
+                ],
+                span,
+            ),
+            span,
+            ir.FunctionType.InCore,
+            attrs={"split": ir.SplitMode.UP_DOWN},
+        )
+        auto_program = ir.Program([auto_func], "auto", span)
+        with passes.PassContext([]):
+            auto_lowered = passes.lower_auto_vector_split()(auto_program)
+        auto_call = _find_first_call_to(
+            _require_function(auto_lowered, "split_auto"), ir.get_op("tile.aic_gather").name
+        )
+        assert auto_call is not None
+
+        assert isinstance(explicit_call.type, ir.TileType)
+        assert explicit_call.type.memory_space == MemorySpace.Mat
         ir.assert_structural_equal(explicit_call.type, auto_call.type)
 
 

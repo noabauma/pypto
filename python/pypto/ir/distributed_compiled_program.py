@@ -47,7 +47,7 @@ from .compiled_program import (
 # the program can be reconstructed (``from_dir``) without the live post-pass IR.
 # Bump ``_META_SCHEMA`` on any incompatible format change.
 _DISTRIBUTED_META_FILENAME = "distributed_meta.json"
-_META_SCHEMA = 1
+_META_SCHEMA = 2
 
 if TYPE_CHECKING:
     from pypto.runtime.distributed_runner import DistributedWorker
@@ -59,14 +59,12 @@ class DistributedConfig:
     """Configuration for L3 distributed execution.
 
     ``aicpu_thread_num=4`` matches the ``tensormap_and_ringbuffer`` runtime's
-    3-scheduler-plus-1-dispatcher layout; ``block_dim=None`` lets the L2
-    simpler runtime pick its own default.
+    3-scheduler-plus-1-dispatcher layout.
     """
 
     device_ids: list[int] = field(default_factory=lambda: [0])
     num_sub_workers: int = 0
     runtime: str = "tensormap_and_ringbuffer"
-    block_dim: int | None = None
     aicpu_thread_num: int = 4
 
 
@@ -157,7 +155,6 @@ class DistributedCompiledProgram:
                 "device_ids": list(dc.device_ids),
                 "num_sub_workers": dc.num_sub_workers,
                 "runtime": dc.runtime,
-                "block_dim": dc.block_dim,
                 "aicpu_thread_num": dc.aicpu_thread_num,
             },
         }
@@ -371,6 +368,8 @@ class DistributedCompiledProgram:
         config: "RunConfig | None" = None,
         *,
         extra_compiled: Sequence["DistributedCompiledProgram"] = (),
+        persistent: bool = False,
+        reset_persistent_windows: bool | None = None,
         callbacks: dict[str, Callable[..., Any]] | None = None,
         sub_worker_overrides: dict[str, Callable[..., Any]] | None = None,
     ) -> "DistributedWorker":
@@ -407,6 +406,17 @@ class DistributedCompiledProgram:
                 program dispatched by ``rt(*args)``; the rest are dispatched via
                 ``rt.run(other, *args)``. All must agree on platform, runtime,
                 and device ids. Defaults to none (single-program).
+            persistent: Retain each compiled program's CommDomains across
+                dispatches. Every request still runs through its own
+                ``Worker.run`` completion fence. Retained windows are restored
+                to zero before reuse by default. Requires artifacts generated
+                by a PyPTO version that supports the internal domain-provider
+                hook.
+            reset_persistent_windows: Whether to restore retained CommDomain
+                windows to zero before every reuse. ``None`` (the default)
+                enables reset in persistent mode. Set to ``False`` only when
+                the caller manually clears or otherwise manages all reused
+                communication-buffer state.
             callbacks: Bind a callable to a SubWorker by name — e.g. a real
                 sampling closure. Abstract SubWorkers (declared with a ``...``
                 body) are runtime-bound callback points and MUST be supplied
@@ -426,6 +436,8 @@ class DistributedCompiledProgram:
         return DistributedWorker(
             [self, *extra_compiled],
             config,
+            persistent=persistent,
+            reset_persistent_windows=reset_persistent_windows,
             callbacks=callbacks,
             sub_worker_overrides=sub_worker_overrides,
         )

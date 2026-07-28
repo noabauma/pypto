@@ -636,14 +636,15 @@ class TestOpMemorySpecRegistry:
         assert constraints[1] == [ir.MemorySpace.Vec]
 
     def test_broadcast_binary_vec_spec(self):
-        """Broadcast binary ops (tile.row_expand_add) constrain both tile inputs."""
+        """tile.row_expand_add constrains its two sources and optional tmp to Vec."""
         spec = ir.get_op_memory_spec("tile.row_expand_add")
         assert spec is not None
         assert spec["output_memory"] == ir.MemorySpace.Vec
         constraints = spec["input_constraints"]
-        assert len(constraints) == 2
+        assert len(constraints) == 3
         assert constraints[0] == [ir.MemorySpace.Vec]
         assert constraints[1] == [ir.MemorySpace.Vec]
+        assert constraints[2] == [ir.MemorySpace.Vec]
 
     def test_full_vec_spec(self):
         """tile.full creates tiles in Vec (no tile inputs)."""

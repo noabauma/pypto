@@ -13,7 +13,7 @@ import ast
 import copy
 import keyword as _keyword_mod
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
@@ -27,6 +27,7 @@ from pypto.language.op import array_ops as _dsl_array
 from pypto.language.op import system_ops as _dsl_system
 from pypto.language.op import tensor_ops as _dsl_tensor
 from pypto.language.op import tile_ops as _dsl_tile
+from pypto.language.optimizations import SPLIT_SLOT_NUM_DEPRECATION
 from pypto.pypto_core import DataType, ir
 from pypto.pypto_core import arith as _arith
 
@@ -137,6 +138,36 @@ def _is_pl_call(node: object, attr_name: str) -> TypeGuard[ast.Call]:
         and isinstance(func.value, ast.Name)
         and func.value.id == "pl"
     )
+
+
+def _is_self_method_call(node: object) -> TypeGuard[ast.Call]:
+    """Return True when ``node`` is the AST for a ``self.<method>(...)`` call.
+
+    This is how the DSL spells a cross-function kernel call, so it is the marker
+    that distinguishes a *dispatch* body from work written inline.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    return isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "self"
+
+
+def _spmd_body_calls(body: "list[ast.stmt]", predicate: "Callable[[ast.Call], bool]") -> "Iterator[ast.Call]":
+    """Yield each call in ``body`` satisfying ``predicate``.
+
+    ``ast.walk`` recurses the whole body subtree, so a call nested inside a
+    ``pl.range`` loop, an argument expression, or a nested ``with`` still counts.
+    Shared by the SPMD body classifiers so they cannot drift apart.
+    """
+    for body_stmt in body:
+        for node in ast.walk(body_stmt):
+            if isinstance(node, ast.Call) and predicate(node):
+                yield node
+
+
+def _spmd_body_has_call(body: "list[ast.stmt]", predicate: "Callable[[ast.Call], bool]") -> bool:
+    """Return True when any call in ``body`` satisfies ``predicate``."""
+    return next(_spmd_body_calls(body, predicate), None) is not None
 
 
 def _is_const_int(value: object) -> bool:
@@ -422,8 +453,9 @@ class _AtKwargState:
     # ``Submit`` by the outliner (mirrors ``pl.submit(..., allow_early_resolve=)``).
     allow_early_resolve: bool = False
     split_mode: "ir.SplitMode | None" = None
-    # Optional cross-core ring-buffer depth from ``pl.split(mode, slot_num=N)``.
-    # Stored on the scope attrs and propagated to the outlined function attr.
+    # Optional cross-core pipe slot count from ``pl.cross_core_slot(slot_num=N)``
+    # (or the deprecated ``pl.split(mode, slot_num=N)`` spelling). Stored on the
+    # scope attrs and propagated to the outlined function attr.
     split_slot_num: "int | None" = None
     # Tracks the ``optimizations=`` kwarg AST so a duplicate ``optimizations=``
     # can be rejected in ``_handle_at_optimizations_kw``.
@@ -1942,11 +1974,12 @@ class ASTParser:
         reshape product check passes whether or not the source carries a
         narrower ``valid_shape`` (issue #1509).
 
-        When the source carries an explicit narrower ``valid_shape``, that
-        narrowing is carried forward via ``tensor.reshape``'s optional 3rd
-        argument; ``tile.reshape`` has no such parameter, so a narrowed tile
-        + rank-lift combo is rejected here (the user should switch to
-        ``pl.store``).
+        A narrower ``valid_shape`` survives the lift on both paths. Reshape maps
+        the source's valid region through to the result, and a lift that only
+        inserts unit axes is a coordinate-only rank change it reproduces exactly.
+        The tensor path additionally restates the lifted region through
+        ``tensor.reshape``'s optional 3rd argument (issue #1509); ``tile.reshape``
+        has no such parameter and does not need one.
         """
         # "Narrowed" means valid_shape is actually smaller than shape; a view
         # with valid_shape == shape (e.g. a tile's canonical implicit view) is
@@ -1956,20 +1989,6 @@ class ASTParser:
         is_narrowed = source_valid_shape is not None and not _shape_exprs_match(
             source_type.shape, source_valid_shape
         )
-
-        # tile.reshape has no valid_shape parameter, so a narrowed tile +
-        # rank-lift would silently drop the narrowing. Reject upfront and point
-        # users to pl.store.
-        if is_narrowed and kind_name != "tensor":
-            raise UnsupportedFeatureError(
-                "Subscript-write with rank reduction is not supported when "
-                "the source tile carries an explicit valid_shape — "
-                "tile.reshape cannot carry valid_shape across the rank lift.",
-                span=span,
-                hint="Write the tile via pl.store directly, or use slice "
-                "indices on every axis instead of scalar indices to avoid "
-                "rank reduction.",
-            )
 
         drop_set = set(drop_dims)
         unit: ir.Expr = ir.ConstInt(1, DataType.INDEX, span)
@@ -1981,12 +2000,14 @@ class ASTParser:
             it = iter(list(seq)[lead_units:])
             return [unit if d in drop_set else next(it) for d in range(len(extents))]
 
-        reshape_op = ir_op.tensor.reshape if kind_name == "tensor" else ir_op.tile.reshape
+        is_tensor = kind_name == "tensor"
+        reshape_op = ir_op.tensor.reshape if is_tensor else ir_op.tile.reshape
         reshape_args: list[list[int | ir.Expr]] = [_lift_shape(source_type.shape)]
-        if is_narrowed:
-            # Tensor path with a genuinely narrower valid_shape — carry it via
-            # reshape's optional 3rd arg so the narrowing survives the rank
-            # lift (issue #1509). Asserted non-None by the is_narrowed guard.
+        if is_narrowed and is_tensor:
+            # Tensor path with a genuinely narrower valid_shape — restate it via
+            # reshape's optional 3rd arg (issue #1509). Reshape derives the same
+            # region from the source anyway, so this only pins it explicitly.
+            # Asserted non-None by the is_narrowed guard.
             assert source_valid_shape is not None
             reshape_args.append(_lift_shape(source_valid_shape))
         return reshape_op(source_expr, *reshape_args, span=span)
@@ -3217,9 +3238,11 @@ class ASTParser:
     ) -> tuple["ir.SplitMode | None", "int | None"]:
         """Parse ``optimizations=[...]`` for ``pl.at`` or ``pl.spmd``.
 
-        Each entry must be ``pl.split(MODE)`` — set the cross-core split mode.
-        The fully qualified form (``pl.optimizations.split(MODE)``) is also
-        accepted.
+        Two entries are recognised, freely combinable because they are
+        orthogonal — ``pl.split(MODE)`` sets the cross-core split mode, and
+        ``pl.cross_core_slot(slot_num=N)`` sets the cross-core pipe slot count.
+        The fully qualified forms (``pl.optimizations.split(MODE)`` etc.) are
+        also accepted.
 
         Args:
             owner: API name used in error messages (e.g. ``"pl.at"``, ``"pl.spmd"``).
@@ -3232,7 +3255,7 @@ class ASTParser:
         if list_hint is None:
             list_hint = "Use optimizations=[pl.split(pl.SplitMode.NONE)]."
         if entry_hint is None:
-            entry_hint = "Each entry must be pl.split(pl.SplitMode.X)."
+            entry_hint = "Each entry must be pl.split(pl.SplitMode.X) or pl.cross_core_slot(slot_num=N)."
         if not isinstance(value, ast.List):
             raise ParserSyntaxError(
                 f"{owner}(optimizations=...) must be a list literal",
@@ -3243,6 +3266,11 @@ class ASTParser:
         split_mode: ir.SplitMode | None = None
         split_slot_num: int | None = None
         seen_split = False
+        seen_cross_core_slot = False
+        # Tracks whether split_slot_num came from the deprecated
+        # ``pl.split(slot_num=)`` spelling, so a list carrying both sources for
+        # one value is rejected instead of letting entry order decide.
+        slot_num_from_split = False
 
         for entry in value.elts:
             if (parsed := self._try_parse_pl_split(entry)) is not None:
@@ -3253,10 +3281,30 @@ class ASTParser:
                     )
                 seen_split = True
                 split_mode, slot_num = parsed
-                # slot_num is valid with any split mode, including SplitMode.NONE:
-                # a NONE mixed kernel still drives a cube->vector cross-core pipe
-                # (on a2a3 via dual-AIV dispatch), and ExpandMixedKernel sizes
-                # that ring from slot_num regardless of split mode.
+                if slot_num is not None:
+                    if seen_cross_core_slot:
+                        raise ParserSyntaxError(
+                            "optimizations=[...] sets the cross-core slot count twice: via the "
+                            "deprecated pl.split(slot_num=...) and via pl.cross_core_slot(...)",
+                            span=self.span_tracker.get_span(entry),
+                            hint="Keep only pl.cross_core_slot(slot_num=N).",
+                        )
+                    split_slot_num = slot_num
+                    slot_num_from_split = True
+            elif (slot_num := self._try_parse_pl_cross_core_slot(entry)) is not None:
+                if seen_cross_core_slot:
+                    raise ParserSyntaxError(
+                        "Duplicate 'pl.cross_core_slot(...)' in optimizations=[...]",
+                        span=self.span_tracker.get_span(entry),
+                    )
+                if slot_num_from_split:
+                    raise ParserSyntaxError(
+                        "optimizations=[...] sets the cross-core slot count twice: via the "
+                        "deprecated pl.split(slot_num=...) and via pl.cross_core_slot(...)",
+                        span=self.span_tracker.get_span(entry),
+                        hint="Drop slot_num= from pl.split(...) and keep pl.cross_core_slot(slot_num=N).",
+                    )
+                seen_cross_core_slot = True
                 split_slot_num = slot_num
             else:
                 raise ParserSyntaxError(
@@ -3276,44 +3324,55 @@ class ASTParser:
             value,
             owner="pl.spmd",
             list_hint="Use optimizations=[pl.split(pl.SplitMode.NONE)].",
-            entry_hint="Each entry must be pl.split(pl.SplitMode.X).",
+            entry_hint="Each entry must be pl.split(pl.SplitMode.X) or pl.cross_core_slot(slot_num=N).",
+        )
+
+    def _is_pl_optimization_call(self, node: ast.expr, name: str) -> bool:
+        """True when ``node`` is ``pl.<name>(...)`` or ``pl.optimizations.<name>(...)``."""
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != name:
+            return False
+        # pl.<name>(...)
+        if isinstance(func.value, ast.Name) and func.value.id == "pl":
+            return True
+        # pl.optimizations.<name>(...)
+        return (
+            isinstance(func.value, ast.Attribute)
+            and func.value.attr == "optimizations"
+            and isinstance(func.value.value, ast.Name)
+            and func.value.value.id == "pl"
         )
 
     def _try_parse_pl_split(self, node: ast.expr) -> "tuple[ir.SplitMode, int | None] | None":
         """Return ``(SplitMode, slot_num)`` if the AST node is ``pl.split(MODE)``; else None.
 
-        ``slot_num`` is ``None`` unless the optional ``slot_num=N`` keyword is
+        ``slot_num`` is ``None`` unless the deprecated ``slot_num=N`` keyword is
         given. Also accepts the fully qualified form
         ``pl.optimizations.split(MODE)``.
         """
-        if not isinstance(node, ast.Call):
+        if not self._is_pl_optimization_call(node, "split"):
             return None
-        func = node.func
-        if not isinstance(func, ast.Attribute) or func.attr != "split":
-            return None
-        # pl.split(...)
-        if isinstance(func.value, ast.Name) and func.value.id == "pl":
-            pass
-        # pl.optimizations.split(...)
-        elif (
-            isinstance(func.value, ast.Attribute)
-            and func.value.attr == "optimizations"
-            and isinstance(func.value.value, ast.Name)
-            and func.value.value.id == "pl"
-        ):
-            pass
-        else:
-            return None
+        assert isinstance(node, ast.Call)  # narrowed by _is_pl_optimization_call
 
         slot_num: int | None = None
         for kw in node.keywords:
             if kw.arg == "slot_num":
-                slot_num = self._eval_pl_split_slot_num(kw.value)
+                slot_num = self._eval_slot_num_literal(
+                    kw.value,
+                    "pl.split(slot_num=...)",
+                    hint="Use e.g. pl.cross_core_slot(slot_num=16).",
+                )
+                # Deprecated spelling: the slot count is orthogonal to the split
+                # mode, so it has its own entry now. Warn rather than reject so
+                # existing kernels keep working.
+                warnings.warn(SPLIT_SLOT_NUM_DEPRECATION, DeprecationWarning, stacklevel=2)
             else:
                 raise ParserSyntaxError(
                     f"Unknown keyword argument '{kw.arg}' in pl.split()",
                     span=self.span_tracker.get_span(kw),
-                    hint="pl.split() accepts only the optional slot_num= keyword.",
+                    hint="pl.split() accepts only the deprecated slot_num= keyword.",
                 )
         if len(node.args) != 1:
             raise ParserSyntaxError(
@@ -3324,8 +3383,51 @@ class ASTParser:
         mode = extract_enum_value(node.args[0], SPLIT_MODE_MAP, "SplitMode", "pl.SplitMode")
         return mode, slot_num
 
-    def _eval_pl_split_slot_num(self, value: ast.expr) -> int:
-        """Evaluate ``slot_num=`` in ``pl.split(...)`` as a positive int literal."""
+    def _try_parse_pl_cross_core_slot(self, node: ast.expr) -> "int | None":
+        """Return the slot count if the node is ``pl.cross_core_slot(slot_num=N)``; else None.
+
+        Also accepts ``pl.optimizations.cross_core_slot(slot_num=N)``. The
+        ``slot_num=`` keyword is required and is the only accepted argument.
+        """
+        if not self._is_pl_optimization_call(node, "cross_core_slot"):
+            return None
+        assert isinstance(node, ast.Call)  # narrowed by _is_pl_optimization_call
+
+        usage_hint = "Use pl.cross_core_slot(slot_num=4)."
+        if node.args:
+            raise ParserSyntaxError(
+                f"pl.cross_core_slot() takes no positional arguments, got {len(node.args)}",
+                span=self.span_tracker.get_span(node),
+                hint=usage_hint,
+            )
+        slot_num: int | None = None
+        for kw in node.keywords:
+            if kw.arg == "slot_num":
+                slot_num = self._eval_slot_num_literal(
+                    kw.value, "pl.cross_core_slot(slot_num=...)", hint=usage_hint
+                )
+            else:
+                raise ParserSyntaxError(
+                    f"Unknown keyword argument '{kw.arg}' in pl.cross_core_slot()",
+                    span=self.span_tracker.get_span(kw),
+                    hint=usage_hint,
+                )
+        if slot_num is None:
+            raise ParserSyntaxError(
+                "pl.cross_core_slot() requires the slot_num= keyword argument",
+                span=self.span_tracker.get_span(node),
+                hint=usage_hint,
+            )
+        return slot_num
+
+    def _eval_slot_num_literal(self, value: ast.expr, api: str, *, hint: str) -> int:
+        """Evaluate a ``slot_num=`` argument as a positive int literal.
+
+        Args:
+            value: The keyword's value AST node.
+            api: API spelling used in error messages (e.g. ``"pl.cross_core_slot(slot_num=...)"``).
+            hint: Usage hint attached to the "not an integer literal" error.
+        """
         # bool is a subclass of int — reject it explicitly.
         if (
             not isinstance(value, ast.Constant)
@@ -3333,13 +3435,13 @@ class ASTParser:
             or not isinstance(value.value, int)
         ):
             raise ParserSyntaxError(
-                "pl.split(slot_num=...) must be an integer literal",
+                f"{api} must be an integer literal",
                 span=self.span_tracker.get_span(value),
-                hint="Use e.g. pl.split(pl.SplitMode.UP_DOWN, slot_num=16).",
+                hint=hint,
             )
         if value.value <= 0:
             raise ParserSyntaxError(
-                f"pl.split(slot_num=...) must be positive, got {value.value}",
+                f"{api} must be positive, got {value.value}",
                 span=self.span_tracker.get_span(value),
             )
         return value.value
@@ -3787,15 +3889,58 @@ class ASTParser:
             hint=f"Use a standalone `with pl.spmd(..., {kwarg}):` (implicit cluster) to keep it.",
         )
 
+    def _reject_submit_dispatch_metadata_in_cluster(
+        self,
+        *,
+        user_dep_vars: list["ir.Var"],
+        core_num: "ir.Expr | None",
+        sync_start: bool,
+        allow_early_resolve: bool,
+        predicate: "ir.Expr | None",
+        span: "ir.Span",
+    ) -> None:
+        """Reject per-task metadata on a Submit nested inside ``pl.cluster()``.
+
+        A cluster body is outlined into one Group task. Calls or plain Submit
+        nodes inside that body identify the Group's AIC/AIV callees, but they
+        are not dispatched independently, so their task-level controls have no
+        runtime carrier and would otherwise be silently ignored.
+        """
+        if not self._is_inside_scope(ir.ScopeKind.Cluster):
+            return
+
+        metadata_fields: list[str] = []
+        if user_dep_vars:
+            metadata_fields.append("deps")
+        if core_num is not None:
+            metadata_fields.append("core_num")
+        if sync_start:
+            metadata_fields.append("sync_start")
+        if allow_early_resolve:
+            metadata_fields.append("allow_early_resolve")
+        if predicate is not None:
+            metadata_fields.append("predicate")
+        if not metadata_fields:
+            return
+
+        construct = "pl.spmd_submit" if core_num is not None else "pl.submit"
+        raise ParserSyntaxError(
+            f"`{construct}(...)` inside `pl.cluster()` cannot carry per-task dispatch metadata "
+            f"({', '.join(metadata_fields)}) — the cluster is dispatched as one Group task, so metadata on "
+            "an inner Submit would be ignored",
+            span=span,
+            hint="Move the dependency or launch control to the dispatch surrounding the cluster, "
+            "or omit it from the inner Submit.",
+        )
+
     @staticmethod
     def _spmd_body_reads_block_idx(body: "list[ast.stmt]") -> bool:
-        """True if any statement in an inline SPMD body calls ``get_block_idx()``.
+        """True if any statement in an SPMD body calls ``get_block_idx()``.
 
-        An inline (auto-outlined) ``pl.spmd`` body distinguishes blocks solely via
-        the per-block index; without it every block executes identical work — almost
-        always a bug, and the reason the body is being outlined into a per-block
-        kernel at all. The single-call direct-dispatch shape is exempt (the callee
-        reads the index internally), so this is only consulted for inline bodies.
+        This is what marks a body as *inline* — it does the per-block work itself
+        and so must be outlined into a per-block kernel. A body that instead
+        dispatches to a kernel reads the index inside the callee and is classified
+        by :meth:`_spmd_body_dispatches_kernel`; see :meth:`_emit_spmd_body`.
 
         Matched at the AST layer (no IR ``Op`` exists yet) by the trailing call name,
         so every valid spelling of the API counts regardless of receiver:
@@ -3804,18 +3949,76 @@ class ASTParser:
         ``get_block_idx()`` imported directly. Matching by name only is deliberately
         lenient: ``get_block_idx`` is unique to this API (no other DSL object exposes
         it), and being lenient here is far safer than rejecting a real body that
-        distinguishes blocks. ``ast.walk`` recurses the whole body subtree, so a
-        nested use (inside a ``pl.range`` loop or an expression argument) is found.
+        distinguishes blocks.
         """
-        for body_stmt in body:
-            for node in ast.walk(body_stmt):
-                if isinstance(node, ast.Call):
-                    func = node.func
-                    if (isinstance(func, ast.Attribute) and func.attr == "get_block_idx") or (
-                        isinstance(func, ast.Name) and func.id == "get_block_idx"
-                    ):
-                        return True
-        return False
+        return _spmd_body_has_call(
+            body,
+            lambda node: (isinstance(node.func, ast.Attribute) and node.func.attr == "get_block_idx")
+            or (isinstance(node.func, ast.Name) and node.func.id == "get_block_idx"),
+        )
+
+    def _explicit_incore_carrier(self, body: "list[ast.stmt]") -> "_AtKwargState | None":
+        """The parsed ``pl.at`` state if ``body`` is a lone ``with pl.at(<CORE_GROUP>, ...):``.
+
+        That nested scope *is* the ``InCoreScopeStmt`` carrier, so
+        :meth:`_emit_spmd_body` must parse it as an ordinary nested scope rather
+        than synthesising a second one around it (which would violate the
+        ``NoNestedInCore`` structural property).
+
+        This is the shape the printer emits for ``Spmd(InCore(...))`` whenever
+        neither the ``as tid`` nor the ``for``-form branch applies — see
+        ``IRPythonPrinter::VisitStmt_(SpmdScopeStmtPtr)``'s plain-with
+        fallthrough. Matching it here is what makes that output re-parseable.
+
+        The level is resolved through :meth:`_parse_at_kwargs`, so the positional
+        form (``pl.at(pl.Level.CORE_GROUP)``) counts too and the enum name is
+        validated against ``LEVEL_MAP`` rather than string-matched. An
+        ``as tid`` capture on the carrier is irrelevant here — it rides on the
+        nested scope either way. Only ``CORE_GROUP`` qualifies: every other level
+        builds a ``HierarchyScopeStmt``, which is not an InCore carrier (see
+        :meth:`_parse_at_scope`).
+
+        Returns the parsed :class:`_AtKwargState` (never ``None`` for a match) so
+        the caller can see whether the carrier itself carries an ``optimizations=``
+        entry; ``None`` when ``body`` is not a carrier.
+        """
+        if len(body) != 1 or not isinstance(body[0], ast.With):
+            return None
+        items = body[0].items
+        if len(items) != 1 or not _is_pl_call(items[0].context_expr, "at"):
+            return None
+        state = self._parse_at_kwargs(items[0].context_expr)
+        return state if state.level == ir.Level.CORE_GROUP else None
+
+    def _spmd_body_kernel_dispatch_count(self, body: "list[ast.stmt]") -> int:
+        """Number of cross-function kernel dispatches in an SPMD body.
+
+        A body with at least one dispatch is a *dispatch* body: the per-block work
+        lives in the callee, which reads the block index internally, so the body
+        itself need not mention ``get_block_idx``.
+
+        The count matters because an unwrapped dispatch body is lowered by
+        ``FindFirstInnerCall`` (``wrapper_call_utils.cpp``), which stops at the
+        first call — orchestration codegen would emit a launch for that callee only
+        and silently drop the rest. Hoisted temporaries and tuple projections are
+        not dispatches, so the shapes ``FlattenCallExpr`` and the multi-output
+        desugar produce still count as exactly one.
+
+        Both call spellings :meth:`parse_call` accepts count: the ``self.<kernel>``
+        cross-function call, and a bare name resolving through ``closure_vars`` to
+        an external ``@pl.function`` / ``@pl.inline``.
+        """
+        from .decorator import InlineFunction  # noqa: PLC0415 (circular import)
+
+        def is_dispatch(node: ast.Call) -> bool:
+            if _is_self_method_call(node):
+                return True
+            if isinstance(node.func, ast.Name):
+                resolved = self.expr_evaluator.closure_vars.get(node.func.id)
+                return isinstance(resolved, (ir.Function, InlineFunction))
+            return False
+
+        return sum(1 for _ in _spmd_body_calls(body, is_dispatch))
 
     def _emit_spmd_body(  # noqa: PLR0913 — args map 1:1 to the SpmdScopeStmt fields
         self,
@@ -3834,39 +4037,102 @@ class ASTParser:
         The two forms differ only in ``scope_attrs`` (the ``as tid`` form adds
         ``task_id_var`` / ``manual_dep_edges``); the body dispatch is identical:
 
-        * single call + no split → ``SpmdScopeStmt(body=Call)`` with no inner InCore
-          wrapper — the historical direct-dispatch shape (the callee is a pre-defined
-          kernel that reads the block index internally). This is also the shape
-          ``OutlineIncoreScopes`` leaves behind once an inline body is outlined, so
-          the IR round-trips identically across passes.
-        * inline multi-statement body, or single-call + split → wrap in
-          ``InCoreScopeStmt(split, <body>)`` for ``OutlineIncoreScopes`` to outline
-          into a synthetic per-block kernel, exactly like ``for i in pl.spmd(n):``.
-          Such an inline body must read the per-block index (see below).
+        The body shape decides whether an inner ``InCoreScopeStmt`` carrier is
+        synthesised. The test is semantic — does the body do per-block work
+        itself, or dispatch it? — not a statement count: a dispatch body may
+        legally hold several statements once ``FlattenCallExpr`` has hoisted a
+        nested call arg, or the multi-output tuple desugar has split an assign
+        into a temp plus projections.
+
+        * an explicit ``with pl.at(<CORE_GROUP level>, ...):`` body → that nested
+          scope already *is* the carrier; parse it as an ordinary nested scope
+          (see :meth:`_is_explicit_incore_carrier`). This is the form the printer
+          emits, so recognising it here is what makes ``Spmd(InCore(...))``
+          round-trip.
+        * dispatch body (does not read the per-block index), no split and no slot
+          count → ``SpmdScopeStmt(body=<stmts>)`` with no inner InCore wrapper —
+          the callee is a pre-defined kernel that reads the block index
+          internally. This is also the shape ``OutlineIncoreScopes`` leaves behind
+          once an inline body is outlined, so the IR round-trips identically
+          across passes.
+        * inline body (reads the per-block index), or any body carrying an
+          ``optimizations=`` entry → wrap in ``InCoreScopeStmt(split, <body>)`` for
+          ``OutlineIncoreScopes`` to outline into a synthetic per-block kernel,
+          exactly like ``for i in pl.spmd(n):``. Both entries lower onto the InCore
+          scope (``split_`` and the ``slot_num`` attr), so either one forces the
+          wrapper.
+
+        A body that neither reads the index nor dispatches a kernel does no
+        per-block differentiation at all and is rejected (see below). An explicit
+        carrier is exempt from that check: the user wrote the InCore scope
+        themselves, so the body is taken as deliberate.
         """
-        # A single body statement whose value is a Call — Assign/AnnAssign/Expr all
-        # expose a `.value`, so one membership test covers the three call-carrying
-        # statement kinds (`x = f()`, `x: T = f()`, and a bare `f()`).
-        body_stmt = stmt.body[0] if len(stmt.body) == 1 else None
-        is_single_call = isinstance(body_stmt, (ast.Assign, ast.AnnAssign, ast.Expr)) and isinstance(
-            body_stmt.value, ast.Call
-        )
-        # An inline (auto-outlined) body must read the per-block index — the
-        # single-call dispatch is exempt (its callee reads it internally). Unlike
-        # the for-form, the with-forms do not bind the index for you, so require an
-        # explicit ``pl.tile.get_block_idx()`` somewhere in the body.
-        if not is_single_call and not self._spmd_body_reads_block_idx(stmt.body):
-            raise ParserSyntaxError(
-                "inline `with pl.spmd(...)` body must read the per-block index via "
-                "`pl.tile.get_block_idx()`; without it every block runs identical work.",
-                span=span,
-                hint="Add `i = pl.tile.get_block_idx()` inside the scope, or use "
-                "`for i in pl.spmd(n):` to bind the block index automatically.",
-            )
-        if is_single_call and split_mode is None:
-            # Historical no-InCore-wrapper shape. Any ``scope_attrs``
+        # ``split_slot_num`` is weighed alongside ``split_mode`` throughout: the
+        # slot count lands on the *InCore* scope (OutlineIncoreScopes reads
+        # ``slot_num`` off InCoreScopeStmt only), so either entry alone is enough
+        # to require a carrier — and enough to collide with one the body already
+        # provides. Before pl.cross_core_slot existed the two were coupled:
+        # slot_num could only arrive via pl.split(mode, slot_num=N), which always
+        # set a mode.
+        has_optimization_entry = split_mode is not None or split_slot_num is not None
+        carrier = self._explicit_incore_carrier(stmt.body)
+        if carrier is not None:
+            # The nested ``pl.at(CORE_GROUP)`` already is the carrier, and an
+            # ``optimizations=`` entry has to land on it. One on the
+            # ``pl.spmd(...)`` line as well is either a duplicate or would have to
+            # be pushed into a scope the user wrote by hand — reject both rather
+            # than silently picking one or dropping it.
+            if has_optimization_entry:
+                carrier_has_entry = carrier.split_mode is not None or carrier.split_slot_num is not None
+                where = (
+                    "is specified twice: on `pl.spmd(...)` and on the inner"
+                    if carrier_has_entry
+                    else "belongs on the InCore scope, but the body already provides one as the inner"
+                )
+                raise ParserSyntaxError(
+                    f"`optimizations=` {where} `pl.at(level=pl.Level.CORE_GROUP, ...)`",
+                    span=span,
+                    hint="Keep `optimizations=[...]` on the inner `pl.at(...)` carrier only.",
+                )
+            needs_incore = False
+        else:
+            is_inline_body = self._spmd_body_reads_block_idx(stmt.body)
+            dispatch_count = 0 if is_inline_body else self._spmd_body_kernel_dispatch_count(stmt.body)
+            if not is_inline_body and dispatch_count == 0:
+                raise ParserSyntaxError(
+                    "`with pl.spmd(...)` body neither reads the per-block index via "
+                    "`pl.tile.get_block_idx()` nor dispatches a `self.<kernel>(...)` call, "
+                    "so every block would run identical work.",
+                    span=span,
+                    hint="Add `i = pl.tile.get_block_idx()` inside the scope, dispatch a kernel "
+                    "that reads it, or use `for i in pl.spmd(n):` to bind the block index "
+                    "automatically.",
+                )
+            # An unwrapped dispatch body is lowered via FindFirstInnerCall, which
+            # stops at the first call — a second dispatch would be silently
+            # dropped by orchestration codegen rather than launched.
+            if dispatch_count > 1:
+                raise ParserSyntaxError(
+                    f"`with pl.spmd(...)` dispatch body launches {dispatch_count} kernels; "
+                    "only one kernel dispatch per SPMD scope is supported.",
+                    span=span,
+                    hint="Use one `pl.spmd(...)` scope per kernel, or make the body inline by "
+                    "reading `pl.tile.get_block_idx()` so the whole body is outlined into a "
+                    "single per-block kernel.",
+                )
+            needs_incore = is_inline_body or has_optimization_entry
+        if not needs_incore:
+            # Either the body already carries its own InCore, or it is a dispatch
+            # body whose per-block work lives in the callee. Any ``scope_attrs``
             # (allow_early_resolve, and for the ``as tid`` form task_id_var /
             # manual_dep_edges) ride on the SpmdScopeStmt.
+            #
+            # ``split_slot_num`` is checked alongside ``split_mode``: the slot
+            # count lands on the *InCore* scope (OutlineIncoreScopes reads
+            # ``slot_num`` off InCoreScopeStmt only), so taking this wrapper-less
+            # path with a slot count set would silently discard it. Before
+            # pl.cross_core_slot existed the two were coupled — slot_num could
+            # only arrive via pl.split(mode, slot_num=N), which always set a mode.
             self._parse_scope_body(
                 stmt,
                 scope_kind,
@@ -3922,10 +4188,10 @@ class ASTParser:
         captured — the body shape is identical (see :meth:`_emit_spmd_body`):
 
         * ``with pl.spmd(n):`` — no captured TaskId, no ``deps=``. Accepts either a
-          single kernel call (historical direct-dispatch shape) or an inline
-          multi-statement body auto-outlined into an InCore kernel (like
-          ``for i in pl.spmd(n):``, minus the auto-bound loop var — read the
-          per-block index inside via ``pl.tile.get_block_idx()``).
+          dispatch body calling a pre-defined kernel (direct dispatch) or an inline
+          body auto-outlined into an InCore kernel (like ``for i in pl.spmd(n):``,
+          minus the auto-bound loop var — read the per-block index inside via
+          ``pl.tile.get_block_idx()``).
         * ``with pl.spmd(n, deps=[...]) as tid:`` — same body shapes, and
           additionally captures the producer ``Scalar[TASK_ID]`` (mirrors
           ``with pl.at(...) as tid:``) so it can feed a ``deps=`` edge.
@@ -3935,9 +4201,9 @@ class ASTParser:
         ``task_id_var`` attr that makes the dispatch lower to an ``ir.Submit``.
         """
         with_hint = (
-            "Use 'with pl.spmd(4):' with a single call or an inline block that reads "
-            "'pl.tile.get_block_idx()', or 'with pl.spmd(4) as tid:' to also capture "
-            "the dispatch TaskId."
+            "Use 'with pl.spmd(4):' with a body that dispatches a 'self.<kernel>(...)' call "
+            "or reads 'pl.tile.get_block_idx()', or 'with pl.spmd(4) as tid:' to also "
+            "capture the dispatch TaskId."
         )
         # ``deps=`` is accepted ONLY with ``as tid`` — gate it by keyword presence,
         # not by the resolved list being non-empty. _parse_submit_deps_kwarg
@@ -3994,10 +4260,10 @@ class ASTParser:
             spmd_attrs.append(("predicate", predicate))
 
         # No ``as tid``: the plain with-form. ``deps=`` was already rejected above
-        # (allow_deps=False), so dep_vars is empty here. The shared helper keeps the
-        # historical single-call direct-dispatch shape and outlines an inline
-        # multi-statement body into a synthetic InCore kernel — identical to the
-        # ``as tid`` form, minus the captured TaskId.
+        # (allow_deps=False), so dep_vars is empty here. The shared helper leaves a
+        # dispatch body unwrapped and outlines an inline body into a synthetic
+        # InCore kernel — identical to the ``as tid`` form, minus the captured
+        # TaskId.
         self._emit_spmd_body(
             stmt,
             span,
@@ -4032,13 +4298,15 @@ class ASTParser:
         plain with-form so the IR is identical to the post-``OutlineIncoreScopes``
         shape (a single Call) and round-trips through print -> reparse:
 
-        * single call, no split → ``SpmdScopeStmt(attrs, body=Call)`` (no InCore
-          wrapper) — the same shape ``OutlineIncoreScopes`` leaves behind once the
-          inline body is outlined, so reparse is stable across passes.
-        * inline multi-statement body, or single-call with split → wrap in
+        * dispatch body, no split → ``SpmdScopeStmt(attrs, body=<stmts>)`` (no
+          InCore wrapper) — the same shape ``OutlineIncoreScopes`` leaves behind
+          once the inline body is outlined, so reparse is stable across passes.
+        * inline body (reads the per-block index), or any body with split → wrap in
           ``InCoreScopeStmt(split, <body>)``, exactly like the for-form (minus the
           synthesised ``loop_var = tile.get_block_idx()``; the body reads the block
           index explicitly via ``pl.tile.get_block_idx()``).
+        * an explicit ``pl.at(<CORE_GROUP level>)`` body already carries its own
+          InCore, so it is parsed as an ordinary nested scope.
 
         The ``kAttrTaskIdVar`` on the outer Spmd scope makes ``OutlineClusterScopes``
         lower the dispatch to an ``ir.Submit`` whose trailing tuple element is the
@@ -4505,10 +4773,14 @@ class ASTParser:
 
         is_core_group = level == ir.Level.CORE_GROUP
 
-        if split_mode is not None and not is_core_group:
+        # Both optimizations= entries lower onto the InCore scope: pl.split(...)
+        # into split_, pl.cross_core_slot(...) into the slot_num attr. Neither
+        # has a meaning on a Hierarchy scope, so reject either at a non-CORE_GROUP
+        # level rather than silently attaching a dead attr.
+        if (split_mode is not None or state.split_slot_num is not None) and not is_core_group:
             raise ParserSyntaxError(
-                "split mode is only supported with level=pl.Level.CORE_GROUP "
-                "(via optimizations=[pl.split(...)])",
+                "optimizations=[pl.split(...)] / optimizations=[pl.cross_core_slot(...)] are only "
+                "supported with level=pl.Level.CORE_GROUP",
                 span=span,
                 hint="Use pl.at(level=pl.Level.CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]).",
             )
@@ -4592,11 +4864,11 @@ class ASTParser:
     def _append_split_slot_num_attr(
         attrs: "list[tuple[str, Any]] | None", slot_num: "int | None"
     ) -> "list[tuple[str, Any]] | None":
-        """Append the ``slot_num`` scope attr (from ``pl.split(mode, slot_num=N)``).
+        """Append the ``slot_num`` scope attr (from ``pl.cross_core_slot(slot_num=N)``).
 
         Appended last so a print -> reparse cycle reproduces the same attr order
-        (``optimizations=[pl.split(...)]`` is printed alongside ``deps=`` /
-        ``dumps=``, and slot_num always lands at the tail here on both passes).
+        (``optimizations=[...]`` is printed alongside ``deps=`` / ``dumps=``, and
+        slot_num always lands at the tail here on both passes).
         Returns ``attrs`` unchanged when ``slot_num`` is ``None``.
         """
         if slot_num is None:
@@ -5887,6 +6159,14 @@ class ASTParser:
             predicate = self._parse_submit_predicate_kwarg(method_name, keywords)
             if predicate is not None:
                 self._validate_predicate_deps(method_name, predicate, user_dep_vars, span)
+            self._reject_submit_dispatch_metadata_in_cluster(
+                user_dep_vars=user_dep_vars,
+                core_num=core_num_expr,
+                sync_start=sync_start,
+                allow_early_resolve=allow_early_resolve,
+                predicate=predicate,
+                span=span,
+            )
         return_types = func_obj.return_types if func_obj else []
         # A callee that declares no ``-> `` annotation has empty ``return_types``
         # but may ``return <value>`` (e.g. an InCore kernel returning its

@@ -33,6 +33,28 @@ on the Python side and raises `ValueError` from `execute_on_device`
 *before* the C++ boundary so the failure traceback points at the
 caller.
 
+### L3 (distributed): one subdirectory per dispatch
+
+A distributed run dispatches to several chips, and one chip may receive
+several dispatches in a single host orchestration — every dispatch would
+otherwise rewrite the same fixed-name files. So on the L3 path PyPTO
+namespaces the prefix per dispatch:
+
+```text
+<work_dir>/dfx_outputs/
+├── rank0/d0/          # rank 0, its 0th dispatch
+├── rank0/d1/          # rank 0, its 1st dispatch
+└── rank1/d0/
+```
+
+`d{k}` counts that card's dispatches within the run, restarting at `d0`
+each run. Every dispatch is filed under the chip that ran it: a `device=`
+pinned dispatch under its own rank, and a comm-less one (no `device=`)
+under the chip it was placed on — those are handed out round-robin over
+the program's chips in submit order. Each leaf holds the flat artefacts
+from the table above, so the L2 contract applies unchanged within one
+dispatch directory.
+
 ## L2 swimlane runs the kernel twice (onboard)
 
 The swimlane converter joins per-task timing against a task graph that **only

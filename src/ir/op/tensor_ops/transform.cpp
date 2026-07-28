@@ -33,11 +33,15 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/reinterpret_view_semantics.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 
 namespace pypto {
 namespace ir {
@@ -170,16 +174,118 @@ TypePtr DeduceTensorReshapeType(const std::vector<ExprPtr>& args,
                                       << " into shape with size " << new_product;
   }
 
-  // Return new TensorType with reshaped dimensions and same dtype
-  // If valid_shape is provided as 3rd argument, store it in TensorView
+  // A reshape is a zero-copy view, so it cannot invent data: the result's valid
+  // region is the source's, mapped through the reshape. A region the target
+  // shape cannot represent is rejected rather than rounded up to fully valid.
+  // Row-major flat order needs BOTH an ND layout and packed row-major strides:
+  // tensor.transpose of a non-trailing axis pair keeps the ND layout while
+  // permuting the strides, so ND alone does not imply the element order the
+  // flat-prefix mapping walks.
+  bool row_major_contiguous = true;
+  if (tensor_type->tensor_view_.has_value()) {
+    const TensorView& source_view = *tensor_type->tensor_view_;
+    row_major_contiguous =
+        source_view.layout == TensorLayout::ND &&
+        (source_view.stride.empty() || tile_view_semantics::ShapeExprListsEquivalent(
+                                           source_view.stride, BuildRowMajorStrides(tensor_type->shape_)));
+  }
+  std::vector<ExprPtr> mapped_valid =
+      ComputeReshapeValidShape(GetValidShape(tensor_type), tensor_type->shape_, new_shape,
+                               row_major_contiguous, args[0]->span_, "tensor.reshape");
+
+  // The optional 3rd argument may narrow the mapped region but may never claim
+  // data outside it. Unknown symbolic relations reject, because reshape emits
+  // no runtime guard that could cut the request back.
   if (args.size() == 3) {
     auto valid_shape_tuple = As<MakeTuple>(args[2]);
     CHECK(valid_shape_tuple) << "tensor.reshape valid_shape (3rd argument) must be a MakeTuple";
-    TensorView tensor_view({}, TensorLayout::ND, valid_shape_tuple->elements_);
-    return std::make_shared<TensorType>(new_shape, tensor_type->dtype_, std::nullopt,
-                                        std::make_optional(std::move(tensor_view)));
+    const std::vector<ExprPtr>& requested = valid_shape_tuple->elements_;
+    CHECK_SPAN(requested.size() == new_shape.size(), args[2]->span_)
+        << "tensor.reshape: valid_shape rank (" << requested.size() << ") must match the target shape rank ("
+        << new_shape.size() << ")";
+    const ExprPtr zero = std::make_shared<ConstInt>(0, DataType::INDEX, args[2]->span_);
+    for (size_t i = 0; i < requested.size(); ++i) {
+      // An upper bound alone admits a negative extent: -1 <= 5 proves true, and
+      // a negative valid_shape is not a region at all. Zero stays legal -- it is
+      // how an empty region is spelled.
+      CHECK_SPAN(ProveValidExtentLessEqual(zero, requested[i]) == ProofResult::kTrue, args[2]->span_)
+          << "tensor.reshape: explicit valid_shape[" << i << "]=" << PythonPrint(requested[i])
+          << " must be provably >= 0; a valid extent counts real elements";
+      const ProofResult within_source = ProveValidExtentLessEqual(requested[i], mapped_valid[i]);
+      CHECK_SPAN(within_source == ProofResult::kTrue, args[2]->span_)
+          << "tensor.reshape: explicit valid_shape[" << i << "]=" << PythonPrint(requested[i])
+          << " is not provably within the source-derived extent " << PythonPrint(mapped_valid[i]);
+    }
+    mapped_valid = requested;
   }
-  return std::make_shared<TensorType>(new_shape, tensor_type->dtype_);
+
+  // Return new TensorType with reshaped dimensions and same dtype. A fully valid
+  // region is canonicalized away by the constructor, leaving no view at all.
+  const PadValue pad =
+      tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->pad : PadValue::null;
+  TensorView tensor_view({}, TensorLayout::ND, std::move(mapped_valid), pad);
+  return std::make_shared<TensorType>(new_shape, tensor_type->dtype_, std::nullopt,
+                                      std::make_optional(std::move(tensor_view)));
+}
+
+TypePtr DeduceTensorReinterpretViewType(const std::vector<ExprPtr>& args,
+                                        const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  constexpr const char* kOpName = "tensor.reinterpret_view";
+  CHECK(args.size() == 1 || args.size() == 2)
+      << kOpName << " requires 1 or 2 arguments (data[, shape]), but got " << args.size();
+  CHECK_SPAN(!As<DistributedTensorType>(args[0]->GetType()), args[0]->span_)
+      << kOpName << " does not support DistributedTensorType in the initial implementation";
+
+  auto tensor_type = As<TensorType>(args[0]->GetType());
+  CHECK_SPAN(tensor_type, args[0]->span_)
+      << kOpName << " requires data to be a TensorType, but got " << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!tensor_type->shape_.empty(), args[0]->span_) << kOpName << " requires a tensor rank >= 1";
+
+  const DataType target_dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
+  const TensorLayout layout =
+      tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : TensorLayout::ND;
+  CHECK_SPAN(layout != TensorLayout::NZ, args[0]->span_)
+      << kOpName << " does not support boxed/fractal NZ tensor layout";
+  CHECK_SPAN(layout != TensorLayout::DN || tensor_type->shape_.size() >= 2, args[0]->span_)
+      << kOpName << " requires rank >= 2 for DN layout";
+
+  bool preserve_explicit_stride = false;
+  if (tensor_type->tensor_view_.has_value() && !tensor_type->tensor_view_->stride.empty()) {
+    const auto expected_stride =
+        tensor_view_semantics::BuildLogicalStridesFromLayout(tensor_type->shape_, layout);
+    CHECK_SPAN(
+        tile_view_semantics::ShapeExprListsEquivalent(tensor_type->tensor_view_->stride, expected_stride),
+        args[0]->span_)
+        << kOpName << " only supports packed tensors with canonical strides for their layout";
+    preserve_explicit_stride = true;
+  }
+
+  std::optional<std::vector<ExprPtr>> requested_shape;
+  if (args.size() == 2) {
+    requested_shape = reinterpret_view_semantics::ExtractShape(args[1], kOpName);
+    CHECK_SPAN(layout != TensorLayout::DN || requested_shape->size() >= 2, args[1]->span_)
+        << kOpName << " requires target rank >= 2 for DN layout";
+  }
+
+  const size_t contiguous_axis =
+      layout == TensorLayout::DN ? tensor_type->shape_.size() - 2 : tensor_type->shape_.size() - 1;
+  const std::vector<ExprPtr> source_valid =
+      tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->valid_shape : std::vector<ExprPtr>{};
+  auto plan = reinterpret_view_semantics::Resolve(tensor_type->shape_, source_valid, tensor_type->dtype_,
+                                                  target_dtype, contiguous_axis, requested_shape, kOpName,
+                                                  args[0]->span_);
+
+  TensorView result_view;
+  result_view.layout = layout;
+  result_view.valid_shape = std::move(plan.valid_shape);
+  const PadValue source_pad =
+      tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->pad : PadValue::null;
+  result_view.pad = reinterpret_view_semantics::NormalizePad(source_pad);
+  if (preserve_explicit_stride) {
+    result_view.stride = tensor_view_semantics::BuildLogicalStridesFromLayout(plan.shape, layout);
+  }
+  return std::make_shared<TensorType>(std::move(plan.shape), target_dtype, tensor_type->memref_,
+                                      std::make_optional(std::move(result_view)));
 }
 
 TypePtr DeduceTensorTransposeType(const std::vector<ExprPtr>& args,
@@ -514,6 +620,9 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
                                       std::make_optional(std::move(new_view)));
 }
 
+// Reshape is a zero-copy view.  Marking that relationship also lets
+// ConvertTensorToTileOps propagate a consumer's memory-space requirement back
+// through reshape to a load-like producer such as tensor.slice.
 REGISTER_OP("tensor.reshape")
     .set_op_category("TensorOp")
     .set_description("Reshape tensor to new shape")
@@ -522,9 +631,23 @@ REGISTER_OP("tensor.reshape")
     .add_argument("valid_shape",
                   "Optional logical valid shape (MakeTuple, same rank as `shape`) carried onto the "
                   "result TensorView; present only in the 3-arg form")
+    .set_output_memory_inherit_input()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorReshapeType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.reinterpret_view")
+    .set_op_category("TensorOp")
+    .set_description(
+        "Zero-copy reinterpretation of a packed tensor with a different dtype and equal byte size")
+    .add_argument("data", "Input tensor (packed canonical TensorType)")
+    .add_argument("shape", "Optional target shape; omitted to scale the physically contiguous dimension")
+    .set_attr<DataType>("dtype")
+    .set_output_memory_inherit_input()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorReinterpretViewType(args, kwargs);
     });
 
 REGISTER_OP("tensor.transpose")

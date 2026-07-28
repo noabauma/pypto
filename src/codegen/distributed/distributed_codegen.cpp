@@ -258,8 +258,9 @@ void DistributedCodegen::EmitImports() {
       "from simpler.task_interface import "
       "CallConfig, CommBufferSpec, DataType, TaskArgs, Tensor, TensorArgType");
   emitter_.EmitLine("from pypto.runtime.tensor_arg import make_tensor_arg");
-  // ``_submit_chip`` wraps ``orch.submit_next_level`` to namespace per-rank DFX
-  // ``output_prefix`` (``<base>/rank{worker}``); a no-op when DFX is off.
+  // ``_submit_chip`` resolves a comm-less dispatch's chip and namespaces the
+  // per-dispatch DFX ``output_prefix`` (``<base>/rank{worker}/d{k}``); the
+  // namespacing half is a no-op when DFX is off.
   emitter_.EmitLine("from pypto.runtime.distributed_runner import _submit_chip");
 }
 
@@ -273,6 +274,10 @@ void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
 
   // Build function signature
   // Orchestrators: def func(orch, _args, config, *, tensors, callables, sub_ids, _keep, world_size):
+  // HOST orchestrators additionally accept an internal ``_domain_provider``
+  // hook. Normal dispatch leaves it unset and allocates transient domains from
+  // ``orch`` exactly as before; the prepared persistent path supplies a
+  // provider that returns retained leases without changing the model entry.
   // SubWorkers are not emitted as Python functions (they run on device or as registered callables)
   if (is_sub_worker) {
     is_worker_context_ = false;
@@ -283,7 +288,11 @@ void DistributedCodegen::EmitFunction(const ir::FunctionPtr& func) {
   // with ``len(DistributedConfig.device_ids)``. ``pld.system.world_size()``
   // lowers to a bare reference to this kwarg.
   std::ostringstream sig;
-  sig << "def " << func->name_ << "(orch, _args, config, *, tensors, callables, sub_ids, _keep, world_size):";
+  sig << "def " << func->name_ << "(orch, _args, config, *, tensors, callables, sub_ids, _keep, world_size";
+  if (ir::LevelToLinquLevel(func->level_.value_or(ir::Level::AIV)) >= 3) {
+    sig << ", _domain_provider=None";
+  }
+  sig << "):";
   emitter_.EmitLine(sig.str());
   emitter_.IncreaseIndent();
 
@@ -558,7 +567,7 @@ void DistributedCodegen::VisitStmt_(const ir::CommDomainScopeStmtPtr& op) {
     window_size_expr << "(" << slot_nbytes[i] << ")";
   }
 
-  emitter_.EmitLine("with orch.allocate_domain(");
+  emitter_.EmitLine("with (_domain_provider or orch.allocate_domain)(");
   emitter_.IncreaseIndent();
   emitter_.EmitLine(std::string("name=\"") + domain_name + "\",");
   emitter_.EmitLine("workers=" + workers.str() + ",");
@@ -845,10 +854,18 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
       }
       if (callee->role_.has_value() && *callee->role_ == ir::Role::Orchestrator) {
         // Orchestrator-to-orchestrator calls: emit as direct function call
-        current_expr_value_ =
-            callee->name_ +
-            "(orch, _args, config, "
-            "tensors=tensors, callables=callables, sub_ids=sub_ids, _keep=_keep, world_size=world_size)";
+        current_expr_value_ = callee->name_ +
+                              "(orch, _args, config, "
+                              "tensors=tensors, callables=callables, sub_ids=sub_ids, _keep=_keep, "
+                              "world_size=world_size";
+        const bool caller_accepts_domain_provider =
+            ir::LevelToLinquLevel(current_func_->level_.value_or(ir::Level::AIV)) >= 3;
+        const bool callee_accepts_domain_provider =
+            ir::LevelToLinquLevel(callee->level_.value_or(ir::Level::AIV)) >= 3;
+        if (caller_accepts_domain_provider && callee_accepts_domain_provider) {
+          current_expr_value_ += ", _domain_provider=_domain_provider";
+        }
+        current_expr_value_ += ")";
         return;
       }
       // Chip-level function (Orchestration/InCore with no role) called from HOST orchestrator
@@ -1060,22 +1077,19 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
     // HOST Worker = SubWorker: orch.submit_sub(callable_id, task_args)
     emitter_.EmitLine("orch.submit_sub(sub_ids[\"" + callee->name_ + "\"], " + ta_var + ")");
   } else {
-    // CHIP Worker: orch.submit_next_level(callable, task_args, config).
-    // N7: thread the dispatch ``device=`` attr (N3 parser) into the
-    // simpler runtime's ``worker=`` kwarg (see simpler/python/simpler/
-    // orchestrator.py — ``-1`` = unconstrained). Empty rank_expr ⇔ no
-    // ``device=`` attr → omit the kwarg, byte-compatible with comm-less L3.
+    // CHIP Worker: dispatch via ``_submit_chip`` (wraps orch.submit_next_level).
+    // N7: thread the dispatch ``device=`` attr (N3 parser) into the simpler
+    // runtime's ``worker=`` kwarg. A rank-pinned dispatch passes its rank; a
+    // comm-less dispatch (empty rank_expr, no ``device=``) passes ``None``,
+    // which ``_submit_chip`` resolves to a concrete chip at dispatch time —
+    // simpler no longer accepts an unconstrained target (simpler #1436). The
+    // chip count is only known at run time, so the choice cannot be baked here.
+    // ``_submit_chip`` also owns the per-dispatch DFX ``output_prefix``
+    // namespacing — see its docstring.
     emitter_.EmitLine("_keep.append(" + ta_var + ")");
-    if (rank_expr.empty()) {
-      emitter_.EmitLine("orch.submit_next_level(callables[\"" + callee->name_ + "\"], " + ta_var +
-                        ", config)");
-    } else {
-      // Rank-pinned dispatch routes through ``_submit_chip`` so DFX artifacts
-      // land in a per-rank subdir (``<output_prefix>/rank{r}``); a no-op
-      // forward to ``submit_next_level`` when DFX is off.
-      emitter_.EmitLine("_submit_chip(orch, callables[\"" + callee->name_ + "\"], " + ta_var + ", config, " +
-                        rank_expr + ")");
-    }
+    const std::string worker_arg = rank_expr.empty() ? "None" : rank_expr;
+    emitter_.EmitLine("_submit_chip(orch, callables[\"" + callee->name_ + "\"], " + ta_var + ", config, " +
+                      worker_arg + ")");
   }
 
   // If this call has an assignment target (return value), alias it to the OUT

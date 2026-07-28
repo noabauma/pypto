@@ -24,6 +24,13 @@
 namespace pypto {
 namespace ir {
 
+/// Private provenance on every compiler-generated ``tile.load(GM -> Mat)``
+/// call introduced while bridging a Tensor operand to tile IR.
+/// ``InferTileMemorySpace`` consumes this evidence when deciding whether a
+/// stationary operand is eligible for loop residency; user-authored tile loads
+/// deliberately do not carry it.
+inline constexpr const char* kCompilerTensorToTileMatBridgeAttr = "__compiler_tensor_to_tile_mat_bridge";
+
 /// Attribute key for ``pl.pipeline(N, stage=F)`` — appears on ``ForStmt.attrs_``
 /// if and only if ``ForStmt.kind_ == ForKind::Pipeline`` (bidirectional invariant
 /// enforced by the structural verifier ``PipelineLoopValid``).
@@ -200,7 +207,7 @@ inline constexpr const char* kAttrCompilerAutoManualScopeCandidate = "__compiler
 //
 // The rebind attr is stamped for **every** iter_arg (even when false) so its
 // presence proves the pass ran; the array-size attr is stamped only when
-// positive. See ``docs/en/dev/passes/42-classify_iter_arg_carry.md``.
+// positive. See ``docs/en/dev/passes/43-classify_iter_arg_carry.md``.
 
 /// Prefix of the per-iter_arg ``bool`` "needs a materialised carry" attr.
 inline constexpr const char* kIterArgRebindAttrPrefix = "iter_arg_rebind_";

@@ -132,9 +132,18 @@ inline const PassProperties kOutlineHierarchyScopesProperties{
 
 // -- Tensor-to-tile conversion pass ------------------------------------------
 
+// Re-opens the AivSplitValid window. OutlineIncoreScopes establishes the property
+// while the AIV-split boundary is still `tensor.aiv_shard` / `tensor.aic_gather` —
+// a TensorType carries no memory space, so the verifier's boundary memory contract
+// check (d) is necessarily skipped there. This pass rewrites those ops to their
+// tile form and attaches the declared boundary memory, which is exactly what
+// check (d) inspects, so it invalidates and re-produces the property to force a
+// second verification at a point where the memory sides are observable.
 inline const PassProperties kConvertTensorToTileOpsProperties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::NormalizedStmtStructure}};
+    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::NormalizedStmtStructure,
+                 IRProperty::AivSplitValid},
+    .invalidated = {IRProperty::AivSplitValid}};
 
 // -- Orchestration tensor optimization pass -----------------------------------
 
@@ -147,6 +156,15 @@ inline const PassProperties kOptimizeOrchTensorsProperties{
 inline const PassProperties kFlattenTileNdTo2DProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::TileOps2D, IRProperty::NormalizedStmtStructure}};
+
+// -- Legalize unsupported tile.cast pairs into native cast chains -------------
+//
+// Property-preserving: expands one tile.cast AssignStmt into a SeqStmts of
+// native tile.cast hops. Empty props (same rationale as LowerCompositeOps):
+// the rewrite stays inside the existing tile.cast vocabulary and does not
+// establish or destroy IRProperties. Pipeline position is FlattenTileNdTo2D
+// → LegalizeTileCast → AutoTileMatmulL0.
+inline const PassProperties kLegalizeTileCastProperties{};
 
 // -- Auto L0 matmul tiling pass -----------------------------------------------
 //
@@ -176,10 +194,17 @@ inline const PassProperties kCanonicalizeTileSliceProperties{
 
 // -- Tile memory space inference pass -----------------------------------------
 
+// Also re-verifies AivSplitValid (same rationale as ConvertTensorToTileOps): this
+// pass is what finally resolves every tile memory space, so an AIV-split boundary
+// whose operand space was still unresolved at pass 10 — and therefore skipped by
+// check (d) — becomes observable here, the last verification point before
+// LowerAutoVectorSplit erases the region node.
 inline const PassProperties kInferTileMemorySpaceProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::NormalizedStmtStructure},
-    .produced = {IRProperty::SSAForm, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
+    .produced = {IRProperty::SSAForm, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure,
+                 IRProperty::AivSplitValid},
+    .invalidated = {IRProperty::AivSplitValid}};
 
 // -- Materialize tensor strides pass (RFC #1300 §2.4) ------------------------
 
@@ -327,11 +352,13 @@ inline const PassProperties kExpandManualPhaseFenceProperties{
 // -- Automatic runtime-scope task dependency pass -----------------------------
 //
 // Reads ``Call.attrs_["arg_directions"]`` and writes
-// ``Call.attrs_["compiler_manual_dep_edges"]`` for runtime scopes. MANUAL
-// scopes are analyzed in the default pipeline. AUTO-scope analysis is
-// controlled by the pass option and remains off by default at high-level
-// pipeline entry points. The pass preserves CallDirectionsResolved because it
-// does not rewrite call args or direction attrs.
+// ``Call.attrs_["compiler_manual_dep_edges"]`` for runtime scopes. User-written
+// MANUAL scopes are never analyzed: their explicit ``deps=[...]`` edges remain
+// the only task dependencies. AUTO-scope analysis is controlled by the pass
+// option and remains off by default at high-level pipeline entry points. The
+// pass preserves CallDirectionsResolved because it does not rewrite call args:
+// in an analyzed AUTO region it only refines already-resolved directions
+// (``Input -> NoDep``, ``InOut -> OutputExisting``), leaving every arg resolved.
 inline const PassProperties kAutoDeriveTaskDependenciesProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::CallDirectionsResolved},
     .produced = {IRProperty::CallDirectionsResolved}};

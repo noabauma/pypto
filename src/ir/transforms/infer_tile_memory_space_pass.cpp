@@ -17,6 +17,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -32,17 +33,20 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
+#include "src/ir/transforms/loop_invariant_mat_residency.h"
 
 namespace pypto {
 namespace ir {
@@ -486,10 +490,69 @@ class TileMemorySpaceMutator : public IRMutator {
     return new_iter_arg;
   }
 
+  using CallArgReplacements = std::unordered_map<const Expr*, std::vector<VarPtr>>;
+
+  std::pair<std::vector<std::pair<std::string, std::any>>, bool> RemapCallAttrs(
+      const CallPtr& op, const CallArgReplacements& arg_replacements) {
+    std::vector<std::pair<std::string, std::any>> new_attrs;
+    bool changed = false;
+    new_attrs.reserve(op->attrs_.size());
+
+    auto remap_var = [&](const VarPtr& var) -> VarPtr {
+      if (!var) return var;
+      auto remapped = AsVarLike(IRMutator::VisitExpr(var));
+      return remapped ? remapped : var;
+    };
+
+    for (const auto& [key, value] : op->attrs_) {
+      if (key == kAttrManualDepEdges || key == kAttrCompilerManualDepEdges ||
+          key == kAttrArgDirOverrideVars || key == kAttrDumpVars) {
+        if (const auto* vars = std::any_cast<std::vector<VarPtr>>(&value)) {
+          std::vector<VarPtr> remapped_vars;
+          bool attr_changed = false;
+          remapped_vars.reserve(vars->size());
+          for (const auto& var : *vars) {
+            if (key == kAttrDumpVars && var) {
+              auto replacements = arg_replacements.find(var.get());
+              if (replacements != arg_replacements.end() &&
+                  (replacements->second.size() != 1 || replacements->second.front().get() != var.get())) {
+                remapped_vars.insert(remapped_vars.end(), replacements->second.begin(),
+                                     replacements->second.end());
+                attr_changed = true;
+                continue;
+              }
+            }
+            auto remapped = remap_var(var);
+            attr_changed = attr_changed || remapped.get() != var.get();
+            remapped_vars.push_back(std::move(remapped));
+          }
+          if (attr_changed) {
+            changed = true;
+            new_attrs.emplace_back(key, std::any(std::move(remapped_vars)));
+            continue;
+          }
+        }
+      } else if (key == kAttrDevice) {
+        if (const auto* device = std::any_cast<ExprPtr>(&value); device && *device) {
+          auto remapped = IRMutator::VisitExpr(*device);
+          INTERNAL_CHECK_SPAN(remapped, op->span_) << "Call device attribute mutated to null";
+          if (remapped.get() != device->get()) {
+            changed = true;
+            new_attrs.emplace_back(key, std::any(std::move(remapped)));
+            continue;
+          }
+        }
+      }
+      new_attrs.emplace_back(key, value);
+    }
+    return {std::move(new_attrs), changed};
+  }
+
   ExprPtr VisitExpr_(const CallPtr& op) override {
     const auto* constraints = GetInputConstraints(op->op_->name_);
 
     std::vector<ExprPtr> new_args;
+    CallArgReplacements arg_replacements;
     bool changed = false;
     new_args.reserve(op->args_.size());
 
@@ -511,15 +574,28 @@ class TileMemorySpaceMutator : public IRMutator {
         new_args.push_back(new_arg);
         if (new_arg.get() != op->args_[i].get()) changed = true;
       }
+      auto old_var = AsVarLike(op->args_[i]);
+      auto new_var = AsVarLike(new_args.back());
+      if (old_var && new_var) {
+        auto& replacements = arg_replacements[old_var.get()];
+        if (std::none_of(replacements.begin(), replacements.end(),
+                         [&](const VarPtr& replacement) { return replacement.get() == new_var.get(); })) {
+          replacements.push_back(std::move(new_var));
+        }
+      }
     }
 
-    if (!changed) return op;
+    auto [new_attrs, attrs_changed] = RemapCallAttrs(op, arg_replacements);
+    if (!changed && !attrs_changed) return op;
     // GlobalVar calls and unregistered ops bypass OpRegistry — reconstruct directly.
     auto& registry = OpRegistry::GetInstance();
     if (As<GlobalVar>(op->op_) || !registry.IsRegistered(op->op_->name_)) {
-      return std::make_shared<Call>(op->op_, std::move(new_args), op->kwargs_, op->GetType(), op->span_);
+      return std::make_shared<Call>(op->op_, std::move(new_args), op->kwargs_, std::move(new_attrs),
+                                    op->GetType(), op->span_);
     }
-    return registry.Create(op->op_->name_, new_args, op->kwargs_, op->span_);
+    auto deduced = registry.Create(op->op_->name_, new_args, op->kwargs_, op->span_);
+    return std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, std::move(new_attrs),
+                                  deduced->GetType(), deduced->span_);
   }
 
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
@@ -571,7 +647,7 @@ class TileMemorySpaceMutator : public IRMutator {
             auto promoted_view = tile_view_semantics::GetImplicitTileView(old_call_type->shape_, promoted);
             auto promoted_type = std::make_shared<TileType>(old_call_type->shape_, old_call_type->dtype_,
                                                             old_call_type->memref_, promoted_view, promoted);
-            new_value = std::make_shared<Call>(call->op_, call->args_, std::move(new_kwargs),
+            new_value = std::make_shared<Call>(call->op_, call->args_, std::move(new_kwargs), call->attrs_,
                                                std::move(promoted_type), call->span_);
           }
         }
@@ -602,8 +678,8 @@ class TileMemorySpaceMutator : public IRMutator {
         // Call type from the LHS annotation — sees a memory_space presence
         // mismatch on body[*].value.type.
         if (new_tile_type->memory_space_ != old_tile_type->memory_space_) {
-          new_value = std::make_shared<Call>(new_call->op_, new_call->args_, new_call->kwargs_, synced_type,
-                                             new_call->span_);
+          new_value = std::make_shared<Call>(new_call->op_, new_call->args_, new_call->kwargs_,
+                                             new_call->attrs_, synced_type, new_call->span_);
         }
         auto synced_var = std::make_shared<Var>(new_var->name_hint_, synced_type, new_var->span_);
         var_cache_[op->var_] = synced_var;
@@ -786,9 +862,9 @@ FunctionPtr TransformInferTileMemorySpace(const FunctionPtr& func) {
   TileMemorySpaceMutator mutator(var_memory, collector.GetNeededMoves());
   auto new_body = mutator.VisitStmt(func->body_);
 
-  auto new_func = MutableCopy(func);
-  new_func->body_ = new_body;
-  return new_func;
+  auto inferred_func = MutableCopy(func);
+  inferred_func->body_ = new_body;
+  return inferred_func;
 }
 
 }  // namespace
@@ -809,7 +885,8 @@ Pass InferTileMemorySpace() {
         new_functions[gvar] = func;
       }
     }
-    return std::make_shared<Program>(std::move(new_functions), program->name_, program->span_);
+    auto inferred = std::make_shared<Program>(std::move(new_functions), program->name_, program->span_);
+    return loop_invariant_mat_residency::Apply(inferred);
   };
   return CreateProgramPass(pass_func, "InferTileMemorySpace", kInferTileMemorySpaceProperties);
 }

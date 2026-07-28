@@ -97,7 +97,8 @@ deducer 会校验打包的 `int` 落在枚举范围内,使 codegen 无需二次�
 ### `pld.tile.remote_load`（TLOAD）
 
 ```text
-pld.tile.remote_load(target, peer, offsets, shape) -> TileType(shape, target.dtype)
+pld.tile.remote_load(target, peer, offsets, shape[, valid_shape])
+    -> TileType(shape, target.dtype)
 ```
 
 把 `peer` rank 的窗口绑定 `DistributedTensor` 切片中的一个区域读入本地 tile。
@@ -105,13 +106,21 @@ pld.tile.remote_load(target, peer, offsets, shape) -> TileType(shape, target.dty
 但源是*远程*切片 —— 地址转换在 codegen 时由
 `CommRemoteOffset(ctx, peer) + addptr + make_tensor_view` 实现。
 
-Verifier：`target` 必须是 `DistributedTensorType`；`peer` 必须是 `ScalarType`
-rank 索引；`offsets` / `shape` 必须各为 `MakeTuple`,其 rank 等于
-`target.shape.size()`。
+`valid_shape` 可选。无论是否传入，类型推导都会将请求窗口与源 tensor 的实际有效
+区域取交集，并检查可证明的物理边界。传入时，`shape` 仍决定 UB tile 的物理分配
+大小，`valid_shape` 进一步限制远程 partition 和 tile 的有效范围。分块集合通信
+用这种形式表达固定宽度的非对齐尾块。
 
-DSL（`python/pypto/language/distributed/op/tile_ops.py`）把 `peer` / `offsets` /
-`shape` 暴露为仅关键字（keyword-only）参数以提升可读性；IR 算子保持位置参数,
-与 `tile.load` 一致。
+任何在推导后仍为符号表达式的源有效范围或请求有效范围，都必须在 kernel 中通过
+标量参数、循环变量或物理 Tensor shape 参数获得运行时绑定；仅出现在类型元数据
+中的符号会在 PTO codegen 阶段被拒绝。
+
+Verifier：`target` 必须是 `DistributedTensorType`；`peer` 必须是 `ScalarType`
+rank 索引；`offsets` / `shape` / 可选 `valid_shape` 必须各为 `MakeTuple`,
+其 rank 等于 `target.shape.size()`。
+
+DSL（`python/pypto/language/distributed/op/tile_ops.py`）接受位置或关键字参数；
+IR 算子保持位置参数，与 `tile.load` 一致。
 
 ### `pld.tile.remote_store`（TSTORE）
 
@@ -236,17 +245,29 @@ pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") ->
 pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum, mode: str = "mesh") -> DistributedTensorType(src)
 ```
 
+完全有效的 packed mesh 目标会被视为一个逻辑 `[1, N]` 线性流，并按最大
+16 KiB 的 UB 块处理。若静态已知的 `N` 小于该预算，物理块宽度会收缩到能够
+覆盖 `N` 的最小 32-byte 对齐宽度；更大或动态的输入仍使用最大块宽。最后一块保持所选物理宽度不变，同时携带
+`valid_shape=[1, min(chunk, N-offset)]`，因此任意元素数量都不会越界读写。
+
 对于 mesh 降级，如果 packed ND 目标的 partial `TensorView.valid_shape` 能通过折叠
-leading dimensions 表示为单个 2D 矩形，Pass 会保留该元数据并且只归约这个矩形；
-strided 目标、DN partial view 和无法按该方式表示的 partial 区域会被明确拒绝。
+leading dimensions 表示为单个 2D 矩形，且静态有界的物理 tile 可放入一个 16-KiB
+chunk，Pass 会保留该元数据，并沿用单矩形路径只归约这个矩形。符号型有效范围会在
+源 tensor 的物理矩形能放入预算时回退使用该物理矩形；过大的 partial 矩形、strided 目标、DN partial view
+和无法按该方式表示的 partial 区域会被明确拒绝。
+
+任何在降级后仍为符号表达式的目标范围或 partial-valid 范围，都必须在 kernel 中
+通过标量参数、循环变量或物理 Tensor shape 参数获得运行时绑定；仅出现在类型元数据
+中的符号会在 PTO codegen 阶段被拒绝。完全动态的物理目标维度由该 Tensor 参数绑定。
 
 对所有参与 rank 的窗口绑定 `src` 切片做原地 all-reduce，并返回与 `src`
 相同的类型。`mode` 关键字选择降级算法：
 
 - **`"mesh"`（默认）** — 全对全直接交换，O(P) 个 HCCL 窗口。信号 shape
-  `[NR, 1]`（每 rank 一个槽位）。4 阶段分解：notify-all (Set 1) /
-  wait-all (Ge 1) / remote_load+accumulate / store-back，外加
-  写后读 (WAR) 防护屏障 (AtomicAdd 1 → Ge 2)。
+  `[NR, 1]`（每 rank 一个槽位）。`AtomicAdd 1` / `wait ≥1` ready 屏障之后进入
+  chunk 循环；每个 chunk 执行 `remote_load+accumulate`，再
+  `AtomicAdd 1` 并等待对应的单调 chunk 计数，最后才 store-back，从而避免
+  写后读 (WAR) 竞态。
 - **`"ring"`** — NCCL 风格的分块 reduce-scatter + allgather 调度，
   O(1) 个 HCCL 窗口。信号 shape `[2 * (NR − 1), NR]`（每轮 ring 一行，
   每 rank 一个槽位）。2(P−1) 轮 ring 步骤，每轮带有屏障 (AtomicAdd 1 →
@@ -254,7 +275,7 @@ strided 目标、DN partial view 和无法按该方式表示的 partial 区域�
   与 `NR` 均为编译期常量时，`LowerCompositeOps` 会常量折叠块大小。
 
 host-orchestrator 用户代码可以在 `for` 和 `while` 循环外省略 `signal`；
-[`SynthesizeAllReduceSignals`](passes/37-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，
+[`SynthesizeAllReduceSignals`](passes/38-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，
 语义 shape 为 `[world_size, 1]`（仅 mesh 模式 — `mode="ring"` 必须显式传入
 signal）。该阶段会先插入 standalone `world_size = pld.world_size()` binding，
 再用该变量构造 buffer size 和 window shape。循环内的所有调用都会被拒绝，因为当前 signal 协议只能
@@ -311,10 +332,10 @@ Verifier：`signal` 必须是 `DistributedTensorType`；`expected` 必须是
 ## 流水线集成
 
 通信域与其槽位分配由
-[`MaterializeCommDomainScopes`](passes/38-materialize_comm_domain_scopes.md) pass 完成。该 pass 将每个
+[`MaterializeCommDomainScopes`](passes/39-materialize_comm_domain_scopes.md) pass 完成。该 pass 将每个
 host_orch 函数体包裹进嵌套的 `CommDomainScopeStmt` 节点（按推断出的通信域逐层嵌套），并产生运行时据以
 绑定物理缓冲的按窗口 `WindowBuffer` 记录。
-随后 [`LowerHostTensorCollectives`](passes/39-lower_host_tensor_collectives.md) 会在最终
+随后 [`LowerHostTensorCollectives`](passes/40-lower_host_tensor_collectives.md) 会在最终
 `Simplify` 之前把 host-level tensor collectives 降为内部 builtin chip dispatch。
 
 ## 测试

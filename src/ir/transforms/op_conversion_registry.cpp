@@ -25,6 +25,7 @@
 
 #include "pypto/backend/common/backend.h"
 #include "pypto/backend/common/backend_config.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
@@ -49,6 +50,13 @@ using tile_conversion_utils::MakeZeroOffsets;
 namespace {
 
 bool IsConstOne(const ExprPtr& expr) { return IsConstValue(expr, 1); }
+
+// A5 index-form gather needs full-tile flat indices; A2A3 keeps the legacy
+// per-row path (see RegisterGatherOps Case 1/2).
+bool IsA5TargetArch() {
+  if (!backend::BackendConfig::IsConfigured()) return false;
+  return backend::BackendConfig::GetBackend()->GetHandler()->GetPtoTargetArch() == "a5";
+}
 
 // Detect row-broadcast pattern: [M, N] op [M, 1] or [M, 1] op [M, N]
 // Returns {wider_arg_idx, narrower_arg_idx} if broadcast detected, empty otherwise
@@ -172,6 +180,7 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
   RegisterSimple("tensor.expands", "tile.expands");
 
   RegisterSimple("tensor.reshape", "tile.reshape");
+  RegisterSimple("tensor.reinterpret_view", "tile.reinterpret_view");
 
   // tensor.transpose → tile.transpose(input, axis1, axis2). The pto.ttrans scratch is a pure
   // codegen detail, not a semantic operand: FlattenTileNdTo2D is the sole owner of scratch
@@ -212,16 +221,90 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
 // ============================================================================
 
 void OpConversionRegistry::RegisterElementwiseBinaryOps() {
-  auto MakeBroadcastBinaryConv = [](const std::string& tile_op,
-                                    const std::string& row_expand_op) -> ConversionFunc {
-    return [tile_op, row_expand_op](const std::vector<ExprPtr>& args,
-                                    const std::vector<std::pair<std::string, std::any>>& kwargs,
-                                    const Span& span) -> ConversionResult {
+  auto MakeBroadcastBinaryConv = [](const std::string& tile_op, const std::string& row_expand_op,
+                                    bool enforce_tdiv_contract = false) -> ConversionFunc {
+    return [tile_op, row_expand_op, enforce_tdiv_contract](
+               const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+               const Span& span) -> ConversionResult {
       auto& op_reg = OpRegistry::GetInstance();
-      auto [wider, narrower] = DetectRowBroadcast(args);
-      if (wider >= 0) {
-        return ConversionResult{op_reg.Create(row_expand_op, {args[wider], args[narrower]}, span)};
+      std::vector<ExprPtr> converted_args = args;
+      std::vector<StmtPtr> prologue;
+      std::optional<DataType> promoted_dtype;
+      if (enforce_tdiv_contract) {
+        INTERNAL_CHECK_SPAN(args.size() == 2, span)
+            << "tensor.div conversion expects exactly 2 tile operands, got " << args.size();
+        auto lhs_type = As<TileType>(args[0]->GetType());
+        auto rhs_type = As<TileType>(args[1]->GetType());
+        INTERNAL_CHECK_SPAN(lhs_type && rhs_type, span)
+            << "tensor.div conversion requires TileType operands after memory promotion";
+
+        promoted_dtype = PromoteDataTypes(lhs_type->dtype_, rhs_type->dtype_);
+        INTERNAL_CHECK_SPAN(promoted_dtype, span)
+            << "tensor.div conversion cannot promote " << lhs_type->dtype_.ToString() << " and "
+            << rhs_type->dtype_.ToString();
+
+        const std::vector<std::shared_ptr<const TileType>> arg_types = {lhs_type, rhs_type};
+        for (size_t i = 0; i < converted_args.size(); ++i) {
+          if (arg_types[i]->dtype_ == *promoted_dtype) continue;
+          std::vector<std::pair<std::string, std::any>> cast_kwargs = {
+              {"target_type", *promoted_dtype},
+              {"mode", 2},  // round
+          };
+          auto cast_call = op_reg.Create("tile.cast", {converted_args[i]}, cast_kwargs, span);
+          const std::string name = i == 0 ? "div_lhs_cast" : "div_rhs_cast";
+          auto cast_var = std::make_shared<Var>(name, cast_call->GetType(), span);
+          prologue.push_back(std::make_shared<AssignStmt>(cast_var, cast_call, span));
+          converted_args[i] = cast_var;
+        }
       }
+
+      auto [wider, narrower] = DetectRowBroadcast(converted_args);
+      if (wider >= 0) {
+        if (enforce_tdiv_contract) {
+          INTERNAL_CHECK_SPAN(wider == 0, span)
+              << "tensor.div cannot lower a row-vector lhs broadcast: pto.trowexpanddiv implements only "
+                 "matrix / row-vector";
+          INTERNAL_CHECK_SPAN(!GetKwargOr<bool>(kwargs, "high_precision", false), span)
+              << "tensor.div(high_precision=True) does not support row broadcasting: "
+                 "the PTO high-precision row-expand division form requires an explicit tmp tile";
+          INTERNAL_CHECK_SPAN(*promoted_dtype == DataType::FP16 || *promoted_dtype == DataType::FP32, span)
+              << "tensor.div row broadcasting supports only FP16 or FP32 because the executable "
+                 "pto.trowexpanddiv templates are floating-point only";
+
+          auto main_type = As<TileType>(converted_args[wider]->GetType());
+          auto row_type = As<TileType>(converted_args[narrower]->GetType());
+          INTERNAL_CHECK_SPAN(main_type && row_type, span)
+              << "tensor.div row broadcasting requires TileType operands after memory promotion";
+          const auto main_valid_shape = GetValidShape(main_type);
+          const auto row_valid_shape = GetValidShape(row_type);
+          INTERNAL_CHECK_SPAN(main_valid_shape.size() >= 2 && row_valid_shape.size() >= 2, span)
+              << "tensor.div row broadcasting requires rank-2 valid regions";
+          CHECK_SPAN(
+              ProveValidExtentLessEqual(main_valid_shape[main_valid_shape.size() - 2],
+                                        row_valid_shape[row_valid_shape.size() - 2]) == ProofResult::kTrue,
+              span)
+              << "tensor.div row broadcasting requires the divisor valid rows to cover the dividend, but "
+                 "got dividend valid_shape "
+              << FormatShape(main_valid_shape) << " and divisor valid_shape " << FormatShape(row_valid_shape);
+          const auto one = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+          CHECK_SPAN(
+              ProveValidExtentEqual(row_valid_shape[row_valid_shape.size() - 1], one) == ProofResult::kTrue,
+              span)
+              << "tensor.div row broadcasting requires the divisor's first column to be valid, but got "
+                 "valid_shape "
+              << FormatShape(row_valid_shape);
+        }
+        auto row_expand_call =
+            op_reg.Create(row_expand_op, {converted_args[wider], converted_args[narrower]}, span);
+        return ConversionResult{std::move(prologue), row_expand_call};
+      }
+
+      if (enforce_tdiv_contract) {
+        auto div_call = kwargs.empty() ? op_reg.Create(tile_op, converted_args, span)
+                                       : op_reg.Create(tile_op, converted_args, kwargs, span);
+        return ConversionResult{std::move(prologue), div_call};
+      }
+
       if (kwargs.empty()) {
         return ConversionResult{op_reg.Create(tile_op, args, span)};
       }
@@ -232,7 +315,7 @@ void OpConversionRegistry::RegisterElementwiseBinaryOps() {
   RegisterCustom("tensor.add", MakeBroadcastBinaryConv("tile.add", "tile.row_expand_add"));
   RegisterCustom("tensor.sub", MakeBroadcastBinaryConv("tile.sub", "tile.row_expand_sub"));
   RegisterCustom("tensor.mul", MakeBroadcastBinaryConv("tile.mul", "tile.row_expand_mul"));
-  RegisterCustom("tensor.div", MakeBroadcastBinaryConv("tile.div", "tile.row_expand_div"));
+  RegisterCustom("tensor.div", MakeBroadcastBinaryConv("tile.div", "tile.row_expand_div", true));
   // tensor.maximum/minimum dispatch by rhs type:
   //   tensor rhs → tile.maximum/minimum
   //   scalar rhs → tile.maximums/minimums
@@ -1120,9 +1203,14 @@ void OpConversionRegistry::RegisterSortOps() {
 // ============================================================================
 // Generalized gather lowering.
 //
-// Hardware constraint: pto.tgather only works correctly when the source tile
-// has exactly 1 row (rows=1).  Therefore all lowering paths use ForStmt loops
-// to decompose the gather into single-row pto.tgather calls.
+// pto.tgather index form expects flat element offsets into src
+// (dst[i,j] = src_flat[indices[i,j]]). Torch-style last-dim gather exposes
+// column indices, so they must be expanded to flat offsets for multi-row src.
+//
+// A5 (GetPtoTargetArch()=="a5"): Case 1/2 emit one full-tile gather after
+//   flat_idx[i,j] = i * src_cols + index[i,j]  (mirrors tensor.scatter).
+// A2A3 / other: keep the legacy per-row (rows=1) loop where column indices
+//   equal flat indices within each 1-row src slice.
 //
 // FlattenTileNdTo2D constraint: tile.load, tile.store, tile.reshape may
 // produce/consume >2D tiles; all other tile ops must be 2D.
@@ -1141,14 +1229,12 @@ void OpConversionRegistry::RegisterSortOps() {
 // Four cases (by rank and norm_dim):
 //
 // Case 1  rank==2, dim==1 (last):
-//   Loop over I0 rows: load [1,S1] and [1,K], single-row gather.
-//   Accumulator [I0, K].  Phase 3 rewrites the loop to per-row tile.store.
+//   A5: load [I0,S1]/[I0,K], expand flat indices, one tile.gather → [I0,K].
+//   A2A3: loop over I0 rows: load [1,S1] and [1,K], single-row gather.
 //
 // Case 2  rank==3, dim==2 (last):
-//   Nested loop: outer I0 × inner I1.
-//   Load [1,1,S2]→reshape[1,S2]; Load [1,1,K]→reshape[1,K]; gather [1,K].
-//   Inner acc [I1,K]; reshape→[1,I1*K]; outer acc [I0,I1*K].
-//   Final reshape [I0,I1*K]→[I0*I1,K]; tile.store at [0,0,0].
+//   A5: reshape to [I0*I1,S2]/[I0*I1,K], then same flat full-tile gather.
+//   A2A3: nested loop: outer I0 × inner I1, single-row gathers + reshape.
 //
 // Case 3  rank==3, dim==0 (first):
 //   Flat-index gather: for each output row r = i0*I1+i1:
@@ -1299,13 +1385,116 @@ void OpConversionRegistry::RegisterGatherOps() {
           return c->value_;
         };
 
+        const DataType idx_dtype = index_info.second;
+
+        // A5 helper: flat_idx[i,j] = i * src_cols + index[i,j].
+        // Prefer a linear arange reshaped to [rows, idx_cols] so every allocated
+        // tile has a 32-byte-aligned row (avoids tile.ci([1, rows]) when rows is
+        // small). Falls back to row_expand_add for odd idx_cols (UT-only shapes).
+        auto emit_a5_flat_idx = [&](std::vector<StmtPtr>& stmts, const VarPtr& idx_2d, int64_t rows,
+                                    int64_t src_cols, int64_t idx_cols,
+                                    const std::string& prefix) -> ExprPtr {
+          const DataType compute_dtype(DataType::INT32);
+          auto make_cd = [&](int64_t v) -> ExprPtr {
+            return std::make_shared<ConstInt>(v, compute_dtype, span);
+          };
+          ExprPtr idx_i32 = idx_2d;
+          if (idx_dtype != compute_dtype) {
+            idx_i32 =
+                emit_to(stmts, "tile.cast", {idx_2d}, {{"target_type", compute_dtype}}, prefix + "_idx_i32");
+          }
+          if (rows == 1) {
+            return idx_dtype == compute_dtype ? idx_i32
+                                              : emit_to(stmts, "tile.cast", {idx_i32},
+                                                        {{"target_type", idx_dtype}}, prefix + "_flat_cast");
+          }
+
+          std::vector<std::pair<std::string, std::any>> ci_kw = {{"dtype", compute_dtype},
+                                                                 {"descending", false}};
+          ExprPtr flat;
+          // INT32 row is 32B-aligned when cols % 8 == 0 (K=8/32/64 on HW ST).
+          if ((idx_cols % 8) == 0) {
+            const int64_t nk = rows * idx_cols;
+            auto lin = emit_to(stmts, "tile.ci", {make_cd(0), MakeShapeTuple({one, make_idx(nk)}, span)},
+                               ci_kw, prefix + "_lin");
+            auto lin_2d = reshape_to(stmts, lin, {make_idx(rows), make_idx(idx_cols)}, prefix + "_lin2d");
+            auto row_ids = emit_to(stmts, "tile.divs", {lin_2d, make_cd(idx_cols)}, {}, prefix + "_row_ids");
+            auto row_base =
+                emit_to(stmts, "tile.muls", {row_ids, make_cd(src_cols)}, {}, prefix + "_row_base");
+            flat = emit_to(stmts, "tile.add", {idx_i32, row_base}, {}, prefix + "_flat_idx");
+          } else {
+            auto row_flat =
+                emit_to(stmts, "tile.ci", {make_cd(0), MakeShapeTuple({one, make_idx(rows)}, span)}, ci_kw,
+                        prefix + "_ci_rows");
+            auto row_ar = reshape_to(stmts, row_flat, {make_idx(rows), one}, prefix + "_row_arange");
+            auto row_base =
+                emit_to(stmts, "tile.muls", {row_ar, make_cd(src_cols)}, {}, prefix + "_row_base");
+            flat = emit_to(stmts, "tile.row_expand_add", {idx_i32, row_base}, {}, prefix + "_flat_idx");
+          }
+          if (idx_dtype != compute_dtype) {
+            return emit_to(stmts, "tile.cast", {flat}, {{"target_type", idx_dtype}}, prefix + "_flat_cast");
+          }
+          return flat;
+        };
+
+        // A5 flat-index gather addresses the source as a flat 1D array
+        // (flat[i,j] = i * src_cols + index[i,j]), which assumes the source is
+        // stored row-major with stride == src_cols. A tile.slice *view* of a
+        // wider tile keeps the parent's stride (e.g. rope = full[:, nope:head]
+        // has stride HEAD_DIM, not ROPE_DIM), so the flat offset misaddresses
+        // every row past the first — only row 0 survives. tile.load already
+        // materializes TensorType sources to a fresh contiguous tile; only
+        // TileType sources — lowered to a view-only tile.slice by
+        // emit_load_or_slice — need this copy into a fresh contiguous tile.
+        auto materialize_src_contig = [&](const VarPtr& src, int64_t rows, int64_t cols, DataType dtype,
+                                          const std::string& name) -> VarPtr {
+          auto sh = MakeShapeTuple({make_idx(rows), make_idx(cols)}, span);
+          std::vector<std::pair<std::string, std::any>> alloc_kw = {{"dtype", dtype},
+                                                                    {"target_memory", MemorySpace::Vec}};
+          auto contig = emit_to(prologue, "tile.create", {sh}, alloc_kw, name + "_alloc");
+          auto ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{zero, zero}, span);
+          return emit_to(prologue, "tile.assemble", {contig, src, ofs}, {}, name + "_copy");
+        };
+
         // ================================================================
         // Case 1  rank==2, dim==1 (last dim)
+        // A5: full-tile gather with flat indices (mirrors tensor.scatter).
+        // A2A3: legacy per-row loop (column index == flat within rows=1 src).
         // ================================================================
         if (rank == 2 && norm_dim == 1) {
           int64_t I0 = get_const(index_shape[0], "index.shape[0]");
           int64_t S1 = get_const(input_shape[1], "input.shape[1]");
           int64_t K = get_const(index_shape[1], "index.shape[1]");
+
+          if (IsA5TargetArch()) {
+            // INT16 flat-index range guard (same bound as tensor.scatter).
+            if (idx_dtype == DataType::INT16) {
+              const int64_t kMaxFlat = 32768;
+              const int64_t max_rows = S1 == 0 ? kMaxFlat : kMaxFlat / S1;
+              CHECK_SPAN(I0 <= max_rows, span)
+                  << "tensor.gather (A5) with INT16 indices: rows(" << I0 << ") * src_cols(" << S1
+                  << ") exceeds the INT16 index range (max flat index 32767, rows <= " << max_rows << ").";
+            }
+
+            auto zero_ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{zero, zero}, span);
+            auto inp_sh = MakeShapeTuple({make_idx(I0), make_idx(S1)}, span);
+            auto inp_full = emit_load_or_slice(prologue, input, zero_ofs, inp_sh, "gather_inp");
+            // Materialize a possibly-strided TileType source (see comment on
+            // materialize_src_contig) so the flat-index gather addresses it
+            // correctly. TensorType sources are already contiguous (tile.load).
+            VarPtr gather_src = inp_full;
+            if (As<TileType>(input->GetType())) {
+              gather_src = materialize_src_contig(inp_full, I0, S1, input_dtype, "gather_src");
+            }
+            auto idx_sh = MakeShapeTuple({make_idx(I0), make_idx(K)}, span);
+            auto idx_full = emit_load_or_slice(prologue, index, zero_ofs, idx_sh, "gather_idx");
+
+            auto flat_idx = emit_a5_flat_idx(prologue, idx_full, I0, S1, K, "gather");
+            auto tmp_sh = MakeShapeTuple({make_idx(I0), make_idx(K)}, span);
+            auto tmp = emit("tile.create", {tmp_sh}, tmp_create_kwargs, "gather_tmp");
+            auto result = emit("tile.gather", {gather_src, flat_idx, tmp}, {}, "gather");
+            return ConversionResult{std::move(prologue), result};
+          }
 
           auto result =
               make_loop(prologue, "gather", index_shape[0], I0, K, input_dtype,
@@ -1323,8 +1512,7 @@ void OpConversionRegistry::RegisterGatherOps() {
         // ================================================================
         // Case 2  rank==3, dim==2 (last dim)
         // Result tile: [I0*I1, K] where tile[i0*I1+i1, k] = output[i0, i1, k].
-        // Stored via tile.store at [0,0,0]; FlattenTileNdTo2D injects
-        // partition_shape [1, I0*I1, K] which covers all elements correctly.
+        // A5: reshape to 2D then full-tile flat gather. A2A3: nested row loops.
         // ================================================================
         if (rank == 3 && norm_dim == 2) {
           int64_t I0 = get_const(index_shape[0], "index.shape[0]");
@@ -1332,6 +1520,40 @@ void OpConversionRegistry::RegisterGatherOps() {
           int64_t S2 = get_const(input_shape[2], "input.shape[2]");
           int64_t K = get_const(index_shape[2], "index.shape[2]");
           int64_t I1K = I1 * K;
+          int64_t I0I1 = I0 * I1;
+
+          if (IsA5TargetArch()) {
+            if (idx_dtype == DataType::INT16) {
+              const int64_t kMaxFlat = 32768;
+              const int64_t max_rows = S2 == 0 ? kMaxFlat : kMaxFlat / S2;
+              CHECK_SPAN(I0I1 <= max_rows, span)
+                  << "tensor.gather (A5) with INT16 indices: rows(" << I0I1 << ") * src_cols(" << S2
+                  << ") exceeds the INT16 index range (max flat index 32767, rows <= " << max_rows << ").";
+            }
+
+            auto zero_ofs = std::make_shared<MakeTuple>(std::vector<ExprPtr>{zero, zero, zero}, span);
+            auto inp_sh = MakeShapeTuple({make_idx(I0), make_idx(I1), make_idx(S2)}, span);
+            auto inp_raw = emit_load_or_slice(prologue, input, zero_ofs, inp_sh, "gather_inp_raw");
+            auto inp_2d = reshape_to(prologue, inp_raw, {make_idx(I0I1), make_idx(S2)}, "gather_inp");
+            // Materialize a possibly-strided TileType source (see comment on
+            // materialize_src_contig); the reshape above preserves a strided
+            // 3D slice's wider stride, which would break the flat-index gather.
+            VarPtr gather_src = inp_2d;
+            if (As<TileType>(input->GetType())) {
+              gather_src = materialize_src_contig(inp_2d, I0I1, S2, input_dtype, "gather_src");
+            }
+            auto idx_sh = MakeShapeTuple({make_idx(I0), make_idx(I1), make_idx(K)}, span);
+            auto idx_raw = emit_load_or_slice(prologue, index, zero_ofs, idx_sh, "gather_idx_raw");
+            auto idx_2d = reshape_to(prologue, idx_raw, {make_idx(I0I1), make_idx(K)}, "gather_idx");
+
+            auto flat_idx = emit_a5_flat_idx(prologue, idx_2d, I0I1, S2, K, "gather");
+            auto tmp_sh = MakeShapeTuple({make_idx(I0I1), make_idx(K)}, span);
+            auto tmp = emit("tile.create", {tmp_sh}, tmp_create_kwargs, "gather_tmp");
+            auto result = emit("tile.gather", {gather_src, flat_idx, tmp}, {}, "gather");
+            // Trailing reshape keeps Phase 3 off (same as the legacy path).
+            auto out_2d = reshape_to(prologue, result, {make_idx(I0I1), make_idx(K)}, "gather_out");
+            return ConversionResult{std::move(prologue), out_2d};
+          }
 
           // Outer loop: i0=0..I0-1, accumulates [I0, I1*K].
           auto outer_result = make_loop(
@@ -1357,7 +1579,6 @@ void OpConversionRegistry::RegisterGatherOps() {
                 return reshape_to(ob, inner_result, {one, make_idx(I1K)}, "gather_inner_flat");
               });
           // Reshape [I0, I1*K] → [I0*I1, K].  Prevents Phase 3 and gives correct 2D layout.
-          int64_t I0I1 = I0 * I1;
           auto out_2d = reshape_to(prologue, outer_result, {make_idx(I0I1), make_idx(K)}, "gather_out");
           return ConversionResult{std::move(prologue), out_2d};
         }
@@ -1738,9 +1959,9 @@ void OpConversionRegistry::RegisterPagedGatherOps() {
       "tensor.gather_row",
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
          const Span& span) -> ConversionResult {
-        INTERNAL_CHECK_SPAN(args.size() == 5, span)
-            << "tensor.gather_row conversion expects 5 args (acc, src, dst_offset, src_offset, shapes), "
-               "but got "
+        INTERNAL_CHECK_SPAN(args.size() == 5 || args.size() == 6, span)
+            << "tensor.gather_row conversion expects 5-6 args (acc, src, dst_offset, src_offset, "
+               "shapes[, valid_shape]), but got "
             << args.size();
         auto& op_reg = OpRegistry::GetInstance();
         bool transpose = false;
@@ -1748,8 +1969,9 @@ void OpConversionRegistry::RegisterPagedGatherOps() {
           if (k == "transpose") transpose = AnyCast<bool>(v, "transpose");
         }
         std::vector<std::pair<std::string, std::any>> gr_kwargs = {{"transpose", transpose}};
-        auto gr_call =
-            op_reg.Create("tile.gather_row", {args[0], args[1], args[2], args[3], args[4]}, gr_kwargs, span);
+        // tile.gather_row shares the 5-or-6 arg signature, so the optional
+        // valid_shape (args[5]) forwards verbatim.
+        auto gr_call = op_reg.Create("tile.gather_row", args, gr_kwargs, span);
         return ConversionResult{gr_call};
       });
 }
@@ -2342,15 +2564,17 @@ void OpConversionRegistry::RegisterDistributedOps() {
 // (tile.aiv_shard / tile.aic_gather) so the result is byte-identical to what the
 // AUTO ``pl.split`` path produces via LowerAutoVectorSplit (pass 18).
 //
-// Memory-space re-attachment. The tile-level split deducer (DeduceSplitReshape)
-// intentionally drops the boundary memory space (returns a TileType with a null
-// memref / null memory_space), because the deduction fixpoint must not inherit an
-// input-side layout. The AUTO path restores it in ReshapeTypeWithMemory:
-//   * C->V aiv_shard  -> the move's Vec DESTINATION memory.
-//   * V->C aic_gather -> the Vec half-tile SOURCE memory (inherit input side).
-// Both boundaries resolve to MemorySpace::Vec (verified against the AUTO oracle:
-// _shard_vec / _gather_vec in test_lower_auto_vector_split.py both assert Vec),
-// so this converter re-attaches Vec to the deduced half/full type.
+// Boundary memory space. The tile-level split deducer (DeduceSplitReshape)
+// intentionally leaves it null (returns a TileType with a null memref / null
+// memory_space), because the deduction fixpoint must not inherit an input-side
+// layout. OpRegistry::Create then fills that null from the CONSUMER-side memory
+// the tile op declares via set_output_memory (cross_core.cpp): Vec for the C->V
+// aiv_shard (AIV pops into UB), Mat for the V->C aic_gather (AIC pops into L1).
+// So this converter attaches nothing of its own — it just asserts the space
+// arrived. LowerAutoVectorSplit builds its boundary ops through the same Create,
+// which is what keeps the two paths from drifting apart; this converter used to
+// hard-code Vec for both directions, which made the gather's declared type
+// disagree with the Mat tpop ExpandMixedKernel actually emits.
 //
 // No InputSpaceReq. The realistic (region-only) operand is an on-chip tile — a
 // cube (Mat/Acc) matmul result for aiv_shard, a Vec vector-compute result for
@@ -2372,13 +2596,18 @@ void OpConversionRegistry::RegisterCrossCoreOps() {
       // args[0] is already tile-typed here (its producer lowered earlier in this
       // pass); the tile deducer forwards the "split" attr and halves/doubles the
       // split-axis extent.
+      // The boundary memory needs no re-attachment here: the split deducer leaves
+      // the space null, and Create fills it from the tile op's set_output_memory
+      // declaration (Vec for the shard, Mat for the gather). LowerAutoVectorSplit
+      // builds its aiv_shard / aic_gather through the same Create, so both paths
+      // read one declaration and cannot drift apart.
       auto call = op_reg.Create(tile_op, args, kwargs, span);
       auto tt = As<TileType>(call->GetType());
-      INTERNAL_CHECK_SPAN(tt, span) << "Internal error: " << tile_op << " must deduce a TileType";
-      // Re-attach the vector-side (Vec) boundary memory the split deducer drops.
-      auto typed =
-          std::make_shared<TileType>(tt->shape_, tt->dtype_, tt->memref_, tt->tile_view_, MemorySpace::Vec);
-      return ConversionResult{std::make_shared<Call>(call->op_, call->args_, call->kwargs_, typed, span)};
+      INTERNAL_CHECK_SPAN(tt && tt->memory_space_.has_value(), span)
+          << "Internal error: OpRegistry::Create left " << tile_op
+          << " without a memory space; it must fill the space-less deduced TileType from the op's "
+             "set_output_memory declaration";
+      return ConversionResult{call};
     };
   };
   RegisterCustom("tensor.aiv_shard", convert("tile.aiv_shard"));

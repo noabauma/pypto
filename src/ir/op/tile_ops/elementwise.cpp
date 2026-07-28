@@ -63,6 +63,16 @@ static ExprPtr MakeRoundUpIndex(const ExprPtr& value, int64_t alignment) {
   return MakeMul(MakeCeilDivIndex(value, alignment), MakeIndexConst(alignment, value->span_), value->span_);
 }
 
+static bool IsTDivDataType(DataType dtype) {
+  return dtype == DataType::INT16 || dtype == DataType::INT32 || dtype == DataType::FP16 ||
+         dtype == DataType::FP32;
+}
+
+static bool IsTSubsDataType(DataType dtype) {
+  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32 ||
+         dtype == DataType::FP16 || dtype == DataType::FP32 || dtype == DataType::BF16;
+}
+
 static std::shared_ptr<TileType> MakePackedPredicateTileType(
     const std::vector<ExprPtr>& logical_shape, const std::shared_ptr<const TileType>& source_tile_type) {
   INTERNAL_CHECK(!logical_shape.empty())
@@ -96,7 +106,8 @@ TypePtr DeduceTileOpTileScalarTileType(const std::vector<ExprPtr>& args,
 
 TypePtr DeduceTileOpElementwiseBinaryType(const std::vector<ExprPtr>& args,
                                           const std::vector<std::pair<std::string, std::any>>& kwargs,
-                                          const std::string& op_name, bool require_int = false) {
+                                          const std::string& op_name, bool require_int = false,
+                                          bool require_tdiv_contract = false) {
   CHECK(args.size() == 2) << "The operator " << op_name << " requires exactly 2 arguments, but got "
                           << args.size();
 
@@ -116,6 +127,46 @@ TypePtr DeduceTileOpElementwiseBinaryType(const std::vector<ExprPtr>& args,
     CHECK(tile_type2->dtype_.IsInt())
         << "The operator " << op_name << " requires integer tile dtype, but got "
         << tile_type2->dtype_.ToString();
+  }
+
+  if (require_tdiv_contract) {
+    CHECK(tile_type1->dtype_ == tile_type2->dtype_)
+        << "The operator " << op_name << " requires src0, src1, and dst to have the same dtype, but got "
+        << tile_type1->dtype_.ToString() << " and " << tile_type2->dtype_.ToString();
+    CHECK(IsTDivDataType(tile_type1->dtype_))
+        << "The operator " << op_name << " requires dtype in {INT16, INT32, FP16, FP32}, but got "
+        << tile_type1->dtype_.ToString();
+
+    CHECK(tile_type1->shape_.size() == tile_type2->shape_.size())
+        << "The operator " << op_name
+        << " requires src0, src1, and dst to have the same physical shape rank, but got "
+        << tile_type1->shape_.size() << " and " << tile_type2->shape_.size();
+    for (size_t i = 0; i < tile_type1->shape_.size(); ++i) {
+      CHECK(DimensionsEqual(tile_type1->shape_[i], tile_type2->shape_[i]))
+          << "The operator " << op_name
+          << " requires src0, src1, and dst to have the same physical shape, but dimension " << i
+          << " differs; got src0 shape " << FormatShape(tile_type1->shape_) << " and src1 shape "
+          << FormatShape(tile_type2->shape_);
+    }
+
+    const auto valid_shape1 = GetValidShape(tile_type1);
+    const auto valid_shape2 = GetValidShape(tile_type2);
+    CHECK(valid_shape1.size() == valid_shape2.size())
+        << "The operator " << op_name
+        << " requires src0, src1, and dst to have the same valid_shape rank, but got " << valid_shape1.size()
+        << " and " << valid_shape2.size();
+    for (size_t i = 0; i < valid_shape1.size(); ++i) {
+      CHECK(ProveValidExtentEqual(valid_shape1[i], valid_shape2[i]) == ProofResult::kTrue)
+          << "The operator " << op_name
+          << " requires src0, src1, and dst to have the same valid_shape, but dimension " << i
+          << " differs; got src0 valid_shape " << FormatShape(valid_shape1) << " and src1 valid_shape "
+          << FormatShape(valid_shape2);
+    }
+
+    TileView tile_view;
+    tile_view.valid_shape = valid_shape1;
+    InheritTileViewLayout(tile_view, tile_type1);
+    return std::make_shared<TileType>(tile_type1->shape_, tile_type1->dtype_, std::nullopt, tile_view);
   }
 
   // Use broadcasting
@@ -192,6 +243,23 @@ TypePtr DeduceTileOpScalarBinaryType(const std::vector<ExprPtr>& args,
   return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);
 }
 
+TypePtr DeduceTileSubsType(const std::vector<ExprPtr>& args,
+                           const std::vector<std::pair<std::string, std::any>>& kwargs,
+                           const std::string& op_name) {
+  auto result_type = DeduceTileOpScalarBinaryType(args, kwargs, op_name);
+  auto tile_type = As<TileType>(args[0]->GetType());
+  auto scalar_type = As<ScalarType>(args[1]->GetType());
+  CHECK(IsTSubsDataType(tile_type->dtype_))
+      << "The operator " << op_name
+      << " requires tile dtype in {INT8, INT16, INT32, FP16, FP32, BF16}, but got "
+      << tile_type->dtype_.ToString();
+  CHECK(IsTSubsDataType(scalar_type->dtype_))
+      << "The operator " << op_name
+      << " requires scalar dtype in {INT8, INT16, INT32, FP16, FP32, BF16}, but got "
+      << scalar_type->dtype_.ToString();
+  return result_type;
+}
+
 TypePtr DeduceTileOpIntScalarBinaryType(const std::vector<ExprPtr>& args,
                                         const std::vector<std::pair<std::string, std::any>>& kwargs,
                                         const std::string& op_name) {
@@ -254,15 +322,21 @@ REGISTER_OP("tile.add")
 
 REGISTER_OP("tile.div")
     .set_op_category("TileOp")
-    .set_description("Element-wise division of two tiles with broadcasting")
+    .set_description("Element-wise division of two tiles with matching physical and valid shapes")
     .add_argument("lhs", "Left-hand side tile (TileType)")
     .add_argument("rhs", "Right-hand side tile (TileType)")
+    .set_attr<bool>("high_precision")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileOpElementwiseBinaryType(args, kwargs, "tile.div");
+      auto result_type = DeduceTileOpElementwiseBinaryType(args, kwargs, "tile.div", false, true);
+      auto result_tile_type = As<TileType>(result_type);
+      CHECK(!GetKwargOr<bool>(kwargs, "high_precision", false) || result_tile_type->dtype_.IsFloat())
+          << "The operator tile.div supports high_precision only for FP16 or FP32 because the PTOAS "
+             "high-precision template does not implement integer division";
+      return result_type;
     });
 
 REGISTER_OP("tile.sub")
@@ -437,7 +511,7 @@ REGISTER_OP("tile.subs")
     .set_output_memory(MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileOpScalarBinaryType(args, kwargs, "tile.subs");
+      return DeduceTileSubsType(args, kwargs, "tile.subs");
     });
 
 REGISTER_OP("tile.rems")

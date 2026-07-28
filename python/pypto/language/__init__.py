@@ -128,7 +128,6 @@ from .op.tile_ops import (
     gemv_acc,
     gemv_bias,
     load,
-    log,
     lrelu,
     matmul_bias,
     max,
@@ -186,6 +185,7 @@ from .op.unified_ops import (
     fillpad_expand,
     fmod,
     fmods,
+    log,
     matmul,
     matmul_acc,
     maximum,
@@ -198,6 +198,7 @@ from .op.unified_ops import (
     part_mul,
     read,
     recip,
+    reinterpret_view,
     reshape,
     row_argmax,
     row_argmin,
@@ -221,7 +222,7 @@ from .op.unified_ops import (
     transpose,
     write,
 )
-from .optimizations import split
+from .optimizations import cross_core_slot, split
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
 from .scope import ScopeMode, manual_scope, scope, spmd_submit, submit
@@ -242,6 +243,7 @@ NZ = TensorLayout.NZ
 FP4 = DataType.FP4
 FP8E4M3FN = DataType.FP8E4M3FN
 FP8E5M2 = DataType.FP8E5M2
+FP8E8M0 = DataType.FP8E8M0
 FP16 = DataType.FP16
 FP32 = DataType.FP32
 BF16 = DataType.BF16
@@ -303,6 +305,7 @@ __all__ = [
     "split_aiv",
     "optimizations",
     "split",
+    "cross_core_slot",
     "adir",
     "array",
     "tile",
@@ -319,9 +322,11 @@ __all__ = [
     "part_min",
     "maximum",
     "exp",
+    "log",
     "cast",
     "concat",
     "reshape",
+    "reinterpret_view",
     "transpose",
     "slice",
     "matmul",
@@ -371,7 +376,6 @@ __all__ = [
     "mscatter",
     "sqrt",
     "rsqrt",
-    "log",
     "relu",
     "matmul_acc",
     "matmul_bias",
@@ -474,6 +478,7 @@ __all__ = [
     "FP4",
     "FP8E4M3FN",
     "FP8E5M2",
+    "FP8E8M0",
     "FP16",
     "FP32",
     "BF16",

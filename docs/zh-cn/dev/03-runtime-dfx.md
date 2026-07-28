@@ -30,6 +30,25 @@ PyPTO 将该 prefix 设为 `<work_dir>/dfx_outputs/`，其下的子路径按上�
 `execute_on_device` 会**先于** C++ 边界抛 `ValueError`，让 traceback
 直接指向调用方代码。
 
+### L3（分布式）：每次 dispatch 一个子目录
+
+分布式 run 会向多张卡下发，且同一张卡在一次 host 编排中可能收到多次
+dispatch——若共用同一 prefix，各次 dispatch 会互相覆盖同名产物。因此 L3
+路径下 PyPTO 按 dispatch 对 prefix 做命名空间隔离：
+
+```text
+<work_dir>/dfx_outputs/
+├── rank0/d0/          # rank 0 的第 0 次 dispatch
+├── rank0/d1/          # rank 0 的第 1 次 dispatch
+└── rank1/d0/
+```
+
+`d{k}` 是该卡在本次 run 内的第 k 次 dispatch，每次 run 从 `d0` 重新计数。
+每次 dispatch 都归档在实际运行它的芯片下：带 `device=` 的按自身 rank，
+comm-less 的（没有 `device=`）则按被分配到的芯片——这类 dispatch 按提交
+顺序在程序的各芯片间轮询分配。每个叶子目录内是上表所述的扁平产物，
+因此在单个 dispatch 目录内 L2 契约完全适用。
+
 ## L2 泳道会把 kernel 跑两遍（onboard）
 
 泳道转换器需要把每个 task 的耗时和一张**只有 `deps.json` 才携带的任务图**做

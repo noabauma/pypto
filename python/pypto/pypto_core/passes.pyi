@@ -235,21 +235,11 @@ class DiagnosticInstrument(PassInstrument):
         """Create a diagnostic instrument running the given check set."""
         ...
 
-class ReportType(Enum):
-    """Type of report to generate."""
-
-    Memory = ...
-    """Memory usage per MemorySpace."""
-
 class ReportInstrument(PassInstrument):
-    """Instrument that generates reports to files after specified passes."""
+    """Instrument that names the directory pipeline artifacts are written to."""
 
     def __init__(self, output_dir: str) -> None:
         """Create a report instrument with output directory."""
-        ...
-
-    def enable_report(self, type: ReportType, trigger_pass: str) -> None:
-        """Enable a report type after a specific pass."""
         ...
 
     def get_output_dir(self) -> str:
@@ -461,34 +451,33 @@ def optimize_orch_tensors() -> Pass:
 def flatten_tile_nd_to_2d() -> Pass:
     """Create a pass that flattens ND tile ops to 2D in InCore functions."""
 
+def legalize_tile_cast() -> Pass:
+    """Create a pass that expands hardware-unsupported ``tile.cast`` pairs.
+
+    ``pto.tcvt`` supports only a profile-dependent subset of (src, dst) dtype
+    pairs. Each non-native cast is rewritten into the shortest chain of native
+    casts for the active backend's ISA (e.g. on A5 ``INT32 -> FP16`` becomes
+    ``INT32 -> FP32 -> FP16``). Already-native casts are left untouched.
+    """
+
 def auto_tile_matmul_l0() -> Pass:
-    """Create a pass that auto-tiles Mat-resident matmul / matmul_acc into a C-stationary K-loop.
+    """Create a pass that auto-tiles static 2D ``tile.matmul`` / ``tile.matmul_acc`` for L0.
 
-    Rewrites each ``tile.matmul`` or ``tile.matmul_acc`` whose Mat operands
-    have static 2D shape into a ``range(0, K, k)`` loop:
+    The active backend's roofline chooser selects
+    ``(m, n, k, stationarity, dbC)``. K-split reductions use a 2-stage
+    pipelined loop and peel a supported non-divisor aligned tail. Plain
+    ``tile.matmul`` may also use an M/N grid with direct-GM placement or an
+    on-chip Mat scratch for chained matmul consumers; compatible
+    f32-to-bf16/f16 ``rint`` casts fold into the FIXPIPE writeback.
 
-    * For ``tile.matmul``, the loop body branches on ``ko == 0`` between
-      ``tile.matmul`` (fresh accumulator) and ``tile.matmul_acc``
-      (accumulating into the iter-arg).
-    * For ``tile.matmul_acc``, every iteration is ``tile.matmul_acc`` with
-      the iter-arg init set to the caller's accumulator — the chain is
-      uniform from the first iteration so no if-else is needed.
-
-    The L0 tile shape ``(m, n, k)`` is chosen by ``utils.choose_l0_tile``
-    from the active backend's L0 capacities. The K-loop is marked
-    ``ForKind.Pipeline`` with ``pipeline_stages=2`` so the downstream
-    ``LowerPipelineLoops`` pass produces a 2-deep ping-pong on the
-    auto-inserted Mat→Left/Right moves. Already-L0-sized matmuls are left
-    untouched.
-
-    Supported today: ``tile.matmul`` and ``tile.matmul_acc``
-    (``tile.matmul_bias`` is deferred). The chooser is a roofline cost-model
-    search over ``(m, n, k, stationarity)``; besides the K-loop it emits
-    **M/N output tiling** (a direct-store grid, or an on-chip **Mat-scratch**
-    assemble when the result is consumed as a matmul operand), a
-    **non-divisor-K boundary peel** for 16-aligned K, and **operand-stationary**
-    (A/B-stationary) schedules. Non-16-aligned K and the other deferred regimes
-    emit a perf hint and are left untouched.
+    Full-K grids support output-, A-, and B-stationary schedules. dbC=2 is
+    enabled under PTOAS and available as a PyPTO planner opt-in. Eligible calls
+    require static 2D operands with B in Mat and A in Mat or Vec. When the
+    chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is needed,
+    although a chained result may still be remapped to Mat by the compatible
+    cast-fold placement above. Other unsupported regimes are left untouched;
+    useful deferred cases emit ``PerfHint`` diagnostics. ``tile.matmul_bias``
+    is deferred.
     """
 
 def canonicalize_tile_slice() -> Pass:
@@ -509,7 +498,18 @@ def canonicalize_tile_slice() -> Pass:
     """
 
 def infer_tile_memory_space() -> Pass:
-    """Create a pass that infers memory_space for TileType variables in InCore functions."""
+    """Infer TileType memory spaces and safe stationary matmul residency.
+
+    Besides assigning ``Vec``/``Mat``/``Left``/``Right``/``Acc`` and inserting
+    required moves, the pass runs a focused internal transform for
+    compiler-generated invariant GM→Mat matmul operand paths. The candidate
+    caller storage must be created by ``tensor.create`` in root orchestration
+    IR. K-tiled fanout may retain the whole GM→Mat panel while leaving
+    K-dependent Left/Right staging inside its original pipeline. External
+    inputs, Submit sites, and direct/external InCore entries decline.
+    User-authored tile loads are never moved, and internal bridge provenance is
+    consumed before the pass returns.
+    """
 
 def materialize_tensor_strides() -> Pass:
     """Create the MaterializeTensorStrides pass (RFC #1300 §2.4).
@@ -849,7 +849,6 @@ __all__ = [
     "PassInstrument",
     "VerificationInstrument",
     "CallbackInstrument",
-    "ReportType",
     "ReportInstrument",
     "PassContext",
     "PassPipeline",
@@ -871,6 +870,7 @@ __all__ = [
     "convert_tensor_to_tile_ops",
     "optimize_orch_tensors",
     "flatten_tile_nd_to_2d",
+    "legalize_tile_cast",
     "auto_tile_matmul_l0",
     "canonicalize_tile_slice",
     "infer_tile_memory_space",
