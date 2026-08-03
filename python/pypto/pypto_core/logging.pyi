@@ -12,8 +12,19 @@ from enum import IntEnum
 
 from pypto.pypto_core.ir import Span
 
-class InternalError(Exception):
-    """Exception raised when an internal system error occurs"""
+class Error(Exception):
+    """Base class for PyPTO errors that have no more specific Python counterpart.
+
+    Raised for `pypto::Error` subclasses without a dedicated translation, notably
+    `VerificationError` from the IR verifier.
+    """
+
+class InternalError(RuntimeError):
+    """Exception raised when an internal system error occurs.
+
+    Registered against `PyExc_RuntimeError`, so it is a sibling of `Error` rather than a
+    subclass -- the C++ hierarchy does not carry over to Python.
+    """
 
 class LogLevel(IntEnum):
     """Enumeration of available log levels"""

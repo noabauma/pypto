@@ -13,6 +13,7 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_MEMREF_UTILS_H_
 
 #include <algorithm>
+#include <any>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -132,12 +133,39 @@ inline std::optional<TileView> RemapTileViewExprs(const std::optional<TileView>&
                   tile_view->blayout, tile_view->slayout, tile_view->fractal, tile_view->pad);
 }
 
+/// Rewrite the SSA values a *pinned* MemRef's slot index names.
+///
+/// A declared allocation's slot index may be a runtime expression (`l0c[i & 1]`),
+/// which makes it the only MemRef field that substitution has to follow: rename
+/// `i` and the index must follow, or it dangles on a stale Var.
+///
+/// Restricted to pinned MemRefs on purpose. `byte_offset_` needs no remap — it is
+/// `ConstInt(0)` until InitMemRef and a concrete address after — and confining
+/// rebuilds to the pinned window keeps them strictly before every pass that keys
+/// on MemRef *pointer* identity (`AllocateMemoryAddr` matches old→new by raw
+/// pointer). Rebuilding one of those later would silently split a shared MemRef.
+template <typename RemapExprFn>
+inline std::optional<MemRefPtr> RemapPinnedMemRefExprs(const std::optional<MemRefPtr>& memref,
+                                                       const RemapExprFn& remap_expr, bool& changed) {
+  if (!memref.has_value() || !(*memref)->is_pinned_) return memref;
+  const auto& slot_index = (*memref)->slot_index_;
+  if (!slot_index.has_value() || !*slot_index) return memref;
+  auto new_index = remap_expr(*slot_index);
+  if (new_index == *slot_index) return memref;
+  changed = true;
+  const auto& old = *memref;
+  return std::make_optional<MemRefPtr>(
+      std::make_shared<MemRef>(old->name_hint_, old->base_, old->byte_offset_, old->size_, old->span_,
+                               old->is_pinned_, old->slot_count_, std::make_optional(std::move(new_index))));
+}
+
 template <typename RemapExprFn>
 inline TypePtr CloneTypeWithMemRefAndRemapExprs(
-    const TypePtr& type, const std::optional<MemRefPtr>& memref, const RemapExprFn& remap_expr,
+    const TypePtr& type, const std::optional<MemRefPtr>& memref_in, const RemapExprFn& remap_expr,
     std::optional<MemorySpace> tile_memory_space_override = std::nullopt) {
-  const bool memref_changed = GetTypeMemRef(type) != memref;
+  const bool memref_changed = GetTypeMemRef(type) != memref_in;
   bool changed = memref_changed;
+  const auto memref = RemapPinnedMemRefExprs(memref_in, remap_expr, changed);
 
   // DistributedTensorType clone path: matches the comment on
   // CloneTypeWithMemRef above. Distinct from the TensorType branch so the
@@ -236,19 +264,40 @@ inline std::optional<uint64_t> ExtractNameCounter(const std::string& name) {
 /// Create an alloc AssignStmt for a MemRef's base Ptr variable.
 /// DDR → tensor.alloc, on-chip → tile.alloc.
 /// Emits: base_ptr: Ptr = {tile,tensor}.alloc(memory_space, size)
-inline StmtPtr CreateAllocStatement(const MemRefPtr& memref, MemorySpace memory_space) {
+/// `alloc_size` overrides the reserved bytes when the allocation is larger than
+/// the MemRef that names it. That happens for a multi-slot declared allocation:
+/// each slot MemRef is sized to its own slot (so its byte range stays inside the
+/// slot), while the allocation has to cover every slot.
+inline StmtPtr CreateAllocStatement(const MemRefPtr& memref, MemorySpace memory_space, bool pinned = false,
+                                    std::optional<uint64_t> alloc_size = std::nullopt) {
   std::string op_name = (memory_space == MemorySpace::DDR) ? "tensor.alloc" : "tile.alloc";
   auto alloc_op = std::make_shared<Op>(op_name);
 
   auto memspace_expr =
       std::make_shared<ConstInt>(static_cast<int64_t>(memory_space), DataType::INDEX, Span::unknown());
-  auto size_expr =
-      std::make_shared<ConstInt>(static_cast<int64_t>(memref->size_), DataType::INDEX, Span::unknown());
+  auto size_expr = std::make_shared<ConstInt>(static_cast<int64_t>(alloc_size.value_or(memref->size_)),
+                                              DataType::INDEX, Span::unknown());
 
   std::vector<ExprPtr> alloc_args = {memspace_expr, size_expr};
-  auto alloc_call = std::make_shared<Call>(alloc_op, alloc_args, GetPtrType(), Span::unknown());
+  // Only emit the kwarg when set, so ordinary compiler allocations print and
+  // compare exactly as before.
+  std::vector<std::pair<std::string, std::any>> alloc_kwargs;
+  if (pinned) alloc_kwargs.emplace_back("pinned", true);
+  auto alloc_call =
+      std::make_shared<Call>(alloc_op, alloc_args, std::move(alloc_kwargs), GetPtrType(), Span::unknown());
 
   return std::make_shared<AssignStmt>(memref->base_, alloc_call, Span::unknown());
+}
+
+/// The base Ptr an alloc statement declares when it is a user-owned (pinned)
+/// buffer, else null. Null for every compiler-created allocation.
+inline VarPtr GetPinnedAllocBase(const StmtPtr& stmt) {
+  auto assign = As<AssignStmt>(stmt);
+  if (!assign) return nullptr;
+  auto call = As<Call>(assign->value_);
+  if (!call || !call->op_) return nullptr;
+  if (!IsOp(call, "tile.alloc") && !IsOp(call, "tensor.alloc")) return nullptr;
+  return call->GetKwarg<bool>("pinned", false) ? assign->var_ : nullptr;
 }
 
 // ============================================================================

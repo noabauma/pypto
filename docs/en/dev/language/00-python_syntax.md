@@ -52,6 +52,20 @@ b: pl.Tensor[[n, m], pl.INT64]     # Symbolic shape
 t: pl.Tile[[16, 16], pl.FP16]
 ```
 
+### Tensor Layout and View
+
+The third subscript element is a layout or a `pl.TensorView`, each written inline or
+held in a variable — bind it once to share one view across several parameters. A
+layout is shorthand for a stride-less view, so every form yields a `TensorView`.
+Same slot and spellings for `pl.DistributedTensor`.
+
+```python
+STRIDED = pl.TensorView(stride=[128, 1], layout=pl.TensorLayout.ND)
+
+x: pl.Tensor[[32, 64], pl.FP32, pl.NZ]      # layout, inline
+y: pl.Tensor[[32, 64], pl.FP32, STRIDED]    # view, by variable
+```
+
 ### Memory References (MemRef)
 
 ```python
@@ -68,6 +82,108 @@ tensor: pl.Tensor[[64, 128], pl.FP32, pl.MemRef(addr_expr, 8192, 0)]
 # Tiles keep memory space on the tile annotation, not inside MemRef
 tile: pl.Tile[[16, 16], pl.FP16, pl.MemRef(addr_expr, 512, 0), pl.Mem.Left]
 ```
+
+### Declared Allocations (one-argument MemRef)
+
+A one-argument `pl.MemRef("name")` declares an allocation of your own, taking it out of
+the compiler's opportunistic reuse. Tiles referencing it share it; nothing else is ever
+packed in. Use it when the packer coalesces tiles you want to stay independent —
+sharing storage adds a WAR dependency that serializes them.
+
+It is the same IR node as the three-argument form; the arity says whether you are
+describing an existing allocation or declaring one. Declaring gives only a name: the
+size comes from the largest tile bound to it and the address from the allocator.
+
+Declare it once, then reference it by variable. An unnamed declaration takes the name
+of the variable it is bound to, so the name is written once:
+
+```python
+ping = pl.MemRef()
+pong = pl.MemRef()
+
+# Two tiles explicitly share one allocation; a third is kept private.
+t0: pl.Tile[[64, 64], pl.FP32, ping, pl.Mem.Vec] = pl.load(a, [0, 0], [64, 64])
+t1: pl.Tile[[64, 64], pl.FP32, pong, pl.Mem.Vec] = pl.exp(t0)
+t2: pl.Tile[[64, 64], pl.FP32, ping, pl.Mem.Vec] = pl.exp(t1)
+```
+
+Prefer that form: a misspelled reference is a Python `NameError`, whereas a misspelled
+string in the inline `pl.MemRef("pign")` form silently declares a second allocation. The
+inline form stays valid — it is what the IR printer emits, so a dumped program reparses
+without a surrounding Python scope, and `pl.MemRef("other")` also names a declaration
+explicitly when the variable name is not the one you want in the IR.
+
+Since the variable supplies the name, variable and allocation must correspond one to one.
+Reaching one declaration through two names (`alias = ping`) and two declarations claiming
+one name are both **rejected** — either would silently merge or split an allocation.
+
+Whether a MemRef is a declaration is recorded explicitly on the IR node
+(`MemRef.is_pinned_`), not inferred from its size or from which pass is running.
+`InitMemRef` consumes the declaration: from there on the allocation carries
+`pinned=True` and the MemRef is an ordinary one, so re-parsing a post-allocation dump
+cannot turn compiler allocations into declared ones.
+
+#### Slots
+
+Pass `slots=N` for N equally-sized slots of one allocation, then pick one by subscript.
+The slots are contiguous and uniformly sized, so rotating through them is a ping-pong the
+packer cannot collapse:
+
+```python
+l0c = pl.MemRef(slots=2)
+
+ping: pl.Tile[[M, N], pl.FP32, l0c[0], pl.Mem.Acc] = pl.tile.matmul(q, b0)
+pong: pl.Tile[[M, N], pl.FP32, l0c[1], pl.Mem.Acc] = pl.tile.matmul(q, b1)
+```
+
+**The index may be a runtime value**, so a rotation needs no unrolling:
+
+```python
+for i, (acc,) in pl.range(N, init_values=(out,)):
+    a: pl.Tile[[M, N], pl.FP32, l0c[i % 2], pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+```
+
+Under `@pl.jit`, name the declaration inline — `pl.MemRef("l0c", slots=2)[i % 2]` — rather
+than binding it to a Python variable. `@pl.jit` re-parses a generated source in a fresh
+module namespace, so a declaration held in a variable is not in scope there. The named form
+is self-contained (and is what the IR printer emits), so it works in both.
+
+`InitMemRef` sizes one slot to the largest tile bound to *any* slot — the slots are
+uniform, so a per-slot size would make the stride inconsistent — and turns the index into
+the byte offset `index * slot_size`. A constant index folds there and takes the ordinary
+constant-address path; a runtime one survives as an expression that becomes the tile's
+address at run time.
+
+Co-liveness is checked **per slot**, not per allocation: two tiles on different slots are
+meant to be live together, and only two tiles landing on the *same* slot can corrupt each
+other. When the index is a runtime expression there is no static slot to attribute a tile
+to, so the check is skipped — the rotation is yours to get right — while isolation from
+every other allocation still holds.
+
+A declared name lives in its own namespace — it never resolves to a Python variable that
+happens to share it. The memory space **is** required (a `TileType` always pairs a
+MemRef with a space), and all tiles bound to one allocation must agree on it. Tiles left
+unannotated keep the default automatic reuse.
+
+Declarations do not clone per pipeline stage, so one inside a `pl.pipeline(stage=2)`
+body is **rejected**: the cloned stages would make the tile co-live with itself on one
+allocation. Declaring slots and asking the compiler to multi-buffer are alternatives,
+not layers. To manage a level yourself, drive it with `pl.range` and declare one
+allocation per slot; leave the levels you want the compiler to manage unannotated.
+
+```python
+l0b_ping, l0b_pong = pl.MemRef(), pl.MemRef()
+
+# Outer level compiler-managed, inner level author-managed ping-pong.
+for stack, (out_outer,) in pl.pipeline(STACKS, stage=2, init_values=(out,)):
+    b_l1: pl.Tile[[K, N], pl.BF16, pl.Mem.Mat] = pl.load(b, [stack * K, 0], [K, N])
+    for col, (out_inner,) in pl.range(0, N, 2 * STEP, init_values=[out_outer]):
+        ping: pl.Tile[[K, STEP], pl.BF16, l0b_ping, pl.Mem.Right] = ...
+        pong: pl.Tile[[K, STEP], pl.BF16, l0b_pong, pl.Mem.Right] = ...
+```
+
+See [InitMemRef](../passes/29-init_memref.md#declared-allocations) and
+[MemoryReuse](../passes/31-memory_reuse.md#declared-allocations).
 
 ### Tile Views (TileView)
 
@@ -332,7 +448,7 @@ See [Language Guide](../../user/01-language_guide.md#incore-scopes) for examples
   - An explicit `with pl.at(<CORE_GROUP level>, ...):` as the sole body statement *is* the InCore carrier: parsed as an ordinary nested scope, not wrapped a second time (positional or keyword `level`, with or without `as tid` / `name_hint=`). This is the form the printer emits for `Spmd(InCore(...))`, so it is what makes that IR round-trip. When the body provides a carrier, `optimizations=` must go on that `pl.at(...)` — putting it on the `pl.spmd(...)` line is rejected, whether or not the carrier also carries one.
   - A dispatch body may launch **one** kernel. It is lowered via `FindFirstInnerCall`, which stops at the first call, so a second dispatch would be silently dropped rather than launched; the parser rejects it instead. Hoisted temporaries and tuple projections are not dispatches and do not count.
 - `for i in pl.spmd(N): ...` — loop variable binds the per-block index (`pl.tile.get_block_idx()`); the body is auto-outlined into a synthetic InCore region.
-- `with pl.spmd(N, deps=[...]) as tid: ...` — **capture form**: mirrors `with pl.at(...) as tid:`. Same body shapes as the plain form above, and additionally captures the dispatch's grid-wide producer `pl.Scalar[pl.TASK_ID]` in `tid` (usable as a `deps=` edge, stored into a `pl.array.create(N, pl.TASK_ID)`, or crossed into `pl.manual_scope`). TaskId capture is orthogonal to the inline body — it is the only thing this form adds over the plain form. Lowers to an `ir.Submit` whose trailing tuple element is the grid TaskId; `core_num` / `sync_start` ride on the outlined `Spmd` Function attrs. See [Manual dependency primitives](#manual-dependency-primitives).
+- `with pl.spmd(N, deps=[...]) as tid: ...` — **capture form**: mirrors `with pl.at(...) as tid:`. Same body shapes as the plain form above, and additionally captures the dispatch's grid-wide producer `pl.Scalar[pl.TASK_ID]` in `tid` (usable as a `deps=` edge, stored into a `pl.array.create(N, pl.TASK_ID)`, or crossed into `pl.manual_scope`). TaskId capture is orthogonal to the inline body — it is the only thing this form adds over the plain form. Lowers to an `ir.Submit` whose trailing tuple element is the grid TaskId; `core_num` / `sync_start` ride on that `Submit`'s own fields (the launch spec belongs to the launch site, not the outlined callee). See [Manual dependency primitives](#manual-dependency-primitives).
 - `out, tid = pl.spmd_submit(kernel, *args, core_num=N)` — **submit form**: dispatches the kernel across `N` blocks *and* captures the dispatch's producer `pl.Scalar[pl.TASK_ID]` (the `pl.submit` sibling for a pre-defined kernel). See [Manual dependency primitives](#manual-dependency-primitives).
 
 All three `pl.spmd(...)` scope forms also accept `allow_early_resolve=True` (a boolean literal; same early-dispatch opt-in as `pl.submit` / `pl.at`). It forces the dispatch to lower to an `ir.Submit` even without `as tid` and lowers to `Arg::set_allow_early_resolve(true)`. Rejected on a `pl.cluster()`-nested `pl.spmd` (such a scope is unwrapped into the Group function and never produces a Submit, so the hint would be lost).
@@ -382,7 +498,7 @@ shape (single kernel call, outlined `pl.at` region, or dependency-only fan-in).
 | `result, tid = pl.submit(kernel, *args, deps=[...], allow_early_resolve=False)` | single kernel call | The trailing `tid` is the producer `pl.Scalar[pl.TASK_ID]`. A parser construct (like `pl.range`), not a runtime function. `allow_early_resolve=True` opts this task in as a speculative early-dispatch producer (lets the scheduler pre-stage its consumers; lowers to `Arg::set_allow_early_resolve(true)`). Also accepts `predicate=(t[i] > 0)` — a dispatch predicate the scheduler evaluates at the dispatch point (see [Dispatch predicate](#dispatch-predicate-predicate)). |
 | `result, tid = pl.spmd_submit(kernel, *args, core_num=N, sync_start=False, deps=[...])` | single SPMD task launch | The SPMD sibling of `pl.submit`: dispatches the kernel across `N` blocks (one orchestration task → one `tid`). `core_num` is a required keyword (positive int expr); `sync_start=True` forces atomic launch of all blocks. Callee may be InCore / AIC / AIV / Group. Records the launch spec on `Submit.core_num` / `Submit.sync_start`. Also accepts `allow_early_resolve=True` (same early-dispatch opt-in as `pl.submit`) and `predicate=(t[i] > 0)` (see [Dispatch predicate](#dispatch-predicate-predicate)). |
 | `with pl.at(level=pl.Level.CORE_GROUP, deps=[...]) as tid:` | outlined `pl.at`-block | The whole block is outlined into an `InCore` kernel + `Submit`; `tid` captures the synthesized Submit's TaskId, usable as a dep for later `pl.submit` / `pl.at` sites. Without `as tid` the outliner synthesizes an unused TaskId Var — deps always travel on `Submit::deps_`. Also accepts `allow_early_resolve=True` (same early-dispatch opt-in as `pl.submit`); it forces the `Submit` shape even without `as tid` and lowers to `Arg::set_allow_early_resolve(true)`. |
-| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD dispatch | The SPMD sibling of the `pl.at ... as tid` form. The inline body is auto-outlined into an `InCore` kernel and dispatched across `N` blocks; `tid` captures the grid-wide producer TaskId. `deps=` accepted only with `as tid`. `core_num` / `sync_start` ride on the outlined `Spmd` Function attrs (the lowered `Submit.core_num` is `None`); codegen reads them via the launch-function fallback. Also accepts `allow_early_resolve=True` (same early-dispatch opt-in as `pl.submit` / `pl.at`; valid on all three `pl.spmd` forms, forcing the `Submit` shape even without `as tid`) and `predicate=(t[i] > 0)` (see [Dispatch predicate](#dispatch-predicate-predicate); also valid on all three forms and also forces the `Submit` shape). Cannot nest inside `pl.cluster()`. |
+| `with pl.spmd(N, deps=[...]) as tid:` | outlined SPMD dispatch | The SPMD sibling of the `pl.at ... as tid` form. The inline body is auto-outlined into an `InCore` kernel and dispatched across `N` blocks; `tid` captures the grid-wide producer TaskId. `deps=` accepted only with `as tid`. `core_num` / `sync_start` ride on the lowered `Submit`'s own `core_num` / `sync_start` fields (the launch spec belongs to the launch site, not the outlined callee); codegen reads them from there. Also accepts `allow_early_resolve=True` (same early-dispatch opt-in as `pl.submit` / `pl.at`; valid on all three `pl.spmd` forms, forcing the `Submit` shape even without `as tid`) and `predicate=(t[i] > 0)` (see [Dispatch predicate](#dispatch-predicate-predicate); also valid on all three forms and also forces the `Submit` shape). Cannot nest inside `pl.cluster()`. |
 | `barrier = pl.system.task_dummy(deps=[...])` | dependency-only barrier | Submits no kernel. The returned TaskId is a compact fan-in point for later `deps=[barrier]`. |
 | `None` (Python literal) | seed / dep entry | The "no producer yet" sentinel. `prev_tid = None` seeds a TaskId loop iter_arg; `None` in `deps=[None]` is dropped (contributes no edge). Lowers to `system.task_invalid` → `PTO2TaskId::invalid()`. |
 

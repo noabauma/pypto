@@ -227,6 +227,8 @@ class MaskPattern:
 def alloc(
     memory_space: MemorySpace,
     size: int,
+    *,
+    pinned: bool = False,
 ) -> PtrType:
     """Stub for the internal ``tile.alloc`` IR operation.
 
@@ -242,6 +244,9 @@ def alloc(
     Args:
         memory_space: Target memory space (e.g. ``pl.Mem.Vec``)
         size: Allocation size in bytes
+        pinned: True when the author declared this allocation via a
+            one-argument ``pl.MemRef(...)``. ``MemoryReuse`` then leaves its
+            membership untouched instead of packing other tiles into it.
 
     Returns:
         Opaque ``PtrType`` sentinel (unused at runtime)
@@ -358,7 +363,7 @@ def load(
     tensor: Tensor,
     offsets: Sequence[IntLike],
     shapes: Sequence[IntLike],
-    valid_shapes: Sequence[IntLike] | None = None,
+    valid_shape: Sequence[IntLike] | None = None,
     target_memory: MemorySpace = MemorySpace.Vec,
     clamp: bool = False,
 ) -> Tile:
@@ -375,13 +380,14 @@ def load(
             coordinate system.
         shapes: Shape of the region to load in each dimension. Always in the
             source tensor's coordinate system.
-        target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat)
-        valid_shapes: Valid shape of the tile in each dimension. When provided, sets
+        valid_shape: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
             as valid_shape. Uses the same coordinate convention as shapes. Narrows
             the tile; cannot widen it past what the source has.
+        target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat).
+            MX-layout tensors require an explicit MemorySpace.Mat.
         clamp: Sanction a read that runs off the end of the source. By default a
-            load asserts ``offsets + valid_shapes`` stays inside the source and is
+            load asserts ``offsets + valid_shape`` stays inside the source and is
             rejected when that provably fails; ``clamp=True`` cuts the request back
             to the source edge instead.
 
@@ -392,13 +398,13 @@ def load(
         >>> # 2D load
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
     """
-    if valid_shapes is None:
-        valid_shapes = shapes
+    if valid_shape is None:
+        valid_shape = shapes
     call_expr = _ir_ops.load(
         tensor.unwrap(),
         _normalize_intlike(offsets),
         _normalize_intlike(shapes),
-        _normalize_intlike(valid_shapes),
+        _normalize_intlike(valid_shape),
         target_memory,
         clamp=clamp,
     )
@@ -595,14 +601,20 @@ def move(
 
     Args:
         tile: Input tile
-        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right)
+        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right,
+            .LeftScale, .RightScale)
         blayout: Optional block layout for the destination tile
         slayout: Optional scatter layout for the destination tile
 
     Returns:
         Tile wrapping the move operation
     """
-    call_expr = _ir_ops.move(tile.unwrap(), target_memory, blayout=blayout, slayout=slayout)
+    call_expr = _ir_ops.move(
+        tile.unwrap(),
+        target_memory,
+        blayout=blayout,
+        slayout=slayout,
+    )
     return Tile(expr=call_expr)
 
 

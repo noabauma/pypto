@@ -44,14 +44,82 @@ program_with_memrefs = init_pass(program)
 ## Algorithm
 
 1. **Normalize structure**: Call `NormalizeStmtStructure` to ensure flat `SeqStmts` structure
-2. **Initialize MemRef**: Read `memory_space` from `TileType` (set by InferTileMemorySpace), create MemRef objects (addr=-1) and attach to variable types
+2. **Resolve declared allocations**: Collect every one-argument `pl.MemRef(...)` declaration and derive each one's size and memory space from the tiles bound to it (see [Declared allocations](#declared-allocations))
+3. **Initialize MemRef**: Read `memory_space` from `TileType` (set by InferTileMemorySpace), create MemRef objects (addr=-1) and attach to variable types
    - **tile.store**: result shares MemRef with the output tensor argument (specified by `output_reuses_input_arg` registry attribute)
    - **View ops** (e.g. `tile.reshape`): output shares MemRef with the input tile
    - **Reuse-input ops** (e.g. `tile.matmul_acc`, `tile.gemv_acc`): output shares MemRef with the specified input (via `output_reuses_input_arg` registry attribute)
    - **ForStmt/IfStmt return_vars**: patched to share MemRef with corresponding yield values
-3. **Collect non-DDR MemRefs**: Gather unique MemRef objects from TileType variables that are not in DDR
-4. **Create alloc statements**: For each non-DDR MemRef, create `tile.alloc(memspace, -1, size, id)`
-5. **Prepend allocs**: Insert alloc statements at the beginning of the function body's top-level `SeqStmts`
+   - **Declared allocations**: the tile keeps the allocation the author declared instead of getting a fresh one
+4. **Collect non-DDR MemRefs**: Gather unique MemRef objects from TileType variables that are not in DDR
+5. **Create alloc statements**: For each non-DDR MemRef, create `tile.alloc(memspace, -1, size, id)` — with `pinned=True` when the base was declared by the author
+6. **Prepend allocs**: Insert alloc statements at the beginning of the function body's top-level `SeqStmts`
+
+## Declared allocations
+
+`pl.Tile[[...], dtype, <alloc>, pl.Mem.Vec]` binds a tile to an allocation the kernel
+author declared, where `<alloc>` is a `pl.MemRef("name")` referenced by variable (or the
+same one-argument form inline, which is what the printer emits). Tiles referencing the
+same allocation share it; `MemoryReuse` never packs anything else into it. This is manual reuse control — see
+[MemoryReuse](31-memory_reuse.md#declared-allocations) for why an author would want it.
+
+**How the declaration reaches this pass.** The parser resolves a one-argument
+`pl.MemRef` to a `MemRef` whose `base_` Ptr is interned by name (so two annotations
+naming one allocation share one base), with `byte_offset = 0`, no size, and
+**`is_pinned_` set**. That flag is what identifies a declaration — re-parsing a
+post-allocation dump also puts MemRefs on `TileType`s, and those are the compiler's.
+Recording it explicitly rather than inferring it (from a sentinel size, or from where in
+the pipeline the pass sits) keeps the classification a property of the data, and lets
+the printer emit the one-argument form so a dump round-trips without inventing a size or
+address.
+
+This pass **consumes** the declaration: the MemRef it produces is an ordinary one
+carrying the derived size, with the flag cleared. From there on the allocation's
+`pinned=True` kwarg is what marks it as the author's.
+
+The declaration lives on the assigned `Var`, not on the RHS `Call` — `ConvertToSSA` merges
+it into the Var's type and op type deduction never produces a MemRef — so any pass that
+rebuilds a type from the Call must carry it over explicitly. `ConvertToSSA` does the
+merge; `FlattenTileNdTo2D` carries it through all four of its rebuilds (ND flatten,
+≤2D `tile.load`, rank>2 `tile.create`/`tile.full`, generic tile op); `InferTileMemorySpace` keeps it when syncing the Var
+type to a rebuilt Call. Passes that clone rather than rebuild (including the per-stage
+bodies `LowerPipelineLoops` emits) preserve it through `MemRef`'s clone path.
+
+**What the pass derives.** The author writes neither a size nor an address:
+
+| Property | Derived from |
+| -------- | ------------ |
+| Size | The largest tile bound to the allocation |
+| Memory space | The space the bound tiles share (they must agree) |
+| Address | Left to `AllocateMemoryAddr`, exactly as for compiler allocations |
+
+**Rejected bindings** (all `pypto::ValueError`, all with the offending tile's span):
+
+- A bound tile with a dynamic shape — a declared allocation must be sized at compile time.
+- Tiles on one allocation disagreeing on memory space.
+- Binding the output of a view / in-place op (`tile.reshape`, `tile.matmul_acc`, …).
+  Such a result lands in its source's allocation, so it cannot be placed elsewhere;
+  bind the source instead.
+
+A fourth rule — tiles bound to **one slot** must not be live at the same time — needs
+lifetime information and is therefore checked in
+[MemoryReuse](31-memory_reuse.md#declared-allocations). Tiles on *different* slots are
+meant to be live together; that is what a multi-slot declaration is for.
+
+```python
+ping, pong = pl.MemRef(), pl.MemRef()
+
+t0: pl.Tile[[64, 64], pl.FP32, ping, pl.Mem.Vec] = pl.load(a, [0, 0], [64, 64])
+t1: pl.Tile[[64, 64], pl.FP32, pong, pl.Mem.Vec] = pl.exp(t0)
+t2: pl.Tile[[64, 64], pl.FP32, ping, pl.Mem.Vec] = pl.exp(t1)  # shares t0's allocation
+```
+
+becomes two pinned allocations, with `t0` and `t2` on `ping`:
+
+```python
+ping: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384, pinned=True)
+pong: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384, pinned=True)
+```
 
 ## Example
 

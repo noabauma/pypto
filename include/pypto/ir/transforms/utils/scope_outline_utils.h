@@ -874,9 +874,9 @@ class ScopeOutliner : public IRMutator {
 
     // Register the outlined function (propagate level/role from ScopeStmt, convert split/core_num to attrs)
     std::vector<std::pair<std::string, std::any>> outlined_attrs;
-    auto append_split_attr = [&](std::optional<SplitMode> split) {
-      if (split.has_value() && split.value() != SplitMode::None) {
-        outlined_attrs.emplace_back("split", static_cast<int>(split.value()));
+    auto append_split_attr = [&](SplitMode split) {
+      if (split != SplitMode::None) {
+        outlined_attrs.emplace_back("split", static_cast<int>(split));
       }
     };
     // Propagate the optional cross-core ring depth (pl.split(mode, slot_num=N))
@@ -903,7 +903,7 @@ class ScopeOutliner : public IRMutator {
     // carries no AUTO cross-core transfer split (``incore->split_``), which has
     // a separate meaning. The authoritative per-region mode is ``node->split_``
     // (consumed at pass 21).
-    auto append_split_aiv_attr = [&](std::optional<SplitMode> incore_split) {
+    auto append_split_aiv_attr = [&](SplitMode incore_split) {
       SplitAivModeSummaryFinder finder;
       finder.VisitStmt(op->body_);
       if (!finder.found) return;
@@ -916,12 +916,15 @@ class ScopeOutliner : public IRMutator {
       // indistinguishably into the function's split / split_aiv attrs (a single
       // pl.split_aiv region legitimately yields a derived function-level split).
       //
-      // ANY pl.split(...) is rejected, SplitMode::None included (RFC #1820).
-      // NONE carries no split of its own, but writing it here still reads as
-      // "auto and manual split mixed on one scope". The cross-core slot count
-      // that used to force the NONE spelling now has its own orthogonal entry,
-      // pl.cross_core_slot(slot_num=N), so nothing needs the exemption.
-      CHECK_SPAN(!incore_split.has_value(), op->span_)
+      // RFC #1820 additionally rejects a literal `pl.split(pl.SplitMode.NONE)`
+      // here: it carries no split of its own, but writing it still reads as "auto
+      // and manual split mixed on one scope". That spelling is invisible to this
+      // pass since #2205 collapsed InCoreScopeStmt's two encodings of "no split"
+      // into `SplitMode::None`, so the parser rejects it instead — where the
+      // literal is still visible (see `_reject_user_split_with_split_aiv_region`).
+      // This check remains the backstop for IR that never went through the parser
+      // (deserialized `.pto`, programmatically built scopes).
+      CHECK_SPAN(incore_split == SplitMode::None, op->span_)
           << "scope combines a function-level pl.split(...) (optimizations=[pl.split(...)]) with "
              "pl.split_aiv region(s); these are mutually exclusive AIV-split mechanisms. Remove "
              "optimizations=[pl.split(...)] or the pl.split_aiv region(s) — the function-level "
@@ -933,21 +936,20 @@ class ScopeOutliner : public IRMutator {
       // share one mode (``uniform_mode``). Differing sibling modes have no single
       // representative: leave the function-level mode unset — the authoritative
       // per-region mode rides ``node->split_`` (consumed at pass 21). No need to
-      // re-check incore_split here: the CHECK above guarantees it is unset.
+      // re-check incore_split here: the CHECK above guarantees it is None.
       if (finder.uniform_mode.has_value()) {
         outlined_attrs.emplace_back("split", static_cast<int>(finder.uniform_mode.value()));
       }
     };
+    // Captured here, attached to the synthesised dispatch below — the launch
+    // spec belongs to the launch site, never to the outlined callee (see
+    // ``kAttrCoreNum`` for why).
+    auto spmd_scope = As<SpmdScopeStmt>(op);
     if (auto incore = As<InCoreScopeStmt>(op)) {
       append_split_attr(incore->split_);
       append_slot_num_attr();
       append_windowize_attr();
       append_split_aiv_attr(incore->split_);
-    } else if (auto spmd = As<SpmdScopeStmt>(op)) {
-      outlined_attrs.emplace_back("core_num", spmd->core_num_);
-      if (spmd->sync_start_) {
-        outlined_attrs.emplace_back("sync_start", true);
-      }
     }
     std::optional<Level> outlined_level;
     std::optional<Role> outlined_role;
@@ -1141,10 +1143,15 @@ class ScopeOutliner : public IRMutator {
       if (!arg_dir_override_indices.empty()) {
         submit_attrs.emplace_back(kAttrArgDirectionOverrides, std::move(arg_dir_override_indices));
       }
+      // Launch spec in the first-class Submit fields — the same shape
+      // ``pl.spmd_submit(..., core_num=N)`` produces, so printing / codegen /
+      // verification take one path.
       synthesised_call_expr = std::make_shared<Submit>(
           global_var, call_args, std::move(submit_deps), std::vector<std::pair<std::string, std::any>>{},
           std::move(submit_attrs), call_return_type ? call_return_type : std::make_shared<UnknownType>(),
-          op->span_, /*core_num=*/std::nullopt, /*sync_start=*/false,
+          op->span_,
+          /*core_num=*/spmd_scope ? std::optional<ExprPtr>(spmd_scope->core_num_) : std::nullopt,
+          /*sync_start=*/spmd_scope && spmd_scope->sync_start_,
           /*allow_early_resolve=*/scope_allow_early_resolve,
           /*predicate=*/scope_predicate ? std::optional<ExprPtr>(scope_predicate) : std::nullopt);
     } else {
@@ -1156,6 +1163,15 @@ class ScopeOutliner : public IRMutator {
       }
       if (!arg_dir_override_indices.empty()) {
         call_attrs.emplace_back(kAttrArgDirectionOverrides, std::move(arg_dir_override_indices));
+      }
+      // Launch spec last: the printer emits bespoke keys first and the rest in
+      // ``attrs_`` order, and a reparse rebuilds them in printed order — so
+      // appending keeps the dispatch structurally equal across print -> parse.
+      if (spmd_scope) {
+        call_attrs.emplace_back(kAttrCoreNum, ExprPtr(spmd_scope->core_num_));
+        if (spmd_scope->sync_start_) {
+          call_attrs.emplace_back(kAttrSyncStart, true);
+        }
       }
       if (!call_attrs.empty()) {
         synthesised_call_expr = std::make_shared<Call>(

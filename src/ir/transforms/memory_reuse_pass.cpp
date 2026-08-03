@@ -50,6 +50,7 @@
 #include "pypto/ir/transforms/utils/memref_collectors.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/reserve_buffer_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
@@ -588,10 +589,19 @@ class TopDownRetargeter {
     //      input of the call already lives on `target_base`, retyping the
     //      output onto the same buffer creates an in-place execution that
     //      the op cannot handle and fails at runtime.
+    //   4. Ops with a registered *fixed* output memory space (e.g. every
+    //      `tile.add`-style elementwise op is `set_output_memory(Vec)`) when
+    //      the target sits in a different space.  The op physically cannot
+    //      write there, so retyping the LHS would only mint IR that claims a
+    //      Vec-only op produces DDR.  Declining leaves the carry yielding a
+    //      different buffer than its init, which YieldFixupMutator reconciles
+    //      with a real move (see AlignLoopCarriesToInitMutator's contract).
+    //      Same-space targets are unaffected: only the MemRef base moves.
     if (IsOutputMemoryInheritInput(entry)) return false;
     if (HasKwarg(*call, "target_memory") && !TargetMemoryKwargMatches(*call, target_memory)) {
       return false;
     }
+    if (FixedOutputMemoryConflicts(entry, *call, target_memory)) return false;
     if (!entry.IsInplaceSafe() && CallReadsBase(*call, target->base_.get())) return false;
 
     // Unconstrained: check liveness, then plan retype.  (Skipped for if-phi
@@ -638,6 +648,22 @@ class TopDownRetargeter {
       return AnyCast<MemorySpace>(v, "kwarg key: target_memory") == *target_memory;
     }
     return false;
+  }
+
+  /// True when the op resolves to a concrete output memory space that differs
+  /// from `target_memory` — i.e. retyping the LHS would claim the op writes
+  /// somewhere it physically cannot.  Ops that defer the choice (the resolver
+  /// returns nullopt: inherit-input and the retargetable `target_memory`-kwarg
+  /// ops) are not constrained here and are handled by their own guards above.
+  static bool FixedOutputMemoryConflicts(const OpRegistryEntry& entry, const Call& call,
+                                         std::optional<MemorySpace> target_memory) {
+    if (!target_memory.has_value()) return false;
+    const auto& spec = entry.GetMemorySpec();
+    if (!spec.has_value() || !spec->deduce_output_memory) return false;
+    // Resolve against the call's own kwargs so a kwarg-driven op reports the
+    // space it actually produces rather than its registered default.
+    auto fixed = spec->deduce_output_memory(call.kwargs_);
+    return fixed.has_value() && *fixed != *target_memory;
   }
 
   /// Retype an IfStmt return_var: recurse into both branches' yield values.
@@ -1678,6 +1704,117 @@ struct ShedCandidate {
 /// MaxRelief: shed the group that frees the most bytes per level ⇒ fewest levels lost to fit the space.
 inline double ScoreMaxRelief(const ShedCandidate& c) { return -static_cast<double>(c.bytes_freed); }
 
+/// One tile independently bound to a declared allocation, with its lifetime.
+struct BoundMember {
+  VarPtr var;
+  int def_point;
+  int last_use_point;
+};
+
+/// Group the tiles a user *independently bound* to each pinned buffer.
+///
+/// A tile whose defining op inherits its source's buffer (a view, an in-place
+/// op, or a bare SSA alias) lands on the same base without the author binding it
+/// there — it is the same data, so overlapping with its source is expected and
+/// legal. Only independently produced tiles compete for the buffer's bytes, and
+/// only those are checked for lifetime overlap.
+class IndependentlyBoundCollector : public IRVisitor {
+ public:
+  IndependentlyBoundCollector(const std::set<const Var*>& pinned_bases,
+                              const std::map<const Var*, std::pair<int, int>>& var_liveness)
+      : pinned_bases_(pinned_bases), var_liveness_(var_liveness) {}
+
+  /// One slot of a declared allocation: its base, and the byte offset that tells
+  /// slots of the same allocation apart. `InitMemRef` has already consumed the
+  /// slot index into that offset, so a null offset (a dynamic index) collapses to
+  /// "some slot" — see the note on `by_slot`.
+  struct SlotKey {
+    const Var* base;
+    int64_t byte_offset;
+
+    bool operator<(const SlotKey& other) const {
+      if (base != other.base) return base < other.base;
+      return byte_offset < other.byte_offset;
+    }
+  };
+
+  /// Slot -> the tiles bound to it, with their lifetimes.
+  ///
+  /// Keyed per *slot*, not per allocation: two tiles on different slots of one
+  /// declared allocation are supposed to be live together — that is what a
+  /// ping-pong is — and only tiles landing on the *same* slot can corrupt each
+  /// other. Tiles whose offset is a runtime expression are skipped entirely,
+  /// since which slot they occupy is not a static fact.
+  std::map<SlotKey, std::vector<BoundMember>> by_slot;
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (op && op->var_) Record(op);
+    IRVisitor::VisitStmt_(op);
+  }
+
+ private:
+  void Record(const AssignStmtPtr& op) {
+    auto memref = GetTypeMemRef(op->var_->GetType());
+    if (!memref.has_value() || !(*memref)->base_) return;
+    const Var* base = (*memref)->base_.get();
+    if (pinned_bases_.count(base) == 0) return;
+    if (AsVarLike(op->value_)) return;  // bare SSA alias — same data
+    if (auto call = As<Call>(op->value_);
+        call && call->op_ && op_predicates::OutputInheritsSourceBuffer(call->op_->name_)) {
+      return;
+    }
+    auto liveness = var_liveness_.find(op->var_.get());
+    if (liveness == var_liveness_.end()) return;
+    // A runtime slot index leaves no static slot to attribute the tile to, so
+    // there is nothing to compare it against. The author owns the rotation in
+    // that case; isolation from other allocations still holds.
+    auto const_offset = As<ConstInt>((*memref)->byte_offset_);
+    if (!const_offset) return;
+    by_slot[{base, const_offset->value_}].push_back(
+        {op->var_, liveness->second.first, liveness->second.second});
+  }
+
+  const std::set<const Var*>& pinned_bases_;
+  const std::map<const Var*, std::pair<int, int>>& var_liveness_;
+};
+
+/// Reject a declared allocation whose independently bound tiles are co-live.
+///
+/// Binding two co-live tiles to one buffer is not a reuse decision, it is data
+/// corruption: the later write lands on bytes the earlier tile still needs. The
+/// packer refuses such a pairing among its own candidates; a hand-written
+/// binding bypasses that path, so it is re-checked here. Touching is allowed —
+/// one tile's last read may be the statement that produces the next.
+///
+/// Sorted sweep rather than a pairwise scan: a *valid* program is exactly one
+/// where every pair is disjoint, so a pairwise check never exits early and would
+/// be quadratic in the member count — which grows with the IR once a binding
+/// inside a loop body is unrolled.
+void ValidateDeclaredAllocs(const StmtPtr& body, const std::set<const Var*>& pinned_bases,
+                            const std::map<const Var*, std::pair<int, int>>& var_liveness) {
+  if (pinned_bases.empty()) return;
+  IndependentlyBoundCollector collector(pinned_bases, var_liveness);
+  collector.VisitStmt(body);
+
+  for (auto& [slot, members] : collector.by_slot) {
+    const Var* base = slot.base;
+    std::sort(members.begin(), members.end(),
+              [](const BoundMember& a, const BoundMember& b) { return a.def_point < b.def_point; });
+    for (size_t i = 1; i < members.size(); ++i) {
+      const BoundMember& prev = members[i - 1];
+      const BoundMember& cur = members[i];
+      CHECK_SPAN(prev.last_use_point <= cur.def_point, cur.var->span_)
+          << "Tiles '" << prev.var->name_hint_ << "' and '" << cur.var->name_hint_
+          << "' are both bound to the same slot of the declared allocation '" << base->name_hint_
+          << "' but are live at the same time (" << prev.var->name_hint_ << ": [" << prev.def_point << ", "
+          << prev.last_use_point << "], " << cur.var->name_hint_ << ": [" << cur.def_point << ", "
+          << cur.last_use_point
+          << "]). Sharing one slot would overwrite data that is still needed — put them on different "
+             "slots, declare separate allocations, or bind only tiles whose lifetimes do not overlap.";
+    }
+  }
+}
+
 std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::vector<LifetimeInterval>& lifetimes, const HazardInputs& hazard,
     const ForbidAliasMap& forbid_alias, const std::map<const Var*, std::set<int>>& phi_family_ids,
@@ -1685,9 +1822,29 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     const std::map<const Var*, std::pair<int, int>>& var_liveness,
     const std::map<const Var*, std::vector<std::pair<int32_t, int32_t>>>& pipeline_membership,
     const std::set<const Var*>& pipeline_load_tiles,
-    const std::map<MemorySpace, uint64_t>& reserved_end_by_space, const FunctionPtr& func,
-    std::vector<Diagnostic>* out_hints) {
+    const std::map<MemorySpace, uint64_t>& reserved_end_by_space, const std::set<const Var*>& pinned_bases,
+    const FunctionPtr& func, std::vector<Diagnostic>* out_hints) {
   std::map<VarPtr, VarPtr> reuse_map;
+
+  // A declared allocation (`pl.Tile[..., pl.MemRef("name"), ...]`) has exactly the membership
+  // the kernel author wrote. The packer neither adds tiles to it nor moves its
+  // tiles into someone else's buffer — that is the whole point of naming it:
+  // coalescing tiles whose lifetimes merely happen not to overlap introduces a
+  // false dependency that serializes them.
+  //
+  // Resolved once per interval rather than inside `can_share`: that predicate is
+  // the innermost step of the O(M^2) pack, which itself re-runs per shed step, so
+  // a type cast + set lookup there would be paid M^2 times — and by every kernel,
+  // including the vast majority that declare no allocation at all. Same reason
+  // `pipeline_membership` is pre-parsed (see LifetimeAnalysisResult).
+  std::vector<bool> is_pinned(lifetimes.size(), false);
+  if (!pinned_bases.empty()) {
+    for (size_t i = 0; i < lifetimes.size(); ++i) {
+      if (!lifetimes[i].variable) continue;
+      auto memref = GetTypeMemRef(lifetimes[i].variable->GetType());
+      is_pinned[i] = memref.has_value() && (*memref)->base_ && pinned_bases.count((*memref)->base_.get()) > 0;
+    }
+  }
 
   // Members of a sharing group (the vars that already physically share one base).
   // Returns a pointer (or nullptr) to avoid copying the vector in the O(M^2) loop.
@@ -1830,7 +1987,7 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
   // fit; the predicate is retained verbatim only as the never-worse-than-legacy floor.
   auto is_l0_space = [](MemorySpace s) {
     return s == MemorySpace::Left || s == MemorySpace::Right || s == MemorySpace::Acc ||
-           s == MemorySpace::Bias;
+           s == MemorySpace::Bias || s == MemorySpace::LeftScale || s == MemorySpace::RightScale;
   };
   // Capacity-gated (#1475): keep software-pipelined operands in separate buffers so the pipeline
   // stages double-buffer instead of serializing on a shared buffer. #1900's `pipeline_membership` tags
@@ -1985,23 +2142,37 @@ std::map<VarPtr, VarPtr> IdentifyReuseOpportunities(
     // earliest on ties). Pure — it does NOT touch reuse_map, since the shed loop below may re-pack.
     auto pack = [&]() {
       std::vector<std::vector<size_t>> buffers;
+      // Parallel to `buffers`: a declared allocation's membership is fixed by the author,
+      // so it opens its own slot and never takes another tile. Handling it here
+      // rather than as a `can_share` gate keeps the check out of the O(M^2) inner
+      // loop, and skips the whole buffer scan for a pinned candidate.
+      std::vector<char> buffer_pinned;
       for (size_t idx : indices) {
+        if (is_pinned[idx]) {
+          buffers.push_back({idx});
+          buffer_pinned.push_back(1);
+          continue;
+        }
         const auto& cand = lifetimes[idx];
         bool placed = false;
-        for (auto& buf : buffers) {
+        for (size_t b = 0; b < buffers.size(); ++b) {
+          if (buffer_pinned[b] != 0) continue;
           bool fits = true;
-          for (size_t member_idx : buf) {
+          for (size_t member_idx : buffers[b]) {
             if (!can_share(cand, lifetimes[member_idx])) {
               fits = false;
               break;
             }
           }
           if (!fits) continue;
-          buf.push_back(idx);
+          buffers[b].push_back(idx);
           placed = true;
           break;
         }
-        if (!placed) buffers.push_back({idx});
+        if (!placed) {
+          buffers.push_back({idx});
+          buffer_pinned.push_back(0);
+        }
       }
       return buffers;
     };
@@ -2931,11 +3102,29 @@ FunctionPtr TransformMemoryReuse(const FunctionPtr& func) {
       for (const auto& [space, end] : resolution.reserved_end_by_space) reserved_end_by_space[space] = end;
     }
   }
+  // Bases the author declared via a one-argument `pl.MemRef(...)`, materialized by
+  // InitMemRef as a pinned alloc. Their membership is off-limits to the packer.
+  // InitMemRef hoists every alloc to the body's top-level SeqStmts, so this scans
+  // that list in place rather than flattening a copy of the whole body. Missing
+  // that shape must not fail open: an empty `pinned_bases` silently disables both
+  // the packer isolation and the co-liveness check below, handing the author back
+  // exactly the coalescing the binding was written to prevent.
+  auto top_level = As<SeqStmts>(new_body);
+  INTERNAL_CHECK_SPAN(top_level, func->span_)
+      << "MemoryReuse expects a top-level SeqStmts body (InitMemRef normalizes it), got "
+      << (new_body ? new_body->TypeName() : "null");
+  std::set<const Var*> pinned_bases;
+  for (const auto& stmt : top_level->stmts_) {
+    if (auto base = GetPinnedAllocBase(stmt)) pinned_bases.insert(base.get());
+  }
+
+  ValidateDeclaredAllocs(new_body, pinned_bases, analysis_result.var_liveness);
+
   std::vector<Diagnostic> hints;
   auto reuse_map = IdentifyReuseOpportunities(
       analysis_result.lifetimes, hazard, forbid_alias, analysis_result.phi_family_ids,
       analysis_result.var_sharing_groups, analysis_result.var_liveness, analysis_result.pipeline_membership,
-      analysis_result.pipeline_load_tiles, reserved_end_by_space, func, &hints);
+      analysis_result.pipeline_load_tiles, reserved_end_by_space, pinned_bases, func, &hints);
   // Surface capacity-forced pipeline-depth reductions (perf hints) and legacy-fallback overflows
   // (warnings) through the unified diagnostic channel → perf_hints.log / stderr.
   if (!hints.empty()) EmitDiagnostics(hints, "MemoryReuse");

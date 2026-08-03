@@ -74,6 +74,7 @@ from .dsl_api import (
     yield_,
 )
 from .op import array_ops as array
+from .op import prefetch_ops as prefetch
 from .op import system_ops as system
 from .op import tensor_ops as tensor
 from .op import tile_ops as tile
@@ -120,8 +121,6 @@ from .op.tile_ops import (
     addsc,
     aic_gather,
     aiv_shard,
-    and_,
-    ands,
     cmps,
     create_tile,
     gemv,
@@ -135,24 +134,15 @@ from .op.tile_ops import (
     min,
     minimums,
     move,
-    not_,
-    or_,
-    ors,
     prelu,
     relu,
     rem,
     rems,
     sel,
     sels,
-    shl,
-    shls,
-    shr,
-    shrs,
     store,
     subc,
     subsc,
-    xor,
-    xors,
 )
 from .op.tile_ops import (
     mscatter as mscatter,
@@ -160,6 +150,8 @@ from .op.tile_ops import (
 from .op.unified_ops import (
     abs,
     add,
+    and_,
+    ands,
     batch_matmul,
     cast,
     cmp,
@@ -192,6 +184,9 @@ from .op.unified_ops import (
     minimum,
     mul,
     neg,
+    not_,
+    or_,
+    ors,
     part_add,
     part_max,
     part_min,
@@ -216,17 +211,38 @@ from .op.unified_ops import (
     row_sum,
     rsqrt,
     set_validshape,
+    shl,
+    shls,
+    shr,
+    shrs,
     slice,
     sqrt,
     sub,
     transpose,
     write,
+    xor,
+    xors,
 )
 from .optimizations import cross_core_slot, split
 from .parser.decorator import InlineFunction, function, inline, program
 from .parser.text_parser import loads, loads_program, parse, parse_program
 from .scope import ScopeMode, manual_scope, scope, spmd_submit, submit
-from .typing import Array, DynVar, InOut, IntLike, MemRef, Out, Scalar, Tensor, Tile, Tuple, dynamic
+from .typing import (
+    Array,
+    AsyncEvent,
+    AsyncSession,
+    DynVar,
+    InOut,
+    IntLike,
+    MemRef,
+    Out,
+    PrefetchAsyncContext,
+    Scalar,
+    Tensor,
+    Tile,
+    Tuple,
+    dynamic,
+)
 
 # Short alias for MemorySpace (pl.Mem.Vec instead of pl.MemorySpace.Vec)
 Mem = MemorySpace
@@ -238,6 +254,8 @@ Ptr = PtrType
 ND = TensorLayout.ND
 DN = TensorLayout.DN
 NZ = TensorLayout.NZ
+MX_A_ZZ = TensorLayout.MX_A_ZZ
+MX_B_NN = TensorLayout.MX_B_NN
 
 # Re-export DataType constants for convenience
 FP4 = DataType.FP4
@@ -308,6 +326,7 @@ __all__ = [
     "cross_core_slot",
     "adir",
     "array",
+    "prefetch",
     "tile",
     "system",
     "tensor",
@@ -466,6 +485,9 @@ __all__ = [
     "MemorySpace",
     "PipeType",
     "Ptr",
+    "PrefetchAsyncContext",
+    "AsyncEvent",
+    "AsyncSession",
     "PtrType",
     "TensorLayout",
     "TensorView",
@@ -475,6 +497,8 @@ __all__ = [
     "ND",
     "DN",
     "NZ",
+    "MX_A_ZZ",
+    "MX_B_NN",
     "FP4",
     "FP8E4M3FN",
     "FP8E5M2",

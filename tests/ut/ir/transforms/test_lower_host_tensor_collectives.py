@@ -15,6 +15,7 @@ from typing import cast
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
+from pypto.language.parser.diagnostics import InvalidOperationError
 from pypto.pypto_core import DataType, ir, passes
 
 
@@ -428,7 +429,7 @@ def test_host_allreduce_rejects_static_signal_smaller_than_explicit_device_count
             return 0
 
     program = passes.materialize_comm_domain_scopes()(P)
-    with pytest.raises(Exception, match=r"signal shape\[0\].*participating device count"):
+    with pytest.raises(ValueError, match=r"signal shape\[0\].*participating device count"):
         passes.lower_host_tensor_collectives()(program)
 
 
@@ -452,31 +453,29 @@ def test_host_allreduce_rejects_rank2_signal_with_dynamic_second_extent():
             return 0
 
     program = passes.materialize_comm_domain_scopes()(P)
-    with pytest.raises(Exception, match=r"rank-2 signal shape\[1\] must be the constant 1"):
+    with pytest.raises(ValueError, match=r"rank-2 signal shape\[1\] must be the constant 1"):
         passes.lower_host_tensor_collectives()(program)
 
 
-def test_host_allreduce_rejects_unsupported_builtin_dtype_variant():
-    @pl.program
-    class P:
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP16]):
-            return data
+def test_host_allreduce_rejects_unsupported_dtype_before_lowering():
+    with pytest.raises(InvalidOperationError, match="target dtype must be FP16 or FP32"):
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(self):
-            data_buf = pld.alloc_window_buffer(256 * pl.FP16.get_byte())
-            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
-            data = pld.window(data_buf, [256], dtype=pl.FP16)
-            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
-            for r in pl.range(pld.world_size()):
-                self.chip_orch(data, device=r)
-            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
-            return 0
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def chip_orch(self, data: pld.DistributedTensor[[256], pl.BF16]):
+                return data
 
-    program = passes.materialize_comm_domain_scopes()(P)
-    with pytest.raises(Exception, match="currently supports only"):
-        passes.lower_host_tensor_collectives()(program)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self):
+                data_buf = pld.alloc_window_buffer(256 * pl.BF16.get_byte())
+                signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+                data = pld.window(data_buf, [256], dtype=pl.BF16)
+                signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+                for r in pl.range(pld.world_size()):
+                    self.chip_orch(data, device=r)
+                pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+                return 0
 
 
 def test_host_barrier_lowers_to_builtin_world_size_loop():
@@ -678,7 +677,7 @@ def test_host_allgather_rejects_aliased_input_target_windows():
             return 0
 
     program = passes.materialize_comm_domain_scopes()(P)
-    with pytest.raises(Exception, match=r"different window allocations"):
+    with pytest.raises(ValueError, match=r"different window allocations"):
         passes.lower_host_tensor_collectives()(program)
 
 
@@ -709,7 +708,7 @@ def test_host_all_to_all_rejects_aliased_input_target_windows():
             return 0
 
     program = passes.materialize_comm_domain_scopes()(P)
-    with pytest.raises(Exception, match=r"different window allocations"):
+    with pytest.raises(ValueError, match=r"different window allocations"):
         passes.lower_host_tensor_collectives()(program)
 
 
@@ -746,6 +745,7 @@ def test_host_all_to_all_lowers_to_namesake_builtin():
     program = passes.materialize_comm_domain_scopes()(P)
     result = passes.lower_host_tensor_collectives()(program)
     host = _get_func(result, "host_orch")
+
     loops = _collect_for_stmts(host.body)
     builtin_loops = [
         loop
@@ -765,3 +765,204 @@ def test_host_all_to_all_lowers_to_namesake_builtin():
         ir.ArgDirection.InOut,
     ]
     assert call.kwargs["dtype"] == DataType.FP32
+
+
+def test_lowered_collective_is_printable_with_dtype_attr():
+    """The lowered ``builtin.tensor.*`` call must survive the python printer.
+
+    ``MakeBuiltinCallWithAttrs`` stamps a ``DataType``-valued ``dtype`` attr on
+    every lowered collective. The pass-dump instrument (``pass_manager.after_pass``)
+    prints the program after each pass, so a value type the printer has no codec
+    arm for aborts the whole compile with an ``InternalError`` — which is how this
+    surfaced in the distributed system tests. Printing here keeps the DataType
+    codec arm wired to the pass that actually produces it.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return 0
+
+    program = cast(ir.Program, passes.materialize_comm_domain_scopes()(P))
+    result = cast(ir.Program, passes.lower_host_tensor_collectives()(program))
+
+    printed = ir.python_print(result, format=False)
+    assert "builtin.tensor.allreduce" in printed, printed
+    # The DataType attr renders in the ``pl.<DTYPE>`` DSL form, not dropped.
+    assert '"dtype": pl.FP32' in printed, printed
+
+
+def test_host_allreduce_ring_lowers_to_ring_builtin():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(7 * 4 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [7, 4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            return 0
+
+    program = cast(ir.Program, passes.materialize_comm_domain_scopes()(P))
+    result = cast(ir.Program, passes.lower_host_tensor_collectives()(program))
+    host = _get_func(result, "host_orch")
+
+    loops = _collect_for_stmts(host.body)
+    builtin_loops = [
+        loop
+        for loop in loops
+        if isinstance(loop.body, ir.EvalStmt)
+        and isinstance(loop.body.expr, ir.Call)
+        and loop.body.expr.op.name == ir.get_op("builtin.tensor.allreduce_ring").name
+    ]
+    assert len(builtin_loops) == 1
+
+    call = _eval_call(builtin_loops[0].body)
+    assert call.kwargs["op"] == int(pld.ReduceOp.Sum)
+    assert call.kwargs["dtype"] == pl.FP32
+    assert list(call.arg_directions) == [ir.ArgDirection.InOut, ir.ArgDirection.InOut]
+
+
+def test_host_allreduce_rejects_unknown_mode():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            self.chip_orch(data, device=0)
+            self.chip_orch(data, device=1)
+            self.chip_orch(data, device=2)
+            self.chip_orch(data, device=3)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="star")
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    with pytest.raises(ValueError, match=r'mode must be "ring" or "mesh"'):
+        passes.lower_host_tensor_collectives()(program)
+
+
+def test_host_allreduce_ring_rejects_mismatched_signal_shape():
+    """Ring signal [5, 4] fails: shape[0]=5 != 2*(4-1)+1 = 7 at P=4."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(5 * 4 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [5, 4], dtype=pl.INT32)
+            self.chip_orch(data, device=0)
+            self.chip_orch(data, device=1)
+            self.chip_orch(data, device=2)
+            self.chip_orch(data, device=3)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    with pytest.raises(ValueError, match=r"must be at least 2\*\(NR-1\)"):
+        passes.lower_host_tensor_collectives()(program)
+
+
+def test_host_allreduce_ring_rejects_nondivisible_numel():
+    """Ring allreduce rejects numel that is not an exact multiple of NR at P=4."""
+    SIZE = 27  # 27 % 4 != 0
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(7 * 4 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [7, 4], dtype=pl.INT32)
+            self.chip_orch(data, device=0)
+            self.chip_orch(data, device=1)
+            self.chip_orch(data, device=2)
+            self.chip_orch(data, device=3)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    with pytest.raises(ValueError, match=r"exact multiple of the rank count"):
+        passes.lower_host_tensor_collectives()(program)
+
+
+def test_host_allreduce_ring_rejects_too_many_ranks():
+    """Ring allreduce rejects more than 16 participating devices (P=17)."""
+    SIZE = 64
+    ROUNDS = 2 * (17 - 1) + 1  # 33 signal rows
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(ROUNDS * 17 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [ROUNDS, 17], dtype=pl.INT32)
+            self.chip_orch(data, device=0)
+            self.chip_orch(data, device=1)
+            self.chip_orch(data, device=2)
+            self.chip_orch(data, device=3)
+            self.chip_orch(data, device=4)
+            self.chip_orch(data, device=5)
+            self.chip_orch(data, device=6)
+            self.chip_orch(data, device=7)
+            self.chip_orch(data, device=8)
+            self.chip_orch(data, device=9)
+            self.chip_orch(data, device=10)
+            self.chip_orch(data, device=11)
+            self.chip_orch(data, device=12)
+            self.chip_orch(data, device=13)
+            self.chip_orch(data, device=14)
+            self.chip_orch(data, device=15)
+            self.chip_orch(data, device=16)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(P)
+    with pytest.raises(ValueError, match=r"16 or fewer"):
+        passes.lower_host_tensor_collectives()(program)
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

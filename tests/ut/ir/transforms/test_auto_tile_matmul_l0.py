@@ -868,9 +868,9 @@ class TestAutoTileMatmulL0MNTiling:
         b = torch.randn(256, 256, dtype=torch.float32)
         c = torch.zeros(256, 256, dtype=torch.float32)
 
-        # compile_for_test runs the full pipeline; AllocateMemoryAddr would
+        # lower runs the full pipeline; AllocateMemoryAddr would
         # raise on an L0c overflow if the output were not tiled.
-        post = kernel.compile_for_test(a, b, c)
+        post = kernel.lower(a, b, c)
         code = torch_codegen(post)
         ns: dict = {}
         exec(code, ns)  # noqa: S102 — executing generated reference code is the point
@@ -1849,6 +1849,689 @@ class TestAutoTileMatmulL0MNTiling:
             if "pto." in mlir or "func.func" in mlir:
                 generated = True
         assert generated, "direct-store full-K must generate valid PTO MLIR"
+
+
+class TestAutoTileMatmulL0ExistingPipelineDbC:
+    """Automatic L0C ping-pong for a user-authored pipeline of L0 matmuls."""
+
+    @staticmethod
+    def _single_matmul_pipeline(tile_m: int = 16, tile_n: int = 128, inner_stage: int = 2, width: int = 512):
+        stacks = 4
+        total_m = stacks * tile_m
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q: pl.Tensor[[tile_m, 128], pl.BF16],
+                b: pl.Tensor[[stacks * 128, width], pl.BF16],
+                out: pl.Out[pl.Tensor[[total_m, width], pl.FP32]],
+            ) -> pl.Tensor[[total_m, width], pl.FP32]:
+                q_mat: pl.Tile[[tile_m, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [tile_m, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[tile_m, 128], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                    q_mat, 0, 0, [tile_m, 128], target_memory=pl.Mem.Left
+                )
+                for stack, (out_o,) in pl.pipeline(0, stacks, 1, stage=2, init_values=(out,)):
+                    b_mat: pl.Tile[[128, width], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                        b, [stack * 128, 0], [128, width], target_memory=pl.Mem.Mat
+                    )
+                    for ni, (out_i,) in pl.pipeline(
+                        0, width, tile_n, stage=inner_stage, init_values=(out_o,)
+                    ):
+                        b_l0: pl.Tile[[128, tile_n], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                            b_mat, 0, ni, [128, tile_n], target_memory=pl.Mem.Right
+                        )
+                        c_l0: pl.Tile[[tile_m, tile_n], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+                        out_s: pl.Tensor[[total_m, width], pl.FP32] = pl.store(
+                            c_l0, [stack * tile_m, ni], out_i
+                        )
+                        out_iy = pl.yield_(out_s)
+                    out_oy = pl.yield_(out_iy)
+                return out_oy
+
+        return Before
+
+    @staticmethod
+    def _mat_scratch_pipeline(tile_m: int, trips: int):
+        tile_n = 128
+        width = trips * tile_n
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q: pl.Tensor[[tile_m, 128], pl.BF16],
+                b: pl.Tensor[[128, width], pl.BF16],
+            ) -> pl.Tile[[tile_m, width], pl.BF16, pl.Mem.Mat]:
+                q_mat: pl.Tile[[tile_m, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [tile_m, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[tile_m, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, width], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, width], target_memory=pl.Mem.Mat
+                )
+                scratch: pl.Tile[[tile_m, width], pl.BF16, pl.Mem.Mat] = pl.tile.create(
+                    [tile_m, width], dtype=pl.BF16, target_memory=pl.Mem.Mat
+                )
+                for ni, (scratch_i,) in pl.pipeline(0, width, tile_n, stage=2, init_values=(scratch,)):
+                    b_l0: pl.Tile[[128, tile_n], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, tile_n], target_memory=pl.Mem.Right
+                    )
+                    c: pl.Tile[[tile_m, tile_n], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+                    scratch_s: pl.Tile[[tile_m, width], pl.BF16, pl.Mem.Mat] = pl.tile.assemble(
+                        scratch_i, c, [0, ni]
+                    )
+                    scratch_r = pl.yield_(scratch_s)
+                return scratch_r
+
+        return Before
+
+    def test_marks_only_direct_inner_pipeline_when_two_accumulators_fit(self):
+        """#2131 shape: shared L0A, moving L0B, and two 8 KiB L0C slots."""
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        Before = self._single_matmul_pipeline()
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(After)
+        assert printed.count("pipeline_double_buffer_c") == 1, (
+            "only the inner, directly-drained matmul pipeline should double-buffer L0C"
+        )
+        assert '"pipeline_double_buffer_c": True' in printed
+        assert '"pipeline_overlap_stores": False' in printed
+        _assert_ssa_valid(After, "test_existing_pipeline_dbc_marker")
+
+        # The existing lowering machinery must realize the marker as two
+        # co-live accumulators: matmul, matmul, drain, drain.
+        lowered = passes.infer_tile_memory_space()(After)
+        lowered = passes.lower_pipeline_loops()(lowered)
+        lowered = passes.canonicalize_io_order()(lowered)
+        seq = []
+        for line in ir.python_print(lowered).splitlines():
+            text = line.strip()
+            if "matmul" in text and "=" in text:
+                seq.append("matmul")
+            elif ".store(" in text and "=" in text:
+                seq.append("store")
+        assert any(seq[i : i + 4] == ["matmul", "matmul", "store", "store"] for i in range(len(seq) - 3)), (
+            f"expected the dbC drain-overlap schedule, got: {seq}"
+        )
+
+        # PyPTO must preserve the two Acc slots without requiring the chooser's
+        # experimental enable_pypto_l0c_double_buffer flag.
+        allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        allocated_text = ir.python_print(allocated)
+
+        def alloc_bases(space: str) -> set[str]:
+            return {
+                line.strip().split(":")[0]
+                for line in allocated_text.splitlines()
+                if f"tile.alloc(pl.Mem.{space}" in line
+            }
+
+        assert len(alloc_bases("Left")) == 1, "the loop-invariant q operand must remain one shared L0A buffer"
+        assert len(alloc_bases("Right")) == 2, "the moving b operand must remain the pipeline's L0B ping-pong"
+        acc_bases = alloc_bases("Acc")
+        assert len(acc_bases) == 2, f"expected two L0C ping-pong buffers, got: {acc_bases}"
+
+    @pytest.mark.parametrize(
+        ("inner_stage", "width", "expected"),
+        [(3, 384, "MMSSMS"), (4, 512, "MMSSMMSS")],
+    )
+    def test_deeper_pipeline_keeps_two_accumulators_and_chunks_the_drain_schedule(
+        self, inner_stage, width, expected
+    ):
+        """A deeper operand pipeline remains a two-slot L0C ping-pong.
+
+        Complete pairs are scheduled as ``MMSS`` and an odd final stage as
+        ``MS``; they must not become ``inner_stage`` co-live accumulators.
+        """
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        # Keep nested-pipeline L0B placement below the 64 KiB Right capacity so
+        # both tested source depths are legal independently of the L0C policy.
+        Before = self._single_matmul_pipeline(tile_n=32, inner_stage=inner_stage, width=width)
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert ir.python_print(After).count("pipeline_double_buffer_c") == 1
+
+        lowered = passes.infer_tile_memory_space()(After)
+        lowered = passes.lower_pipeline_loops()(lowered)
+        lowered = passes.canonicalize_io_order()(lowered)
+        sequence = []
+        for line in ir.python_print(lowered).splitlines():
+            text = line.strip()
+            if "matmul" in text and "=" in text:
+                sequence.append("M")
+            elif ".store(" in text and "=" in text:
+                sequence.append("S")
+        assert expected in "".join(sequence), f"expected depth-two dbC chunks, got: {sequence}"
+
+        allocated = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+        acc_allocs = {
+            line.strip().split(":")[0]
+            for line in ir.python_print(allocated).splitlines()
+            if "tile.alloc(pl.Mem.Acc" in line
+        }
+        assert len(acc_allocs) == 2, (
+            f"stage={inner_stage} must still rotate exactly two L0C buffers: {acc_allocs}"
+        )
+
+    def test_rejects_pipeline_with_separately_lowered_tail_group(self):
+        """A partial stage group can need an additional physical Acc allocation."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        # Three iterations at stage=2 lower as one two-stage main group plus a
+        # separate one-stage tail. Until allocation can prove cross-group reuse,
+        # leave this pipeline on its original one-accumulator policy.
+        Before = self._single_matmul_pipeline(tile_n=128, inner_stage=2, width=384)
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    def test_defers_single_compute_drain_pair(self):
+        """Two iterations do not amortize the two-slot fill/drain bubble."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        Before = self._single_matmul_pipeline(tile_n=128, inner_stage=2, width=256)
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+        _assert_ssa_valid(After, "test_existing_pipeline_dbc_single_pair")
+
+    def test_marks_exact_half_l0c_accumulator(self):
+        """Two 128x128 f32 accumulators exactly fill A2/A3's 128 KiB L0C."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        After = passes.auto_tile_matmul_l0()(self._single_matmul_pipeline(tile_m=128))
+        assert "pipeline_double_buffer_c" in ir.python_print(After)
+
+    def test_ptoas_planner_leaves_existing_pipeline_unchanged(self):
+        """#2131 targets PyPTO; PTOAS already supplies physical Acc separation."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PTOAS):
+            After = passes.auto_tile_matmul_l0()(self._single_matmul_pipeline())
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    def test_no_backend_leaves_existing_pipeline_unchanged(self):
+        """Backend-specific profitability is unavailable, so recognition is a no-op."""
+        _backend.reset_for_testing()
+        Before = self._single_matmul_pipeline()
+
+        After = passes.auto_tile_matmul_l0()(Before)
+
+        ir.assert_structural_equal(After, Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    def test_preserves_explicit_one_accumulator_policy_on_rerun(self):
+        """A chooser-emitted dbC=1 loop is an explicit policy, not a new candidate."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[256, 64], pl.BF16],
+                rhs: pl.Tensor[[64, 256], pl.BF16],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                lhs_mat: pl.Tile[[256, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [256, 64], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[64, 256], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [64, 256], target_memory=pl.Mem.Mat
+                )
+                c: pl.Tile[[256, 256], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_mat, rhs_mat)
+                out_s: pl.Tensor[[256, 256], pl.FP32] = pl.store(c, [0, 0], out)
+                return out_s
+
+        once = passes.auto_tile_matmul_l0()(Before)
+        printed = ir.python_print(once)
+        assert "pipeline_overlap_stores" in printed
+        assert "pipeline_double_buffer_c" not in printed
+
+        twice = passes.auto_tile_matmul_l0()(once)
+        ir.assert_structural_equal(twice, once)
+
+    def test_marks_pipeline_with_moving_left_operand(self):
+        """The stationary-panel pattern is symmetric: L0A may be the moving side."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[512, 128], pl.BF16],
+                b: pl.Tensor[[128, 16], pl.BF16],
+                out: pl.Out[pl.Tensor[[512, 16], pl.FP32]],
+            ) -> pl.Tensor[[512, 16], pl.FP32]:
+                a_mat: pl.Tile[[512, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a, [0, 0], [512, 128], target_memory=pl.Mem.Mat
+                )
+                b_mat: pl.Tile[[128, 16], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 16], target_memory=pl.Mem.Mat
+                )
+                b_l0: pl.Tile[[128, 16], pl.BF16, pl.Mem.Right] = pl.tile.move(
+                    b_mat, target_memory=pl.Mem.Right
+                )
+                for mi, (out_i,) in pl.pipeline(0, 512, 128, stage=2, init_values=(out,)):
+                    a_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        a_mat, mi, 0, [128, 128], target_memory=pl.Mem.Left
+                    )
+                    c: pl.Tile[[128, 16], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(a_l0, b_l0)
+                    out_s: pl.Tensor[[512, 16], pl.FP32] = pl.store(c, [mi, 0], out_i)
+                    out_r = pl.yield_(out_s)
+                return out_r
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" in ir.python_print(After)
+        _assert_ssa_valid(After, "test_existing_pipeline_dbc_moving_left")
+
+    @pytest.mark.parametrize(
+        ("tile_m", "trips", "expected"),
+        [
+            (16, 8, False),  # 8 KiB Acc: measured regression
+            (32, 8, False),  # 16 KiB Acc: measured tie
+            (64, 4, False),  # 32 KiB Acc but too little work for the Mat path
+            (64, 8, True),  # 32 KiB Acc and four complete compute/drain pairs
+        ],
+    )
+    def test_applies_path_specific_mat_scratch_profitability(self, tile_m, trips, expected):
+        """Acc->Mat uses its own trip-count and L0C-share admission gate."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        Before = self._mat_scratch_pipeline(tile_m, trips)
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert ("pipeline_double_buffer_c" in ir.python_print(After)) is expected
+        _assert_ssa_valid(After, "test_existing_pipeline_dbc_assemble_profitability")
+
+        if expected:
+            allocated = passes.infer_tile_memory_space()(After)
+            allocated = passes.lower_pipeline_loops()(allocated)
+            allocated = passes.canonicalize_io_order()(allocated)
+            allocated = passes.materialize_tensor_strides()(allocated)
+            allocated = passes.init_mem_ref()(allocated)
+            allocated = passes.materialize_semantic_aliases()(allocated)
+            allocated = passes.memory_reuse()(allocated)
+            acc_allocs = {
+                line.strip().split(":")[0]
+                for line in ir.python_print(allocated).splitlines()
+                if "tile.alloc(pl.Mem.Acc" in line
+            }
+            assert len(acc_allocs) == 2, (
+                f"admitted Mat-scratch dbC must allocate exactly two Acc slots: {acc_allocs}"
+            )
+
+    def test_rejects_loop_carried_matmul_operand(self):
+        """An operand IterArg changes by loop semantics and is not invariant."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                q_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                for ni, (q_i, out_i) in pl.pipeline(0, 512, 128, stage=2, init_values=(q_l0, out)):
+                    b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
+                    )
+                    c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_i, b_l0)
+                    out_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c, [0, ni], out_i)
+                    _q_r, out_r = pl.yield_(q_i, out_s)
+                return out_r
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    def test_rejects_noncanonical_assemble_target(self):
+        """An assemble must update and yield its matching scratch IterArg."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+            ) -> pl.Tile[[16, 512], pl.BF16, pl.Mem.Mat]:
+                q_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                scratch: pl.Tile[[16, 512], pl.BF16, pl.Mem.Mat] = pl.tile.create(
+                    [16, 512], dtype=pl.BF16, target_memory=pl.Mem.Mat
+                )
+                for ni in pl.pipeline(0, 512, 128, stage=2):
+                    b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
+                    )
+                    c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+                    _scratch_s: pl.Tile[[16, 512], pl.BF16, pl.Mem.Mat] = pl.tile.assemble(
+                        scratch, c, [0, ni]
+                    )
+                return scratch
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    def test_rejects_when_other_live_acc_values_exhaust_l0c(self):
+        """The extra slot is checked against all co-resident function Acc values."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+                spare_out: pl.Out[pl.Tensor[[128, 240], pl.FP32]],
+            ) -> tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[128, 240], pl.FP32]]:
+                # 120 KiB + the candidate's existing 8 KiB exactly fills L0C;
+                # adding the second candidate slot would overflow.
+                spare: pl.Tile[[128, 240], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [128, 240], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                )
+                q_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                for ni, (out_i,) in pl.pipeline(0, 512, 128, stage=2, init_values=(out,)):
+                    b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
+                    )
+                    c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+                    out_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c, [0, ni], out_i)
+                    out_r = pl.yield_(out_s)
+                spare_r: pl.Tensor[[128, 240], pl.FP32] = pl.store(spare, [0, 0], spare_out)
+                return out_r, spare_r
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    @pytest.mark.parametrize(
+        ("staged_rows", "staged_cols", "expected_marked"),
+        [
+            (112, 256, True),  # 2 * 56 KiB + 2 * 8 KiB = 128 KiB
+            (128, 240, False),  # 2 * 60 KiB + 2 * 8 KiB = 136 KiB
+        ],
+    )
+    def test_accounts_for_pipeline_replicated_non_cube_acc_footprint(
+        self, staged_rows, staged_cols, expected_marked
+    ):
+        """Capacity admission charges every physical stage copy of another Acc."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+        staged_width = 2 * staged_cols
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                staged_src: pl.Tensor[[staged_rows, staged_width], pl.BF16],
+                staged_out: pl.Out[pl.Tensor[[staged_rows, staged_width], pl.BF16]],
+                q: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> tuple[
+                pl.Tensor[[staged_rows, staged_width], pl.BF16],
+                pl.Tensor[[16, 512], pl.FP32],
+            ]:
+                staged_mat: pl.Tile[[staged_rows, staged_width], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    staged_src,
+                    [0, 0],
+                    [staged_rows, staged_width],
+                    target_memory=pl.Mem.Mat,
+                )
+                for sj, (staged_i,) in pl.pipeline(
+                    0, staged_width, staged_cols, stage=2, init_values=(staged_out,)
+                ):
+                    staged_acc: pl.Tile[[staged_rows, staged_cols], pl.BF16, pl.Mem.Acc] = pl.tile.extract(
+                        staged_mat,
+                        0,
+                        sj,
+                        [staged_rows, staged_cols],
+                        target_memory=pl.Mem.Acc,
+                    )
+                    staged_s: pl.Tensor[[staged_rows, staged_width], pl.BF16] = pl.store(
+                        staged_acc, [0, sj], staged_i
+                    )
+                    staged_r = pl.yield_(staged_s)
+
+                q_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                for ni, (out_i,) in pl.pipeline(0, 512, 128, stage=2, init_values=(out,)):
+                    b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
+                    )
+                    c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+                    out_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c, [0, ni], out_i)
+                    out_r = pl.yield_(out_s)
+                return staged_r, out_r
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert ("pipeline_double_buffer_c" in ir.python_print(After)) is expected_marked
+
+    def test_rejects_other_acc_definition(self):
+        """The marker is loop-wide, so unrelated Acc state defers it."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                q_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                for ni, (out_i,) in pl.pipeline(0, 512, 128, stage=2, init_values=(out,)):
+                    b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
+                    )
+                    _other_acc: pl.Tile[[16, 128], pl.BF16, pl.Mem.Acc] = pl.tile.extract(
+                        b_mat, 0, ni, [16, 128], target_memory=pl.Mem.Acc
+                    )
+                    c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+                    out_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c, [0, ni], out_i)
+                    out_r = pl.yield_(out_s)
+                return out_r
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    def test_rejects_additional_store_like_operation(self):
+        """Canonicalize would float every store-like op, so only one drain is allowed."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+                copied_b: pl.Out[pl.Tensor[[128, 512], pl.BF16]],
+            ) -> tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[128, 512], pl.BF16]]:
+                q_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                for ni, (out_i, copied_i) in pl.pipeline(0, 512, 128, stage=2, init_values=(out, copied_b)):
+                    b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
+                    )
+                    c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+                    out_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c, [0, ni], out_i)
+                    copied_s: pl.Tensor[[128, 512], pl.BF16] = pl.store(b_l0, [0, ni], copied_i)
+                    out_r, copied_r = pl.yield_(out_s, copied_s)
+                return out_r, copied_r
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    def test_rejects_gemv_side_accumulator(self):
+        """Every registered cube MAD family participates in the one-MAD guard."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> pl.Tensor[[16, 512], pl.FP32]:
+                q_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                for ni, (out_i,) in pl.pipeline(0, 512, 128, stage=2, init_values=(out,)):
+                    b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
+                    )
+                    _other: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.gemv(q_l0, b_l0)
+                    c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
+                    out_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c, [0, ni], out_i)
+                    out_r = pl.yield_(out_s)
+                return out_r
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+
+    def test_does_not_mark_when_two_accumulators_exceed_l0c(self):
+        """A 192x128 f32 accumulator is 96 KiB, larger than half of A2/A3 L0C."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        After = passes.auto_tile_matmul_l0()(self._single_matmul_pipeline(tile_m=192))
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+        _assert_ssa_valid(After, "test_existing_pipeline_dbc_capacity_guard")
+
+    def test_does_not_make_independent_matmuls_compete_for_half_l0c(self):
+        """Two MADs in one stage need a joint schedule; the local recognizer defers."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                q0: pl.Tensor[[16, 128], pl.BF16],
+                q1: pl.Tensor[[16, 128], pl.BF16],
+                b: pl.Tensor[[128, 512], pl.BF16],
+                out0: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+                out1: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
+            ) -> tuple[pl.Tensor[[16, 512], pl.FP32], pl.Tensor[[16, 512], pl.FP32]]:
+                q0_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q0, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q0_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q0_mat, target_memory=pl.Mem.Left
+                )
+                q1_mat: pl.Tile[[16, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q1, [0, 0], [16, 128], target_memory=pl.Mem.Mat
+                )
+                q1_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q1_mat, target_memory=pl.Mem.Left
+                )
+                b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
+                )
+                for ni, (out0_i, out1_i) in pl.pipeline(0, 512, 128, stage=2, init_values=(out0, out1)):
+                    b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
+                    )
+                    c0: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q0_l0, b_l0)
+                    out0_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c0, [0, ni], out0_i)
+                    c1: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q1_l0, b_l0)
+                    out1_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c1, [0, ni], out1_i)
+                    out0_rv, out1_rv = pl.yield_(out0_s, out1_s)
+                return out0_rv, out1_rv
+
+        After = passes.auto_tile_matmul_l0()(Before)
+        assert "pipeline_double_buffer_c" not in ir.python_print(After)
+        _assert_ssa_valid(After, "test_existing_pipeline_dbc_two_matmuls")
 
 
 class TestAutoTileMatmulL0Skips:

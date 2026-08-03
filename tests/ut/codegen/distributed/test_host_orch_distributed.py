@@ -67,8 +67,10 @@ def pass_verification_context():
         yield
 
 
-def _lower(program) -> str:
+def _lower(program, convert_to_ssa=False) -> str:
     """Apply the late host-distributed pipeline, then run distributed codegen directly."""
+    if convert_to_ssa:
+        program = passes.convert_to_ssa()(program)
     program = passes.synthesize_allreduce_signals()(program)
     program = passes.materialize_comm_domain_scopes()(program)
     program = passes.materialize_dist_tensor_ctx()(program)
@@ -272,12 +274,15 @@ def test_comm_group_program_emits_domain_provider_with_block():
     # the alloc) lowers to `workers=[*range(world_size)]` — resolved at
     # orch_fn time against the runner-bound `world_size` kwarg.
     assert re.search(r"workers=\[\*range\(world_size\)\],", code), code
-    # window_size is the sum of all slot nbytes expressions, each parenthesised.
-    # Single slot → `window_size=((64 * 4)),` (the inner parens come from the
-    # Mul expression the parser produces for ``SIZE * pl.FP32.get_byte()``).
-    assert re.search(r"window_size=\(\(64 \* 4\)\),", code), code
+    # window_size is the sum of aligned physical slot sizes. Each spec keeps
+    # its exact logical size in count and exposes only its physical size via
+    # nbytes.
+    # Single slot → `window_size=((((64 * 4) + 31) // 32) * 32),`. The inner
+    # parentheses come from the Mul expression.
+    aligned_size = r"\(\(\(\(64 \* 4\) \+ 31\) // 32\) \* 32\)"
+    assert re.search(rf"window_size=\({aligned_size}\),", code), code
     assert re.search(
-        r'CommBufferSpec\(name="data_buf", dtype="opaque", count=\(64 \* 4\), nbytes=\(64 \* 4\)\),',
+        rf'CommBufferSpec\(name="data_buf", dtype="opaque", count=\(64 \* 4\), nbytes={aligned_size}\),',
         code,
     ), code
     assert "as __comm_d0:" in code, code
@@ -285,6 +290,46 @@ def test_comm_group_program_emits_domain_provider_with_block():
     # ``contexts`` parameter must not appear anywhere.
     assert "contexts[" not in code, code
     assert re.search(r"__comm_d0\[\w+\]\.buffer_ptrs", code), code
+
+
+def test_comm_buffer_specs_align_each_physical_allocation():
+    """An odd FP16 data buffer must not misalign the following INT32 signal."""
+
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def chip_orch(
+            self,
+            data: pld.DistributedTensor[[17], pl.FP16],
+            signal: pld.DistributedTensor[[2], pl.INT32],
+        ) -> pl.Tensor[[17], pl.FP16]:
+            return data  # type: ignore[return-value]
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self) -> pl.Tensor[[17], pl.FP16]:
+            data_buf = pld.alloc_window_buffer(17 * pl.FP16.get_byte())
+            signal_buf = pld.alloc_window_buffer(2 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [17], dtype=pl.FP16)
+            signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+            return self.chip_orch(data, signal, device=0)
+
+    code = _lower(Prog)
+    data_logical = r"\(17 \* 2\)"
+    signal_logical = r"\(2 \* 4\)"
+    data_alloc = rf"\(\(\({data_logical} \+ 31\) // 32\) \* 32\)"
+    signal_alloc = rf"\(\(\({signal_logical} \+ 31\) // 32\) \* 32\)"
+    assert re.search(
+        rf'CommBufferSpec\(name="data_buf", dtype="opaque", count={data_logical}, nbytes={data_alloc}\),',
+        code,
+    ), code
+    assert re.search(
+        (
+            rf'CommBufferSpec\(name="signal_buf", dtype="opaque", '
+            rf"count={signal_logical}, nbytes={signal_alloc}\),"
+        ),
+        code,
+    ), code
+    assert re.search(rf"window_size=\({data_alloc}\) \+ \({signal_alloc}\),", code), code
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +619,93 @@ def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
     assert spec.variant == "builtin.tensor.allreduce__sum__fp32"
     assert spec.entry_symbol == "builtin_tensor_allreduce__sum__fp32"
     assert spec.template_dir == ":pypto.runtime.builtins.collectives.allreduce"
-    assert spec.template_vars == {"op_cpp": "ReduceOp::kSum", "dtype_cpp": "float"}
+    assert spec.template_vars == {
+        "op_cpp": "ReduceOp::kSum",
+        "reduce_inst": "TADD",
+        "dtype_cpp": "float",
+    }
+
+
+@pytest.mark.parametrize(
+    ("reduce_op", "op_suffix", "op_cpp", "reduce_inst"),
+    [
+        (pld.ReduceOp.Sum, "sum", "ReduceOp::kSum", "TADD"),
+        (pld.ReduceOp.Max, "max", "ReduceOp::kMax", "TMAX"),
+        (pld.ReduceOp.Min, "min", "ReduceOp::kMin", "TMIN"),
+        (pld.ReduceOp.Prod, "prod", "ReduceOp::kProd", "TMUL"),
+    ],
+)
+def test_host_allreduce_builtin_supports_every_op(
+    reduce_op,
+    op_suffix,
+    op_cpp,
+    reduce_inst,
+):
+    DTYPE = pl.FP32
+    REDUCE_OP = reduce_op
+    DTYPE_BYTES = 4
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], DTYPE]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * DTYPE_BYTES)
+            signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
+            data = pld.window(data_buf, [SIZE], dtype=DTYPE)
+            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=REDUCE_OP)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+    variant = f"builtin.tensor.allreduce__{op_suffix}__fp32"
+
+    assert f'callables["{variant}"]' in generated
+    specs = cg.get_builtin_next_level_specs()
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.variant == variant
+    assert spec.template_vars == {
+        "op_cpp": op_cpp,
+        "reduce_inst": reduce_inst,
+        "dtype_cpp": "float",
+    }
+
+
+def test_host_allreduce_builtin_codegen_supports_fp16_variant():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[17], pl.FP16]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(17 * pl.FP16.get_byte())
+            signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
+            data = pld.window(data_buf, [17], dtype=pl.FP16)
+            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+    variant = "builtin.tensor.allreduce__sum__fp16"
+    assert f'callables["{variant}"]' in generated
+    specs = cg.get_builtin_next_level_specs()
+    assert len(specs) == 1
+    assert specs[0].variant == variant
+    assert specs[0].template_vars == {
+        "op_cpp": "ReduceOp::kSum",
+        "reduce_inst": "TADD",
+        "dtype_cpp": "half",
+    }
 
 
 def test_implicit_host_allreduce_builtin_codegen_materializes_signal():
@@ -636,6 +767,12 @@ def test_host_allreduce_builtin_variant_is_recorded_once():
     assert len(cg.get_builtin_next_level_specs()) == 1
 
 
+def _finalize_chip_program_for_generate(program):
+    """Apply codegen-entry scope passes omitted by the partial host-orch pipeline."""
+    program = passes.derive_call_directions()(program)
+    return passes.classify_iter_arg_carry()(passes.materialize_runtime_scopes()(program))
+
+
 def test_backend_materializes_builtin_next_level_files(tmp_path):
     @pl.program
     class Prog:
@@ -657,6 +794,7 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     program = passes.materialize_comm_domain_scopes()(Prog)
     program = passes.lower_host_tensor_collectives()(program)
     program = passes.materialize_dist_tensor_ctx()(program)
+    program = _finalize_chip_program_for_generate(program)
     files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
 
     base = "next_levels/builtin.tensor.allreduce__sum__fp32"
@@ -666,7 +804,7 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
 
     entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp"]
     assert "builtin_tensor_allreduce__sum__fp32" in entry_cpp
-    assert "submit_allreduce_kernel<ReduceOp::kSum, float>" in entry_cpp
+    assert "submit_allreduce_kernel<ReduceOp::kSum>" in entry_cpp
 
     kernel_config = files[f"{base}/kernel_config.py"]
     assert '"function_name": "aicpu_orchestration_entry"' in kernel_config
@@ -675,6 +813,84 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     kernel_cpp = files[f"{base}/kernels/aiv/builtin_tensor_allreduce__sum__fp32_kernel.cpp"]
     assert "platform_comm/comm_context.h" in kernel_cpp
     assert "data_tensor->ndims" in kernel_cpp
+    assert "transfer_chunk" in kernel_cpp
+    assert "acc_tile.SetValidShape(1, transfer_chunk)" in kernel_cpp
+    assert "recv_tile.SetValidShape(1, transfer_chunk)" in kernel_cpp
+    assert "acc_tile.SetValidShape(1, chunk)" in kernel_cpp
+    assert "Global data_store_g" in kernel_cpp
+    assert "TADD(acc_tile, acc_tile, recv_tile)" in kernel_cpp
+
+
+def test_host_allreduce_ring_builtin_codegen_uses_ring_next_level_callable_key():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(7 * 4 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [7, 4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            self.chip_orch(data, device=0)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+
+    assert 'callables["builtin.tensor.allreduce_ring__sum__fp32"]' in generated, generated
+    assert "orch.submit_next_level" in generated, generated
+    assert "distributed_collectives" not in generated, generated
+
+    specs = cg.get_builtin_next_level_specs()
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.op_name == "builtin.tensor.allreduce_ring"
+    assert spec.variant == "builtin.tensor.allreduce_ring__sum__fp32"
+    assert spec.entry_symbol == "builtin_tensor_allreduce_ring__sum__fp32"
+    assert spec.template_dir == ":pypto.runtime.builtins.collectives.allreduce_ring"
+    assert spec.template_vars == {"op_cpp": "ReduceOp::kSum", "dtype_cpp": "float"}
+
+
+def test_backend_materializes_ring_allreduce_builtin_next_level_files(tmp_path):
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+            signal_buf = pld.alloc_window_buffer(7 * 4 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            signal = pld.window(signal_buf, [7, 4], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            return 0
+
+    program = passes.materialize_comm_domain_scopes()(Prog)
+    program = passes.lower_host_tensor_collectives()(program)
+    program = passes.materialize_dist_tensor_ctx()(program)
+    program = _finalize_chip_program_for_generate(program)
+    files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
+
+    base = "next_levels/builtin.tensor.allreduce_ring__sum__fp32"
+    assert f"{base}/kernel_config.py" in files
+    assert f"{base}/orchestration/builtin_tensor_allreduce_ring__sum__fp32.cpp" in files
+    assert f"{base}/kernels/aiv/builtin_tensor_allreduce_ring__sum__fp32_kernel.cpp" in files
+
+    entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce_ring__sum__fp32.cpp"]
+    assert "submit_allreduce_ring_kernel<ReduceOp::kSum, float>" in entry_cpp
+
+    kernel_cpp = files[f"{base}/kernels/aiv/builtin_tensor_allreduce_ring__sum__fp32_kernel.cpp"]
+    assert "RoundBarrier" in kernel_cpp
+    assert "signal_rows" in kernel_cpp
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +1129,7 @@ def _assert_host_collective_next_level_files(program_cls, tmp_path, variant, sig
     program = passes.materialize_comm_domain_scopes()(program_cls)
     program = passes.lower_host_tensor_collectives()(program)
     program = passes.materialize_dist_tensor_ctx()(program)
+    program = _finalize_chip_program_for_generate(program)
     files = pto_backend.generate(program, str(tmp_path), skip_ptoas=True)
 
     entry = variant.replace(".", "_")
@@ -931,6 +1148,8 @@ def _assert_host_collective_next_level_files(program_cls, tmp_path, variant, sig
 @pytest.mark.parametrize(
     ("package_name", "variant"),
     [
+        ("allreduce", "builtin.tensor.allreduce__sum__fp32"),
+        ("allreduce_ring", "builtin.tensor.allreduce_ring__sum__fp32"),
         ("barrier", "builtin.tensor.barrier__fp32"),
         ("broadcast", "builtin.tensor.broadcast__root0__fp32"),
         ("reduce_scatter", "builtin.tensor.reduce_scatter__sum__fp32"),
@@ -947,6 +1166,84 @@ def test_host_collective_builtin_template_package_exists(package_name, variant):
         assert (templates / name).is_file(), f"missing {name} in {package_name}"
     assert (root / "__init__.py").is_file(), f"missing __init__.py in {package_name}"
     assert variant.startswith("builtin.tensor."), variant
+
+
+# ---------------------------------------------------------------------------
+#  IfStmt phi codegen (issue #2180)
+# ---------------------------------------------------------------------------
+
+
+def test_if_cross_branch_phi_yields_tensors() -> None:
+    """Tensor phi emitted by ConvertToSSA for a cross-branch diverging variable
+    is yielded via ``tensors[...]`` assignments, not bare Python names (issue #2180)."""
+    SIZE = 4
+    P = 2
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def identity(self, x: pl.Tensor[[SIZE, SIZE], pl.FP32]) -> pl.Tensor[[SIZE, SIZE], pl.FP32]:
+            return x
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_run(self, x: pl.Tensor[[SIZE, SIZE], pl.FP32]) -> pl.Tensor[[SIZE, SIZE], pl.FP32]:
+            return self.identity(x)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self, x: pl.Tensor[[SIZE, SIZE], pl.FP32], zero: pl.Tensor[[SIZE, SIZE], pl.FP32]
+        ) -> pl.Scalar[pl.INT32]:
+            for r in pl.range(P):
+                if r == 0:
+                    boundary = zero
+                else:
+                    boundary = self.chip_run(x)
+                self.chip_run(boundary)
+            return 0  # pyright: ignore[reportReturnType]
+
+    code = _lower(Prog, convert_to_ssa=True)
+
+    # Sanity check: the generated Python must be syntactically valid.
+    compile(code, "<host_orch>", "exec")
+
+    # Locate the ``if`` line via line-anchored regex (avoids false matches
+    # on substrings within comments, identifiers, or guard lines).
+    lines = code.splitlines()
+    if_idx = None
+    for i, line in enumerate(lines):
+        if re.search(r"^\s*if\s+.*:\s*$", line):
+            if_idx = i
+            break
+    assert if_idx is not None, f"No if statement found in generated code:\n{code}"
+
+    # Find the matching ``else:`` at the same indent level.
+    if_indent = len(lines[if_idx]) - len(lines[if_idx].lstrip())
+    else_idx = None
+    for i in range(if_idx + 1, len(lines)):
+        stripped = lines[i].lstrip()
+        if stripped.startswith("else:") and (len(lines[i]) - len(stripped)) == if_indent:
+            else_idx = i
+            break
+    assert else_idx is not None, f"No else at indent level {if_indent} in generated code:\n{code}"
+
+    then_block = "\n".join(lines[if_idx + 1 : else_idx])
+    else_block = "\n".join(lines[else_idx + 1 :])
+
+    # Both branches must emit a tensors-based phi assignment so the merged
+    # scope has a single ``tensors["boundary__phi_v<...>"]`` entry.
+    phi_yield_pat = r'tensors\["boundary__phi_v\d+"\]\s*=\s*tensors\["[^"]+"\]'
+    assert re.search(phi_yield_pat, then_block), (
+        "Then-branch must yield tensor phi via tensors[...] = tensors[...]:\n" + code
+    )
+    assert re.search(phi_yield_pat, else_block), (
+        "Else-branch must yield tensor phi via tensors[...] = tensors[...]:\n" + code
+    )
+
+    # No bare-Python-name tensor assignment in the then-branch (the bug was
+    # ``boundary__ssa_v0 = zero__ssa_v0`` which raised NameError).
+    assert not re.search(r"boundary__ssa_v\d+\s*=.*\w+__ssa", then_block), (
+        "Then-branch must not contain bare Python tensor assignments:\n" + code
+    )
 
 
 if __name__ == "__main__":

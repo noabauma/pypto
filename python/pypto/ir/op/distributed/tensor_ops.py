@@ -379,8 +379,41 @@ def all_to_all(
     return _ir_core.create_op_call("pld.tensor.all_to_all", _args, {}, actual_span)
 
 
+def all_to_all_v(
+    input: Expr,
+    target: Expr,
+    signal: Expr,
+    send_counts: Expr,
+    recv_counts: Expr,
+    *,
+    span: Span | None = None,
+) -> Call:
+    """Build a ``pld.tensor.all_to_all_v(...)`` Call.
+
+    5-arg window-as-result intrinsic: 2D Tensor or DistributedTensor
+    [NR*MAX_RECV, SIZE] input, DistributedTensor [NR*MAX_RECV, SIZE] target
+    (staging window / result), INT32 barrier signal [NR, 1], INT32
+    ``send_counts`` [NR] / [NR, 1] holding the number of rows to send to each
+    destination, and window-bound INT32 ``recv_counts`` [NR, 1] that receives
+    per-source valid-row counts after the barrier (published via
+    ``pld.system.notify`` as ``min(send_counts[dest], MAX_RECV)``). Powered by
+    LowerCompositeOps into a 2-phase push-based decomposition (push → barrier),
+    returning the target window. The caller reads back from the window with
+    ``pl.load``, using ``recv_counts[src, 0]`` to skip unwritten holes.
+
+    ``send_counts`` is read at runtime, so the counts may be data-dependent;
+    each count is clamped to the per-peer capacity ``MAX_RECV =
+    target.shape[0] // NR``. The barrier signal is single-use and must not be
+    reused inside a ``for``/``while`` loop.
+    """
+    actual_span = _get_span_or_capture(span, frame_offset=1)
+    _args: list[Expr] = [input, target, signal, send_counts, recv_counts]
+    return _ir_core.create_op_call("pld.tensor.all_to_all_v", _args, {}, actual_span)
+
+
 __all__ = [
     "all_to_all",
+    "all_to_all_v",
     "alloc_window_buffer",
     "allgather",
     "allreduce",

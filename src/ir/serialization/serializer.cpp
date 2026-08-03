@@ -262,9 +262,32 @@ class IRSerializer::Impl {
 
     const auto& memref = *memref_opt.value();
     std::map<std::string, msgpack::object> memref_map;
+    // `base` (the name) is what old blobs carry and what old readers expect, so it
+    // stays. `base_node` is the base as a real node, which is what actually
+    // preserves identity: allocation identity is base_ *pointer* identity, and the
+    // node graph shares one object across every reference to it — including the
+    // alloc statement that defines the Ptr. Reconstructing a base from its name
+    // instead gives the MemRefs a Var that is not the alloc's, so the address
+    // allocator cannot match them to their allocation.
     memref_map["base"] = msgpack::object(memref.base_->name_hint_, zone);
+    memref_map["base_node"] = SerializeNode(memref.base_, zone);
     memref_map["byte_offset"] = SerializeNode(memref.byte_offset_, zone);
     memref_map["size"] = msgpack::object(memref.size_, zone);
+    // An author-declared allocation is only a declaration because of these three
+    // fields: drop them and `pl.MemRef("buf", slots=2)[1]` reads back as an
+    // ordinary compiler allocation, so InitMemRef stops treating it as declared
+    // and the selected slot is gone. Written only when they carry something —
+    // the reader defaults to exactly these values — so an ordinary allocation
+    // still serializes byte-for-byte as before.
+    if (memref.is_pinned_) {
+      memref_map["is_pinned"] = msgpack::object(memref.is_pinned_, zone);
+    }
+    if (memref.slot_count_ != 1) {
+      memref_map["slot_count"] = msgpack::object(memref.slot_count_, zone);
+    }
+    if (memref.slot_index_.has_value() && *memref.slot_index_) {
+      memref_map["slot_index"] = SerializeNode(*memref.slot_index_, zone);
+    }
     return msgpack::object(memref_map, zone);
   }
 
@@ -467,7 +490,8 @@ class IRSerializer::Impl {
       }
       type_map["types"] = msgpack::object(types_vec, zone);
     } else if (IsA<MemRefType>(type) || IsA<UnknownType>(type) || IsA<PtrType>(type) ||
-               IsA<WindowBufferType>(type) || IsA<CommCtxType>(type)) {
+               IsA<WindowBufferType>(type) || IsA<CommCtxType>(type) || IsA<PrefetchAsyncContextType>(type) ||
+               IsA<AsyncEventType>(type) || IsA<AsyncSessionType>(type)) {
       // Singleton marker types (no extra fields beyond the type_kind key).
     } else {
       INTERNAL_UNREACHABLE << "Unknown Type subclass: " << type->TypeName();

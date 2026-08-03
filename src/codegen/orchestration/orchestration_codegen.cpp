@@ -85,13 +85,13 @@ struct IterArgCarryPlan {
 using namespace pypto::ir;  // NOLINT(build/namespaces)
 
 CoreType InferFunctionCoreType(const FunctionPtr& func) {
-  // After ExpandMixedKernel runs (part of every Default / DebugTileOptimization
-  // pipeline), every InCore function reaching codegen has been split into AIC,
-  // AIV, or Group / Spmd wrappers. The two callers of this function
-  // (GenerateFunctionCallCode and GenerateSpmdCallCode) both filter Spmd /
-  // Group out before invoking it. Tests that bypass the pipeline must declare
-  // their kernels with the appropriate AIC / AIV type explicitly so codegen
-  // sees the concrete core type without re-deriving from body memory spaces.
+  // After ExpandMixedKernel runs (part of the Default pipeline), every InCore
+  // function reaching codegen has been split into AIC, AIV, or Group / Spmd
+  // wrappers. The two callers of this function (GenerateFunctionCallCode and
+  // GenerateSpmdCallCode) both filter Spmd / Group out before invoking it.
+  // Tests that bypass the pipeline must declare their kernels with the
+  // appropriate AIC / AIV type explicitly so codegen sees the concrete core
+  // type without re-deriving from body memory spaces.
   switch (func->func_type_) {
     case FunctionType::AIC:
       return CoreType::CUBE;
@@ -230,6 +230,17 @@ bool ReferencesIdentifier(const std::string& code, const std::string& name) {
 class OrchestrationStmtCodegen : public CodegenBase {
  public:
   using ManualTaskIdBinding = std::variant<int, std::string, std::vector<std::string>>;
+
+  /// One task dependency edge plus its provenance. ``user_written`` marks an
+  /// edge the user spelled as ``deps=[...]`` (``kAttrManualDepEdges``, or the
+  /// typed ``Submit::deps_`` projected through ``SubmitToCallView``) as opposed
+  /// to a compiler-derived hazard patch (``kAttrCompilerManualDepEdges``).
+  /// Only the former is an error when it fails to resolve — see
+  /// ``ResolveDepEdgeBinding``.
+  struct DepEdge {
+    VarPtr var;
+    bool user_written;
+  };
 
   explicit OrchestrationStmtCodegen(const ProgramPtr& prog, std::map<std::string, int>* func_ids,
                                     std::map<std::string, CoreType>* core_types,
@@ -2257,18 +2268,20 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return GenerateExprString(expr);
   }
 
-  // Resolve the effective SPMD launch spec for a dispatch. ``pl.spmd_submit``
-  // carries core_num/sync_start on the Submit, surfaced as Call attrs by
-  // SubmitToCallView; the scope-based ``with pl.spmd`` path carries them on
-  // the Spmd-wrapper function. Prefer the call's own attrs (spmd_submit), then
-  // fall back to the launch function's attrs (scope-based spmd / group).
+  // Resolve the effective SPMD launch spec for a dispatch. The spec rides the
+  // launch site: ``core_num`` / ``sync_start`` Call attrs for an outlined
+  // ``with pl.spmd`` / ``pl.cluster()`` dispatch, or the first-class Submit
+  // fields for ``pl.spmd_submit`` / an ``as tid`` scope (surfaced as Call attrs
+  // by SubmitToCallView). The launch-function fallback is legacy: no pass
+  // produces a Function-level spec any more, but hand-written and deserialized
+  // IR may still spell a constant one.
   [[nodiscard]] std::pair<ExprPtr, bool> EffectiveLaunchSpec(const CallPtr& call,
                                                              const FunctionPtr& launch_func) const {
-    ExprPtr core_num = call->GetAttr<ExprPtr>("core_num", nullptr);
-    bool sync_start = call->GetAttr<bool>("sync_start", false);
+    ExprPtr core_num = call->GetAttr<ExprPtr>(kAttrCoreNum, nullptr);
+    bool sync_start = call->GetAttr<bool>(kAttrSyncStart, false);
     if (!core_num && launch_func) {
-      core_num = launch_func->GetAttr<ExprPtr>("core_num", nullptr);
-      sync_start = launch_func->GetAttr<bool>("sync_start", false);
+      core_num = launch_func->GetAttr<ExprPtr>(kAttrCoreNum, nullptr);
+      sync_start = launch_func->GetAttr<bool>(kAttrSyncStart, false);
     }
     return {core_num, sync_start};
   }
@@ -2460,10 +2473,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// runtime adds these on top of any auto-tracked deps in auto scope (final
   /// fanin = auto ∪ explicit), so this count fires whenever the parser
   /// attached ``deps=[...]`` to the Call.
-  std::vector<VarPtr> GetDependencyEdges(const CallPtr& call) const {
-    std::vector<VarPtr> merged;
+  std::vector<DepEdge> GetDependencyEdges(const CallPtr& call) const {
+    std::vector<DepEdge> merged;
     std::unordered_set<uint64_t> seen;
-    auto append_edges = [&](const char* key) {
+    auto append_edges = [&](const char* key, bool user_written) {
       for (const auto& [k, v] : call->attrs_) {
         if (k != key) continue;
         const auto* edges = std::any_cast<std::vector<VarPtr>>(&v);
@@ -2471,14 +2484,71 @@ class OrchestrationStmtCodegen : public CodegenBase {
         for (const auto& edge : *edges) {
           if (!edge) continue;
           if (!seen.insert(edge->UniqueId()).second) continue;
-          merged.push_back(edge);
+          merged.push_back(DepEdge{edge, user_written});
         }
         return;
       }
     };
-    append_edges(kAttrManualDepEdges);
-    append_edges(kAttrCompilerManualDepEdges);
+    // Every ``manual_dep_edges`` carrier is treated as user-authored. The two
+    // shapes that reach here are a ``pl.submit(..., deps=[...])`` (via
+    // ``SubmitToCallView``) and a ``system.task_dummy`` barrier — and the
+    // barrier is NOT reliably compiler-authored: the parser stamps the same
+    // ``dummy_task`` attr on a user-written ``pl.system.task_dummy(deps=[...])``,
+    // whose edges must be enforced like any other user edge.
+    //
+    // ``ExpandManualPhaseFence`` also synthesises barriers under this key, but
+    // it only ever names a TaskId live in the same manual scope it rewrites, so
+    // those always resolve. Were one not to, raising is still the right answer —
+    // a dropped fanin there is a genuinely lost ordering edge.
+    append_edges(kAttrManualDepEdges, /*user_written=*/true);
+    append_edges(kAttrCompilerManualDepEdges, /*user_written=*/false);
     return merged;
+  }
+
+  /// Resolve ``edge`` to the live ``PTO2TaskId`` binding of its producer, or
+  /// ``nullptr`` when no binding is visible here — the producer sits in a
+  /// scope that has already closed, so its C++ local is gone and the edge is
+  /// dropped from the emitted ``set_dependencies`` call.
+  ///
+  /// Dropping is benign for a *compiler-derived* edge: it is a best-effort
+  /// hazard patch and may legitimately name a TaskId produced inside a closed
+  /// scope. For a *user-written* ``deps=[...]`` edge it is not — the consumer
+  /// would be left unordered against its producer, which surfaces at runtime
+  /// as a silent stale read — so fail loudly instead of emitting wrong code.
+  ///
+  /// ``CountManualDeps`` and ``EmitManualDeps`` both resolve through here, so
+  /// the dep-array sizing and the dep-array fill never disagree on which edges
+  /// survive.
+  const ManualTaskIdBinding* ResolveDepEdgeBinding(const DepEdge& edge, const CallPtr& call) const {
+    if (!edge.var) return nullptr;
+    const auto* binding = ResolveManualTaskIdBinding(edge.var.get());
+    if (binding == nullptr) {
+      if (edge.user_written) {
+        // ``GetSSABaseName`` can itself strip to "" (see the loop-var note
+        // below), so fall back on the stripped result, not the raw hint.
+        std::string name = GetSSABaseName(edge.var->name_hint_);
+        if (name.empty()) name = "<anonymous>";
+        CHECK_SPAN(false, call->span_)
+            << "Task dependency deps=[" << name << "] cannot be honored: its TaskId is produced inside a "
+            << "scope that has already closed at this point, so the ordering edge would be lost and the "
+            << "consumer could read stale data. Note that pl.range / pl.parallel loop bodies and if/else "
+            << "branches each open their own scope, so this fires even with no pl.scope() in the source. "
+            << "Either consume the TaskId inside the scope that produces it (for example, keep producer "
+            << "and consumer in one pl.manual_scope()), or hoist the producer out of the inner scope. For "
+            << "a TaskId produced in a loop body, consume it in that same body or accumulate the ids into "
+            << "an Array[N, TASK_ID] and depend on that after the loop.";
+      }
+      return nullptr;
+    }
+    // Invariant: a dep edge never resolves directly to a kernel-Call LHS
+    // (int-variant entry). The parser enforces that ``deps=[...]`` only
+    // accepts ``Scalar[TASK_ID]`` Vars, so an edge always resolves to a TaskId
+    // binding (string variant) or a TaskId iter_arg array (vector variant).
+    INTERNAL_CHECK_SPAN(std::get_if<int>(binding) == nullptr, call->span_)
+        << "Internal error: manual_dep_edge var '" << edge.var->name_hint_
+        << "' resolves to a kernel-Call LHS (int variant). Expected "
+        << "a Scalar[TASK_ID] Var (string variant).";
+    return binding;
   }
 
   void CollectCompilerDepTaskIds(const ProgramPtr& program) {
@@ -2560,18 +2630,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return vars;
   }
 
-  size_t CountManualDeps(const std::vector<VarPtr>& edges, const CallPtr& call) const {
+  size_t CountManualDeps(const std::vector<DepEdge>& edges, const CallPtr& call) const {
     size_t total = 0;
     std::unordered_set<std::string> seen_names;
     for (const auto& edge : edges) {
-      if (!edge) continue;
-      const auto* binding = ResolveManualTaskIdBinding(edge.get());
+      const auto* binding = ResolveDepEdgeBinding(edge, call);
       if (!binding) continue;
-      if (std::get_if<int>(binding)) {
-        INTERNAL_CHECK_SPAN(false, call->span_) << "Internal error: manual_dep_edge var '" << edge->name_hint_
-                                                << "' resolves to a kernel-Call LHS (int variant). Expected "
-                                                << "a Scalar[TASK_ID] Var (string variant).";
-      }
       if (auto* names = std::get_if<std::vector<std::string>>(binding)) {
         for (const auto& name : *names) {
           if (seen_names.insert(name).second) {
@@ -2761,25 +2825,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
       EmitDepArrayInsert(name, deps_arr, deps_cnt);
     };
     for (const auto& edge : edges) {
-      if (!edge) continue;
-      const auto* binding = ResolveManualTaskIdBinding(edge.get());
+      const auto* binding = ResolveDepEdgeBinding(edge, call);
       if (!binding) {
-        // Compiler-derived edges may reference TaskIds produced inside a
-        // closed ``pl.scope()`` that is no longer visible at this point in
-        // the manual scope.  ``CountManualDeps`` already skips these, so
-        // emit must be consistent: silently drop the out-of-scope edge.
+        // A compiler-derived edge may name a TaskId produced inside a closed
+        // ``pl.scope()`` that is no longer visible here. ``CountManualDeps``
+        // already skips it when sizing the array, so emit must be consistent
+        // and silently drop it too. (A *user* edge in this state threw above.)
         continue;
       }
-      if (std::get_if<int>(binding)) {
-        // Invariant: a ``manual_dep_edges`` entry should never resolve
-        // directly to a kernel-Call LHS (int-variant entry). The parser
-        // enforces that ``deps=[...]`` only accepts ``Scalar[TASK_ID]``
-        // Vars, so dep edges should always resolve to a TaskId binding
-        // (string variant) or a TaskId iter_arg array (vector variant).
-        INTERNAL_CHECK_SPAN(false, call->span_) << "Internal error: manual_dep_edge var '" << edge->name_hint_
-                                                << "' resolves to a kernel-Call LHS (int variant). Expected "
-                                                << "a Scalar[TASK_ID] Var (string variant).";
-      } else if (auto* names = std::get_if<std::vector<std::string>>(binding)) {
+      if (auto* names = std::get_if<std::vector<std::string>>(binding)) {
         // Array-carry iter_arg: include every valid slot.
         for (const auto& name : *names) {
           emit_one_dep(name);

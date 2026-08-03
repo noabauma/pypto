@@ -136,6 +136,7 @@ DistTensorBinding ResolveDistTensorBinding(const ExprPtr& arg, codegen::PTOCodeg
 struct PeerViewInfo {
   std::string ssa;
   std::string view_type_str;
+  std::string ptr_ssa;
 };
 
 PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& peer_expr,
@@ -164,11 +165,10 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
   codegen.Emit(peer_ptr + " = pto.addptr " + target.local_ptr_ssa + ", " + delems + " : " + ptr_type +
                " -> " + ptr_type);
 
-  // (3) make_tensor_view at the call site. Same shape/stride emission as
-  // ``EmitMakeTensorViews``: row-major strides, ``{layout = #pto.layout<nd>}``
-  // attribute, dynamic-shape result type (``?x?x…xT``). ``addptr``'s
-  // direct consumer is this ``make_tensor_view`` in the same func →
-  // PTOAS's per-func lowering rule is satisfied.
+  // (3) make_tensor_view at the call site. Mirror ``EmitMakeTensorViews`` so
+  // local and peer views use identical shape/stride/layout metadata.
+  // ``addptr``'s direct consumer is this ``make_tensor_view`` in the same
+  // func, satisfying PTOAS's per-func lowering rule.
   std::vector<std::string> shape_ssa(rank);
   for (size_t i = 0; i < rank; ++i) {
     if (auto ci = As<ir::ConstInt>(shape[i])) {
@@ -177,10 +177,34 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
       shape_ssa[i] = codegen.EmitCastToIndex(shape[i], codegen.GetExprAsCode(shape[i]));
     }
   }
-  std::vector<std::string> stride_ssa(rank);
-  std::string layout_str = "nd";
   const auto& tensor_view = target.type->tensor_view_;
-  if (tensor_view.has_value() && tensor_view->stride.size() == rank) {
+  bool is_column_vector = false;
+  if (rank >= 2) {
+    auto last_dim = As<ir::ConstInt>(shape.back());
+    is_column_vector = last_dim && last_dim->value_ == 1;
+  }
+  const bool use_column_vector_convention = is_column_vector && !tensor_view.has_value();
+
+  ir::TensorLayout layout = ir::TensorLayout::ND;
+  if (tensor_view.has_value()) {
+    layout = tensor_view->layout;
+  }
+  if (use_column_vector_convention) {
+    layout = ir::TensorLayout::DN;
+  }
+
+  auto emit_stride_mul = [&](const std::string& lhs, size_t dim_idx) {
+    std::string mul = codegen.NewTemp();
+    codegen.Emit(mul + " = arith.muli " + lhs + ", " + shape_ssa[dim_idx] + " : index");
+    return mul;
+  };
+
+  std::vector<std::string> stride_ssa(rank);
+  const bool has_explicit_stride = tensor_view.has_value() && !tensor_view->stride.empty();
+  if (has_explicit_stride) {
+    CHECK(tensor_view->stride.size() == rank)
+        << "EmitCommRemoteView: explicit stride rank " << tensor_view->stride.size()
+        << " does not match tensor shape rank " << rank;
     for (size_t i = 0; i < rank; ++i) {
       if (auto ci = As<ir::ConstInt>(tensor_view->stride[i])) {
         stride_ssa[i] = codegen.GetOrEmitConstant(ci->value_, DataType::INDEX);
@@ -189,23 +213,56 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
             codegen.EmitCastToIndex(tensor_view->stride[i], codegen.GetExprAsCode(tensor_view->stride[i]));
       }
     }
-    switch (tensor_view->layout) {
-      case ir::TensorLayout::DN:
-        layout_str = "dn";
-        break;
-      case ir::TensorLayout::NZ:
-        layout_str = "nz";
-        break;
-      case ir::TensorLayout::ND:
-        break;
+  } else if (use_column_vector_convention) {
+    stride_ssa[rank - 2] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    if (rank == 2) {
+      stride_ssa[rank - 1] = shape_ssa[0];
+    } else {
+      stride_ssa[rank - 1] = shape_ssa[rank - 1];
+      stride_ssa[rank - 3] = shape_ssa[rank - 2];
+      for (int j = static_cast<int>(rank) - 4; j >= 0; --j) {
+        const size_t dim = static_cast<size_t>(j);
+        stride_ssa[dim] = emit_stride_mul(stride_ssa[dim + 1], dim + 1);
+      }
+    }
+  } else if (layout == ir::TensorLayout::DN) {
+    CHECK(rank >= 2) << "EmitCommRemoteView: DN layout requires rank >= 2, got " << rank;
+    stride_ssa[rank - 2] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    stride_ssa[rank - 1] = shape_ssa[rank - 2];
+    if (rank >= 3) {
+      stride_ssa[rank - 3] = emit_stride_mul(shape_ssa[rank - 2], rank - 1);
+      for (int j = static_cast<int>(rank) - 4; j >= 0; --j) {
+        const size_t dim = static_cast<size_t>(j);
+        stride_ssa[dim] = emit_stride_mul(stride_ssa[dim + 1], dim + 1);
+      }
     }
   } else {
     stride_ssa[rank - 1] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
-    for (size_t j = rank - 1; j > 0; --j) {
-      std::string mul = codegen.NewTemp();
-      codegen.Emit(mul + " = arith.muli " + stride_ssa[j] + ", " + shape_ssa[j] + " : index");
-      stride_ssa[j - 1] = mul;
+    if (rank >= 2) {
+      stride_ssa[rank - 2] = shape_ssa[rank - 1];
+      for (int j = static_cast<int>(rank) - 3; j >= 0; --j) {
+        const size_t dim = static_cast<size_t>(j);
+        stride_ssa[dim] = emit_stride_mul(stride_ssa[dim + 1], dim + 1);
+      }
     }
+  }
+
+  std::string layout_str = "nd";
+  switch (layout) {
+    case ir::TensorLayout::DN:
+      layout_str = "dn";
+      break;
+    case ir::TensorLayout::NZ:
+      layout_str = "nz";
+      break;
+    case ir::TensorLayout::MX_A_ZZ:
+      layout_str = "mx_a_zz";
+      break;
+    case ir::TensorLayout::MX_B_NN:
+      layout_str = "mx_b_nn";
+      break;
+    case ir::TensorLayout::ND:
+      break;
   }
 
   std::string peer_view = codegen.NewTemp();
@@ -231,7 +288,7 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
   mv << "] {layout = #pto.layout<" << layout_str << ">} : " << view_type.str();
   codegen.Emit(mv.str());
 
-  return {peer_view, view_type.str()};
+  return {peer_view, view_type.str(), peer_ptr};
 }
 
 }  // namespace
@@ -350,6 +407,16 @@ static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::Codegen
   }
   tstore_line << ") outs(" << partition_view << " : " << partition_type << ")";
   codegen.Emit(tstore_line.str());
+
+  // Data-before-signal (ptoas memory-consistency): clean+invalidate the
+  // peer-addressed lines this store dirtied. The peer offset
+  // (`local_ptr + delems(peer)`) is only known here and is not yet expressible in
+  // the IR, so this cacheinvalid is emitted by codegen as a WORKAROUND (a local
+  // `system.cacheinvalid` would address the wrong, local lines). The paired GM
+  // release **fence** is inserted by the InsertCommFence pass as an explicit
+  // `system.fence` op right after this write — do not embed it here. (TODO: give
+  // the peer-region cacheinvalid a first-class IR representation.)
+  codegen.Emit("pto.cmo.cacheinvalid " + partition_view + " single_cache_line : " + partition_type);
   return "";
 }
 
@@ -390,15 +457,25 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
       binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
       GetIndexOffsetCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
 
-  // PTOAS contract: tnotify value's MLIR type must match the signal element
-  // type. Emit using the value's own ScalarType — mismatched IR-level dtypes
-  // surface here as a PTOAS verifier diagnostic rather than as silently
-  // garbled DMA.
+  // PTOAS's TNotifyOp declares `value` as AnySignlessInteger with an
+  // additional 32-bit-width verifier check (the comm ISA's signal slot is a
+  // fixed i32 register) — MLIR's IndexType does not satisfy that, so a
+  // pl.range loop induction variable (default dtype INDEX) used as `value`
+  // would otherwise reach PTOAS as `index` and fail to parse ("invalid kind
+  // of type specified"). Cast to i32 the same way pto_ops_datamove.cpp casts
+  // blockLen for its own "must be i32 per PTO ISA" operand; EmitCastToI32 is
+  // a no-op when the operand is already INT32.
   std::string value_ssa = codegen.GetExprAsCode(op->args_[3]);
   auto value_scalar = As<ir::ScalarType>(op->args_[3]->GetType());
   CHECK(value_scalar) << "pld.system.notify value must have ScalarType, got "
                       << op->args_[3]->GetType()->TypeName();
-  std::string value_type = codegen.GetTypeString(value_scalar->dtype_);
+  value_ssa = codegen.EmitCastToI32(op->args_[3], value_ssa);
+  std::string value_type = codegen.GetTypeString(DataType::INT32);
+  // A notify publishes completion to a peer. Drain every local pipeline first
+  // so the peer cannot observe the signal before preceding VEC work or GM
+  // accesses are complete. PTOAS's TNOTIFY lowering only drains MTE2/MTE3,
+  // which is insufficient for read-complete barriers following VEC operations.
+  codegen.Emit("pto.barrier <PIPE_ALL>");
   std::ostringstream tnotify;
   tnotify << "pto.comm.tnotify(" << partition_view << ", " << value_ssa << " : " << partition_type << ", "
           << value_type << ") {notifyOp = #pto<notify_op " << notify_attr << ">}";
@@ -448,14 +525,18 @@ static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
       EmitPartitionViewPTO(signal_var->name_hint_ + "_local", local_view, local_view_type, partition_type,
                            GetIndexOffsetCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
 
-  // PTOAS contract: twait expected value's MLIR type must match the signal
-  // element type. Emit using the expected value's own ScalarType — see notify
-  // codegen above for the rationale.
+  // PTOAS's TWaitOp declares `cmpValue` as AnySignlessInteger with an
+  // additional 32-bit-width verifier check — see notify codegen above for
+  // the full rationale. Cast to i32 so a pl.range loop induction variable
+  // (default dtype INDEX, e.g. `expected=step + 1`) doesn't reach PTOAS as
+  // `index` and fail with "invalid kind of type specified". EmitCastToI32
+  // is a no-op when the operand is already INT32.
   std::string expected_ssa = codegen.GetExprAsCode(op->args_[2]);
   auto expected_scalar = As<ir::ScalarType>(op->args_[2]->GetType());
   CHECK(expected_scalar) << "pld.system.wait expected must have ScalarType, got "
                          << op->args_[2]->GetType()->TypeName();
-  std::string expected_type = codegen.GetTypeString(expected_scalar->dtype_);
+  expected_ssa = codegen.EmitCastToI32(op->args_[2], expected_ssa);
+  std::string expected_type = codegen.GetTypeString(DataType::INT32);
   std::ostringstream twait;
   twait << "pto.comm.twait(" << partition_view << ", " << expected_ssa << " : " << partition_type << ", "
         << expected_type << ") {cmp = #pto<wait_cmp " << cmp_attr << ">}";
@@ -611,19 +692,21 @@ static std::string MakePutCodegenPTO(const CallPtr& op, codegen::CodegenBase& co
   tput << ") {atomicType = #pto<atomic_type " << atomic_attr << ">}";
   codegen.Emit(tput.str());
 
-  // Drain TPUT's writes before returning, so a following `pld.system.notify`
-  // (cross-rank signal that the data has landed) does not race ahead of them.
-  // Emitted unconditionally: the chunked sliding path strictly requires it (its
-  // last chunk's MTE3 store is otherwise still in-flight, a deterministic stale
-  // read), and the single-shot path — though self-draining for that store — has
-  // the same cross-rank data-before-signal obligation, so the extra barrier is
-  // harmless there.
-  //
-  // WORKAROUND for PTOAS#872: the proper fix drains prior stores inside
-  // TNOTIFY_IMPL (`pipe_barrier(PIPE_ALL); dsb(DSB_DDR)` before the signal),
-  // which also adds the DDR-observability fence a pipe barrier alone can't give.
-  // Remove this once that lands.
+  // Tail pipe barrier: drain the TPUT DMA pipe before the release markers. The GM
+  // release fence (inserted by the InsertCommFence pass right after this write)
+  // orders *memory* (DDR observability) but does NOT drain the MTE pipe that
+  // issued the DMA, so without this barrier the following notify can fire before
+  // the (possibly atomic) TPUT has landed at the peer — device tests (test_l3_put
+  // atomic_add / row_put) flake without it. Device-verified: an MTE3-scoped
+  // barrier is NOT enough (TPUT issues on MTE3 but its cross-rank DMA/atomic
+  // completion involves another pipe) — only PIPE_ALL is stable. (WORKAROUND for
+  // PTOAS#872; remove once PTOAS drains the tput itself.)
   codegen.Emit("pto.barrier <PIPE_ALL>");
+
+  // Data-before-signal peer-region cacheinvalid (see remote_store: emitted here as
+  // a WORKAROUND because the peer offset is not yet IR-expressible). The paired GM
+  // release fence is inserted by the InsertCommFence pass — not embedded here.
+  codegen.Emit("pto.cmo.cacheinvalid " + dst_pview + " single_cache_line : " + partition_type);
   return "";
 }
 
@@ -765,14 +848,11 @@ void RegisterDistributedOps(Backend& backend, const std::unordered_set<std::stri
   // Distributed N6 ops — cross-rank tile load + per-rank signal notify/wait +
   // synchronous bulk get/put. See MakeRemoteLoadCodegenPTO /
   // MakeNotifyCodegenPTO / MakeWaitCodegenPTO / MakeGetCodegenPTO /
-  // MakePutCodegenPTO for the emitted MLIR shape.
-  // Cross-rank ops lower to a single
-  // ``func.call @CommRemoteOffset_<dtype>`` against a module-level helper
-  // emitted by PTOCodegen::EmitCommRemoteOffsetHelpers; the helper returns
-  // the peer-vs-local element offset (``index``) and the call site emits
-  // ``pto.addptr`` + ``pto.make_tensor_view`` locally so PTOAS's per-func
-  // "addptr must feed make_tensor_view" check is satisfied. The helper's
-  // byte-offset literals are pinned to ``comm_layout::k*`` constants
+  // MakePutCodegenPTO for the emitted MLIR shape. Cross-rank ops inline the
+  // CommContext scalar reads and peer-vs-local element-offset arithmetic
+  // before ``pto.addptr`` + ``pto.make_tensor_view``. Keeping the full chain
+  // in the caller satisfies PTOAS memory-consistency and addptr-consumer
+  // checks. Byte-offset literals are pinned to ``comm_layout::k*`` constants
   // (PyPTO compile-time static_asserts catch any CommContext ABI drift).
   reg("pld.tile.remote_load", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeRemoteLoadCodegenPTO(op, codegen);

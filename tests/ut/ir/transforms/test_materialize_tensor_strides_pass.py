@@ -27,6 +27,7 @@ Tests follow the Before/Expected ``@pl.program`` pattern: the pass runs on
 from collections.abc import Sequence
 from typing import cast
 
+import pypto
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
@@ -325,7 +326,8 @@ def test_nz_on_tensor_rejected_by_paired_verifier():
     # NZ on a TensorType is invalid IR. The pass leaves the slot untouched
     # rather than CHECK-failing inside BuildLogicalStridesFromLayout — but
     # because the pass produces TensorViewCanonical, PassPipeline runs the
-    # paired verifier, which surfaces the bug as a thrown ValueError.
+    # paired verifier, which surfaces the bug as a thrown VerificationError
+    # (pypto.Error on the Python side).
     @pl.program
     class Before:
         @pl.function
@@ -335,7 +337,7 @@ def test_nz_on_tensor_rejected_by_paired_verifier():
         ):
             pl.const(0, pl.INT64)
 
-    with pytest.raises(ValueError, match="NZ layout"):
+    with pytest.raises(pypto.Error, match="NZ layout"):
         _materialize(Before)
 
 
@@ -349,7 +351,7 @@ def test_nz_on_distributed_tensor_rejected_by_paired_verifier():
         ):
             pl.const(0, pl.INT64)
 
-    with pytest.raises(ValueError, match="NZ layout"):
+    with pytest.raises(pypto.Error, match="NZ layout"):
         _materialize(Before)
 
 

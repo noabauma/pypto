@@ -17,6 +17,8 @@ domains, and a complete synchronous cleanup boundary for every caller-visible
 request.
 """
 
+import importlib.util
+import json
 import sys
 import threading
 import weakref
@@ -32,12 +34,20 @@ from pypto.ir.distributed_compiled_program import DistributedConfig
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import ParamDirection
 from pypto.runtime import DeviceTensor
+from pypto.runtime.bench import (
+    _L3_SWIMLANE_GRAPH_BEGIN,
+    _L3_SWIMLANE_GRAPH_END,
+    _L3_SWIMLANE_TIMING_BEGIN,
+    _L3_SWIMLANE_TIMING_END,
+)
 from pypto.runtime.distributed_runner import (
     DistributedWorker,
     _assemble_chip_callables,
     _clear_dfx_dispatch_dirs,
     _collect_l3_swimlane,
+    _construct_worker,
     _make_call_config,
+    _reset_dfx_dispatch_state,
     _submit_chip,
 )
 from pypto.runtime.runner import RunConfig
@@ -70,7 +80,7 @@ def patched_setup():
     worker._orch.malloc.return_value = 0xDEAD0000
 
     mod = "pypto.runtime.distributed_runner"
-    chip_callables = ({"chip_orch": object()}, "rt_name")
+    chip_callables = ({"chip_orch": object()}, "rt_name", False)
     with (
         patch(f"{mod}._assemble_chip_callables", return_value=chip_callables) as assemble,
         patch(f"{mod}._load_orch_entry", return_value=(MagicMock(name="entry_fn"), None)) as load_entry,
@@ -183,6 +193,159 @@ class TestPerTaskRingSizing:
         # rt.run(...) honors the same per-dispatch ring sizing as rt(...).
         assert m["make_call_config"].call_count == 2
         assert m["make_call_config"].call_args.args[1] is rc
+        rt.close()
+
+
+class TestPreparedSwimlaneTwoPass:
+    """Prepared onboard L3 captures deps, then measures without dep_gen."""
+
+    _CALL_CONFIG_ARG = 5
+
+    def test_onboard_reuses_worker_for_graph_then_clean_timing(self, patched_setup, tmp_path, capsys):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.platform = "a2a3"
+        compiled.output_dir = tmp_path
+        rt = DistributedWorker(compiled)
+
+        # Ignore the baseline config constructed during prepare(); this test
+        # observes the two configs built for the caller-visible dispatch.
+        m["make_call_config"].reset_mock()
+        deps_call_config = MagicMock(name="DepsCallConfig")
+        timing_call_config = MagicMock(name="TimingCallConfig")
+        m["make_call_config"].side_effect = [deps_call_config, timing_call_config]
+        events: list[str] = []
+        m["dispatch"].side_effect = lambda *args: events.append(
+            "deps" if args[self._CALL_CONFIG_ARG] is deps_call_config else "timing"
+        )
+
+        run_config = RunConfig(
+            platform="a2a3",
+            enable_l2_swimlane=1,  # pyright: ignore[reportArgumentType]
+            enable_pmu=3,
+            enable_scope_stats=True,
+            enable_dump_args=2,
+        )
+        with (
+            patch(
+                "pypto.runtime.distributed_runner._clear_dfx_dispatch_dirs",
+                side_effect=lambda _path: events.append("clear"),
+            ) as clear,
+            patch(
+                "pypto.runtime.distributed_runner._collect_l3_swimlane",
+                side_effect=lambda _output, _platform: events.append("collect"),
+            ) as collect,
+        ):
+            rt(DeviceTensor(0x1000, (16, 16), torch.float32), config=run_config)
+
+        assert events == ["clear", "deps", "timing", "collect"]
+        assert m["dispatch"].call_count == 2
+        assert all(call.args[0] is m["worker"] for call in m["dispatch"].call_args_list)
+        assert m["construct"].call_count == 1
+        assert m["worker"].init.call_count == 1
+        clear.assert_called_once_with(tmp_path / "dfx_outputs")
+        collect.assert_called_once_with(tmp_path, "a2a3")
+
+        assert m["make_call_config"].call_count == 2
+        deps_build, timing_build = m["make_call_config"].call_args_list
+        deps_config = deps_build.args[1]
+        assert deps_config.enable_l2_swimlane is False
+        assert deps_config.enable_dep_gen is True
+        assert deps_config.enable_pmu == 0
+        assert deps_config.enable_scope_stats is False
+        assert deps_config.enable_dump_args == 0
+
+        timing_config = timing_build.args[1]
+        assert timing_config.enable_l2_swimlane == 1
+        assert timing_config.enable_dep_gen is False
+        assert timing_config.enable_pmu == 3
+        assert timing_config.enable_scope_stats is True
+        assert timing_config.enable_dump_args == 2
+        assert timing_build.kwargs["co_enable_swimlane_dep_gen"] is False
+        captured = capsys.readouterr()
+        assert [line for line in captured.err.splitlines() if "l3_swimlane_pass=" in line] == [
+            _L3_SWIMLANE_GRAPH_BEGIN,
+            _L3_SWIMLANE_GRAPH_END,
+            _L3_SWIMLANE_TIMING_BEGIN,
+            _L3_SWIMLANE_TIMING_END,
+        ]
+        rt.close()
+
+    def test_simulator_keeps_single_pass(self, patched_setup, tmp_path):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.output_dir = tmp_path
+        rt = DistributedWorker(compiled)
+
+        m["make_call_config"].reset_mock()
+        call_config = MagicMock(name="SimCallConfig")
+        m["make_call_config"].return_value = call_config
+        run_config = RunConfig(
+            platform="a2a3sim",
+            enable_l2_swimlane=1,  # pyright: ignore[reportArgumentType]
+        )
+        with patch("pypto.runtime.distributed_runner._collect_l3_swimlane") as collect:
+            rt(DeviceTensor(0x1000, (16, 16), torch.float32), config=run_config)
+
+        m["dispatch"].assert_called_once()
+        assert m["dispatch"].call_args.args[self._CALL_CONFIG_ARG] is call_config
+        m["make_call_config"].assert_called_once_with(
+            compiled._distributed_config,
+            run_config,
+            dfx_base=tmp_path / "dfx_outputs",
+        )
+        collect.assert_called_once_with(tmp_path, "a2a3sim")
+        rt.close()
+
+    def test_dep_gen_without_swimlane_keeps_single_pass(self, patched_setup, tmp_path):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.platform = "a2a3"
+        compiled.output_dir = tmp_path
+        rt = DistributedWorker(compiled)
+
+        m["make_call_config"].reset_mock()
+        run_config = RunConfig(platform="a2a3", enable_dep_gen=True)
+        with patch("pypto.runtime.distributed_runner._collect_l3_swimlane") as collect:
+            rt(DeviceTensor(0x1000, (16, 16), torch.float32), config=run_config)
+
+        m["dispatch"].assert_called_once()
+        m["make_call_config"].assert_called_once_with(
+            compiled._distributed_config,
+            run_config,
+            dfx_base=tmp_path / "dfx_outputs",
+        )
+        collect.assert_not_called()
+        rt.close()
+
+    def test_persistent_route_waits_for_graph_then_timing_requests(self, patched_setup, tmp_path):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        compiled.platform = "a2a3"
+        compiled.output_dir = tmp_path
+        rt = DistributedWorker(compiled)
+
+        # Exercise _dispatch_prepared's persistent branch without starting a
+        # background thread: each call into _dispatch_persistent is the
+        # synchronous request/fence used by the real dispatcher.
+        rt._persistent = True
+        m["make_call_config"].reset_mock()
+        deps_call_config = MagicMock(name="DepsCallConfig")
+        timing_call_config = MagicMock(name="TimingCallConfig")
+        m["make_call_config"].side_effect = [deps_call_config, timing_call_config]
+        with (
+            patch.object(rt, "_dispatch_persistent") as dispatch_persistent,
+            patch("pypto.runtime.distributed_runner._collect_l3_swimlane"),
+        ):
+            rt(
+                DeviceTensor(0x1000, (16, 16), torch.float32),
+                config=RunConfig(platform="a2a3", enable_l2_swimlane=True),
+            )
+
+        assert [call.args[2] for call in dispatch_persistent.call_args_list] == [
+            deps_call_config,
+            timing_call_config,
+        ]
         rt.close()
 
 
@@ -737,6 +900,34 @@ class TestOneShotRegression:
         patched_setup["dispatch"].assert_called_once()
         patched_setup["worker"].close.assert_called_once()
 
+    def test_one_shot_enables_sdma_when_a_chip_requires_it(self, patched_setup):
+        from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
+
+        patched_setup["assemble"].return_value = ({"chip_orch": object()}, "rt_name", True)
+        compiled = _fake_compiled([_param("a", [8, 8])], [])
+
+        execute_distributed(compiled, [torch.zeros(8, 8, dtype=torch.float32)])
+
+        assert patched_setup["construct"].call_args.kwargs["enable_sdma"] is True
+
+
+class TestWorkerConstruction:
+    def test_forwards_enable_sdma_to_simpler_worker(self, monkeypatch):
+        worker_cls = MagicMock(name="simpler.Worker")
+        monkeypatch.setitem(sys.modules, "simpler.worker", SimpleNamespace(Worker=worker_cls))
+        dc = DistributedConfig(device_ids=[0, 1])
+
+        _construct_worker(dc, "a2a3", "tensormap_and_ringbuffer", 3, enable_sdma=True)
+
+        worker_cls.assert_called_once_with(
+            level=3,
+            device_ids=[0, 1],
+            num_sub_workers=3,
+            platform="a2a3",
+            runtime="tensormap_and_ringbuffer",
+            enable_sdma=True,
+        )
+
 
 class TestExplicitDispatchAPI:
     """The new ``run`` / ``register`` surface that mirrors ChipWorker.
@@ -958,6 +1149,26 @@ class TestMultiProgram:
         assert m["construct"].call_args.args[3] == 2
         rt.close()
 
+    def test_enables_sdma_when_any_program_requires_it(self, patched_setup):
+        m = patched_setup
+        m["assemble"].side_effect = [
+            ({"chip_a": object()}, "rt_name", False),
+            ({"chip_b": object()}, "rt_name", True),
+        ]
+        prog_a = _fake_compiled([_param("a", [4])], [])
+        prog_b = _fake_compiled([_param("b", [8])], [])
+
+        rt = DistributedWorker([prog_a, prog_b])
+
+        assert m["construct"].call_args.kwargs["enable_sdma"] is True
+        rt.close()
+
+    def test_single_program_preserves_default_sdma_capability(self, patched_setup):
+        rt = DistributedWorker(_fake_compiled([_param("a", [4])], []))
+
+        assert patched_setup["construct"].call_args.kwargs["enable_sdma"] is False
+        rt.close()
+
     def test_single_program_list_keeps_call_shortcut(self, patched_setup):
         # A one-element list is what ``compiled.prepare()`` builds; the
         # ``rt(*args)`` shortcut must keep working for it.
@@ -1092,8 +1303,8 @@ class TestMultiProgram:
     def test_rejects_mismatched_runtime(self, patched_setup):
         m = patched_setup
         m["assemble"].side_effect = [
-            ({"chip_orch": object()}, "rt_name"),
-            ({"chip_orch": object()}, "other_rt"),
+            ({"chip_orch": object()}, "rt_name", False),
+            ({"chip_orch": object()}, "other_rt", False),
         ]
         prog_a = _fake_compiled([_param("a", [4])], [])
         prog_b = _fake_compiled([_param("b", [8])], [])
@@ -1129,13 +1340,32 @@ class TestAssembleChipCallables:
         compiled = self._build(tmp_path, ["chip_a", "chip_b"], stray=True)
         ca = MagicMock(return_value=(MagicMock(name="ChipCallable"), "tensormap_and_ringbuffer", {}))
         self._stub_device_runner(monkeypatch, ca)
-        chip_callables, runtime_name = _assemble_chip_callables(compiled)
+        chip_callables, runtime_name, enable_sdma = _assemble_chip_callables(compiled)
 
         assert set(chip_callables) == {"chip_a", "chip_b"}  # stray dir skipped
         assert runtime_name == "tensormap_and_ringbuffer"
+        assert enable_sdma is False
         called_dirs = {call.args[0] for call in ca.call_args_list}
         assert called_dirs == {tmp_path / "next_levels" / "chip_a", tmp_path / "next_levels" / "chip_b"}
         assert all(call.args[1] == "a2a3sim" for call in ca.call_args_list)
+
+    def test_aggregates_enable_sdma_across_chip_configs(self, tmp_path, monkeypatch):
+        compiled = self._build(tmp_path, ["chip_a", "chip_b"])
+        ca = MagicMock(
+            side_effect=[
+                (MagicMock(name="ChipCallableA"), "tensormap_and_ringbuffer", {}),
+                (
+                    MagicMock(name="ChipCallableB"),
+                    "tensormap_and_ringbuffer",
+                    {"enable_sdma": True},
+                ),
+            ]
+        )
+        self._stub_device_runner(monkeypatch, ca)
+
+        _, _, enable_sdma = _assemble_chip_callables(compiled)
+
+        assert enable_sdma is True
 
     def test_raises_on_inconsistent_runtime(self, tmp_path, monkeypatch):
         compiled = self._build(tmp_path, ["chip_a", "chip_b"])
@@ -1288,6 +1518,39 @@ class TestSubmitChip:
         _submit_chip(orch, "chip", "ta", cfg, 1)
         assert [c[1] for c in orch.calls] == [1, 0, 1]
 
+    def test_records_each_dispatchs_l2_program(self, tmp_path):
+        # Issue #2169: ``rank{w}/d{k}`` says where a dispatch ran, not what it
+        # ran, and ``func_id`` only means something within one L2 program. The
+        # marker written here is what lets the offline post-pass label a
+        # dispatch's records with its own program's kernel names.
+        chip_cids = {"lm_head": object(), "mtp_decode_layer": object()}
+        orch = _RecordingOrch()
+        _reset_dfx_dispatch_state(orch, chip_cids)
+        cfg = _SpyDfxConfig(output_prefix=str(tmp_path))
+
+        # One card, two different programs -> d0 and d1 name their own program.
+        _submit_chip(orch, chip_cids["mtp_decode_layer"], "ta", cfg, 0)
+        _submit_chip(orch, chip_cids["lm_head"], "ta", cfg, 0)
+
+        assert json.loads((tmp_path / "rank0" / "d0" / "dispatch_program.json").read_text()) == {
+            "program": "mtp_decode_layer"
+        }
+        assert json.loads((tmp_path / "rank0" / "d1" / "dispatch_program.json").read_text()) == {
+            "program": "lm_head"
+        }
+
+    def test_no_marker_when_chip_names_unstamped(self, tmp_path):
+        # A caller that bypassed ``_reset_dfx_dispatch_state`` leaves no name
+        # table on ``orch``; the dispatch must still go through (the marker is a
+        # diagnostic, never a precondition).
+        orch = _RecordingOrch()
+        cfg = _SpyDfxConfig(output_prefix=str(tmp_path))
+
+        _submit_chip(orch, "chip_a", "ta", cfg, 0)
+
+        assert orch.calls == [("chip_a", 0, f"{tmp_path}/rank0/d0")]
+        assert not (tmp_path / "rank0" / "d0" / "dispatch_program.json").exists()
+
 
 def _write_dfx_dispatch_dirs(dfx: Path, *rels: str) -> None:
     """Lay down ``<dfx>/<rel>/l2_swimlane_records.json`` for each dispatch dir.
@@ -1298,6 +1561,54 @@ def _write_dfx_dispatch_dirs(dfx: Path, *rels: str) -> None:
     for rel in rels:
         (dfx / rel).mkdir(parents=True)
         (dfx / rel / "l2_swimlane_records.json").write_text("{}", encoding="utf-8")
+
+
+def _write_chip_program(output_dir: Path, program: str, *kernel_names: str) -> None:
+    """Lay down ``next_levels/<program>/kernel_config.py`` naming *kernel_names*.
+
+    Every L2 program numbers its kernels from ``func_id`` 0 — that shared
+    numbering is exactly what makes a name map merged across programs wrong
+    (issue #2169), so each program written here starts at 0 on purpose.
+    """
+    chip_dir = output_dir / "next_levels" / program
+    chip_dir.mkdir(parents=True)
+    kernels = [{"func_id": i, "name": name} for i, name in enumerate(kernel_names)]
+    (chip_dir / "kernel_config.py").write_text(f"KERNELS = {kernels!r}\n", encoding="utf-8")
+
+
+def _mark_dispatch_program(disp_dir: Path, program: str) -> None:
+    """Stamp the marker ``_submit_chip`` writes for a dispatch of *program*."""
+    (disp_dir / "dispatch_program.json").write_text(json.dumps({"program": program}), encoding="utf-8")
+
+
+@pytest.fixture
+def fake_swimlane_converter(monkeypatch):
+    """Register a fake ``simpler_setup.tools.swimlane_converter``.
+
+    The real module ships with the optional ``simpler`` runtime package, which is
+    not installed in CI. The fake reproduces the one function pypto calls,
+    ``load_kernel_config``, with the real contract: import the ``kernel_config.py``
+    and return its ``func_id`` (as ``str``) -> ``name`` mapping. Tests therefore
+    still exercise the genuine on-disk layout.
+    """
+    pkg = ModuleType("simpler_setup")
+    tools = ModuleType("simpler_setup.tools")
+    mod = ModuleType("simpler_setup.tools.swimlane_converter")
+
+    def load_kernel_config(config_path: str) -> dict[str, str]:
+        spec = importlib.util.spec_from_file_location("kernel_config", config_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return {str(k["func_id"]): k["name"] for k in module.KERNELS}
+
+    mod.load_kernel_config = load_kernel_config  # pyright: ignore[reportAttributeAccessIssue]
+    tools.swimlane_converter = mod  # pyright: ignore[reportAttributeAccessIssue]
+    pkg.tools = tools  # pyright: ignore[reportAttributeAccessIssue]
+    monkeypatch.setitem(sys.modules, "simpler_setup", pkg)
+    monkeypatch.setitem(sys.modules, "simpler_setup.tools", tools)
+    monkeypatch.setitem(sys.modules, "simpler_setup.tools.swimlane_converter", mod)
+    return mod
 
 
 class TestClearDfxDispatchDirs:
@@ -1330,14 +1641,16 @@ class TestCollectL3Swimlane:
     """``_collect_l3_swimlane`` converts every ``rank*/d{k}`` dispatch's records."""
 
     @staticmethod
-    def _spy_generate_swimlane(monkeypatch) -> list[Path]:
-        """Record which dispatch dirs the converter was invoked on."""
+    def _spy_generate_swimlane(monkeypatch) -> list[SimpleNamespace]:
+        """Record each converter invocation (dispatch dir, ``-k`` dir, name map)."""
         import pypto.runtime.runner as _runner  # noqa: PLC0415
 
-        seen: list[Path] = []
+        seen: list[SimpleNamespace] = []
 
-        def _fake(work_dir, out_dir, records, func_names=None):  # noqa: ANN001, ARG001
-            seen.append(out_dir)
+        def _fake(work_dir, out_dir, records, func_names=None):  # noqa: ANN001
+            seen.append(
+                SimpleNamespace(work_dir=work_dir, out_dir=out_dir, records=records, func_names=func_names)
+            )
 
         monkeypatch.setattr(_runner, "_generate_swimlane", _fake)
         return seen
@@ -1358,7 +1671,7 @@ class TestCollectL3Swimlane:
 
         _collect_l3_swimlane(tmp_path, "a2a3")
 
-        assert sorted(str(p.relative_to(dfx)) for p in seen) == [
+        assert sorted(str(s.out_dir.relative_to(dfx)) for s in seen) == [
             "rank0/d0",
             "rank0/d1",
             "rank1/d0",
@@ -1381,6 +1694,130 @@ class TestCollectL3Swimlane:
         _collect_l3_swimlane(tmp_path, "a2a3")
 
         assert seen == []
+
+    def test_name_map_is_scoped_to_each_dispatchs_own_program(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # Regression for issue #2169. Two L2 programs both number their kernels
+        # from func_id 0, so a name map merged across them relabels one
+        # program's tasks with the other's names — silently and plausibly
+        # (``lm_head_dispatch_wait``, a cross-card spin-wait, printed as
+        # ``mtp_projection_norm``). Each dispatch must get its own program's map.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "lm_head", "lm_head_dispatch_push", "lm_head_dispatch_wait")
+        _write_chip_program(tmp_path, "mtp_decode_layer", "mtp_projection_rms", "mtp_projection_norm")
+        dfx = tmp_path / "dfx_outputs"
+        _write_dfx_dispatch_dirs(dfx, "rank0/d0", "rank0/d1")
+        _mark_dispatch_program(dfx / "rank0" / "d0", "mtp_decode_layer")
+        _mark_dispatch_program(dfx / "rank0" / "d1", "lm_head")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        by_dir = {s.out_dir.name: s for s in seen}
+        assert set(by_dir) == {"d0", "d1"}
+        # Each dispatch's name map holds its own program's kernels...
+        for disp, program, names in (
+            ("d0", "mtp_decode_layer", ["mtp_projection_rms", "mtp_projection_norm"]),
+            ("d1", "lm_head", ["lm_head_dispatch_push", "lm_head_dispatch_wait"]),
+        ):
+            name_map = json.loads((dfx / "rank0" / disp / "name_map.json").read_text())
+            assert name_map["callable_id_to_name"] == {"0": names[0], "1": names[1]}
+            assert by_dir[disp].func_names == dfx / "rank0" / disp / "name_map.json"
+            # ...and the converter's ``-k`` fallback names the same program, so
+            # the two label sources can never disagree.
+            assert by_dir[disp].work_dir == tmp_path / "next_levels" / program
+
+    def test_sole_program_names_an_unmarked_dispatch(self, tmp_path, monkeypatch, fake_swimlane_converter):
+        # Only one L2 program in the build: there is no namespace to confuse, so
+        # a dispatch without a marker (e.g. artifacts from an older run) is still
+        # labelled rather than degraded to anonymous tasks.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms", "matmul")
+        dfx = tmp_path / "dfx_outputs"
+        _write_dfx_dispatch_dirs(dfx, "rank0/d0")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        name_map = json.loads((dfx / "rank0" / "d0" / "name_map.json").read_text())
+        assert name_map["callable_id_to_name"] == {"0": "rms", "1": "matmul"}
+        assert seen[0].work_dir == tmp_path / "next_levels" / "only_chip"
+
+    def test_unresolvable_dispatch_converts_without_names(
+        self, tmp_path, monkeypatch, fake_swimlane_converter, capsys
+    ):
+        # Several programs and no marker: the program is genuinely unknown. The
+        # records still convert, but with anonymous labels — a wrong name is
+        # worse than no name, since it reads as a real measurement.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "lm_head", "lm_head_dispatch_push")
+        _write_chip_program(tmp_path, "mtp_decode_layer", "mtp_projection_rms")
+        dfx = tmp_path / "dfx_outputs"
+        _write_dfx_dispatch_dirs(dfx, "rank0/d0")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert len(seen) == 1
+        assert seen[0].func_names is None
+        assert not (dfx / "rank0" / "d0" / "name_map.json").exists()
+        # ``work_dir`` holds no kernel_config.py, so no other program's table is
+        # handed to the converter's ``-k`` fallback either.
+        assert not (seen[0].work_dir / "kernel_config.py").exists()
+        assert "No L2 program recorded for rank0/d0" in capsys.readouterr().out
+
+    def test_unresolvable_dispatch_drops_a_stale_name_map(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # With no map passed, the converter auto-discovers a sibling
+        # ``name_map*.json`` — so a map left by an earlier run would quietly
+        # resurrect the mislabelling this fix removes.
+        self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "lm_head", "lm_head_dispatch_push")
+        _write_chip_program(tmp_path, "mtp_decode_layer", "mtp_projection_rms")
+        dfx = tmp_path / "dfx_outputs"
+        _write_dfx_dispatch_dirs(dfx, "rank0/d0")
+        stale = dfx / "rank0" / "d0" / "name_map.json"
+        stale.write_text('{"callable_id_to_name": {"0": "mtp_projection_rms"}}', encoding="utf-8")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert not stale.exists()
+
+    def test_resolved_program_without_a_table_drops_a_stale_name_map(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # The program resolves, but its ``kernel_config.py`` names no kernels, so
+        # no map is written for this run. A previous run's map must not survive to
+        # be picked up in its place — this dispatch renders anonymously.
+        self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "lm_head")  # KERNELS = []
+        dfx = tmp_path / "dfx_outputs"
+        _write_dfx_dispatch_dirs(dfx, "rank0/d0")
+        _mark_dispatch_program(dfx / "rank0" / "d0", "lm_head")
+        stale = dfx / "rank0" / "d0" / "name_map.json"
+        stale.write_text('{"callable_id_to_name": {"0": "mtp_projection_rms"}}', encoding="utf-8")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert not stale.exists()
+
+    def test_stray_subdir_does_not_hide_the_sole_program(
+        self, tmp_path, monkeypatch, fake_swimlane_converter
+    ):
+        # ``next_levels/`` may hold a subdir that is not an L2 program (no
+        # kernel_config.py). Counting it would make the build look multi-program
+        # and needlessly drop the unmarked dispatch to anonymous labels.
+        seen = self._spy_generate_swimlane(monkeypatch)
+        _write_chip_program(tmp_path, "only_chip", "rms")
+        (tmp_path / "next_levels" / "scratch").mkdir()
+        dfx = tmp_path / "dfx_outputs"
+        _write_dfx_dispatch_dirs(dfx, "rank0/d0")
+
+        _collect_l3_swimlane(tmp_path, "a2a3")
+
+        assert seen[0].work_dir == tmp_path / "next_levels" / "only_chip"
+        assert json.loads((dfx / "rank0" / "d0" / "name_map.json").read_text())["callable_id_to_name"] == {
+            "0": "rms"
+        }
 
 
 class _BoolStrictCallConfig:
@@ -1460,6 +1897,29 @@ class TestMakeCallConfigDepGenType:
         run_config = RunConfig(enable_dump_args=1, enable_l2_swimlane=0)  # pyright: ignore[reportArgumentType]
         cfg = _make_call_config(DistributedConfig(), run_config, dfx_base=tmp_path / "dfx")
         assert cfg.enable_dep_gen is False
+
+    def test_clean_timing_suppresses_implicit_dep_gen(self, tmp_path, fake_simpler_task_interface):
+        run_config = RunConfig(enable_l2_swimlane=1)  # pyright: ignore[reportArgumentType]
+        cfg = _make_call_config(
+            DistributedConfig(),
+            run_config,
+            dfx_base=tmp_path / "dfx",
+            co_enable_swimlane_dep_gen=False,
+        )
+        assert cfg.enable_dep_gen is False
+
+    def test_explicit_dep_gen_still_wins_when_co_enable_is_off(self, tmp_path, fake_simpler_task_interface):
+        run_config = RunConfig(
+            enable_l2_swimlane=1,  # pyright: ignore[reportArgumentType]
+            enable_dep_gen=True,
+        )
+        cfg = _make_call_config(
+            DistributedConfig(),
+            run_config,
+            dfx_base=tmp_path / "dfx",
+            co_enable_swimlane_dep_gen=False,
+        )
+        assert cfg.enable_dep_gen is True
 
 
 class _PersistentDomainHandle:

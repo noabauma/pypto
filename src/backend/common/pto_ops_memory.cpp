@@ -89,15 +89,15 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   auto shapes_tuple = As<ir::MakeTuple>(op->args_[2]);
   INTERNAL_CHECK_SPAN(shapes_tuple, op->span_) << "tile.load third argument must be a tuple (shapes)";
 
-  // valid_shapes is optional: when omitted (callers built before the 4-arg
+  // valid_shape is optional: when omitted (callers built before the 4-arg
   // signature was introduced, or hand-written IR), fall back to shapes so the
   // partition_view covers the entire physical region — equivalent to the DSL
-  // behavior `pl.load(..., valid_shapes=None)`.
-  auto valid_shapes_tuple = shapes_tuple;
+  // behavior `pl.load(..., valid_shape=None)`.
+  auto valid_shape_tuple = shapes_tuple;
   if (op->args_.size() >= 4) {
-    valid_shapes_tuple = As<ir::MakeTuple>(op->args_[3]);
-    INTERNAL_CHECK_SPAN(valid_shapes_tuple, op->span_)
-        << "tile.load fourth argument must be a tuple (valid_shapes)";
+    valid_shape_tuple = As<ir::MakeTuple>(op->args_[3]);
+    INTERNAL_CHECK_SPAN(valid_shape_tuple, op->span_)
+        << "tile.load fourth argument must be a tuple (valid_shape)";
   }
 
   auto tensor_type = AsTensorTypeLike(tensor->GetType());
@@ -114,13 +114,24 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
   std::string tile_buf_type = codegen.GetCurrentResultTileBufTypeString();
 
-  // RFC #1300 P7: the IR's offsets / shapes / valid_shapes are already in
+  // PTOAS needs the MX layout on tload in addition to the source TensorView.
+  std::string pto_layout;
+  if (tensor_type->tensor_view_.has_value()) {
+    if (tensor_type->tensor_view_->layout == ir::TensorLayout::MX_A_ZZ) {
+      pto_layout = "mx_a_zz";
+    } else if (tensor_type->tensor_view_->layout == ir::TensorLayout::MX_B_NN) {
+      pto_layout = "mx_b_nn";
+    }
+  }
+  const bool is_mx_load = !pto_layout.empty();
+
+  // RFC #1300 P7: the IR's offsets / shapes / valid_shape are already in
   // canonical coordinates (matching the source TensorType's shape). There is
   // no implicit dn_swap here — earlier passes ensure all coordinate systems
   // match before codegen.
-  std::vector<std::string> partition_dims = GetDimStrings(valid_shapes_tuple->elements_);
+  std::vector<std::string> partition_dims = GetDimStrings(valid_shape_tuple->elements_);
   std::vector<std::string> offset_codes = GetIndexOffsetCodes(offsets_tuple->elements_, codegen);
-  std::vector<std::string> size_codes = GetSizeCodes(valid_shapes_tuple->elements_, codegen);
+  std::vector<std::string> size_codes = GetSizeCodes(valid_shape_tuple->elements_, codegen);
 
   std::string partition_type = MakePartitionTensorViewType(partition_dims, dtype_str);
   std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
@@ -129,6 +140,9 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::ostringstream tload_line;
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
   tload_line << tile_buf << " : " << tile_buf_type << ")";
+  if (is_mx_load) {
+    tload_line << " {layout = #pto.layout<" << pto_layout << ">}";
+  }
   codegen.Emit(tload_line.str());
 
   // No follow-up `pto.set_validshape` is emitted: every `pto.alloc_tile`
@@ -748,6 +762,12 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
       case ir::TensorLayout::NZ:
         layout_str = "nz";
         break;
+      case ir::TensorLayout::MX_A_ZZ:
+        layout_str = "mx_a_zz";
+        break;
+      case ir::TensorLayout::MX_B_NN:
+        layout_str = "mx_b_nn";
+        break;
       case ir::TensorLayout::ND:
         break;
     }
@@ -818,8 +838,14 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
 
   reg("system.cacheinvalid", [](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) {
     auto& codegen = AsPto(codegen_base);
+    // No-arg form: invalidate the whole GM address space.
+    if (op->args_.empty()) {
+      codegen.Emit("pto.cmo.cacheinvalid all #pto.address_space<gm>");
+      return std::string("");
+    }
     INTERNAL_CHECK_SPAN(op->args_.size() == 3, op->span_)
-        << "system.cacheinvalid takes 3 arguments (tensor, offsets, shapes), got " << op->args_.size();
+        << "system.cacheinvalid takes 0 (whole-GM) or 3 arguments (tensor, shapes, offsets), got "
+        << op->args_.size();
     const auto tensor_var = AsVarLike(op->args_[0]);
     INTERNAL_CHECK_SPAN(tensor_var, op->span_)
         << "system.cacheinvalid first argument must be a tensor variable";
@@ -832,38 +858,21 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
 
     const std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
 
-    // A region of all-ones sizes is a single element (scalar write): flatten the
-    // N-D offsets into a linear element offset and invalidate through a raw ptr.
-    // Any larger dimension (or a dynamic size) is a tile store: address the region
-    // through a partition_tensor_view, matching tile.store's outs() operand.
-    bool is_scalar_write = true;
-    for (const auto& size : shapes_tuple->elements_) {
-      auto size_const = As<ir::ConstInt>(size);
-      if (!size_const || size_const->value_ != 1) {
-        is_scalar_write = false;
-        break;
-      }
-    }
-
-    if (is_scalar_write) {
-      const std::string base_ptr = codegen.GetTensorBasePtr(tensor_var);
-      const std::string ptr_type = "!pto.ptr<" + dtype_str + ">";
-      const std::string off = GetFlatOffsetSSA(offsets_tuple, tensor_type->shape_, codegen);
-      const std::string write_ptr = codegen.NewTemp();
-      codegen.Emit(write_ptr + " = pto.addptr " + base_ptr + ", " + off + " : " + ptr_type + " -> " +
-                   ptr_type);
-      codegen.Emit("pto.cmo.cacheinvalid " + write_ptr + " single_cache_line");
-    } else {
-      const std::string tensor_view = codegen.GetOrCreateTensorView(tensor_var);
-      const std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
-      const std::string partition_type =
-          MakePartitionTensorViewType(GetDimStrings(shapes_tuple->elements_), dtype_str);
-      const std::string payload_view =
-          EmitPartitionViewPTO(tensor_var->name_hint_, tensor_view, tensor_view_type, partition_type,
-                               GetIndexOffsetCodes(offsets_tuple->elements_, codegen),
-                               GetSizeCodes(shapes_tuple->elements_, codegen), codegen);
-      codegen.Emit("pto.cmo.cacheinvalid " + payload_view + " single_cache_line : " + partition_type);
-    }
+    // Every region — a single element included — is addressed through a
+    // partition_tensor_view, matching tile.store's outs() operand. ptoas lowers
+    // that to a DCCI on the view's base address (hw-native-sys/PTOAS#1001, in
+    // v0.52), so the all-ones case needs no special handling: a raw `!pto.ptr`
+    // operand is rejected outright, at parse without a type annotation and by
+    // the lowering pass with one.
+    const std::string tensor_view = codegen.GetOrCreateTensorView(tensor_var);
+    const std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
+    const std::string partition_type =
+        MakePartitionTensorViewType(GetDimStrings(shapes_tuple->elements_), dtype_str);
+    const std::string payload_view =
+        EmitPartitionViewPTO(tensor_var->name_hint_, tensor_view, tensor_view_type, partition_type,
+                             GetIndexOffsetCodes(offsets_tuple->elements_, codegen),
+                             GetSizeCodes(shapes_tuple->elements_, codegen), codegen);
+    codegen.Emit("pto.cmo.cacheinvalid " + payload_view + " single_cache_line : " + partition_type);
     return std::string("");
   });
 }

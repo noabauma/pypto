@@ -49,6 +49,15 @@ using tile_conversion_utils::MakeZeroOffsets;
 
 namespace {
 
+// tile.cast round mode: None(0), RINT(1), ROUND(2), FLOOR(3), CEIL(4), TRUNC(5), ODD(6).
+// `mode` is a declared attr that codegen reads unconditionally when emitting
+// `pto.tcvt {rmode = ...}`, so every tile.cast built here must supply one.
+// Follows the LowerCompositeOps convention: ROUND only where a conversion actually
+// rounds (float -> int), NONE where it cannot — all the index casts below are
+// int -> int, where the rounding mode is a no-op.
+constexpr int kCastModeNone = 0;
+constexpr int kCastModeRound = 2;
+
 bool IsConstOne(const ExprPtr& expr) { return IsConstValue(expr, 1); }
 
 // A5 index-form gather needs full-tile flat indices; A2A3 keeps the legacy
@@ -72,6 +81,24 @@ std::pair<int, int> DetectRowBroadcast(const std::vector<ExprPtr>& args) {
   if (rhs_is_col_vec) return {0, 1};
   if (lhs_is_col_vec) return {1, 0};
   return {-1, -1};
+}
+
+// Allocate a Vec scratch tile shaped like ``model``, append its binding to
+// ``prologue``, and return the Var to pass as the op's scratch operand.
+//
+// Several PTO instructions need a scratch buffer that the *tile* frontend makes the
+// caller supply, because tile buffer lifetimes are user-managed (``pto.txor``'s third
+// operand, the high-precision ``pto.trsqrt`` form). The tensor-level conversions
+// synthesize it instead, so tensor authors never see a ``tmp`` parameter.
+VarPtr AppendScratchTile(std::vector<StmtPtr>* prologue, const std::shared_ptr<const TileType>& model,
+                         const std::string& name, const Span& span) {
+  auto shape_tuple = MakeShapeTuple(model->shape_, span);
+  std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", model->dtype_},
+                                                                 {"target_memory", MemorySpace::Vec}};
+  auto create_call = OpRegistry::GetInstance().Create("tile.create", {shape_tuple}, create_kwargs, span);
+  auto tmp_var = std::make_shared<Var>(name, create_call->GetType(), span);
+  prologue->push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
+  return tmp_var;
 }
 
 }  // namespace
@@ -142,18 +169,51 @@ void OpConversionRegistry::RegisterScalarAndUnaryOps() {
             << "tensor.rsqrt conversion: input must be TileType after memory promotion, got "
             << input->GetType()->TypeName();
 
-        auto shape_tuple = std::make_shared<MakeTuple>(tile_type->shape_, span);
-        std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", tile_type->dtype_},
-                                                                       {"target_memory", MemorySpace::Vec}};
-        auto create_call = op_reg.Create("tile.create", {shape_tuple}, create_kwargs, span);
-
-        auto tmp_var = std::make_shared<Var>("rsqrt_tmp", create_call->GetType(), span);
         std::vector<StmtPtr> prologue;
-        prologue.push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
+        auto tmp_var = AppendScratchTile(&prologue, tile_type, "rsqrt_tmp", span);
 
         auto rsqrt_call = op_reg.Create("tile.rsqrt", {input, tmp_var}, span);
         return ConversionResult{std::move(prologue), rsqrt_call};
       });
+
+  // Bitwise / shift ops. Type deduction already rejects broadcasting operands
+  // (there is no tile.row_expand_and), so every shape that reaches here maps 1:1.
+  RegisterSimple("tensor.and", "tile.and");
+  RegisterSimple("tensor.ands", "tile.ands");
+  RegisterSimple("tensor.or", "tile.or");
+  RegisterSimple("tensor.ors", "tile.ors");
+  RegisterSimple("tensor.not", "tile.not");
+  RegisterSimple("tensor.shl", "tile.shl");
+  RegisterSimple("tensor.shls", "tile.shls");
+  RegisterSimple("tensor.shr", "tile.shr");
+  RegisterSimple("tensor.shrs", "tile.shrs");
+
+  // tensor.xor/xors -> tile.xor/xors(lhs, rhs, tmp). pto.txor/txors need a third
+  // scratch operand, which the tile frontend makes the caller supply. Allocate it
+  // here so tensor-level authors never see it — same shape of lowering as the
+  // high-precision tensor.rsqrt scratch above.
+  auto MakeXorConv = [](const std::string& tensor_op, const std::string& tile_op) -> ConversionFunc {
+    return [tensor_op, tile_op](const std::vector<ExprPtr>& args,
+                                const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                const Span& span) -> ConversionResult {
+      INTERNAL_CHECK_SPAN(args.size() == 2, span)
+          << tensor_op << " -> " << tile_op << " conversion expects 2 args (lhs, rhs), got " << args.size();
+      // The scratch tile matches the lhs: tile.xor's dst shape/dtype follow src0,
+      // and tile.xors preserves the src element type outright.
+      auto tile_type = As<TileType>(args[0]->GetType());
+      INTERNAL_CHECK_SPAN(tile_type, span) << tensor_op << " -> " << tile_op
+                                           << " conversion: lhs must be TileType after memory promotion, got "
+                                           << args[0]->GetType()->TypeName();
+
+      std::vector<StmtPtr> prologue;
+      auto tmp_var = AppendScratchTile(&prologue, tile_type, "xor_tmp", span);
+
+      auto xor_call = OpRegistry::GetInstance().Create(tile_op, {args[0], args[1], tmp_var}, span);
+      return ConversionResult{std::move(prologue), xor_call};
+    };
+  };
+  RegisterCustom("tensor.xor", MakeXorConv("tensor.xor", "tile.xor"));
+  RegisterCustom("tensor.xors", MakeXorConv("tensor.xors", "tile.xors"));
 }
 
 // ============================================================================
@@ -183,9 +243,13 @@ void OpConversionRegistry::RegisterBroadcastAndTransformOps() {
   RegisterSimple("tensor.reinterpret_view", "tile.reinterpret_view");
 
   // tensor.transpose → tile.transpose(input, axis1, axis2). The pto.ttrans scratch is a pure
-  // codegen detail, not a semantic operand: FlattenTileNdTo2D is the sole owner of scratch
-  // materialization (it emits the codegen-ready 4-arg form for both 2D and per-page >2D
-  // transposes, before the memory allocator runs). So the conversion emits no tmp here.
+  // codegen detail, not a semantic operand: FlattenTileNdTo2D is the sole owner of the
+  // *ttrans* scratch (it emits the codegen-ready 4-arg form for both 2D and per-page >2D
+  // transposes, before the memory allocator runs), because its shape depends on the
+  // 2D-flattening decision that has not been made at conversion time. So the conversion
+  // emits no tmp here. Scratch operands that a tile op declares as *required* — pto.txor's
+  // third operand, the high-precision pto.trsqrt form — are synthesized here instead, via
+  // AppendScratchTile; emitting the op without them would produce invalid IR.
   RegisterCustom(
       "tensor.transpose",
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -248,7 +312,7 @@ void OpConversionRegistry::RegisterElementwiseBinaryOps() {
           if (arg_types[i]->dtype_ == *promoted_dtype) continue;
           std::vector<std::pair<std::string, std::any>> cast_kwargs = {
               {"target_type", *promoted_dtype},
-              {"mode", 2},  // round
+              {"mode", kCastModeRound},
           };
           auto cast_call = op_reg.Create("tile.cast", {converted_args[i]}, cast_kwargs, span);
           const std::string name = i == 0 ? "div_lhs_cast" : "div_rhs_cast";
@@ -386,10 +450,9 @@ void OpConversionRegistry::RegisterMemoryOps() {
           // pad_value on a tensor.slice over a TensorType input, the pad intent is
           // lost here — a follow-up tile.fillpad is the workaround until tile.load
           // grows its own pad_value kwarg.
-          auto valid_shapes = (args.size() == 4) ? args[3] : shape;
+          auto valid_shape = (args.size() == 4) ? args[3] : shape;
           std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
-          auto load_call =
-              op_reg.Create("tile.load", {input, offset, shape, valid_shapes}, load_kwargs, span);
+          auto load_call = op_reg.Create("tile.load", {input, offset, shape, valid_shape}, load_kwargs, span);
           return ConversionResult{load_call};
         }
 
@@ -563,7 +626,8 @@ void OpConversionRegistry::RegisterMemoryOps() {
     // row_base[k] = index.flat[k] * d, broadcast across cols; flat_idx = index.flat[k]*d + c.
     ExprPtr idx_src = args[1];
     if (idx_tile->dtype_ != compute_dtype) {
-      idx_src = emit("tile.cast", {idx_src}, {{"target_type", compute_dtype}}, "su_idx_i32");
+      idx_src = emit("tile.cast", {idx_src}, {{"target_type", compute_dtype}, {"mode", kCastModeNone}},
+                     "su_idx_i32");
     }
     auto idx_flat =
         emit("tile.reshape", {idx_src, MakeShapeTuple({make_idx(n), one}, span)}, {}, "su_idx_flat");
@@ -571,7 +635,8 @@ void OpConversionRegistry::RegisterMemoryOps() {
     auto flat_idx = emit("tile.row_expand_add", {col_nd, row_base}, {}, "su_flat_idx");
     // Narrow the finished row-major [n, d] flat indices to the tscatter-required width.
     if (idx_dtype != compute_dtype) {
-      flat_idx = emit("tile.cast", {flat_idx}, {{"target_type", idx_dtype}}, "su_flat_idx_cast");
+      flat_idx = emit("tile.cast", {flat_idx}, {{"target_type", idx_dtype}, {"mode", kCastModeNone}},
+                      "su_flat_idx_cast");
     }
 
     const int dt_bytes = static_cast<int>(dt.GetBit()) / 8;
@@ -673,15 +738,14 @@ void OpConversionRegistry::RegisterMemoryOps() {
         auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), span);
         auto shapes = MakeShapeTuple(tensor_type->shape_, span);
 
-        std::vector<ExprPtr> valid_shape = tensor_type->shape_;
+        std::vector<ExprPtr> logical_valid_shape = tensor_type->shape_;
         if (tensor_type->tensor_view_.has_value() && !tensor_type->tensor_view_->valid_shape.empty()) {
-          valid_shape = tensor_type->tensor_view_->valid_shape;
+          logical_valid_shape = tensor_type->tensor_view_->valid_shape;
         }
-        auto valid_shapes = MakeShapeTuple(valid_shape, span);
+        auto valid_shape = MakeShapeTuple(logical_valid_shape, span);
 
         std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
-        auto load_call =
-            op_reg.Create("tile.load", {input, offsets, shapes, valid_shapes}, load_kwargs, span);
+        auto load_call = op_reg.Create("tile.load", {input, offsets, shapes, valid_shape}, load_kwargs, span);
         auto load_var = std::make_shared<Var>("fillpad_src", load_call->GetType(), span);
 
         std::vector<StmtPtr> prologue;
@@ -720,15 +784,14 @@ void OpConversionRegistry::RegisterMemoryOps() {
         // Load the (smaller) source tensor into a tile carrying its valid region.
         auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), span);
         auto shapes = MakeShapeTuple(tensor_type->shape_, span);
-        std::vector<ExprPtr> valid_shape = tensor_type->shape_;
+        std::vector<ExprPtr> logical_valid_shape = tensor_type->shape_;
         if (tensor_type->tensor_view_.has_value() && !tensor_type->tensor_view_->valid_shape.empty()) {
-          valid_shape = tensor_type->tensor_view_->valid_shape;
+          logical_valid_shape = tensor_type->tensor_view_->valid_shape;
         }
-        auto valid_shapes = MakeShapeTuple(valid_shape, span);
+        auto valid_shape = MakeShapeTuple(logical_valid_shape, span);
 
         std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
-        auto load_call =
-            op_reg.Create("tile.load", {input, offsets, shapes, valid_shapes}, load_kwargs, span);
+        auto load_call = op_reg.Create("tile.load", {input, offsets, shapes, valid_shape}, load_kwargs, span);
         auto load_var = std::make_shared<Var>("fillpad_expand_src", load_call->GetType(), span);
 
         std::vector<StmtPtr> prologue;
@@ -862,13 +925,13 @@ void OpConversionRegistry::RegisterMemoryOps() {
 
         auto load_tensor_tile = [&](const ExprPtr& tensor, const ExprPtr& offsets,
                                     const std::vector<ExprPtr>& shape,
-                                    const std::vector<ExprPtr>& valid_shape, const std::string& name_hint,
-                                    std::vector<StmtPtr>& stmts) -> ExprPtr {
+                                    const std::vector<ExprPtr>& logical_valid_shape,
+                                    const std::string& name_hint, std::vector<StmtPtr>& stmts) -> ExprPtr {
           auto shapes = MakeShapeTuple(shape, span);
-          auto valid_shapes = MakeShapeTuple(valid_shape, span);
+          auto valid_shape = MakeShapeTuple(logical_valid_shape, span);
           std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
           auto load_call =
-              op_reg.Create("tile.load", {tensor, offsets, shapes, valid_shapes}, load_kwargs, span);
+              op_reg.Create("tile.load", {tensor, offsets, shapes, valid_shape}, load_kwargs, span);
           auto load_var = std::make_shared<Var>(name_hint, load_call->GetType(), span);
           stmts.push_back(std::make_shared<AssignStmt>(load_var, load_call, span));
           return load_var;
@@ -1400,13 +1463,13 @@ void OpConversionRegistry::RegisterGatherOps() {
           };
           ExprPtr idx_i32 = idx_2d;
           if (idx_dtype != compute_dtype) {
-            idx_i32 =
-                emit_to(stmts, "tile.cast", {idx_2d}, {{"target_type", compute_dtype}}, prefix + "_idx_i32");
+            idx_i32 = emit_to(stmts, "tile.cast", {idx_2d},
+                              {{"target_type", compute_dtype}, {"mode", kCastModeNone}}, prefix + "_idx_i32");
           }
           if (rows == 1) {
-            return idx_dtype == compute_dtype ? idx_i32
-                                              : emit_to(stmts, "tile.cast", {idx_i32},
-                                                        {{"target_type", idx_dtype}}, prefix + "_flat_cast");
+            if (idx_dtype == compute_dtype) return idx_i32;
+            return emit_to(stmts, "tile.cast", {idx_i32},
+                           {{"target_type", idx_dtype}, {"mode", kCastModeNone}}, prefix + "_flat_cast");
           }
 
           std::vector<std::pair<std::string, std::any>> ci_kw = {{"dtype", compute_dtype},
@@ -1432,7 +1495,8 @@ void OpConversionRegistry::RegisterGatherOps() {
             flat = emit_to(stmts, "tile.row_expand_add", {idx_i32, row_base}, {}, prefix + "_flat_idx");
           }
           if (idx_dtype != compute_dtype) {
-            return emit_to(stmts, "tile.cast", {flat}, {{"target_type", idx_dtype}}, prefix + "_flat_cast");
+            return emit_to(stmts, "tile.cast", {flat}, {{"target_type", idx_dtype}, {"mode", kCastModeNone}},
+                           prefix + "_flat_cast");
           }
           return flat;
         };

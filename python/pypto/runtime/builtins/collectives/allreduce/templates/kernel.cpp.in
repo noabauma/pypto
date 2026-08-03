@@ -31,6 +31,7 @@ namespace {
 
 static constexpr int64_t kTileCount = 256;
 static constexpr int kMaxSupportedRanks = 16;
+static constexpr int kTransferAlignmentBytes = 32;
 
 template <typename T>
 AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *local_ptr, int pe) {
@@ -92,23 +93,31 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int64_t chunk64 = numel - base;
     if (chunk64 > kTileCount) chunk64 = kTileCount;
     int chunk = static_cast<int>(chunk64);
+    int transfer_chunk =
+        ((chunk * static_cast<int>(sizeof({{dtype_cpp}})) + kTransferAlignmentBytes - 1) /
+         kTransferAlignmentBytes) *
+        (kTransferAlignmentBytes / static_cast<int>(sizeof({{dtype_cpp}})));
 
-    ShapeDyn shape(1, 1, 1, 1, chunk);
-    StrideDyn stride(chunk, chunk, chunk, chunk, 1);
+    ShapeDyn load_shape(1, 1, 1, 1, transfer_chunk);
+    StrideDyn load_stride(transfer_chunk, transfer_chunk, transfer_chunk, transfer_chunk, 1);
+    ShapeDyn store_shape(1, 1, 1, 1, chunk);
+    StrideDyn store_stride(chunk, chunk, chunk, chunk, 1);
 
-    Global data_g(data + base, shape, stride);
-    TLOAD(acc_tile, data_g);
+    acc_tile.SetValidShape(1, transfer_chunk);
+    recv_tile.SetValidShape(1, transfer_chunk);
+    Global data_load_g(data + base, load_shape, load_stride);
+    TLOAD(acc_tile, data_load_g);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
     for (int peer = 0; peer < nranks; ++peer) {
       if (peer == my_rank) continue;
       __gm__ {{dtype_cpp}} *remote_data = CommRemotePtr(comm_ctx, data + base, peer);
-      Global remote_g(remote_data, shape, stride);
+      Global remote_g(remote_data, load_shape, load_stride);
       TLOAD(recv_tile, remote_g);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-      TADD(acc_tile, acc_tile, recv_tile);
+      {{reduce_inst}}(acc_tile, acc_tile, recv_tile);
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     }
@@ -129,7 +138,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(data_g, acc_tile);
+    acc_tile.SetValidShape(1, chunk);
+    Global data_store_g(data + base, store_shape, store_stride);
+    TSTORE(data_store_g, acc_tile);
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
   }

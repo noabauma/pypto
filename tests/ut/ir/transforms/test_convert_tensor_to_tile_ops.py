@@ -11,6 +11,7 @@
 
 from collections.abc import Callable
 
+import pypto
 import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
@@ -320,6 +321,30 @@ _UNARY_1D_OPS = [
     ("abs", tensor_ops.abs, tile_ops.abs),
     ("sin", tensor_ops.sin, tile_ops.sin),
     ("cos", tensor_ops.cos, tile_ops.cos),
+]
+
+# Bitwise / shift ops that map 1:1 (issue #2216). xor/xors are excluded: they need
+# a synthesized scratch operand and are covered separately below.
+_BITWISE_1_1_BINARY_OPS = [
+    ("and_", tensor_ops.and_, tile_ops.and_),
+    ("or_", tensor_ops.or_, tile_ops.or_),
+    ("shl", tensor_ops.shl, tile_ops.shl),
+    ("shr", tensor_ops.shr, tile_ops.shr),
+]
+
+_BITWISE_1_1_SCALAR_OPS = [
+    ("ands", tensor_ops.ands, tile_ops.ands),
+    ("ors", tensor_ops.ors, tile_ops.ors),
+    ("shls", tensor_ops.shls, tile_ops.shls),
+    ("shrs", tensor_ops.shrs, tile_ops.shrs),
+]
+
+# The tensor-tensor entry points auto-dispatch a scalar rhs to the same tile `*s` op.
+_BITWISE_SCALAR_DISPATCH_OPS = [
+    ("and_", tensor_ops.and_, tile_ops.ands),
+    ("or_", tensor_ops.or_, tile_ops.ors),
+    ("shl", tensor_ops.shl, tile_ops.shls),
+    ("shr", tensor_ops.shr, tile_ops.shrs),
 ]
 
 # 2D row/col-expand-style binary ops with a vector side input.
@@ -907,6 +932,99 @@ class TestConvertTensorToTileOps:
         )
         _assert_convert_equal(before, expected)
 
+    @pytest.mark.parametrize(("op_name", "tensor_op", "tile_op"), _BITWISE_1_1_BINARY_OPS)
+    def test_bitwise_binary_1_1(self, op_name, tensor_op, tile_op):
+        """tensor.and/or/shl/shr lower 1:1 to their tile counterparts."""
+        before, expected = _make_pair(
+            in_specs=[("x", [64], DataType.INT32), ("y", [64], DataType.INT32)],
+            out_shape=[64],
+            out_dtype=DataType.INT32,
+            tensor_op=lambda ins, op=tensor_op: op(ins[0], ins[1]),
+            tile_op=lambda ts, op=tile_op: op(ts[0], ts[1]),
+        )
+        _assert_convert_equal(before, expected)
+
+    @pytest.mark.parametrize(
+        ("op_name", "tensor_op", "tile_op"), _BITWISE_1_1_SCALAR_OPS + _BITWISE_SCALAR_DISPATCH_OPS
+    )
+    def test_bitwise_scalar_reaches_tile_scalar_op(self, op_name, tensor_op, tile_op):
+        """A scalar rhs lands on tile.<op>s, whether spelled `*s` or auto-dispatched."""
+        before, expected = _make_pair(
+            in_specs=[("x", [64], DataType.INT32)],
+            out_shape=[64],
+            out_dtype=DataType.INT32,
+            tensor_op=lambda ins, op=tensor_op: op(ins[0], 0xFF),
+            tile_op=lambda ts, op=tile_op: op(ts[0], 0xFF),
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_not_conversion(self):
+        """tensor.not lowers 1:1 to tile.not (int16, matching TNOT)."""
+        before, expected = _make_pair(
+            in_specs=[("x", [64], DataType.INT16)],
+            out_shape=[64],
+            out_dtype=DataType.INT16,
+            tensor_op=lambda ins: tensor_ops.not_(ins[0]),
+            tile_op=lambda ts: tile_ops.not_(ts[0]),
+        )
+        _assert_convert_equal(before, expected)
+
+    @pytest.mark.parametrize(
+        ("op_name", "extra_in", "tensor_call", "tile_call"),
+        [
+            (
+                "xor",
+                [("y", [64], DataType.INT32)],
+                lambda ins: tensor_ops.xor(ins[0], ins[1]),
+                lambda ts, tmp: tile_ops.xor(ts[0], ts[1], tmp),
+            ),
+            (
+                "xors",
+                [],
+                lambda ins: tensor_ops.xors(ins[0], 5),
+                lambda ts, tmp: tile_ops.xors(ts[0], 5, tmp),
+            ),
+        ],
+    )
+    def test_xor_conversion_synthesizes_scratch_tile(self, op_name, extra_in, tensor_call, tile_call):
+        """tensor.xor/xors allocate the pto.txor scratch and thread it in as operand 3."""
+        in_specs: list[InSpec] = [("x", [64], DataType.INT32), *extra_in]
+
+        def expected_body(ib, tiles):
+            tmp = ib.let("xor_tmp", tile_ops.create([64], DataType.INT32))
+            return ib.let("z_tile", tile_call(tiles, tmp))
+
+        before = _make_before(
+            in_specs=in_specs,
+            out_shape=[64],
+            out_dtype=DataType.INT32,
+            body=lambda ib, ins: ib.let("z", tensor_call(ins)),
+        )
+        expected = _make_expected(
+            in_specs=in_specs, out_shape=[64], out_dtype=DataType.INT32, body=expected_body
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_xor_scratch_matches_lhs_dtype(self):
+        """The synthesized scratch must follow the lhs, not a hardcoded dtype."""
+        before = _make_before(
+            in_specs=[("x", [32], DataType.INT16), ("y", [32], DataType.INT16)],
+            out_shape=[32],
+            out_dtype=DataType.INT16,
+            body=lambda ib, ins: ib.let("z", tensor_ops.xor(ins[0], ins[1])),
+        )
+
+        after = passes.convert_tensor_to_tile_ops()(before)
+        kernel = _require_function(after, "main_incore_0")
+        create = _find_first_call_to(kernel, "tile.create")
+        assert create is not None, "tensor.xor did not synthesize a scratch tile"
+        assert isinstance(create.type, ir.TileType)
+        assert create.type.dtype == DataType.INT16
+
+        xor = _find_first_call_to(kernel, "tile.xor")
+        assert xor is not None
+        assert len(xor.args) == 3, "tile.xor must receive the scratch as its third operand"
+
     @pytest.mark.parametrize(
         ("op_name", "in_specs", "body", "tile_op_name"),
         [
@@ -1363,6 +1481,74 @@ class TestConvertTensorToTileOps:
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 ret0_out: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
                 y: pl.Tensor[[16, 128], pl.FP32] = self.main_incore_0(a, b0, b1, ret0_out)
+                return y
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        _assert_convert_output_equal(After, Expected)
+
+    def test_set_validshape_operand_loads_straight_to_mat(self):
+        """A matmul operand wrapped in tensor.set_validshape still loads straight to Mat (#2227).
+
+        ``tensor.set_validshape`` is pure metadata over the input's storage, so the
+        matmul's Mat requirement must propagate back through it to the load-like
+        producer. Without that back-propagation the operand materialises in Vec and
+        needs a tile.move to Mat — a vector->cube boundary that flips the otherwise
+        pure-CUBE InCore scope to MIXED, making ExpandMixedKernel split it into an
+        AIC/AIV pair.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a_src: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                a: pl.Tensor[[16, 64], pl.BF16] = pl.slice(a_src, [16, 64], [0, 0])
+                av: pl.Tensor[[16, 64], pl.BF16] = pl.set_validshape(a, 8, 64)
+                y: pl.Tensor[[16, 64], pl.FP32] = pl.matmul(av, b, out_dtype=pl.FP32)
+                return y
+
+            @pl.function
+            def main(
+                self,
+                a_src: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                y: pl.Tensor[[16, 64], pl.FP32] = self.main_incore_0(a_src, b)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a_src: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+                ret0_out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                # Consumer-driven: the Mat demand reaches the slice THROUGH
+                # set_validshape, so no Vec load + tile.move(Mat) bridge appears.
+                a_mat: pl.Tile[[16, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    a_src, [0, 0], [16, 64], [16, 64], target_memory=pl.MemorySpace.Mat
+                )
+                av_mat = pl.tile.set_validshape(a_mat, 8, 64)
+                b_mat: pl.Tile[[64, 64], pl.BF16, pl.MemorySpace.Mat] = pl.load(
+                    b, [0, 0], [64, 64], [64, 64], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Acc] = pl.tile.matmul(av_mat, b_mat)
+                out_store: pl.Tensor[[16, 64], pl.FP32] = pl.store(y_tile, [0, 0], ret0_out)
+                return out_store
+
+            @pl.function
+            def main(
+                self,
+                a_src: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[64, 64], pl.BF16],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                ret0_out: pl.Tensor[[16, 64], pl.FP32] = pl.create_tensor([16, 64], dtype=pl.FP32)
+                y: pl.Tensor[[16, 64], pl.FP32] = self.main_incore_0(a_src, b, ret0_out)
                 return y
 
         After = passes.convert_tensor_to_tile_ops()(Before)
@@ -2267,7 +2453,7 @@ class TestNestedControlFlow:
         func = ir.Function("incore", [x_param], [tensor_type], body, span, ir.FunctionType.InCore)
         prog = ir.Program([func], "test_program", span)
 
-        with pytest.raises(Exception, match="has no registered tile conversion"):
+        with pytest.raises(pypto.InternalError, match="has no registered tile conversion"):
             passes.convert_tensor_to_tile_ops()(prog)
 
     def test_iter_arg_init_from_tensor_param_gets_preloaded(self):
@@ -3045,11 +3231,7 @@ class TestScatterUpdateConversion:
                 result: pl.Tensor[[16, 64], pl.FP16] = self.main_incore_0(index, src)
                 return result
 
-        # NOTE: bypass tracks a known pass bug — ConvertTensorToTileOps scatter_update
-        # emits tile.cast without the declared `mode` attr (op_conversion_registry.cpp),
-        # which fails the print->parse roundtrip. Remove NONE once the pass is fixed.
-        with passes.PassContext([], passes.VerificationLevel.NONE):
-            After = passes.convert_tensor_to_tile_ops()(Before)
+        After = passes.convert_tensor_to_tile_ops()(Before)
         text = ir.python_print(After)
         # Assert exact op presence: scatter_update must lower to the index-form tile.scatter,
         # never the mask-form tile.scatter_mask (substring "tile.scatter" would match both).
@@ -3057,6 +3239,12 @@ class TestScatterUpdateConversion:
         assert "pl.tile.scatter_mask(" not in text
         assert text.count("pl.tile.scatter(") >= 1
         assert "scatter_update" not in text
+        # The flat-index narrowing cast must carry the declared `mode` attr: codegen reads
+        # it unconditionally when emitting `pto.tcvt {rmode = ...}`. This i32 -> i16 index
+        # cast cannot round, so it must be `none`(0), not `round`(2).
+        casts = _find_calls_to(_require_function(After, "main_incore_0"), "tile.cast")
+        assert len(casts) == 1, f"expected one flat-index cast, got {len(casts)}"
+        assert dict(casts[0].kwargs)["mode"] == 0
 
     def test_scatter_update_fp16_rejects_oversized_flat_index(self):
         """2-byte dst with m*d > 32767 overflows the i16 flat index — must raise, not miscompile."""
@@ -3082,7 +3270,7 @@ class TestScatterUpdateConversion:
                 result: pl.Tensor[[128, 256], pl.FP16] = self.main_incore_0(index, src)
                 return result
 
-        with pytest.raises(Exception, match="i16 flat-index limit"):
+        with pytest.raises(ValueError, match="i16 flat-index limit"):
             passes.convert_tensor_to_tile_ops()(Before)
 
     def test_scatter_update_rejects_4d(self):
@@ -3109,7 +3297,7 @@ class TestScatterUpdateConversion:
                 result: pl.Tensor[[4, 4, 1, 64], pl.FP32] = self.main_incore_0(index, src)
                 return result
 
-        with pytest.raises(Exception, match="only 2D input/src is currently supported"):
+        with pytest.raises(ValueError, match="only 2D input/src is currently supported"):
             passes.convert_tensor_to_tile_ops()(Before)
 
 
@@ -3467,6 +3655,41 @@ class TestConvertGatherOp:
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_gather_int16_index_casts_carry_mode(self):
+        """A5 INT16-index gather: both flat-index tile.casts carry the `mode` attr.
+
+        An INT16 index (legal with a 16-bit input) is widened to INT32 for the flat-index
+        arithmetic and narrowed back afterwards. Codegen reads `mode` unconditionally when
+        emitting `pto.tcvt {rmode = ...}`; both casts are int -> int and cannot round, so
+        each must carry `none`(0).
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                inp: pl.Tensor[[4, 16], pl.FP16],
+                idx: pl.Tensor[[4, 8], pl.INT16],
+            ) -> pl.Tensor[[4, 8], pl.FP16]:
+                out: pl.Tensor[[4, 8], pl.FP16] = pl.tensor.gather(inp, dim=-1, index=idx)
+                return out
+
+            @pl.function
+            def main(
+                self,
+                inp: pl.Tensor[[4, 16], pl.FP16],
+                idx: pl.Tensor[[4, 8], pl.INT16],
+            ) -> pl.Tensor[[4, 8], pl.FP16]:
+                out: pl.Tensor[[4, 8], pl.FP16] = self.main_incore_0(inp, idx)
+                return out
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        casts = _find_calls_to(_require_function(After, "main_incore_0"), "tile.cast")
+        assert len(casts) == 2, f"expected widen + narrow casts, got {len(casts)}"
+        for cast in casts:
+            assert dict(cast.kwargs)["mode"] == 0
 
     def test_gather_conversion_expand(self):
         """A5 expand gather (K > S1): flat uses src cols, not output cols."""
@@ -4561,6 +4784,49 @@ class TestWindowSliceIncoreConversion:
             elif bp.name_hint == "local_data":
                 assert after_dir == ir.ParamDirection.In, f"local_data must be In, got {after_dir}"
 
+    def test_all_to_all_v_keeps_send_counts_read_only(self):
+        """``pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts)``
+        upgrades ``target``, ``signal``, and ``recv_counts`` to InOut, while
+        ``input`` and ``send_counts`` stay In: the lowering only *reads* the
+        send counts (``tensor.read``) and *writes* recv_counts via peer notify (Set).
+        """
+        SIZE = 16
+        nr = 2
+        total = nr * 2
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                inp: pl.Tensor[[total, SIZE], pl.FP32],
+                counts: pl.Tensor[[nr, 1], pl.INT32],
+                target: pld.DistributedTensor[[total, SIZE], pl.FP32],
+                signal: pld.DistributedTensor[[nr, 1], pl.INT32],
+                recv_counts: pld.DistributedTensor[[nr, 1], pl.INT32],
+            ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+                result = pld.tensor.all_to_all_v(inp, target, signal, counts, recv_counts)  # type: ignore[arg-type]
+                return result
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        after_fn = After["kernel"]
+        assert after_fn is not None
+        before_fn = Before["kernel"]
+        assert before_fn is not None
+
+        expected_directions = {
+            "inp": ir.ParamDirection.In,
+            "counts": ir.ParamDirection.In,
+            "target": ir.ParamDirection.InOut,
+            "signal": ir.ParamDirection.InOut,
+            "recv_counts": ir.ParamDirection.InOut,
+        }
+        for i, bp in enumerate(before_fn.params):
+            want = expected_directions.get(bp.name_hint)
+            if want is not None:
+                got = after_fn.param_directions[i]
+                assert got == want, f"{bp.name_hint} must be {want}, got {got}"
+
     def test_reduce_scatter_upgrades_target_and_signal_to_inout(self):
         """``pld.tensor.reduce_scatter(target, signal, op=...)`` upgrades both
         params to InOut (same 5-phase pattern as allreduce)."""
@@ -4876,8 +5142,7 @@ class TestConvertCrossCoreSplitOps:
             attrs={"split": ir.SplitMode.UP_DOWN},
         )
         auto_program = ir.Program([auto_func], "auto", span)
-        with passes.PassContext([]):
-            auto_lowered = passes.lower_auto_vector_split()(auto_program)
+        auto_lowered = passes.lower_auto_vector_split()(auto_program)
         auto_call = _find_first_call_to(
             _require_function(auto_lowered, "split_auto"), ir.get_op("tile.aiv_shard").name
         )
@@ -4958,7 +5223,17 @@ class TestConvertCrossCoreSplitOps:
             attrs={"split": ir.SplitMode.UP_DOWN},
         )
         auto_program = ir.Program([auto_func], "auto", span)
-        with passes.PassContext([]):
+        # Property verification stays ON; only the print->parse roundtrip is dropped.
+        # LowerAutoVectorSplit halves the `tile.add` RESULT to the per-lane [128, 128]
+        # but leaves its operand `vec` at the full [256, 128] param width, so the pass
+        # output is not re-parsable ("annotation for 'vec_h' has shape dimension
+        # 0 = 128 but expression has shape dimension 0 = 256"). That is the same V->C
+        # boundary defect family documented in test_lower_auto_vector_split.py; this
+        # test only compares the resulting `tile.aic_gather` TYPE against the explicit
+        # path, which is unaffected. Tracked by hw-native-sys/pypto#2203 — re-enable
+        # the roundtrip once the pass shards or rejects a full-width source instead
+        # of silently halving only the result.
+        with passes.PassContext([passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)]):
             auto_lowered = passes.lower_auto_vector_split()(auto_program)
         auto_call = _find_first_call_to(
             _require_function(auto_lowered, "split_auto"), ir.get_op("tile.aic_gather").name

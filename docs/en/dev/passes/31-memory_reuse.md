@@ -91,6 +91,50 @@ program_optimized = reuse_pass(program)
 
 After MemRef sharing, some MemRef objects become unreferenced (their variables now point to a different shared MemRef). The pass traverses the surrounding `SeqStmts` and removes any `tile.alloc` `AssignStmt` whose LHS MemRef pointer is not in the set of still-used MemRefs.
 
+## Declared allocations
+
+Reuse is opportunistic: any two tiles whose lifetimes do not overlap are candidates
+for one buffer. That is the right default for capacity, but it is not free — two
+tiles sharing a buffer are ordered by a WAR dependency the source never asked for,
+and the hardware must serialize work the scheduler could otherwise overlap.
+
+Referencing a declared `pl.MemRef("name")` in a tile annotation lets the author take an
+allocation out of the packer's hands. InitMemRef materializes it as a `tile.alloc(..., pinned=True)`
+(see [InitMemRef](29-init_memref.md#declared-allocations)), and this pass then treats it as
+closed: a pinned interval opens its own slot in the first-fit pack and that slot is
+skipped when placing every later candidate. (Isolation is a per-slot flag inside the
+packing loop rather than another `can_share` gate — `can_share` is the innermost step
+of an O(M²) pack that re-runs per shed step, so the check is resolved once per interval
+instead of once per pair.) Concretely:
+
+- Tiles the author bound to **different** buffers are never coalesced, however
+  disjoint their lifetimes — the point is to keep them independent.
+- Tiles the author bound to the **same** buffer already share one base from InitMemRef
+  and stay that way.
+- Unbound tiles are packed as before, and never pulled into a declared allocation.
+
+The cost is the author's to manage: pinning trades capacity for parallelism, and an
+over-pinned kernel surfaces as a hard `AllocateMemoryAddr` overflow rather than being
+silently coalesced back.
+
+**Overlap check.** Two tiles independently bound to the **same slot** must not be live at
+the same time — that is not reuse, it is the later write destroying data the earlier tile
+still needs. The check is per slot, not per allocation: two tiles on *different* slots of a
+`pl.MemRef(slots=N)` declaration are meant to be live together (that is the ping-pong), and
+only tiles landing on one slot can corrupt each other. A runtime slot index (`l0c[i % 2]`)
+has no static slot to attribute a tile to, so the check is skipped there — the rotation is
+the author's to get right — while isolation from every other allocation still holds. This pass owns the check because it is where lifetimes are computed
+(`ComputeLifetimes`); the rule matches the packer's own `var_overlap`, so *touching* is
+allowed (one tile's last read may be the statement that produces the next member).
+Tiles that land on the allocation by inheritance rather than by binding — views, in-place
+results, bare SSA aliases — are excluded: they are the same data as their source, so
+overlapping with it is expected.
+
+Because the isolation guarantee lives here, and ptoas replaces this pass wholesale,
+A declared allocation under `memory_planner=PTOAS` is **rejected** at InitMemRef rather than
+silently honored-but-unenforced: allocating them without isolating them would
+hand back exactly the coalescing the author wrote the binding to prevent.
+
 ## Ascend910B load + tpop_from_aic hazard
 
 On Ascend910B AIV functions with a non-`None` `SplitMode`, a writer that consumes **both** a `tile.load` result (or a legal-view descendant of one) **and** a `tile.tpop_from_aic` value must not place its output in the same physical buffer as that load result. Allowing the writer's output to in-place-reuse the load buffer produces silently wrong results on this hardware.

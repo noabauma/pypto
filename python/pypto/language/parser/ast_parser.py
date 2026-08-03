@@ -24,6 +24,7 @@ from pypto.ir.printer import python_print
 from pypto.language.distributed import op as _dsl_pld
 from pypto.language.dsl_api import RangeIterator as _DslRangeIterator
 from pypto.language.op import array_ops as _dsl_array
+from pypto.language.op import prefetch_ops as _dsl_prefetch
 from pypto.language.op import system_ops as _dsl_system
 from pypto.language.op import tensor_ops as _dsl_tensor
 from pypto.language.op import tile_ops as _dsl_tile
@@ -490,6 +491,13 @@ _AT_STASH_KWARGS = {
     "dumps": "dumps_kw",
 }
 
+# Call attrs that never appear inside a printed ``attrs={...}`` dict. On
+# ``system.task_dummy`` they ride bespoke surfaces (``manual_dep_edges`` prints
+# as ``deps=[...]``; ``dummy_task`` is re-derived from the op), and the printer
+# rejects them on every other op. Accepting either from a generic attrs dict
+# would build IR that cannot be printed back.
+_TASK_DUMMY_ONLY_ATTRS = frozenset({"manual_dep_edges", "dummy_task"})
+
 
 def _split_spmd_for_loop_name_hints(name_hint: str) -> tuple[str, str]:
     """Map one ``for i in pl.spmd(..., name_hint=...)`` hint to Spmd vs InCore names.
@@ -584,6 +592,15 @@ class ASTParser:
         # Track loop kinds for break/continue validation
         self._loop_kind_stack: list[str] = []
         self._scope_kind_stack: list[ir.ScopeKind] = []
+        # Set while parsing the body of an InCore scope the user declared with an
+        # explicit ``optimizations=[pl.split(MODE)]`` — MODE included when it is
+        # ``NONE``. ``InCoreScopeStmt.split_`` cannot answer this: it has a single
+        # encoding of "no split" (``SplitMode.NONE``), so a literal
+        # ``pl.split(pl.SplitMode.NONE)`` is indistinguishable there from writing
+        # no ``pl.split`` at all (issue #2205). The literal is only visible here,
+        # which is where the RFC #1820 mutual-exclusion rejection now lives.
+        # InCore scopes never nest (NoNestedInCore), so one slot suffices.
+        self._incore_user_split: ir.SplitMode | None = None
         # Active ``pl.split_aiv(mode=...)`` modes (innermost last). ``pl.aiv_shard`` /
         # ``pl.aic_gather`` inherit the split mode from this stack rather than
         # taking it as an argument.
@@ -711,6 +728,61 @@ class ASTParser:
     def _is_inside_scope(self, scope_kind: ir.ScopeKind) -> bool:
         """Return whether parsing is currently nested inside the given scope kind."""
         return scope_kind in self._scope_kind_stack
+
+    @contextmanager
+    def _incore_user_split_context(
+        self, scope_kind: "ir.ScopeKind", split_mode: "ir.SplitMode | None"
+    ) -> Iterator[None]:
+        """Record the enclosing InCore scope's *literal* ``pl.split(MODE)`` entry.
+
+        ``split_mode`` is the parsed ``optimizations=[pl.split(MODE)]`` entry, or
+        ``None`` when the user wrote no ``pl.split`` at all. Only the parser can
+        tell the two apart once ``MODE`` is ``NONE`` — see
+        :meth:`_reject_user_split_with_split_aiv_region`.
+
+        A no-op for every other scope kind: ``optimizations=[pl.split(...)]`` only
+        lowers onto an InCore scope, so another kind must neither set nor clear the
+        record of an enclosing one.
+        """
+        if scope_kind != ir.ScopeKind.InCore:
+            yield
+            return
+        previous = self._incore_user_split
+        self._incore_user_split = split_mode
+        try:
+            yield
+        finally:
+            self._incore_user_split = previous
+
+    def _reject_user_split_with_split_aiv_region(self, stmt: ast.For, hint: str) -> None:
+        """Reject ``pl.split_aiv`` inside an InCore scope declaring ``pl.split(...)``.
+
+        A function-level AUTO split (``optimizations=[pl.split(MODE)]``) and
+        explicit ``pl.split_aiv`` regions are mutually exclusive AIV-split
+        mechanisms: downstream lowering takes the per-region path and would
+        silently drop the function-level split. **Any** ``pl.split(...)`` is
+        rejected, ``pl.SplitMode.NONE`` included (RFC #1820) — NONE carries no
+        split of its own, but writing it still reads as "auto and manual split
+        mixed on one scope", and the cross-core slot count that once forced the
+        NONE spelling now has its own orthogonal ``pl.cross_core_slot(slot_num=N)``
+        entry.
+
+        ``OutlineIncoreScopes`` keeps the same rejection for the modes that reach
+        the IR, and remains the backstop for scopes that never went through this
+        parser. It cannot see a literal ``NONE``, so that spelling is caught here.
+        """
+        if self._incore_user_split is None:
+            return
+        raise ParserSyntaxError(
+            f"scope combines a function-level pl.split(pl.SplitMode.{self._incore_user_split.name}) "
+            "(optimizations=[pl.split(...)]) with a pl.split_aiv region; these are mutually "
+            "exclusive AIV-split mechanisms — the function-level split would be silently "
+            "dropped (the per-region split governs the lanes)",
+            span=self.span_tracker.get_span(stmt),
+            hint="Remove optimizations=[pl.split(...)] or the pl.split_aiv region. To pin a "
+            "custom cross-core slot count, use optimizations=[pl.cross_core_slot(slot_num=N)], "
+            f"which is orthogonal to splitting. {hint}",
+        )
 
     @contextmanager
     def _split_aiv_mode_context(self, mode: ir.SplitMode) -> Iterator[None]:
@@ -1244,7 +1316,12 @@ class ASTParser:
             and self._is_printed_alloc_call(stmt.value)
         ):
             value_expr = self._parse_printed_alloc_call(stmt.value)
-            ptr_var = ir.Var(var_name, ir.PtrType(), span)
+            # Adopt the Var a signature annotation already interned for this
+            # name. A parameter's MemRef may name a base Ptr allocated here, and
+            # the signature parses first; minting a second Var would leave the
+            # parameter's MemRef pointing at a different allocation identity
+            # than the alloc that defines it.
+            ptr_var = self.type_resolver.interned_base_ptr(var_name) or ir.Var(var_name, ir.PtrType(), span)
             self.builder.emit(ir.AssignStmt(ptr_var, value_expr, span))
             self.scope_manager.define_var(var_name, ptr_var, span=span)
             return
@@ -1773,11 +1850,27 @@ class ASTParser:
         Parser-only concerns (everything else delegates to the DSL wrapper /
         IR builder / C++ deducer via :func:`invoke_dsl`):
 
+        - HOST-only, like ``world_size`` (see ``_validate_pld_op_call``): the
+          window buffer is a host-orchestration resource, not lowerable inside
+          InCore / SPMD scopes.
         - LHS must be a single ``ast.Name``.
         - That name must be globally unique within the ``@pl.program``.
         - User can't pass ``name=`` (it's parser-injected from the LHS).
         """
         span = self.span_tracker.get_span(value)
+
+        in_device_scope = any(
+            self._is_inside_scope(kind) for kind in (ir.ScopeKind.InCore, ir.ScopeKind.Spmd)
+        )
+        if self._func_level != ir.Level.HOST or in_device_scope:
+            raise ParserSyntaxError(
+                "pld.tensor.alloc_window_buffer() can only be called in HOST orchestration "
+                "context (not inside InCore / SPMD scopes); "
+                f"current function level: {self._func_level}",
+                span=span,
+                hint="Use '@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)' "
+                "on the enclosing function and call outside any nested device-side scope",
+            )
 
         if not isinstance(target, ast.Name):
             raise ParserSyntaxError(
@@ -4168,7 +4261,10 @@ class ASTParser:
                     name_hint=incore_name_hint,
                     attrs=incore_attrs,
                 ):
-                    with self._scope_kind_context(ir.ScopeKind.InCore):
+                    with (
+                        self._scope_kind_context(ir.ScopeKind.InCore),
+                        self._incore_user_split_context(ir.ScopeKind.InCore, split_mode),
+                    ):
                         self.scope_manager.enter_scope("spmd_with_incore")
                         self._parse_body_siblings(stmt.body)
                         self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
@@ -4501,7 +4597,10 @@ class ASTParser:
                     name_hint=incore_name_hint,
                     attrs=incore_attrs,
                 ):
-                    with self._scope_kind_context(ir.ScopeKind.InCore):
+                    with (
+                        self._scope_kind_context(ir.ScopeKind.InCore),
+                        self._incore_user_split_context(ir.ScopeKind.InCore, split_mode),
+                    ):
                         # Bind `i = pl.tile.get_block_idx()` as the first
                         # statement of the outlined InCore body.
                         loop_var = self.builder.var(loop_var_name, ir.ScalarType(DataType.INDEX), span=span)
@@ -4547,6 +4646,10 @@ class ASTParser:
                 span=self.span_tracker.get_span(stmt),
                 hint=split_aiv_hint,
             )
+        # Placement check, like the nested-region one above: an enclosing InCore
+        # scope that declares its own optimizations=[pl.split(...)] already picked
+        # the AUTO split mechanism, which this region would silently override.
+        self._reject_user_split_with_split_aiv_region(stmt, split_aiv_hint)
         if not isinstance(stmt.target, ast.Name):
             raise ParserSyntaxError(
                 "for ... in pl.split_aiv(...) must use a single loop variable",
@@ -4750,7 +4853,10 @@ class ASTParser:
             manual=manual,
             attrs=attrs,
         ):
-            with self._scope_kind_context(scope_kind):
+            with (
+                self._scope_kind_context(scope_kind),
+                self._incore_user_split_context(scope_kind, split),
+            ):
                 self.scope_manager.enter_scope("scope")
                 self._parse_body_siblings(stmt.body)
                 self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
@@ -5765,6 +5871,11 @@ class ASTParser:
             op_name = attrs[2]
             return self._parse_array_op(op_name, call)
 
+        # pl.prefetch.{operation} (3-segment)
+        if len(attrs) >= 3 and attrs[0] == "pl" and attrs[1] == "prefetch":
+            op_name = attrs[2]
+            return self._parse_prefetch_op(op_name, call)
+
         # pl.const(value, dtype) — typed constant literal
         if len(attrs) >= 2 and attrs[0] == "pl" and attrs[1] == "const":
             return self._parse_typed_constant(call)
@@ -5778,7 +5889,11 @@ class ASTParser:
             return self._parse_dtype_get_byte(attrs[1], call)
 
         # pl.{operation} (2-segment, unified dispatch or promoted ops)
-        if len(attrs) >= 2 and attrs[0] == "pl" and attrs[1] not in ("tensor", "tile", "system", "array"):
+        if (
+            len(attrs) >= 2
+            and attrs[0] == "pl"
+            and attrs[1] not in ("tensor", "tile", "system", "array", "prefetch")
+        ):
             op_name = attrs[1]
             return self._parse_unified_op(op_name, call)
 
@@ -7207,6 +7322,14 @@ class ASTParser:
                 "unsupported kind (expected all ints, all pl.adir.<name>, or all names)",
                 span=node_span,
             )
+        # ``pl.<DTYPE>`` -> DataType. The printer emits DataType attrs in this
+        # form (PrintAttrValue's DataType arm), and ``parse_expression`` has no
+        # way to represent a dtype, so resolve it before the generic fallback.
+        if isinstance(value_node, ast.Attribute):
+            try:
+                return self.type_resolver.resolve_dtype(value_node)
+            except ParserTypeError:
+                pass
         # Bare name -> Var; any other expression -> the parsed IR expression.
         return self.parse_expression(value_node)
 
@@ -7589,6 +7712,12 @@ class ASTParser:
         wrappers / IR builders take no attrs parameter, so the dispatch helpers
         parse it here and re-attach it via ``ir.set_call_attrs`` after building
         the call. Returns ``None`` when no ``attrs=`` kwarg is present.
+
+        Values are read by ``_parse_attr_value`` — the same open-world reader the
+        GlobalVar-call / Submit paths use — so every type the printer's
+        ``PrintAttrValue`` can emit round-trips. No key allowlist: the writer
+        (``print_serialized_attrs``) is a denylist, so a key without a bespoke
+        surface must be recoverable here or the round-trip silently loses it.
         """
         for keyword in call.keywords:
             if keyword.arg != "attrs":
@@ -7598,8 +7727,38 @@ class ASTParser:
                     "op attrs must be a dict literal",
                     span=self.span_tracker.get_span(keyword.value),
                 )
-            return self._parse_attrs_dict(keyword.value)
+            return self._parse_generic_attrs_dict(ast.unparse(call.func), keyword.value)
         return None
+
+    def _parse_generic_attrs_dict(self, method_name: str, node: ast.Dict) -> dict[str, object]:
+        """Read an open-world ``attrs={...}`` dict literal via ``_parse_attr_value``.
+
+        Only the string-literal-key invariant is enforced; each value's type is
+        inferred from syntax by ``_parse_attr_value``, whose matching writer is
+        ``PrintAttrValue`` in the C++ python printer.
+        """
+        result: dict[str, object] = {}
+        for key_node, value_node in zip(node.keys, node.values):
+            if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                raise ParserSyntaxError(
+                    "attrs keys must be string literals",
+                    span=self.span_tracker.get_span(key_node) if key_node else None,
+                )
+            key = key_node.value
+            if key in _TASK_DUMMY_ONLY_ATTRS:
+                # The printer never emits these into ``attrs={...}``: on
+                # ``system.task_dummy`` they ride the bespoke ``deps=`` surface
+                # (and ``dummy_task`` is re-derived from the op), and on any
+                # other op the printer rejects them outright. Accepting one here
+                # would build IR that cannot be printed back.
+                raise ParserSyntaxError(
+                    f"attrs['{key}'] on call to '{method_name}' is not a writable attr; "
+                    "manual dependency edges are written as deps=[...] on "
+                    "pl.system.task_dummy or pl.submit",
+                    span=self.span_tracker.get_span(value_node),
+                )
+            result[key] = self._parse_attr_value(method_name, key, value_node)
+        return result
 
     @staticmethod
     def _attach_op_attrs(result: ir.Expr, attrs: dict[str, object] | None) -> ir.Expr:
@@ -7912,18 +8071,29 @@ class ASTParser:
         namespace = func.value.attr  # "tile" or "tensor"
         op_name = f"{namespace}.alloc"
 
-        if call.keywords:
-            raise InvalidOperationError(
-                f"{op_name} in printed IR must use positional arguments only",
-                span=self.span_tracker.get_span(call),
-            )
+        # `pinned=True` is the only keyword an alloc carries — it marks an
+        # allocation the author declared via a one-argument `pl.MemRef(...)`,
+        # which MemoryReuse must leave alone. Everything else stays positional.
+        kwargs: dict[str, Any] = {}
+        for keyword in call.keywords:
+            if keyword.arg != "pinned":
+                raise InvalidOperationError(
+                    f"{op_name} in printed IR accepts no keyword argument '{keyword.arg}'",
+                    span=self.span_tracker.get_span(call),
+                )
+            if not (isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool)):
+                raise InvalidOperationError(
+                    f"{op_name} 'pinned' must be a bool literal",
+                    span=self.span_tracker.get_span(call),
+                )
+            kwargs["pinned"] = keyword.value.value
         args = [self.parse_expression(arg) for arg in call.args]
         if len(args) != 2:
             raise InvalidOperationError(
                 f"{op_name} in printed IR expects 2 positional args (memory_space, size), got {len(args)}",
                 span=self.span_tracker.get_span(call),
             )
-        return ir.create_op_call(op_name, args, {}, self.span_tracker.get_span(call))
+        return ir.create_op_call(op_name, args, kwargs, self.span_tracker.get_span(call))
 
     def _parse_system_op(self, op_name: str, call: ast.Call) -> ir.Expr:
         """Parse system operation."""
@@ -7939,7 +8109,10 @@ class ASTParser:
                 "pl.system.task_dummy must not use positional arguments",
                 span=span,
             )
-        allowed_kwargs = {"deps"}
+        # ``attrs=`` is the machine-only round-trip surface, not a user API: the
+        # printer's denylist emits every non-bespoke attr into it, so rejecting
+        # it here would turn a printed attr into an unparseable program.
+        allowed_kwargs = {"deps", "attrs"}
         for kw in call.keywords:
             if kw.arg not in allowed_kwargs:
                 raise ParserTypeError(
@@ -7958,11 +8131,20 @@ class ASTParser:
         attrs: list[tuple[str, Any]] = [("dummy_task", True)]
         if deps:
             attrs.append(("manual_dep_edges", deps))
+        # ``deps=`` and the op identity are the bespoke carriers for
+        # ``manual_dep_edges`` / ``dummy_task``, reconstructed above; both are
+        # rejected inside a generic attrs dict, so everything left here is an
+        # ordinary attr to recover.
+        attrs.extend((self._parse_op_attrs(call) or {}).items())
         return ir.Call(base.op, base.args, base.kwargs, attrs, base.type, base.span)
 
     def _parse_array_op(self, op_name: str, call: ast.Call) -> ir.Expr:
         """Parse array operation (create / get_element / update_element)."""
         return self._dispatch_op(_dsl_array, "pl.array", op_name, call)
+
+    def _parse_prefetch_op(self, op_name: str, call: ast.Call) -> ir.Expr:
+        """Parse async-prefetch operation (make_context / async_prefetch / session / wait)."""
+        return self._dispatch_op(_dsl_prefetch, "pl.prefetch", op_name, call)
 
     def _validate_pld_op_call(self, op_name: str, call: ast.Call) -> None:
         """Parser-context checks shared by 2-segment and 3-segment pld paths.

@@ -490,7 +490,11 @@ becomes a *compiler-owned* MANUAL scope when fully covered, and otherwise stays
 AUTO with its representable edges emitted on top of runtime auto-tracking. A
 hand-placed `pl.scope()` always keeps `manual=false`, and has its partial edges
 stripped if analysis falls back. Codegen merges the two lists in that order and
-deduplicates by Var identity before emitting the stack array.
+deduplicates by Var identity before emitting the stack array, tagging each entry
+with its provenance (`DepEdge::user_written`).
+
+The provenance decides what happens when an edge fails to resolve to a live
+TaskId binding — see [Unresolvable dep edges](#unresolvable-dep-edges).
 
 ### TaskId sourcing
 
@@ -524,6 +528,38 @@ and `array_carry_vars_` on entry and restores them on exit, so a binding
 produced inside a scope does not leak to an enclosing scope where its identifier
 would be out of C++ scope. Loop / branch carries are declared *before* their
 body's `PTO2_SCOPE`, so they correctly survive the block.
+
+### Unresolvable dep edges
+
+A consequence of that lifetime rule: a dep edge naming a TaskId produced in a
+scope that has **already closed** cannot resolve — the binding was restored away
+on scope exit. Codegen's response depends on the edge's provenance:
+
+| Edge provenance | Behavior when unresolvable |
+| --------------- | -------------------------- |
+| Compiler-derived (`compiler_manual_dep_edges`) | Silently skipped. These are a best-effort hazard patch; `PrepareCrossScopeTaskIdHoists` already LCA-hoists the ones it can, and dropping the rest is safe because the pass only ever *adds* ordering |
+| User-written (`deps=[...]`) | **Hard error** — `CHECK_SPAN` raises a `pypto::ValueError` naming the TaskId and the DSL source line |
+
+Provenance is the attr key. Note that `attrs["dummy_task"]` is *not* an
+authorship marker: the parser stamps it on a user-written
+`pl.system.task_dummy(deps=[...])` exactly as
+[`ExpandManualPhaseFence`](../passes/37-expand_manual_phase_fence.md) does on the
+barriers it synthesises, so every `manual_dep_edges` carrier is enforced. The
+synthesised barrier only ever names a TaskId live in the manual scope it
+rewrites, so its fanin always resolves.
+
+Dropping a user edge would leave the consumer unordered against its producer and
+surface at runtime as a silent stale read, so codegen refuses to emit rather than
+emit wrong code. `ResolveDepEdgeBinding` is the single resolve-and-validate site
+both `CountManualDeps` (array sizing) and `EmitManualDeps` (array fill) route
+through, so the two can never disagree on which edges survive.
+
+The scope that closed need not be user-written. `MaterializeRuntimeScopes` wraps
+every `ForStmt` body and every `IfStmt` branch body in its own AUTO scope, so
+this fires on ordinary orchestration code with no `pl.scope()` / `pl.manual_scope()`
+in sight — e.g. a TaskId captured inside a `pl.range` body and depended on after
+the loop. The fix is to keep the consumer in the producer's scope, or hoist the
+producer outward.
 
 One exception applies to the `array_carry_vars_` restore on a `MANUAL` scope: an
 array carry registered *inside* the scope whose backing array was declared in

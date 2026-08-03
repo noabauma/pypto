@@ -16,6 +16,7 @@
  * This file implements unary operations for tensors that operate element-wise.
  */
 
+#include <algorithm>
 #include <any>
 #include <memory>
 #include <string>
@@ -223,10 +224,38 @@ TypePtr DeduceTensorCastType(const std::vector<ExprPtr>& args,
       << " equals input dtype; same-dtype cast is not a valid operation. "
       << "Remove the cast or use a different target_type.";
 
-  // mode kwarg is optional, not used in type deduction
+  // `mode` does not affect type deduction, but ConvertTensorToTileOps forwards this
+  // op's kwargs verbatim to tile.cast, whose codegen reads `mode` unconditionally.
+  // Require it here so a missing kwarg is reported against the op the caller wrote
+  // rather than surfacing later as a tile.cast failure inside the conversion pass.
+  const bool found_mode =
+      std::any_of(kwargs.begin(), kwargs.end(), [](const auto& kv) { return kv.first == "mode"; });
+  CHECK(found_mode) << "tensor.cast requires a 'mode' kwarg (round mode: none(0), rint(1), "
+                       "round(2), floor(3), ceil(4), trunc(5), odd(6)). Pass mode=\"round\" (2) "
+                       "to match the pl.cast / tensor_ops.cast default.";
 
   // Cast preserves shape and the input's valid region; only dtype changes.
   return DeduceTensorUnaryResultType(tensor_type, target_dtype);
+}
+
+TypePtr DeduceTensorNotType(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  CHECK(args.size() == 1) << "tensor.not requires exactly 1 argument, but got " << args.size();
+
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type)
+      << "tensor.not requires first argument to be a TensorType or DistributedTensorType, but got "
+      << args[0]->GetType()->TypeName();
+
+  // Matches tile.not, which this lowers 1:1 onto: pto.tnot / TNOT is defined for
+  // 16-bit integer element types only. Accepting a wider integer here would only
+  // defer the failure into ConvertTensorToTileOps.
+  CHECK(tensor_type->dtype_ == DataType::INT16 || tensor_type->dtype_ == DataType::UINT16)
+      << "tensor.not requires an int16 or uint16 tensor dtype, but got " << tensor_type->dtype_.ToString()
+      << ". Reinterpret or cast the tensor to a 16-bit integer dtype first.";
+
+  // Bitwise complement rewrites each element in place; dtype is unchanged.
+  return DeduceTensorUnaryResultType(tensor_type, tensor_type->dtype_);
 }
 
 // ============================================================================
@@ -249,6 +278,15 @@ REGISTER_OP("tensor.abs")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorAbsType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.not")
+    .set_op_category("TensorOp")
+    .set_description("Element-wise bitwise NOT of an int16/uint16 tensor")
+    .add_argument("input", "Input tensor (TensorType) with int16 or uint16 dtype")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorNotType(args, kwargs);
     });
 
 REGISTER_OP("tensor.recip")

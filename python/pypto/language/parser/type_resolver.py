@@ -10,7 +10,6 @@
 """Type annotation resolution for IR parsing."""
 
 import ast
-import warnings
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
@@ -18,7 +17,7 @@ from pypto.language.typing.dynamic import DynVar
 from pypto.language.typing.scalar import Scalar
 from pypto.pypto_core import DataType, ir
 
-from .diagnostics import ParserTypeError
+from .diagnostics import ParserError, ParserTypeError
 from .expr_evaluator import ExprEvaluator
 
 
@@ -61,6 +60,16 @@ def _implicit_tile_view_defaults(
         default_blayout = ir.TileLayout.col_major
         default_slayout = ir.TileLayout.row_major
         default_fractal = 1024
+    elif memory_space == ir.MemorySpace.LeftScale:
+        # ISA TileLeftScale: RowMajor / RowMajor, MX scale fractal size 32.
+        default_blayout = ir.TileLayout.row_major
+        default_slayout = ir.TileLayout.row_major
+        default_fractal = 32
+    elif memory_space == ir.MemorySpace.RightScale:
+        # ISA TileRightScale: ColMajor / ColMajor, MX scale fractal size 32.
+        default_blayout = ir.TileLayout.col_major
+        default_slayout = ir.TileLayout.col_major
+        default_fractal = 32
     return default_blayout, default_slayout, default_fractal
 
 
@@ -100,6 +109,19 @@ def _is_pl_yield_call(node: ast.expr) -> bool:
     if isinstance(func, ast.Attribute) and func.attr == "yield_":
         return True
     return isinstance(func, ast.Name) and func.id == "yield_"
+
+
+# Async-prefetch handle annotations -> singleton IR type getter. The printer and
+# user source use exported DSL wrapper names; raw IR type names remain accepted
+# as legacy aliases for previously serialized Python text.
+_OPAQUE_HANDLE_TYPE_GETTERS: dict[str, Callable[[], ir.Type]] = {
+    "PrefetchAsyncContextType": ir.PrefetchAsyncContextType.get,
+    "PrefetchAsyncContext": ir.PrefetchAsyncContextType.get,
+    "AsyncEventType": ir.AsyncEventType.get,
+    "AsyncEvent": ir.AsyncEventType.get,
+    "AsyncSessionType": ir.AsyncSessionType.get,
+    "AsyncSession": ir.AsyncSessionType.get,
+}
 
 
 _TYPE_KIND_NAMES: dict[type, str] = {
@@ -164,6 +186,8 @@ class TypeResolver:
         "ND": ir.TensorLayout.ND,
         "DN": ir.TensorLayout.DN,
         "NZ": ir.TensorLayout.NZ,
+        "MX_A_ZZ": ir.TensorLayout.MX_A_ZZ,
+        "MX_B_NN": ir.TensorLayout.MX_B_NN,
     }
 
     _MEMORY_SPACE_MAP: dict[str, "ir.MemorySpace"] = {
@@ -174,6 +198,8 @@ class TypeResolver:
         "Right": ir.MemorySpace.Right,
         "Acc": ir.MemorySpace.Acc,
         "Bias": ir.MemorySpace.Bias,
+        "LeftScale": ir.MemorySpace.LeftScale,
+        "RightScale": ir.MemorySpace.RightScale,
     }
 
     def __init__(
@@ -314,6 +340,13 @@ class TypeResolver:
         if self._is_comm_ctx_type_node(type_node):
             return ir.CommCtxType.get()
 
+        # Opaque async-prefetch handles — singleton markers with no subscript
+        # payload. Accept the public wrapper spelling printed today and the
+        # legacy raw IR type spelling emitted by older printers.
+        opaque_handle = self._resolve_opaque_handle_type_node(type_node)
+        if opaque_handle is not None:
+            return opaque_handle
+
         # Handle attribute access like pl.Tensor
         if isinstance(type_node, ast.Attribute):
             raise ParserTypeError(
@@ -333,6 +366,24 @@ class TypeResolver:
         if isinstance(node, ast.Attribute):
             return isinstance(node.value, ast.Name) and node.value.id == "pld" and node.attr == "CommCtxType"
         return isinstance(node, ast.Name) and node.id == "CommCtxType"
+
+    @staticmethod
+    def _resolve_opaque_handle_type_node(node: ast.expr) -> ir.Type | None:
+        """Resolve an async-prefetch handle annotation, or None if not one.
+
+        Both spellings resolve to the same singleton: the public DSL wrapper
+        name emitted by the printer (``AsyncEvent``) and the legacy raw IR type
+        name (``AsyncEventType``). A module prefix is optional so any import
+        alias (``pl.AsyncEvent``, ``lang.AsyncEvent``) works.
+        """
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            name = node.attr
+        elif isinstance(node, ast.Name):
+            name = node.id
+        else:
+            return None
+        getter = _OPAQUE_HANDLE_TYPE_GETTERS.get(name)
+        return getter() if getter is not None else None
 
     def _resolve_subscript_type(self, subscript_node: ast.Subscript) -> ir.Type:  # noqa: PLR0912
         """Resolve subscript type annotation.
@@ -468,22 +519,10 @@ class TypeResolver:
             if self._is_memref_node(third):
                 memref = self.resolve_memref(third)
                 return tensor_ctor(shape, dtype, memref, None)
-            if self._is_tensorview_node(third):
-                tensor_view = self._resolve_tensorview(third)
-                return tensor_ctor(shape, dtype, None, tensor_view)
-            layout = self.resolve_layout(third)
-            self._warn_on_user_facing_dn_layout(layout, type_name)
-            tensor_view = ir.TensorView([], layout)
-            return tensor_ctor(shape, dtype, None, tensor_view)
+            return tensor_ctor(shape, dtype, None, self._resolve_tensor_view_slot(third, type_name))
 
         # Tensor / DistributedTensor 4 args: [shape, dtype, layout_or_tensorview, memref]
-        third = slice_value.elts[2]
-        if self._is_tensorview_node(third):
-            tensor_view = self._resolve_tensorview(third)
-        else:
-            layout = self.resolve_layout(third)
-            self._warn_on_user_facing_dn_layout(layout, type_name)
-            tensor_view = ir.TensorView([], layout)
+        tensor_view = self._resolve_tensor_view_slot(slice_value.elts[2], type_name)
         memref_node = slice_value.elts[3]
         if not self._is_memref_node(memref_node):
             raise ParserTypeError(
@@ -513,12 +552,16 @@ class TypeResolver:
         memory_space_node: ast.expr | None = None
 
         for node in extra_nodes:
-            if self._is_memref_node(node) or self._resolve_memref_var_ref(node) is not None:
+            if (
+                self._is_memref_node(node)
+                or (self._resolve_memref_var_ref(node) is not None)
+                or (self._resolve_memref_slot_ref(node) is not None)
+            ):
                 if memref_node is not None:
                     raise ParserTypeError(
                         "Tile annotation can contain at most one memref argument",
                         span=self._get_span(node),
-                        hint="Remove the duplicate pl.MemRef(...) or MemRefType variable argument",
+                        hint="Remove the duplicate pl.MemRef(...) / MemRefType argument",
                     )
                 memref_node = node
                 continue
@@ -560,7 +603,8 @@ class TypeResolver:
             raise ParserTypeError(
                 "Tile annotation with a memref argument must also specify explicit memory space",
                 span=self._get_span(memref_node),
-                hint="Use pl.Tile[[shape], dtype, pl.MemRef(base, offset, size), pl.Mem.Vec] or "
+                hint="Use pl.Tile[[shape], dtype, pl.MemRef(base, offset, size), pl.Mem.Vec], "
+                'pl.Tile[[shape], dtype, pl.MemRef("scratch"), pl.Mem.Vec], or '
                 "pl.Tile[[shape], dtype, memref_var, pl.Mem.Vec]",
             )
 
@@ -569,7 +613,7 @@ class TypeResolver:
         elif self._is_memref_node(memref_node):
             memref = self.resolve_memref(memref_node)
         else:
-            memref = self._resolve_memref_var_ref(memref_node)
+            memref = self._resolve_memref_var_ref(memref_node) or self._resolve_memref_slot_ref(memref_node)
         # Resolve memory_space first so it can be passed to _resolve_tileview for
         # memory-space-aware implicit blayout/slayout/fractal defaults.
         #
@@ -592,13 +636,218 @@ class TypeResolver:
         return ir.TileType(shape, dtype, memref, tile_view, memory_space)
 
     def _resolve_memref_var_ref(self, node: ast.expr) -> "ir.MemRef | None":
-        """Resolve a previously bound MemRef variable used in a Tile annotation."""
-        if not isinstance(node, ast.Name) or self.scope_lookup is None:
+        """Resolve a MemRef referenced by name in a Tile annotation.
+
+        Two sources, in order: a MemRef bound earlier in the parsed program (a
+        printed dump names its alloc-defined Ptr that way), then an allocation the
+        author declared in enclosing Python::
+
+            scratch = pl.MemRef()
+            t: pl.Tile[[64, 64], pl.FP32, scratch, pl.Mem.Vec] = ...
+
+        The declared form is the one to prefer: a misspelled reference is a
+        ``NameError`` from Python itself, whereas a misspelled string in the
+        inline ``pl.MemRef("scartch")`` form quietly declares a second allocation.
+
+        Args:
+            node: Candidate AST node from a Tile annotation's trailing arguments
+
+        Returns:
+            The MemRef, or None if the node is not a MemRef reference
+        """
+        if not isinstance(node, ast.Name):
             return None
-        var = self.scope_lookup(node.id)
-        if isinstance(var, ir.MemRef):
-            return var
-        return None
+        if self.scope_lookup is not None:
+            var = self.scope_lookup(node.id)
+            if isinstance(var, ir.MemRef):
+                return var
+        declared = self.expr_evaluator.closure_vars.get(node.id)
+        if not isinstance(declared, ir.MemRef):
+            return None
+        if not declared.is_pinned_:
+            # A fully specified MemRef object: it already carries its own base.
+            return declared
+        return self._make_declared_memref(
+            self._declared_alloc_name(declared, node),
+            self._get_span(node),
+            slots=declared.slot_count_,
+            slot=declared.slot_index_,
+        )
+
+    def _resolve_memref_slot_ref(self, node: ast.expr) -> "ir.MemRef | None":
+        """Resolve ``decl[k]`` — one slot of a multi-slot declared allocation.
+
+        The index is an ordinary index expression, so it may be a runtime value::
+
+            l0c = pl.MemRef(slots=2)
+            for sub, (acc,) in pl.pipeline(...):
+                a: pl.Tile[[M, N], pl.FP32, l0c[sub & 1], pl.Mem.Acc] = pl.tile.matmul(...)
+
+        `InitMemRef` scales it by the derived slot size into the MemRef's byte
+        offset. A constant index folds there and takes the ordinary constant-address
+        path; a runtime one survives as an expression that codegen lowers into the
+        tile's address assignment.
+
+        Args:
+            node: Candidate AST node from a Tile annotation's trailing arguments
+
+        Returns:
+            The MemRef for the selected slot, or None if the node is not a
+            subscript over a declared allocation
+
+        Raises:
+            ParserTypeError: If the declaration holds a single slot, or a constant
+                index is out of range
+        """
+        if not isinstance(node, ast.Subscript):
+            return None
+        span = self._get_span(node)
+
+        # Two spellings reach here: a reference to a declared variable, and the
+        # inline `pl.MemRef("name", slots=N)[k]` the printer emits for a dump.
+        if isinstance(node.value, ast.Name):
+            declared = self.expr_evaluator.closure_vars.get(node.value.id)
+            if not isinstance(declared, ir.MemRef) or not declared.is_pinned_:
+                return None
+            decl_name = self._declared_alloc_name(declared, node.value)
+            slot_count = declared.slot_count_
+        elif self._is_memref_node(node.value):
+            inline = self.resolve_memref(node.value)
+            if not inline.is_pinned_:
+                return None
+            decl_name = inline.base_.name_hint
+            slot_count = inline.slot_count_
+        else:
+            return None
+        if slot_count <= 1:
+            raise ParserTypeError(
+                f"'{decl_name}' was declared with a single slot, so it cannot be subscripted",
+                span=span,
+                hint=f"Declare it as pl.MemRef(slots=N) to subscript it, or reference "
+                f"'{decl_name}' without a subscript",
+            )
+
+        # Same pure-index-expression contract as a TileView field: constants, vars
+        # and arithmetic over them, with no parsing side effects.
+        index = self._parse_tileview_expr(node.slice)
+        const_index = index.value if isinstance(index, ir.ConstInt) else None
+        if const_index is not None and not 0 <= const_index < slot_count:
+            raise ParserTypeError(
+                f"Slot index {const_index} is out of range for '{decl_name}', "
+                f"declared with {slot_count} slot(s)",
+                span=span,
+                hint=f"Subscript within [0, {slot_count}), or declare more slots",
+            )
+        return self._make_declared_memref(decl_name, span, slots=slot_count, slot=index)
+
+    def _declared_alloc_name(self, declared: "ir.MemRef", node: ast.Name) -> str:
+        """The name a declared allocation goes by, and the checks that keep it one.
+
+        An unnamed ``pl.MemRef()`` is named after the variable it is bound to, so
+        the name is written once. That only holds up while variable and allocation
+        correspond one-to-one, which is what the two checks below enforce:
+
+        * one declaration reached through two names (``b = a``) would silently
+          become two allocations;
+        * two declarations claiming one name would silently become one.
+
+        A declaration with an explicit name is exempt from the first check — the
+        name is its own, not the variable's — but still may not collide with
+        another declaration.
+
+        Args:
+            declared: The declared allocation's MemRef marker
+            node: The AST Name node referencing it
+
+        Returns:
+            The allocation's name
+
+        Raises:
+            ParserTypeError: If the variable-to-allocation correspondence breaks
+        """
+        explicit = declared.base_.name_hint
+        name = explicit or node.id
+        span = self._get_span(node)
+
+        if not hasattr(self, "_declared_alloc_names"):
+            self._declared_alloc_names: dict[int, str] = {}
+            self._declared_alloc_owners: dict[str, int] = {}
+
+        seen = self._declared_alloc_names.setdefault(id(declared), name)
+        if seen != name:
+            raise ParserTypeError(
+                f"Declared allocation '{seen}' is also referenced as '{name}'",
+                span=span,
+                hint=f"An unnamed pl.MemRef() is named after its variable, so aliasing it "
+                f"('{name} = {seen}') is ambiguous. Reference it as '{seen}', declare a "
+                f'separate pl.MemRef(), or name it explicitly with pl.MemRef("...")',
+            )
+
+        owner = self._declared_alloc_owners.setdefault(name, id(declared))
+        if owner != id(declared):
+            raise ParserTypeError(
+                f"Two separate pl.MemRef() declarations both resolve to the name '{name}'",
+                span=span,
+                hint="Declared allocations are identified by name within a function. Give one of "
+                'them an explicit name with pl.MemRef("...")',
+            )
+        return name
+
+    def _resolve_slots_kwarg(self, node: ast.Call, span: "ir.Span") -> int:
+        """Read `slots=N` off a declaration, defaulting to a single slot.
+
+        Args:
+            node: The `pl.MemRef(...)` call node
+            span: Source location
+
+        Returns:
+            The declared slot count
+
+        Raises:
+            ParserTypeError: If `slots` is not a positive integer literal
+        """
+        for keyword in node.keywords:
+            if keyword.arg != "slots":
+                continue
+            value = keyword.value
+            if not (
+                isinstance(value, ast.Constant)
+                and isinstance(value.value, int)
+                and not isinstance(value.value, bool)
+                and value.value >= 1
+            ):
+                raise ParserTypeError(
+                    f"slots must be a positive integer literal, got {ast.unparse(value)}",
+                    span=span,
+                    hint='Use pl.MemRef("scratch", slots=2)',
+                )
+            return value.value
+        return 1
+
+    def _make_declared_memref(
+        self, name: str, span: "ir.Span", slots: int = 1, slot: "ir.Expr | None" = None
+    ) -> "ir.MemRef":
+        """Build the unresolved MemRef for a declared allocation's name.
+
+        A declared allocation's name is its own namespace, unrelated to Python
+        variable names, so this must not reach ``scope_lookup``. That fallback
+        exists for ``pl.MemRef(base, offset, size)`` naming an alloc-defined Ptr;
+        a declaration never has one (it is resolved before InitMemRef creates
+        any). Left in, a name that merely collided with an in-scope variable — a
+        tensor parameter ``a`` and ``pl.MemRef("a")`` — would silently take that
+        variable, of arbitrary type, as the allocation base.
+
+        Args:
+            name: Allocation name, shared by every annotation naming it
+            span: Source location
+            slots: How many slots the declaration holds
+            slot: Index expression selecting the slot, or None when unsubscripted
+
+        Returns:
+            A MemRef with ``is_pinned_`` set, on the interned base Ptr
+        """
+        base_var = self._intern_base_ptr(name, span, skip_scope_lookup=True)
+        return ir.MemRef(base_var, 0, 0, span, is_pinned=True, slots=slots, slot=slot)
 
     def _resolve_tuple_type(self, subscript_node: ast.Subscript) -> list[ir.Type]:
         """Resolve tuple[T1, T2, ...] return type annotation.
@@ -1100,40 +1349,68 @@ class TypeResolver:
             hint="Use pl.FP32, pl.INT32, or other supported dtype constants",
         )
 
-    def _warn_on_user_facing_dn_layout(self, layout: "ir.TensorLayout", type_name: str) -> None:
-        """Emit a ``DeprecationWarning`` when the user writes the layout-only DN
-        shorthand on a tensor type annotation (RFC #1300 supplementary 1).
+    def _reject_user_facing_dn_layout(
+        self, layout: "ir.TensorLayout", type_name: str, node: ast.expr
+    ) -> None:
+        """Reject the layout-only DN shorthand on a tensor type annotation.
 
-        Suppressed for ``ir.TensorLayout.ND`` (default, no-op marker) and for
-        explicit ``pl.TensorView(stride=..., layout=DN)`` forms (which carry
-        their own stride and don't rely on the shorthand's implicit coordinate
-        flip). Tile-side layouts are never seen here — Tile annotations route
-        through ``_resolve_tile_annotation_args``.
+        Writing ``pl.Tensor[..., pl.DN]`` requires the user to mentally hold two
+        coordinate systems at once (IR-logical post-view vs. runtime row-major),
+        which is exactly the ambiguity RFC #1300 removes — so the shorthand is
+        not accepted. The marker may also arrive through a variable
+        (``MY = ir.TensorLayout.DN; pl.Tensor[[64, 128], pl.FP32, MY]``), so the
+        message quotes the source spelling rather than assuming ``pl.DN``.
+
+        Only the bare layout marker is rejected. ``ir.TensorLayout.ND`` is the
+        default no-op marker, and an explicit ``pl.TensorView(stride=...,
+        layout=DN)`` carries its own stride, so neither relies on the implicit
+        coordinate flip. Tile-side layouts are never seen here — Tile
+        annotations route through ``_resolve_tile_annotation_args``.
+
+        Raises:
+            ParserTypeError: If ``layout`` is ``ir.TensorLayout.DN``
         """
         if layout != ir.TensorLayout.DN:
             return
-        warnings.warn(
-            f"pl.{type_name}[..., pl.DN] is deprecated (RFC #1300 supplementary 1). "
-            "Writing the DN layout-only shorthand requires the user to mentally hold "
-            "two coordinate systems at once (IR-logical post-view vs. runtime "
-            "row-major), which is exactly the ambiguity RFC #1300 aims to eliminate. "
-            "Three migration patterns cover every DN scenario without writing pl.DN:\n"
+        raise ParserTypeError(
+            f"pl.{type_name}[..., {ast.unparse(node)}] is not supported: the DN "
+            "layout-only shorthand forces two coordinate systems (IR-logical "
+            "post-view vs. runtime row-major) onto one annotation",
+            span=self._get_span(node),
+            hint="Three patterns cover every DN scenario without pl.DN:\n"
             "  * source tensor shape, no layout marker: pl.Tensor[[N, K], pl.FP32]\n"
             "  * derive DN at use site: xt = pl.transpose(x, -2, -1)  # ND -> DN\n"
             "  * inherit DN through slice/reshape from a DN-producing op\n"
-            "If you must express a strided-DN view (e.g. canonical pretty-print "
-            "round-trip), use pl.TensorView(stride=[...], layout=pl.TensorLayout.DN) "
-            "instead — it forces explicit stride and avoids the implicit-coord-flip "
-            "hazard.",
-            DeprecationWarning,
-            stacklevel=4,
+            "For a strided-DN view (e.g. canonical pretty-print round-trip), write "
+            "pl.TensorView(stride=[...], layout=pl.TensorLayout.DN) — it forces an "
+            "explicit stride and avoids the implicit-coord-flip hazard.",
         )
 
-    def resolve_layout(self, layout_node: ast.expr) -> "ir.TensorLayout":
+    def _layout_choices_hint(self, dn_allowed: bool) -> str:
+        """Build the "valid layouts" hint for a layout slot.
+
+        A hint has to name only layouts the *failing slot* accepts. A bare
+        tensor-annotation slot rejects DN (see ``_reject_user_facing_dn_layout``),
+        so listing it there would send the user from one error straight into
+        another.
+
+        Args:
+            dn_allowed: Whether DN is legal in the slot being diagnosed
+
+        Returns:
+            Hint text listing the layouts that slot accepts
+        """
+        names = [name for name in self._LAYOUT_MAP if dn_allowed or name != "DN"]
+        return f"Use a valid layout: {', '.join(f'pl.{name}' for name in names)}"
+
+    def resolve_layout(self, layout_node: ast.expr, dn_allowed: bool = True) -> "ir.TensorLayout":
         """Resolve layout annotation to ir.TensorLayout.
 
         Args:
             layout_node: AST node representing layout (e.g., pl.NZ, NZ, or a variable)
+            dn_allowed: Whether the slot being resolved accepts DN. Only shapes the
+                "valid layouts" hint — a resolved DN is rejected by the caller that
+                forbids it, which can explain the migration in context.
 
         Returns:
             TensorLayout enum value
@@ -1142,6 +1419,7 @@ class TypeResolver:
             ParserTypeError: If layout cannot be resolved
         """
         span = self._get_span(layout_node)
+        choices = self._layout_choices_hint(dn_allowed)
 
         if isinstance(layout_node, ast.Attribute):
             layout_name = layout_node.attr
@@ -1150,7 +1428,7 @@ class TypeResolver:
             raise ParserTypeError(
                 f"Unknown layout: {layout_name}",
                 span=span,
-                hint=f"Use a valid layout: {', '.join(self._LAYOUT_MAP.keys())}",
+                hint=choices,
             )
 
         if isinstance(layout_node, ast.Name):
@@ -1165,19 +1443,19 @@ class TypeResolver:
                 raise ParserTypeError(
                     f"Layout variable '{layout_name}' must be a TensorLayout, got {type(value).__name__}",
                     span=span,
-                    hint=f"Use a valid layout: {', '.join(self._LAYOUT_MAP.keys())}",
+                    hint=choices,
                 )
 
             raise ParserTypeError(
                 f"Unknown layout: {layout_name}",
                 span=span,
-                hint=f"Use a valid layout: {', '.join(self._LAYOUT_MAP.keys())}",
+                hint=choices,
             )
 
         raise ParserTypeError(
             f"Cannot resolve layout: {ast.unparse(layout_node)}",
             span=span,
-            hint="Use pl.ND, pl.DN, or pl.NZ",
+            hint=choices,
         )
 
     def validate_annotation_consistency(
@@ -1289,6 +1567,72 @@ class TypeResolver:
         return (isinstance(func, ast.Attribute) and func.attr == "TensorView") or (
             isinstance(func, ast.Name) and func.id == "TensorView"
         )
+
+    def _resolve_tensor_view_slot(self, node: ast.expr, type_name: str) -> "ir.TensorView":
+        """Resolve slot 3 of a Tensor / DistributedTensor annotation to an ir.TensorView.
+
+        The slot holds either a tensor view or a layout, and either may be
+        written inline or held in a variable::
+
+            pl.Tensor[[32, 64], pl.FP32, pl.TensorView(stride=[128, 1], ...)]
+            pl.Tensor[[32, 64], pl.FP32, STRIDED]  # STRIDED = pl.TensorView(...)
+            pl.Tensor[[32, 64], pl.FP32, pl.NZ]
+            pl.Tensor[[32, 64], pl.FP32, my_layout]  # my_layout = ir.TensorLayout.NZ
+
+        A layout is widened to a stride-less view carrying it, so every form
+        yields a view. ``pl.DN`` is the one layout the slot does not accept —
+        see ``_reject_user_facing_dn_layout``.
+
+        Args:
+            node: AST node in slot 3 of the annotation
+            type_name: "Tensor" or "DistributedTensor", for diagnostics
+
+        Returns:
+            ir.TensorView instance
+
+        Raises:
+            ParserTypeError: If the node is neither a tensor view nor a layout,
+                or if it is the bare ``pl.DN`` layout marker
+        """
+        if self._is_tensorview_node(node):
+            return self._resolve_tensorview(node)
+        from_var = self._resolve_tensorview_var_ref(node)
+        if from_var is not None:
+            return from_var
+        layout = self.resolve_layout(node, dn_allowed=False)
+        self._reject_user_facing_dn_layout(layout, type_name, node)
+        return ir.TensorView([], layout)
+
+    def _resolve_tensorview_var_ref(self, node: ast.expr) -> "ir.TensorView | None":
+        """Resolve a TensorView referenced by name in a tensor annotation.
+
+        A view spelled out in full is long, and one shared by several parameters
+        would otherwise have to be repeated verbatim on each. Binding it once in
+        enclosing Python and referencing the name is the natural way to share it::
+
+            STRIDED = pl.TensorView(stride=[128, 1], layout=pl.TensorLayout.ND)
+            def kernel(self, data: pl.Tensor[[32, 64], pl.FP32, STRIDED], ...)
+
+        This mirrors the closure support ``resolve_layout`` already provides for
+        the layout that may occupy the same slot.
+
+        Args:
+            node: Candidate AST node from slot 3 of a tensor annotation
+
+        Returns:
+            The TensorView, or None if the node is not a TensorView reference
+        """
+        if not isinstance(node, ast.Name):
+            return None
+        # A bare layout name resolves as a layout, and did so before views were
+        # reachable by name — so keep that precedence and skip the evaluation,
+        # which is the expensive half of resolving this slot.
+        if node.id in self._LAYOUT_MAP:
+            return None
+        success, value = self.expr_evaluator.try_eval_expr(node)
+        if success and isinstance(value, ir.TensorView):
+            return value
+        return None
 
     def _resolve_tensorview(self, node: ast.expr) -> "ir.TensorView":
         """Resolve a pl.TensorView(...) AST call to ir.TensorView.
@@ -1579,14 +1923,19 @@ class TypeResolver:
             hint="Use pl.PadValue.null, pl.PadValue.zero, pl.PadValue.max, or pl.PadValue.min",
         )
 
-    def _is_memref_node(self, node: ast.expr) -> bool:
-        """Check if an AST node is a pl.MemRef(...) call."""
+    @staticmethod
+    def _is_call_to(node: ast.expr, name: str) -> bool:
+        """Check if an AST node is a ``pl.<name>(...)`` or bare ``<name>(...)`` call."""
         if not isinstance(node, ast.Call):
             return False
         func = node.func
-        return (isinstance(func, ast.Attribute) and func.attr == "MemRef") or (
-            isinstance(func, ast.Name) and func.id == "MemRef"
+        return (isinstance(func, ast.Attribute) and func.attr == name) or (
+            isinstance(func, ast.Name) and func.id == name
         )
+
+    def _is_memref_node(self, node: ast.expr) -> bool:
+        """Check if an AST node is a pl.MemRef(...) call."""
+        return self._is_call_to(node, "MemRef")
 
     def _is_memory_space_node(self, node: ast.expr) -> bool:
         """Check if an AST node is a pl.Mem.<space> or pl.MemorySpace.<space> reference."""
@@ -1610,6 +1959,8 @@ class TypeResolver:
         """Resolve a pl.MemRef(base, byte_offset, size) AST call to ir.MemRef.
 
         Supports:
+        - Declaration: pl.MemRef(name) — an allocation of the author's own, size
+          and address left for InitMemRef and the allocator to derive
         - New format: pl.MemRef(base_name, byte_offset, size) — bare name or string ref
         - Legacy format: pl.MemRef(addr, size, id) — integer addr
 
@@ -1630,6 +1981,26 @@ class TypeResolver:
             )
 
         span = self._get_span(node)
+
+        # One argument: a declared allocation. The author names it and nothing
+        # else — InitMemRef derives the size from the tiles bound to it and the
+        # allocator assigns the address — so there is no offset/size to give.
+        # `slots=N` is the only keyword, and it is what the printer emits for a
+        # multi-slot declaration so the dump reparses.
+        if len(node.args) == 1 and all(kw.arg == "slots" for kw in node.keywords):
+            name_node = node.args[0]
+            if not (
+                isinstance(name_node, ast.Constant) and isinstance(name_node.value, str) and name_node.value
+            ):
+                raise ParserTypeError(
+                    f"A declared allocation's name must be a non-empty string literal, "
+                    f"got {ast.unparse(name_node)}",
+                    span=span,
+                    hint='Use pl.MemRef("scratch")',
+                )
+            return self._make_declared_memref(
+                name_node.value, span, slots=self._resolve_slots_kwarg(node, span)
+            )
 
         if len(node.args) == 3:
             first_arg = node.args[0]
@@ -1663,15 +2034,25 @@ class TypeResolver:
             hint="Use pl.MemRef(base_name, byte_offset, size)",
         )
 
-    def _intern_base_ptr(self, name: str, span: "ir.Span") -> "ir.Var":
+    def _intern_base_ptr(self, name: str, span: "ir.Span", skip_scope_lookup: bool = False) -> "ir.Var":
         """Get or create a shared Var for a base Ptr name.
 
         Ensures that two MemRef annotations referencing the same base name
         share the same Var instance, so MemRef.SameAllocation() works after
         parse round-trips. Checks scope_lookup first (for alloc-defined vars),
         then falls back to a per-resolver cache.
+
+        Args:
+            name: Base Ptr name to intern
+            span: Source location, used when a fresh Var is created
+            skip_scope_lookup: Resolve only through the resolver-local cache.
+                Set for a declared allocation's name, which lives in its own
+                namespace — see ``_make_declared_memref``.
+
+        Returns:
+            The shared Var for this base name
         """
-        if self.scope_lookup is not None:
+        if self.scope_lookup is not None and not skip_scope_lookup:
             existing = self.scope_lookup(name)
             if existing is not None:
                 return existing
@@ -1680,6 +2061,25 @@ class TypeResolver:
         if name not in self._base_ptr_cache:
             self._base_ptr_cache[name] = ir.Var(name, ir.PtrType(), span)
         return self._base_ptr_cache[name]
+
+    def interned_base_ptr(self, name: str) -> "ir.Var | None":
+        """Return the Var already interned for a MemRef base name, if any.
+
+        A signature annotation may name a base Ptr that the body allocates
+        further down (``InitMemRef`` does this whenever a Tile parameter lands
+        in a compiler-allocated buffer). The signature is parsed first, so it
+        interns a Var for the name before the allocation is seen; the body's
+        alloc must then bind that *same* Var, or the parameter's MemRef and the
+        allocation stop sharing an allocation identity and pointer-based
+        aliasing (``MemRef.SameAllocation``) silently breaks.
+
+        Args:
+            name: Base Ptr name to look up
+
+        Returns:
+            The interned Var, or None if no annotation has referenced this name
+        """
+        return getattr(self, "_base_ptr_cache", {}).get(name)
 
     def _try_resolve_memref_base(self, node: ast.expr) -> str | None:
         """Try to resolve the first arg of pl.MemRef as a base name.
@@ -1721,11 +2121,19 @@ class TypeResolver:
             if method is not None:
                 return getattr(lhs, method)(rhs)
 
-        raise ParserTypeError(
-            f"MemRef byte_offset must be an integer or variable, got: {ast.unparse(node)}",
-            span=self._get_span(node),
-            hint="Use an integer value for the byte offset, e.g., 0 or 1024",
-        )
+        # A resolved slot index becomes part of the byte offset (`i % 2 * 16384`),
+        # so the offset can be any pure index expression — more than the
+        # add/sub/mul handled above. Fall back to the same index-expression parser
+        # the slot subscript and TileView fields use, so a printed program with a
+        # runtime slot round-trips.
+        try:
+            return self._parse_tileview_expr(node)
+        except ParserError:
+            raise ParserTypeError(
+                f"MemRef byte_offset must be an index expression, got: {ast.unparse(node)}",
+                span=self._get_span(node),
+                hint="Use an integer, a variable, or arithmetic over them, e.g. 1024 or i % 2 * 512",
+            ) from None
 
     def _resolve_memory_space(self, node: ast.expr) -> "ir.MemorySpace":
         """Resolve a memory space AST node (e.g., pl.Mem.DDR or pl.MemorySpace.DDR)."""

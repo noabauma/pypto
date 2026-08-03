@@ -467,7 +467,9 @@ void BindPass(nb::module_& m) {
              "on-chip Mat scratch for chained matmul consumers; compatible f32->bf16/f16 rint\n"
              "casts fold into the FIXPIPE writeback. Full-K grids support output-, A-, and\n"
              "B-stationary schedules. dbC=2 is enabled under PTOAS and available as a PyPTO\n"
-             "planner opt-in. Already-L0-sized and unsupported regimes are left untouched;\n"
+             "planner opt-in. Under PyPTO, a canonical already-L0 stationary-panel pipeline\n"
+             "may automatically use two L0C slots when its post-lowering Acc footprint fits.\n"
+             "Other already-L0-sized and unsupported regimes are left untouched;\n"
              "useful deferred cases emit PerfHint diagnostics. tile.matmul_bias is deferred.");
   passes.def("canonicalize_tile_slice", &pass::CanonicalizeTileSlice,
              "Create a pass that lowers Mat-resident tile.slice into tile.extract\n\n"
@@ -551,6 +553,16 @@ void BindPass(nb::module_& m) {
              "slot) and attrs['iter_arg_array_size_<i>'] (int, positive extents only) onto each\n"
              "ForStmt, so orchestration codegen reads the carry lowering instead of re-deriving\n"
              "it from an alias fixpoint. Runs last, after materialize_runtime_scopes.");
+  passes.def("insert_comm_fence", &pass::InsertCommFence,
+             "Insert the ptoas data-before-signal markers. Local publishing write\n"
+             "(tile.store or tensor.write into a window-bound dst, get into a window-bound\n"
+             "local dst): a region system.cacheinvalid\n"
+             "+ GM system.fence. Remote write (remote_store / put): only system.fence — its\n"
+             "peer-region cacheinvalid is emitted by codegen (peer offset not yet\n"
+             "IR-expressible). Opaque write (Submit / unregistered call): a conservative\n"
+             "whole-GM system.cacheinvalid + system.fence. After each wait: a whole-GM\n"
+             "system.cacheinvalid. Notify: nothing. Idempotent. Runs last, after all\n"
+             "statement-reordering passes.");
   passes.def("normalize_stmt_structure", &pass::NormalizeStmtStructure,
              "Create a pass that normalizes statement structure");
   passes.def("derive_call_directions", &pass::DeriveCallDirections,

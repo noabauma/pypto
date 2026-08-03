@@ -16,7 +16,9 @@
 
 #include "pypto/ir/core_affinity_kind.h"
 #include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/type.h"
 
 namespace pypto {
 namespace ir {
@@ -54,9 +56,54 @@ bool IsBufferAliasingViewOp(const std::string& op_name) {
   return entry.OutputMemoryInheritsInput() && entry.IsInplaceSafe();
 }
 
+bool OutputInheritsSourceBuffer(const std::string& op_name) {
+  auto& registry = OpRegistry::GetInstance();
+  if (!registry.IsRegistered(op_name)) return false;
+  const auto& entry = registry.GetEntry(op_name);
+  // Inheriting the input's memory *space* is not the same as landing in its
+  // buffer: tile.transpose inherits the space but permutes into a fresh one
+  // (pto.ttrans, registered not_inplace_safe()). IsBufferAliasingViewOp already
+  // draws that line, so reuse it rather than testing OutputMemoryInheritsInput()
+  // directly — otherwise a transpose output, which does own its buffer, could
+  // not be bound to a declared allocation.
+  return IsBufferAliasingViewOp(op_name) || entry.GetOutputReusesInputArg().has_value();
+}
+
 bool IsBuiltinOp(const std::string& op_name) {
   return op_name.rfind("tile.", 0) == 0 || op_name.rfind("tensor.", 0) == 0 ||
          op_name.rfind("system.", 0) == 0 || op_name.rfind("array.", 0) == 0;
+}
+
+bool IsPublishingWrite(const CallPtr& call) {
+  if (!call || !call->op_) return false;
+  // Remote writes always publish into a peer's window.
+  if (IsOp(call, "pld.tile.remote_store") || IsOp(call, "pld.tile.put") || IsOp(call, "pld.tensor.put")) {
+    return true;
+  }
+  // A local store whose destination tensor is window-bound: a peer can
+  // remote_load it, so it carries the same data-before-signal obligation.
+  if (IsOp(call, "tile.store") && call->args_.size() > 2 && call->args_[2] &&
+      As<DistributedTensorType>(call->args_[2]->GetType())) {
+    return true;
+  }
+  // A scalar write into a window-bound tensor publishes for the same reason.
+  // ConvertTensorToTileOps deliberately leaves `tensor.write` unconverted when
+  // its destination is a DistributedTensor (PTO codegen lowers it to
+  // `pto.store_scalar`), so it reaches this pass as a registered builtin and
+  // would otherwise fall through to the `IsRegistered` guard below as false.
+  if (IsOp(call, "tensor.write") && !call->args_.empty() && call->args_[0] &&
+      As<DistributedTensorType>(call->args_[0]->GetType())) {
+    return true;
+  }
+  // A get into a window-bound local destination publishes for the same reason.
+  if ((IsOp(call, "pld.tile.get") || IsOp(call, "pld.tensor.get")) && !call->args_.empty() &&
+      call->args_[0] && As<DistributedTensorType>(call->args_[0]->GetType())) {
+    return true;
+  }
+  // Conservative: an unregistered op name is a call to a user function whose body
+  // is not analysed interprocedurally — assume it may publish. Registered builtin
+  // and distributed ops fall through to false (handled above or non-publishing).
+  return !OpRegistry::GetInstance().IsRegistered(call->op_->name_);
 }
 
 }  // namespace op_predicates

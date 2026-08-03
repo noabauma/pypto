@@ -344,6 +344,12 @@ class TensorLayout(enum.Enum):
     NZ = ...
     """NZ layout."""
 
+    MX_A_ZZ = ...
+    """MX Left/A scale GM pack (ZZ)."""
+
+    MX_B_NN = ...
+    """MX Right/B scale GM pack (NN)."""
+
 class TileLayout(enum.Enum):
     """Tile layout enumeration (shared by blayout and slayout)."""
 
@@ -614,7 +620,15 @@ class TileView:
     """Scatter layout."""
 
     fractal: Final[int]
-    """Fractal size."""
+    """Fractal size in bytes (not elements).
+
+    In a boxed (NZ/ZN) layout the inner box is ``M0 = 16`` rows by
+    ``fractal / dtype_bytes / M0`` columns, so the same byte value describes a
+    different element geometry per dtype. The two matmul-path values are both
+    16x16 boxes: ``512`` (Mat/Left/Right operand, 16x16 FP16) and ``1024``
+    (Acc accumulator, 16x16 FP32/INT32). MX scale tiles (LeftScale/RightScale)
+    instead carry ``32``, the MX block size of one shared exponent per 32
+    elements; the scale dtype is 1 byte, so bytes and elements coincide there."""
 
     pad: Final[PadValue]
     """Pad mode."""
@@ -637,7 +651,7 @@ class TileView:
             start_offset: Starting offset (Expr/int/Scalar, int auto-converted to ConstInt; None allowed)
             blayout: Block layout (default: row_major)
             slayout: Scatter layout (default: none_box)
-            fractal: Fractal size (default: 512)
+            fractal: Fractal size in bytes, not elements (default: 512)
             pad: Pad mode (default: null)
         """
 
@@ -999,6 +1013,10 @@ class MemorySpace(enum.Enum):
 
     Bias = ...
     """Bias buffer."""
+    LeftScale = ...
+    """L0A-side MX block-scale buffer (A5)."""
+    RightScale = ...
+    """L0B-side MX block-scale buffer (A5)."""
 
     ScalarLocal = ...
     """On-core scalar register file / C stack (ArrayType)."""
@@ -1046,6 +1064,49 @@ class CommCtxType(Type):
         """Get the shared singleton CommCtxType instance."""
         ...
 
+class PrefetchAsyncContextType(Type):
+    """Singleton marker type for ``prefetch.make_context`` outputs.
+
+    Opaque handle to an asynchronous GM->L2 prefetch context backed by the
+    runtime-injected SDMA workspace. Consumed by ``prefetch.async_prefetch``
+    and ``prefetch.session``; lowers to PTOAS
+    ``!pto.prefetch_async_context``.
+    """
+
+    def __init__(self) -> None: ...
+    @staticmethod
+    def get() -> PrefetchAsyncContextType:
+        """Get the shared singleton PrefetchAsyncContextType instance."""
+        ...
+
+class AsyncEventType(Type):
+    """Singleton marker type for ``prefetch.async_prefetch`` outputs.
+
+    Opaque handle to an in-flight asynchronous DMA completion event. Paired
+    with an :class:`AsyncSessionType` in ``prefetch.wait``; lowers to PTOAS
+    ``!pto.async_event``.
+    """
+
+    def __init__(self) -> None: ...
+    @staticmethod
+    def get() -> AsyncEventType:
+        """Get the shared singleton AsyncEventType instance."""
+        ...
+
+class AsyncSessionType(Type):
+    """Singleton marker type for ``prefetch.session`` outputs.
+
+    Opaque handle to the asynchronous DMA session an event belongs to. Paired
+    with an :class:`AsyncEventType` in ``prefetch.wait``; lowers to PTOAS
+    ``!pto.async_session``.
+    """
+
+    def __init__(self) -> None: ...
+    @staticmethod
+    def get() -> AsyncSessionType:
+        """Get the shared singleton AsyncSessionType instance."""
+        ...
+
 class MemRef(Var):
     """Memory reference variable for shaped types (inherits from Var)."""
 
@@ -1058,8 +1119,51 @@ class MemRef(Var):
     size_: int
     """Size in bytes (64-bit unsigned)."""
 
+    is_pinned_: bool
+    """True for an author-declared allocation, false for a compiler allocation."""
+
+    slot_count_: int
+    """How many equally-sized slots the declared allocation holds (1 when unsubscripted)."""
+
+    slot_index_: Expr | None
+    """Which slot of the declared allocation this MemRef denotes, as an index expression
+    (None when the declaration is unsubscripted). An expression rather than an int so the
+    index may be a runtime value; `InitMemRef` scales it into ``byte_offset_``."""
+
+    def __getitem__(self, slot: int) -> MemRef:
+        """Select one slot of a multi-slot declared allocation by constant index.
+
+        Only constant indices go through here. A runtime index (``l0c[i % 2]``) appears
+        inside a Tile annotation, which the parser resolves from the AST without
+        evaluating the subscript.
+
+        Args:
+            slot: Slot index, in ``[0, slot_count_)``
+
+        Returns:
+            The same declaration bound to ``slot`` — same base Ptr, so all slots
+            share one allocation
+
+        Raises:
+            ValueError: If this MemRef is not a declaration, or the index is out of range
+        """
+        ...
+
     @overload
-    def __init__(self, base: Var, byte_offset: int, size: int, span: Span = ...) -> None: ...
+    def __init__(self, span: Span = ..., slots: int = ...) -> None: ...
+    @overload
+    def __init__(self, name: str, span: Span = ..., slots: int = ...) -> None: ...
+    @overload
+    def __init__(
+        self,
+        base: Var,
+        byte_offset: int,
+        size: int,
+        span: Span = ...,
+        is_pinned: bool = ...,
+        slots: int = ...,
+        slot: Expr | None = ...,
+    ) -> None: ...
     @overload
     def __init__(self, base: Var, byte_offset: Expr, size: int, span: Span = ...) -> None: ...
     @overload
@@ -1099,7 +1203,7 @@ class _CommLayoutModule:
     Values mirror `offsetof(::CommContext, ...)` on the runtime header and are
     pinned by `static_assert` in `include/pypto/codegen/distributed/comm_layout.h`.
     Treat any drift between these constants and the literals embedded in emitted
-    CommRemoteOffset kernels as a runtime/codegen ABI break.
+    remote-address calculations as a runtime/codegen ABI break.
     """
 
     RANK_ID_OFFSET: Final[int]
@@ -2202,22 +2306,28 @@ class ReduceOp(enum.IntEnum):
     """Reduction operator for collective reductions — ``pld.tensor.allreduce`` and friends.
 
     Stored as ``int`` in op kwargs; the C++ deducer validates the int falls
-    within this enum's range. First-version lowering accepts only ``Sum``;
-    ``Max`` / ``Min`` / ``Prod`` are reserved enum values and are rejected
-    at the deducer until their lowerings land.
+    within this enum's range. Support is per-operation, not uniform across
+    the enum:
+
+    .. note::
+
+       **Per-operation support:** ``pld.tensor.allreduce`` (both the InCore
+       composite and the HOST builtin) accepts all four values. Other
+       reducing collectives are narrower — ``pld.tensor.reduce_scatter``
+       accepts only :attr:`Sum` and rejects the rest at the deducer.
     """
 
     Sum = 0
     """Element-wise sum across ranks."""
 
     Max = 1
-    """Element-wise max across ranks (reserved; lowering pending)."""
+    """Element-wise maximum across ranks."""
 
     Min = 2
-    """Element-wise min across ranks (reserved; lowering pending)."""
+    """Element-wise minimum across ranks."""
 
     Prod = 3
-    """Element-wise product across ranks (reserved; lowering pending)."""
+    """Element-wise product across ranks."""
 
 class ScopeStmt(Stmt):
     """Scope statement: marks a region with specific execution context (abstract base).
@@ -2246,12 +2356,12 @@ class ScopeStmt(Stmt):
 class InCoreScopeStmt(ScopeStmt):
     """InCore scope: AICore sub-graph region."""
 
-    split: Final[SplitMode | None]
-    """Split mode for cross-core transfer (None or SplitMode.None for no split)."""
+    split: Final[SplitMode]
+    """Split mode for cross-core transfer (SplitMode.NONE = no split)."""
 
     def __init__(
         self,
-        split: SplitMode | None = None,
+        split: SplitMode = SplitMode.NONE,
         name_hint: str = "",
         *,
         body: Stmt,

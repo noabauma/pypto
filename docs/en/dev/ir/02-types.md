@@ -119,7 +119,7 @@ tensor_with_both = ir.TensorType([128, 256], DataType.FP16, memref=memref, tenso
 **TensorView fields:**
 
 - `stride`: stride for each dimension
-- `layout`: `TensorLayout.ND` / `DN` / `NZ`
+- `layout`: `TensorLayout.ND` / `DN` / `NZ` / `MX_A_ZZ` / `MX_B_NN`
 - `valid_shape`: optional valid-region dimensions (empty means use full shape)
 - `pad`: `PadValue.null` (default) / `zero` / `max` / `min` — padding mode used
   when loads/slices read outside the `valid_shape`. Peer of `TileView.pad`;
@@ -201,6 +201,13 @@ implicit TileView derived from the tile shape and, when present, the tile
 memory space. Redundant explicit defaults such as `pl.TileView()` are treated
 as semantically equivalent to the omitted form and may print back in canonical
 syntax.
+
+The implicit view depends on the memory space, so the constructor collapses a
+view to `nullopt` only against the space it is given. An `f_deduce_type`
+producing a tile in a known space **must pass that space** — deducing against
+`nullopt` and letting `OpRegistry::Create` stamp it afterwards canonicalizes
+twice, against two different implicit layouts, making the result depend on
+whether the view happened to collapse (i.e. on `valid_shape` and `pad`).
 
 ### ArrayType
 

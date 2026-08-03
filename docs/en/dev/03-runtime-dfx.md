@@ -43,6 +43,7 @@ namespaces the prefix per dispatch:
 ```text
 <work_dir>/dfx_outputs/
 ├── rank0/d0/          # rank 0, its 0th dispatch
+│   └── dispatch_program.json   # which next_levels/<program> ran here
 ├── rank0/d1/          # rank 0, its 1st dispatch
 └── rank1/d0/
 ```
@@ -55,7 +56,16 @@ the program's chips in submit order. Each leaf holds the flat artefacts
 from the table above, so the L2 contract applies unchanged within one
 dispatch directory.
 
-## L2 swimlane runs the kernel twice (onboard)
+The path records *where* a dispatch ran, not *what* it ran, so
+`_submit_chip` also drops a `dispatch_program.json` naming the
+`next_levels/<program>` behind it. Kernel names must be resolved through
+it: `func_id` is a per-L2-program namespace — every program numbers its
+kernels from 0 — so a name map merged across programs relabels one
+program's tasks with another's names, silently and plausibly. A dispatch
+whose program cannot be resolved is converted with anonymous labels
+instead of guessed ones.
+
+## Swimlane runs the workload twice (onboard)
 
 The swimlane converter joins per-task timing against a task graph that **only
 `deps.json` carries** — the device hot path no longer records per-task fanout,
@@ -64,8 +74,8 @@ dependency arrows. But dep_gen collection has high overhead that perturbs the
 very timing the swimlane measures. The two captures therefore come from separate
 runs (Simpler's documented "capture the graph once, time many times" workflow).
 
-So enabling `enable_l2_swimlane` on an **onboard** platform runs the kernel
-twice, transparently:
+For **onboard L2**, enabling `enable_l2_swimlane` runs the kernel twice,
+transparently:
 
 1. **Graph pass** — dep_gen only, producing `deps.json`. Runs in a **separate
    subprocess** (`python -m pypto.runtime._dep_gen_capture`). This is required,
@@ -86,7 +96,16 @@ explicitly changes nothing about the passes (the graph pass already produced
 hint. Simulator platforms (`*sim`) stay single-pass — swimlane conversion is
 skipped there regardless.
 
-The subprocess rebuilds the orchestration arguments two ways: from `golden.py`
+Distributed L3 uses the same graph/timing split without the L2 capture
+subprocess. The one-shot path creates a fresh Worker lifecycle for each pass.
+A prepared `DistributedWorker` keeps its resident handles and forked hierarchy,
+but enters two separate `Worker.run()` fences: dep-gen-only first, then
+swimlane with dep_gen forced off. Per-card dispatch counters restart for both
+passes, so graph and timing artefacts join in the same `rank{r}/d{k}` directory.
+Both passes execute the program; mutable arguments are not restored between
+them, matching the existing one-shot L3 replay semantics.
+
+The L2 subprocess rebuilds the orchestration arguments two ways: from `golden.py`
 when driven by the pytest harness (deterministic inputs → faithful graph), or
 from a recorded spec when driven by the compiled-program API
 (`execute_compiled`). The task graph can be routed by tensor *values*, not just
@@ -286,6 +305,8 @@ this hint at the end of every scope-stats-enabled run.
 | Pipeline bundle | [runner.py](../../../python/pypto/runtime/runner.py) | `_DfxOpts` dataclass + `_DfxOpts.from_run_config` |
 | Per-flag post-run dispatch | [runner.py](../../../python/pypto/runtime/runner.py) | `_collect_dfx_artifacts` |
 | Kernel-name map synthesis | [runner.py](../../../python/pypto/runtime/runner.py) | `_write_name_map` |
+| L3 per-dispatch program marker | [distributed_runner.py](../../../python/pypto/runtime/distributed_runner.py) | `_record_dispatch_program` / `_read_dispatch_program` |
+| L3 per-dispatch swimlane conversion | [distributed_runner.py](../../../python/pypto/runtime/distributed_runner.py) | `_collect_l3_swimlane` / `_write_dispatch_name_map` |
 | pytest entry | [tests/st/conftest.py](../../../tests/st/conftest.py) | `pytest_addoption` |
 | Harness pipeline ctx | [tests/st/harness/core/test_runner.py](../../../tests/st/harness/core/test_runner.py) | `start_pipeline(..., enable_*)` |
 
@@ -456,10 +477,11 @@ by walking `next_levels/`; `platform` and `distributed_config` default to the
 values recorded at compile time and can be overridden to replay on a different
 target / device set.
 
-**Limitation:** DFX flags (`--pmu`, `--swimlane`, `--dump-args`, …) are **not
-yet plumbed through the L3 dispatch path** — they apply to single-chip replay
-only. The L3 edit-and-rerun loop itself (correctness re-check after a `.pto`/cpp
-edit) is fully supported.
+L3 replay forwards runtime DFX fields from `RunConfig` through each chip
+dispatch. Artifacts are written under
+`dfx_outputs/rank{r}/d{k}/`; onboard swimlane uses the graph/timing two-pass
+protocol described above. The edit-and-rerun loop therefore supports both
+correctness re-checks and L3 runtime diagnostics.
 
 ## Related
 

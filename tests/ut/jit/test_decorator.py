@@ -372,6 +372,11 @@ class TestJitCaching:
     ``_cache`` dict.  They do NOT execute on device (no NPU required).
     """
 
+    @pytest.fixture(autouse=True)
+    def _disable_ptoas_for_source_only_tests(self, monkeypatch, tmp_path):
+        """Keep cache compilation source-only on hosts with an unusable ptoas."""
+        monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "missing_ptoas"))
+
     def test_cache_hit_same_shape(self):
         """Second call with same shape returns cached program without recompilation."""
         torch = pytest.importorskip("torch")
@@ -394,9 +399,9 @@ class TestJitCaching:
         b = torch.randn(128, 128)
         c = torch.empty(128, 128)
 
-        add_kernel.compile_for_test(a, b, c)
+        add_kernel.compile(a, b, c)
         assert len(add_kernel._cache) == 1
-        add_kernel.compile_for_test(a, b, c)
+        add_kernel.compile(a, b, c)
         assert len(add_kernel._cache) == 1  # no new entry — cache hit
 
     def test_cache_miss_different_shape(self):
@@ -425,9 +430,9 @@ class TestJitCaching:
         b64 = torch.randn(64, 64)
         c64 = torch.empty(64, 64)
 
-        add_kernel2.compile_for_test(a128, b128, c128)
+        add_kernel2.compile(a128, b128, c128)
         assert len(add_kernel2._cache) == 1
-        add_kernel2.compile_for_test(a64, b64, c64)
+        add_kernel2.compile(a64, b64, c64)
         assert len(add_kernel2._cache) == 2  # different shape — cache miss
 
     def test_dynamic_dim_cache_hit_different_concrete_value(self):
@@ -453,9 +458,9 @@ class TestJitCaching:
         a512 = torch.randn(512, 128)
         c512 = torch.empty(512, 128)
 
-        dyn_kernel.compile_for_test(a256, c256)
+        dyn_kernel.compile(a256, c256)
         assert len(dyn_kernel._cache) == 1
-        dyn_kernel.compile_for_test(a512, c512)
+        dyn_kernel.compile(a512, c512)
         # Both M values → same cache entry (M is dynamic)
         assert len(dyn_kernel._cache) == 1
 
@@ -482,9 +487,9 @@ class TestJitCaching:
         a256 = torch.randn(256, 256)
         c256 = torch.empty(256, 256)
 
-        dyn_kernel2.compile_for_test(a128, c128)
+        dyn_kernel2.compile(a128, c128)
         assert len(dyn_kernel2._cache) == 1
-        dyn_kernel2.compile_for_test(a256, c256)
+        dyn_kernel2.compile(a256, c256)
         # K changed (128 → 256), should be different compilations
         assert len(dyn_kernel2._cache) == 2
 
@@ -528,9 +533,9 @@ class TestJitCaching:
         a512 = torch.randn(512, 128)
         c512 = torch.empty(512, 128)
 
-        ann_dyn_kernel.compile_for_test(a256, c256)
+        ann_dyn_kernel.compile(a256, c256)
         assert len(ann_dyn_kernel._cache) == 1
-        ann_dyn_kernel.compile_for_test(a512, c512)
+        ann_dyn_kernel.compile(a512, c512)
         # Both M values → same cache entry (M is dynamic via annotation alone).
         assert len(ann_dyn_kernel._cache) == 1
 
@@ -552,7 +557,7 @@ class TestJitCaching:
 
         a = torch.randn(64, 64)
         c = torch.empty(64, 64)
-        simple.compile_for_test(a, c)
+        simple.compile(a, c)
         cached_values = list(simple._cache.values())
         assert len(cached_values) == 1
         assert isinstance(cached_values[0], CompiledProgram)
@@ -641,10 +646,8 @@ class TestMultiFuncIntegration:
 
         x = torch.randn(64, 64)
         out = torch.empty(64, 64)
-        copy_entry.compile_for_test(x, out)
-        cached_values = list(copy_entry._cache.values())
-        assert len(cached_values) == 1
-        assert isinstance(cached_values[0], CompiledProgram)
+        program = copy_entry.lower(x, out)
+        assert isinstance(program, ir.Program)
 
     def test_multi_func_contains_both_functions(self):
         """Compiled program contains both the @jit.incore dep and the @jit entry functions."""
@@ -667,16 +670,15 @@ class TestMultiFuncIntegration:
         a = torch.randn(32, 32)
         b = torch.randn(32, 32)
         c = torch.empty(32, 32)
-        add_entry.compile_for_test(a, b, c)
-        compiled = list(add_entry._cache.values())[0]
-        assert isinstance(compiled, CompiledProgram)
-        func_names = [f.name for f in compiled.program.functions.values()]
+        program = add_entry.lower(a, b, c)
+        func_names = [f.name for f in program.functions.values()]
         assert "add_incore" in func_names
         assert "add_entry" in func_names
 
-    def test_multi_func_cache_hit(self):
+    def test_multi_func_cache_hit(self, monkeypatch, tmp_path):
         """Two multi-function JIT calls with same shapes reuse the cached program."""
         torch = pytest.importorskip("torch")
+        monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "missing_ptoas"))
 
         @jit.incore
         def relu_incore(x: pl.Tensor, out: pl.Out[pl.Tensor]):
@@ -693,9 +695,9 @@ class TestMultiFuncIntegration:
 
         x = torch.randn(16, 16)
         out = torch.empty(16, 16)
-        relu_entry.compile_for_test(x, out)
+        relu_entry.compile(x, out)
         assert len(relu_entry._cache) == 1
-        relu_entry.compile_for_test(x, out)
+        relu_entry.compile(x, out)
         assert len(relu_entry._cache) == 1  # cache hit
 
     def test_multi_func_structural_equal_to_program(self):
@@ -745,7 +747,7 @@ class TestMultiFuncIntegration:
         a = torch.randn(32, 32)
         b = torch.randn(32, 32)
         c = torch.empty(32, 32)
-        got = add_entry.compile_for_test(a, b, c)
+        got = add_entry.lower(a, b, c)
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         expected_post_pass = pm.run_passes(Expected)
         ir.assert_structural_equal(got, expected_post_pass)
@@ -921,10 +923,8 @@ class TestSliceAndDepReturnMetadata:
 
         src = torch.randn(32, 32)
         out = torch.empty(16, 32)
-        slice_entry.compile_for_test(src, out)
-        compiled = list(slice_entry._cache.values())[0]
-        assert isinstance(compiled, CompiledProgram)
-        func_names = [f.name for f in compiled.program.functions.values()]
+        program = slice_entry.lower(src, out)
+        func_names = [f.name for f in program.functions.values()]
         assert "copy_incore" in func_names
         assert "slice_entry" in func_names
 
@@ -950,9 +950,8 @@ class TestSliceAndDepReturnMetadata:
 
         src = torch.randn(32, 32)
         out = torch.empty(16, 32)
-        chain_entry.compile_for_test(src, out)
-        compiled = list(chain_entry._cache.values())[0]
-        assert isinstance(compiled, CompiledProgram)
+        program = chain_entry.lower(src, out)
+        assert isinstance(program, ir.Program)
 
     def test_multi_value_dep_return_flows_into_next_dep(self):
         """A tuple-returning @pl.jit.incore dep's results inherit their Out params' metas."""
@@ -989,9 +988,8 @@ class TestSliceAndDepReturnMetadata:
 
         src = torch.randn(32, 32)
         out = torch.empty(16, 32)
-        split_entry.compile_for_test(src, out)
-        compiled = list(split_entry._cache.values())[0]
-        assert isinstance(compiled, CompiledProgram)
+        program = split_entry.lower(src, out)
+        assert isinstance(program, ir.Program)
 
     def test_runtime_sized_slice_uses_static_parent_dim(self):
         """A pl.slice with a runtime-scalar width is advertised to the consuming
@@ -1018,9 +1016,8 @@ class TestSliceAndDepReturnMetadata:
         big = torch.randn(16, 128)
         cfg = torch.zeros(1, dtype=torch.int64)
         out = torch.empty(16, 128)
-        attn_entry.compile_for_test(big, cfg, out)
-        compiled = list(attn_entry._cache.values())[0]
-        assert isinstance(compiled, CompiledProgram)
+        program = attn_entry.lower(big, cfg, out)
+        assert isinstance(program, ir.Program)
 
     def test_dep_return_then_runtime_slice_then_dep(self):
         """The paged-attention shape: a dep return value is sliced to a runtime
@@ -1054,9 +1051,8 @@ class TestSliceAndDepReturnMetadata:
         big = torch.randn(16, 128)
         cfg = torch.zeros(1, dtype=torch.int64)
         out = torch.empty(16, 128)
-        attn_entry.compile_for_test(big, cfg, out)
-        compiled = list(attn_entry._cache.values())[0]
-        assert isinstance(compiled, CompiledProgram)
+        program = attn_entry.lower(big, cfg, out)
+        assert isinstance(program, ir.Program)
 
     def test_unresolvable_create_tensor_dim_still_raises_clear_error(self):
         """A pl.create_tensor with a non-static dim has no parent to fall back
@@ -1081,7 +1077,7 @@ class TestSliceAndDepReturnMetadata:
         cfg = torch.zeros(1, dtype=torch.int64)
         out = torch.empty(16, 32)
         with pytest.raises(ValueError, match="missing inferred tensor metadata"):
-            bad_entry.compile_for_test(cfg, out)
+            bad_entry.lower(cfg, out)
 
     def test_extract_local_tensor_metas_reshape(self):
         """``_extract_local_tensor_metas`` infers metas for pl.reshape results."""
@@ -1273,7 +1269,7 @@ class TestDynamicLocalTensorMetadata:
 
         hidden = torch.empty(7, _HIDDEN_1524, dtype=torch.bfloat16)
         out = torch.empty(7, _HIDDEN_1524, dtype=torch.bfloat16)
-        fwd_dv.compile_for_test(hidden, out)
+        fwd_dv.lower(hidden, out)
 
     def test_shape_attribute_emits_anchor_not_dynvar(self):
         """``M, N = a.shape`` for a dynamic-bound param emits
@@ -1295,7 +1291,7 @@ class TestDynamicLocalTensorMetadata:
 
         a = torch.empty(5, _HIDDEN_1524, dtype=torch.bfloat16)
         out = torch.empty(5, _HIDDEN_1524, dtype=torch.bfloat16)
-        shape_unpack.compile_for_test(a, out)
+        shape_unpack.lower(a, out)
 
     def test_dim_alias_rebind_is_safe(self):
         """An alias rebound to a non-``pl.tensor.dim`` value must not stamp
@@ -1350,7 +1346,7 @@ class TestDynamicLocalTensorMetadata:
         out = torch.empty(7, _HIDDEN_1524, dtype=torch.bfloat16)
         # Should not raise — previously failed with
         # "missing inferred tensor metadata for parameter 'hidden_states'".
-        fwd_1524.compile_for_test(hidden, out)
+        fwd_1524.lower(hidden, out)
 
     def test_reshape_propagates_dyndim_via_dim_alias(self):
         """pl.reshape with a dim-aliased DynDim in shape propagates the DynDim.
@@ -1618,10 +1614,10 @@ class TestInlineFuncIntegration:
         a = torch.randn(32, 32)
         b = torch.randn(32, 32)
         c = torch.empty(32, 32)
-        # compile_for_test() returns the post-pass IR (after PassManager.Default).
+        # lower() returns the post-pass IR (after PassManager.Default).
         # CompiledProgram.program is the *pre-pass* IR, so the cache entry would
         # still contain "add_inline"; we must inspect the post-pass return value.
-        post_pass = add_entry.compile_for_test(a, b, c)
+        post_pass = add_entry.lower(a, b, c)
         func_names = [f.name for f in post_pass.functions.values()]
         assert "add_inline" not in func_names, (
             f"Inline function should have been spliced and removed, got {func_names}"
@@ -1664,7 +1660,7 @@ class TestInlineFuncIntegration:
         a = torch.randn(32, 32)
         b = torch.randn(32, 32)
         c = torch.empty(32, 32)
-        post_pass = add_entry.compile_for_test(a, b, c)
+        post_pass = add_entry.lower(a, b, c)
         # After OutlineIncoreScopes: entry is Orchestration, inline body became
         # an InCore-class function (AIV/AIC/InCore) named *_incore_*.
         func_names = [f.name for f in post_pass.functions.values()]
@@ -1726,7 +1722,7 @@ class TestInlineFuncIntegration:
 
         a = torch.randn(32, 32)
         out = torch.empty(32, 32)
-        post_pass = entry_nested.compile_for_test(a, out)
+        post_pass = entry_nested.lower(a, out)
         func_names = [f.name for f in post_pass.functions.values()]
         assert "leaf" not in func_names, f"leaf should be spliced, got {func_names}"
         assert "mid" not in func_names, f"mid should be spliced, got {func_names}"
@@ -1779,7 +1775,7 @@ class TestInlineFuncIntegration:
         out = torch.empty(32, 32)
         # Compilation must succeed without "Unsupported function call" errors,
         # and post-pass IR must have spliced both helpers and the shared leaf.
-        post_pass = entry_diamond.compile_for_test(a, out)
+        post_pass = entry_diamond.lower(a, out)
         func_names = [f.name for f in post_pass.functions.values()]
         for spliced in ("shared", "a_helper", "b_helper"):
             assert spliced not in func_names, f"{spliced} should be spliced, got {func_names}"
@@ -1807,7 +1803,7 @@ class TestInlineFuncIntegration:
 
         a = torch.randn(32, 32)
         out = torch.empty(32, 32)
-        post_pass = entry_mixed.compile_for_test(a, out)
+        post_pass = entry_mixed.lower(a, out)
         func_names = [f.name for f in post_pass.functions.values()]
         assert "helper" not in func_names, f"helper should be spliced, got {func_names}"
         assert "entry_mixed" in func_names
@@ -1845,7 +1841,7 @@ class TestInlineFuncIntegration:
         a = torch.randn(32, 32)
         o0 = torch.empty(32, 32)
         o1 = torch.empty(32, 32)
-        post_pass = entry.compile_for_test(a, o0, o1)
+        post_pass = entry.lower(a, o0, o1)
         func_names = [f.name for f in post_pass.functions.values()]
         assert "two_returns" not in func_names
         assert "entry" in func_names
@@ -1876,7 +1872,7 @@ class TestInlineFuncIntegration:
 
         a = torch.randn(32, 32)
         out = torch.empty(32, 32)
-        post_pass = entry.compile_for_test(a, out)
+        post_pass = entry.lower(a, out)
         func_names = [f.name for f in post_pass.functions.values()]
         assert "produce" not in func_names
         assert "entry" in func_names
@@ -1913,7 +1909,7 @@ class TestInlineFuncIntegration:
         a = torch.randn(32, 32)
         o0 = torch.empty(32, 32)
         o1 = torch.empty(32, 32)
-        post_pass = entry.compile_for_test(a, o0, o1)
+        post_pass = entry.lower(a, o0, o1)
         func_names = [f.name for f in post_pass.functions.values()]
         assert "two_returns" not in func_names
         assert "entry" in func_names
@@ -1952,7 +1948,7 @@ class TestInlineFuncIntegration:
         o1 = torch.empty(32, 32)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            post_pass = entry.compile_for_test(a, o0, o1)
+            post_pass = entry.lower(a, o0, o1)
         # Bare pl.Tensor inline params must not emit the deprecation warning.
         assert not any(issubclass(w.category, DeprecationWarning) for w in caught), (
             f"Unexpected DeprecationWarning for bare pl.Tensor inline params: "
@@ -1994,7 +1990,7 @@ class TestInlineFuncIntegration:
 
         x = torch.randn(2, 64, 128, dtype=torch.bfloat16)
         y = torch.empty(2, 64, 128, dtype=torch.bfloat16)
-        post_pass = reshape_caller.compile_for_test(x, y)
+        post_pass = reshape_caller.lower(x, y)
         func_names = [f.name for f in post_pass.functions.values()]
         assert "copy_inline" not in func_names, f"Inline should be spliced, got {func_names}"
         assert "reshape_caller" in func_names
@@ -2033,7 +2029,7 @@ class TestInlineFuncIntegration:
 
         src = torch.randn(256, 128, dtype=torch.bfloat16)
         y = torch.empty(128, 128, dtype=torch.bfloat16)
-        post_pass = subscript_caller.compile_for_test(src, y)
+        post_pass = subscript_caller.lower(src, y)
         func_names = [f.name for f in post_pass.functions.values()]
         assert "copy_inline" not in func_names, f"Inline should be spliced, got {func_names}"
         assert "subscript_caller" in func_names
@@ -2106,7 +2102,7 @@ class TestOpaqueFuncIntegration:
         a = torch.randn(32, 32)
         b = torch.randn(32, 32)
         c = torch.empty(32, 32)
-        got = add_entry.compile_for_test(a, b, c)
+        got = add_entry.lower(a, b, c)
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         expected_post_pass = pm.run_passes(Expected)
         ir.assert_structural_equal(got, expected_post_pass)
@@ -2147,7 +2143,7 @@ class TestRoundTrip:
         a = torch.randn(128, 128)
         b = torch.randn(128, 128)
         c = torch.empty(128, 128)
-        got = tile_add.compile_for_test(a, b, c)
+        got = tile_add.lower(a, b, c)
         pm = PassManager.get_strategy(OptimizationStrategy.Default)
         expected_post_pass = pm.run_passes(Expected)
         ir.assert_structural_equal(got, expected_post_pass)
@@ -2248,14 +2244,14 @@ class TestCompileKwargForwarding:
         """Compile-side RunConfig fields map onto the ir.compile() parameter names."""
         artifacts_dir = tmp_path / "jit_artifacts"
         cfg = RunConfig(
-            strategy=OptimizationStrategy.DebugTileOptimization,
+            strategy=OptimizationStrategy.Default,
             dump_passes=True,
             compile_profiling=True,
             save_kernels_dir=str(artifacts_dir),
             analyze_auto_scopes_for_deps=True,
         )
         kwargs = _run_config_compile_kwargs(cfg)
-        assert kwargs["strategy"] == OptimizationStrategy.DebugTileOptimization
+        assert kwargs["strategy"] == OptimizationStrategy.Default
         assert kwargs["dump_passes"] is True
         assert kwargs["profiling"] is True  # mapped from RunConfig.compile_profiling
         assert kwargs["output_dir"] == str(artifacts_dir)  # from RunConfig.save_kernels_dir
@@ -2440,7 +2436,7 @@ class TestCompileKwargForwarding:
 
         dc = DistributedConfig(device_ids=[0, 1])
         cfg = RunConfig(
-            strategy=OptimizationStrategy.DebugTileOptimization,
+            strategy=OptimizationStrategy.Default,
             dump_passes=True,
             compile_profiling=True,
             distributed_config=dc,
@@ -2459,7 +2455,7 @@ class TestCompileKwargForwarding:
             **_run_config_compile_kwargs(cfg),
         )
         assert result == "fake-compiled-program"
-        assert captured["strategy"] == OptimizationStrategy.DebugTileOptimization
+        assert captured["strategy"] == OptimizationStrategy.Default
         assert captured["dump_passes"] is True
         assert captured["profiling"] is True
         assert captured["platform"] == "a2a3sim"

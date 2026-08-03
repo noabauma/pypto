@@ -30,9 +30,8 @@
  *     pld.tensor.allreduce(target, signal, *, op: int)  -> DistributedTensorType
  *
  * The ``op`` integer is the underlying value of :enum:`ReduceOp` (see
- * ``include/pypto/ir/comm.h``); the deducer rejects unsupported variants so
- * the lowering rule can dispatch without a separate guard. First-version
- * lowering implements only ``ReduceOp::kSum``.
+ * ``include/pypto/ir/comm.h``). Sum, maximum, minimum, and product are
+ * supported by both mesh and ring lowering.
  *
  * Result type: same as ``target`` (the call is in-place — semantically the
  * returned :class:`DistributedTensor` *is* ``target``, post-reduce). User code
@@ -47,12 +46,12 @@
  *   orchestrator's ``pld.window(...)`` call and may be ``nullopt`` on
  *   InCore parameters that flow through; matching the sibling
  *   ``pld.system.notify`` / ``pld.tile.remote_load`` deducers, this op
- *   relies on the kind check alone here.
+ *   relies on the kind check alone here. Its element type must be FP16 or
+ *   FP32.
  * * ``signal`` must have :class:`DistributedTensorType` with element type
  *   INT32 — the lowering uses ``pld.system.notify`` / ``pld.system.wait``
  *   against this slot.
- * * ``op`` kwarg must be a known :enum:`ReduceOp` value; first-version
- *   lowering accepts only ``ReduceOp::kSum``.
+ * * ``op`` kwarg must be a known :enum:`ReduceOp` value.
  */
 
 #include <any>
@@ -87,6 +86,8 @@ TypePtr DeduceTensorAllReduceType(const std::vector<ExprPtr>& args,
   CHECK(target_type) << "pld.tensor.allreduce target must be a DistributedTensor (window-bound), "
                         "got "
                      << args[0]->GetType()->TypeName();
+  CHECK(target_type->dtype_ == DataType::FP16 || target_type->dtype_ == DataType::FP32)
+      << "pld.tensor.allreduce target dtype must be FP16 or FP32, got " << target_type->dtype_.ToString();
 
   if (args.size() == 2) {
     auto signal_type = As<DistributedTensorType>(args[1]->GetType());
@@ -99,14 +100,10 @@ TypePtr DeduceTensorAllReduceType(const std::vector<ExprPtr>& args,
         << signal_type->dtype_.ToString();
   }
 
-  // Validate `op` kwarg falls in the ReduceOp range — first version supports
-  // kSum only; the other enum values are accepted by the parser binding but
-  // rejected here so users get a clear error rather than silently wrong
-  // codegen.
+  // Validate `op` kwarg falls in the ReduceOp range.
   auto op_value = GetRequiredKwarg<int>(kwargs, "op", "pld.tensor.allreduce");
-  CHECK(op_value == static_cast<int>(ReduceOp::kSum))
-      << "pld.tensor.allreduce op must be ReduceOp.Sum (got int " << op_value
-      << "); Max / Min / Prod lowerings are not yet implemented";
+  CHECK(op_value >= static_cast<int>(ReduceOp::kSum) && op_value <= static_cast<int>(ReduceOp::kProd))
+      << "pld.tensor.allreduce op must be ReduceOp.Sum, Max, Min, or Prod (got int " << op_value << ")";
 
   // Result type: same DistributedTensorType as the input target (in-place
   // reduce — the same view holds the reduced value on every rank). Preserve

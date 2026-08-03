@@ -19,9 +19,12 @@ namespace {
 
 enum class ReduceOp : int32_t {
   kSum = 0,
+  kMax = 1,
+  kMin = 2,
+  kProd = 3,
 };
 
-template <ReduceOp Op, typename DType>
+template <ReduceOp Op>
 void submit_allreduce_kernel(const L2TaskArgs &orch_args) {
   const Tensor &data = orch_args.tensor(0).ref();
   const Tensor &signal = orch_args.tensor(1).ref();
@@ -47,7 +50,7 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const L2TaskArgs &orch_args) {
-  submit_allreduce_kernel<{{op_cpp}}, {{dtype_cpp}}>(orch_args);
+  submit_allreduce_kernel<{{op_cpp}}>(orch_args);
 }
 
 // The sanitized builtin symbol is kept as an alias-like wrapper for easier

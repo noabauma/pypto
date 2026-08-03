@@ -41,33 +41,49 @@ using ir::MakeTuple;
 
 namespace {
 
-std::string AllReduceOpSuffix(int reduce_op) {
+struct AllReduceOpVariant {
+  const char* suffix;
+  const char* cpp;
+  const char* instruction;
+};
+
+AllReduceOpVariant GetAllReduceOpVariant(int reduce_op) {
+  switch (static_cast<ir::ReduceOp>(reduce_op)) {
+    case ir::ReduceOp::kSum:
+      return {"sum", "ReduceOp::kSum", "TADD"};
+    case ir::ReduceOp::kMax:
+      return {"max", "ReduceOp::kMax", "TMAX"};
+    case ir::ReduceOp::kMin:
+      return {"min", "ReduceOp::kMin", "TMIN"};
+    case ir::ReduceOp::kProd:
+      return {"prod", "ReduceOp::kProd", "TMUL"};
+    default:
+      throw pypto::ValueError("unsupported builtin.tensor.allreduce ReduceOp " + std::to_string(reduce_op));
+  }
+}
+
+struct AllReduceDTypeVariant {
+  const char* suffix;
+  const char* cpp;
+};
+
+AllReduceDTypeVariant GetAllReduceDTypeVariant(const DataType& dtype) {
+  if (dtype == DataType::FP16) return {"fp16", "half"};
+  if (dtype == DataType::FP32) return {"fp32", "float"};
+  throw pypto::ValueError("unsupported builtin.tensor.allreduce dtype " + dtype.ToString());
+}
+
+std::string ReduceScatterOpSuffix(int reduce_op) {
   CHECK(reduce_op == static_cast<int>(ir::ReduceOp::kSum))
-      << "builtin.tensor.allreduce variant mangling currently supports only ReduceOp.Sum, got " << reduce_op;
+      << "builtin.tensor.reduce_scatter variant mangling currently supports only ReduceOp.Sum, got "
+      << reduce_op;
   return "sum";
 }
 
-std::string AllReduceOpCpp(int reduce_op) {
+std::string ReduceScatterOpCpp(int reduce_op) {
   CHECK(reduce_op == static_cast<int>(ir::ReduceOp::kSum))
-      << "builtin.tensor.allreduce currently supports only ReduceOp.Sum, got " << reduce_op;
+      << "builtin.tensor.reduce_scatter currently supports only ReduceOp.Sum, got " << reduce_op;
   return "ReduceOp::kSum";
-}
-
-std::string AllReduceDTypeSuffix(const DataType& dtype) {
-  CHECK(dtype == DataType::FP32)
-      << "builtin.tensor.allreduce variant mangling currently supports only FP32, got " << dtype.ToString();
-  return "fp32";
-}
-
-std::string AllReduceDTypeCpp(const DataType& dtype) {
-  CHECK(dtype == DataType::FP32)
-      << "builtin.tensor.allreduce template instantiation currently supports only FP32, got "
-      << dtype.ToString();
-  return "float";
-}
-
-std::string MangleTensorAllReduceVariant(const std::string& op_name, int reduce_op, const DataType& dtype) {
-  return op_name + "__" + AllReduceOpSuffix(reduce_op) + "__" + AllReduceDTypeSuffix(dtype);
 }
 
 std::string Fp32VariantSuffix(const DataType& dtype) {
@@ -206,19 +222,43 @@ REGISTER_DISTRIBUTED_OP(pld_tensor_window, "pld.tensor.window") {
 // ============================================================================
 // builtin.tensor.allreduce: compiler-generated host collective chip dispatch.
 // ============================================================================
+
+std::string EmitAllReduceLikeDispatch(DistributedCodegen& dist_codegen, const CallPtr& op,
+                                      bool include_reduce_inst) {
+  const int reduce_op = op->GetAttr<int>("op");
+  const auto dtype = op->GetAttr<DataType>("dtype");
+  const auto reduce_variant = GetAllReduceOpVariant(reduce_op);
+  const auto dtype_variant = GetAllReduceDTypeVariant(dtype);
+  const std::string variant = op->op_->name_ + "__" + reduce_variant.suffix + "__" + dtype_variant.suffix;
+
+  if (dist_codegen.MarkBuiltinEmitted(variant)) {
+    if (include_reduce_inst) {
+      dist_codegen.RecordBuiltinNextLevel(op, variant,
+                                          {{"op_cpp", reduce_variant.cpp},
+                                           {"reduce_inst", reduce_variant.instruction},
+                                           {"dtype_cpp", dtype_variant.cpp}});
+    } else {
+      dist_codegen.RecordBuiltinNextLevel(op, variant,
+                                          {{"op_cpp", reduce_variant.cpp}, {"dtype_cpp", dtype_variant.cpp}});
+    }
+  }
+  EmitBuiltinWindowCollectiveDispatch(dist_codegen, op, variant);
+  return "";
+}
+
 REGISTER_DISTRIBUTED_OP(builtin_tensor_allreduce, "builtin.tensor.allreduce") {
   auto* dist_codegen = dynamic_cast<DistributedCodegen*>(&codegen);
   INTERNAL_CHECK(dist_codegen) << "builtin.tensor.allreduce codegen requires DistributedCodegen";
-  const int reduce_op = op->GetAttr<int>("op");
-  const auto dtype = op->GetAttr<DataType>("dtype");
-  const std::string variant = MangleTensorAllReduceVariant(op->op_->name_, reduce_op, dtype);
+  return EmitAllReduceLikeDispatch(*dist_codegen, op, /*include_reduce_inst=*/true);
+}
 
-  if (dist_codegen->MarkBuiltinEmitted(variant)) {
-    dist_codegen->RecordBuiltinNextLevel(
-        op, variant, {{"op_cpp", AllReduceOpCpp(reduce_op)}, {"dtype_cpp", AllReduceDTypeCpp(dtype)}});
-  }
-  EmitBuiltinWindowCollectiveDispatch(*dist_codegen, op, variant);
-  return "";
+// ============================================================================
+// builtin.tensor.allreduce_ring: host ring allreduce chip dispatch.
+// ============================================================================
+REGISTER_DISTRIBUTED_OP(builtin_tensor_allreduce_ring, "builtin.tensor.allreduce_ring") {
+  auto* dist_codegen = dynamic_cast<DistributedCodegen*>(&codegen);
+  INTERNAL_CHECK(dist_codegen) << "builtin.tensor.allreduce_ring codegen requires DistributedCodegen";
+  return EmitAllReduceLikeDispatch(*dist_codegen, op, /*include_reduce_inst=*/false);
 }
 
 // ============================================================================
@@ -264,11 +304,11 @@ REGISTER_DISTRIBUTED_OP(builtin_tensor_reduce_scatter, "builtin.tensor.reduce_sc
   const int reduce_op = op->GetAttr<int>("op");
   const auto dtype = op->GetAttr<DataType>("dtype");
   const std::string variant =
-      op->op_->name_ + "__" + AllReduceOpSuffix(reduce_op) + "__" + Fp32VariantSuffix(dtype);
+      op->op_->name_ + "__" + ReduceScatterOpSuffix(reduce_op) + "__" + Fp32VariantSuffix(dtype);
 
   if (dist_codegen->MarkBuiltinEmitted(variant)) {
     dist_codegen->RecordBuiltinNextLevel(
-        op, variant, {{"op_cpp", AllReduceOpCpp(reduce_op)}, {"dtype_cpp", Fp32TypeCpp(dtype)}});
+        op, variant, {{"op_cpp", ReduceScatterOpCpp(reduce_op)}, {"dtype_cpp", Fp32TypeCpp(dtype)}});
   }
   EmitBuiltinWindowCollectiveDispatch(*dist_codegen, op, variant);
   return "";

@@ -48,7 +48,7 @@ import torch
 
 from pypto._external_source import kernel_binary_cache_path
 
-from .elf_parser import extract_text_section
+from .elf_parser import elf_build_id_64, extract_text_section
 from .kernel_compiler import KernelCompiler
 from .task_interface import (
     CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
@@ -477,6 +477,60 @@ def compile_single_orchestration(
 # compile_and_assemble
 # ---------------------------------------------------------------------------
 
+# ``hid`` (ELF Build-ID 64 of an orchestration ``.so``, lowercase hex) → that
+# orchestration's display name (see ``callable_display_name``). The runtime
+# identifies a callable in its ``[STRACE]`` timing markers by this hash alone (it
+# never emits a name), so recording the pairing at assemble time is what lets
+# ``pypto.runtime.benchmark`` label a measured dispatch readably. Process-wide and
+# append-only: ``hid`` is content-derived, so two entries can only collide when
+# the ``.so`` bytes are identical — in which case the name is identical too.
+_CALLABLE_NAMES: dict[str, str] = {}
+
+
+def callable_display_name(orchestration: dict[str, Any]) -> str:
+    """A human-readable, per-program name for an ``ORCHESTRATION`` manifest entry.
+
+    The manifest's ``function_name`` is the fixed AICPU entry symbol the runtime
+    dlsym's — ``aicpu_orchestration_entry`` for *every* program — so it cannot
+    tell two callables apart. The generated source file is named after the
+    orchestration itself (``orchestration/prefill_fwd.cpp``, and for an L3 build
+    its ``next_levels/<name>/`` directory matches), so its stem is the
+    distinguishing name. Falls back to ``function_name`` if ``source`` is absent.
+    """
+    source = orchestration.get("source")
+    return Path(source).stem if source else str(orchestration.get("function_name", ""))
+
+
+def register_callable_identity(orch_so: bytes, name: str) -> str:
+    """Record ``hid → name`` for an orchestration ``.so`` and return the hid.
+
+    *orch_so* must be the exact buffer handed to the runtime (the same bytes it
+    hashes in ``record_device_orch_callable``), so the computed hid matches the
+    ``hid=`` field of that callable's ``[STRACE]`` markers.
+
+    Args:
+        orch_so: Complete orchestration shared-object bytes.
+        name: Display name for the callable — see :func:`callable_display_name`.
+
+    Returns:
+        The callable's hid — :func:`~pypto.runtime.elf_parser.elf_build_id_64`
+        formatted as lowercase hex, matching the marker wire format.
+    """
+    hid = f"{elf_build_id_64(orch_so):x}"
+    _CALLABLE_NAMES.setdefault(hid, name)
+    return hid
+
+
+def callable_name(hid: str) -> str | None:
+    """The orchestration's display name for *hid*, or ``None`` if unknown.
+
+    Returns ``None`` when the callable was not assembled in this process, or on a
+    ``*sim`` platform: the sim host seeds the marker hid with the runtime's
+    ``callable_id`` rather than the ELF Build-ID, so marker hids do not match the
+    hashes recorded here.
+    """
+    return _CALLABLE_NAMES.get(hid.lower())
+
 
 def _missing_kernel_config_error(work_dir: Path) -> FileNotFoundError:
     """Explain why a build output has no runtime manifest."""
@@ -671,12 +725,18 @@ def compile_and_assemble(
 
     # Assemble ChipCallable
     orch_sig = orchestration.get("signature", [])
+    func_name = orchestration["function_name"]
     chip_callable = ChipCallable.build(
         signature=orch_sig,
-        func_name=orchestration["function_name"],
+        func_name=func_name,
         binary=orch_so_binary,
         children=kernel_binaries,
     )
+    # ``orch_so_binary`` is the buffer the runtime hashes into the ``hid=`` of this
+    # callable's [STRACE] markers; pair it with the per-program display name (NOT
+    # ``func_name``, the shared AICPU entry symbol) so benchmark timing can be
+    # attributed to a readable orchestration rather than an opaque hash.
+    register_callable_identity(orch_so_binary, callable_display_name(orchestration))
 
     return chip_callable, runtime_name, runtime_config
 
@@ -695,6 +755,7 @@ def execute_on_device(  # noqa: PLR0913
     *,
     level: int = 2,
     aicpu_thread_num: int | None = None,
+    enable_sdma: bool = False,
     output_prefix: str | None = None,
     enable_l2_swimlane: bool = False,
     enable_dump_args: int = 0,
@@ -724,6 +785,9 @@ def execute_on_device(  # noqa: PLR0913
             user-API support.
         aicpu_thread_num: Number of AICPU threads. ``None`` leaves the
             field unset and uses the simpler runtime default.
+        enable_sdma: Whether the worker must provision the SDMA workspace
+            required by prefetch artifacts. Defaults to ``False`` for legacy,
+            hand-built, and non-prefetch callables.
         output_prefix: Directory under which the runtime writes diagnostic
             artifacts (``l2_swimlane_records.json`` / ``args_dump/`` /
             ``pmu.csv`` / ``deps.json`` / ``scope_stats/``). Required
@@ -797,12 +861,24 @@ def execute_on_device(  # noqa: PLR0913
         cfg.output_prefix = output_prefix
 
     env = runtime_env or {}
-    active = _PyptoWorker.current(level=level, platform=platform, device_id=device_id, runtime=runtime_name)
+    active = _PyptoWorker.current(
+        level=level,
+        platform=platform,
+        device_id=device_id,
+        runtime=runtime_name,
+        require_sdma=enable_sdma,
+    )
     with _temporary_env(env):
         if active is not None:
             active._run_chip(chip_callable, orch_args, cfg)
             return
-        worker = Worker(level=level, device_id=device_id, platform=platform, runtime=runtime_name)
+        worker = Worker(
+            level=level,
+            device_id=device_id,
+            platform=platform,
+            runtime=runtime_name,
+            enable_sdma=enable_sdma,
+        )
         # Prewarm with this dispatch's own config so the single run below hits the
         # prebuilt runtime-arena cache instead of paying the ~800ms cold build
         # inside the timed dispatch. No-op without a prebuilt arena.
@@ -833,7 +909,7 @@ def validate_golden(
     Positions where the golden holds ``NaN`` are treated as *don't-care* and are
     excluded from the comparison. Tests use this to mark output regions that the
     kernel leaves undefined by contract — e.g. the area outside a tile's
-    ``valid_shapes``, or an oversized scratch buffer's unused tail. (The runtime
+    ``valid_shape``, or an oversized scratch buffer's unused tail. (The runtime
     no longer zero-fills pure-output buffers, so such regions hold pooled-allocator
     garbage rather than 0.) A golden with no ``NaN`` compares every element, so this
     is fully backward-compatible.

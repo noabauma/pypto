@@ -20,7 +20,7 @@ the `dst` side via `AsTensorTypeLike` — TGET only needs a writable local GM
 region to receive into, so kernels can TGET directly into host-backed output
 tensors; `src` still requires a window-bound `DistributedTensor`.
 
-There are **twelve ops** and **four ABI enums**:
+There are **thirteen ops** and **four ABI enums**:
 
 | Op | Direction | Result | Hardware |
 | -- | --------- | ------ | -------- |
@@ -34,6 +34,7 @@ There are **twelve ops** and **four ABI enums**:
 | `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite / HOST builtin |
+| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes `min(send_counts[dest], MAX_RECV)` rows per destination into a flat 2D staging window, and publishes that clamped count into peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set) so the receiver can skip unwritten holes; returns window as result (same window-as-result pattern as symmetric `all_to_all`). Rows beyond a sender's count are not transferred, so those window rows keep their prior contents. InCore only — there is no HOST-orchestration lowering | `DistributedTensorType` (same as target) | composite InCore |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 
@@ -92,9 +93,9 @@ enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.t
 | `AtomicType` | `kNone` | plain remote store — overwrite the peer's dst slice |
 | `AtomicType` | `kAdd` | atomically add the source data into the peer's dst slice |
 | `ReduceOp` | `kSum` | sum-reduce every participating rank's window slice |
-| `ReduceOp` | `kMax` | reserved max-reduce variant; lowering pending |
-| `ReduceOp` | `kMin` | reserved min-reduce variant; lowering pending |
-| `ReduceOp` | `kProd` | reserved product-reduce variant; lowering pending |
+| `ReduceOp` | `kMax` | max-reduce every participating rank's window slice |
+| `ReduceOp` | `kMin` | min-reduce every participating rank's window slice |
+| `ReduceOp` | `kProd` | product-reduce every participating rank's window slice |
 
 Each enum is mirrored across three layers (C++ `enum class` → `nb::enum_` in the
 bindings → `.pyi` stub) and surfaced to the DSL as `pld.NotifyOp` /
@@ -273,6 +274,29 @@ region is in bounds (checked on static dims); any dynamic transfer dim requires
 a matching static chunk. Besides `chunk_rows` / `chunk_cols`, `get` accepts no
 keyword attributes.
 
+### `pld.tensor.all_to_all_v`
+
+```text
+pld.tensor.all_to_all_v(
+    input, target, signal, send_counts, recv_counts
+) -> DistributedTensorType(target)
+```
+
+InCore-only variable-size all-to-all (MPI_Alltoallv). Flat 2D layouts:
+
+- `input` — Tensor or DistributedTensor `[NR*MAX_RECV, SIZE]`
+- `target` — DistributedTensor `[NR*MAX_RECV, SIZE]` (window-as-result)
+- `signal` — DistributedTensor INT32 `[NR, 1]` (single-use Set(1)/wait≥1 barrier)
+- `send_counts` — Tensor-like INT32 `[NR]` or `[NR, 1]` (runtime rows per dest)
+- `recv_counts` — DistributedTensor INT32 `[NR, 1]` (InOut recvcounts)
+
+`MAX_RECV = target.shape[0] // NR`. Lowering reads `send_counts[dest]` at
+runtime, clamps to `MAX_RECV`, TPUTs that many rows into the peer window, and
+publishes the **clamped** count into peer `recv_counts[my_rank, 0]` via
+`pld.system.notify` (Set). After the barrier the receiver uses
+`recv_counts[src, 0]` to skip unwritten holes. Rows beyond the count are not
+transferred (window tails keep prior contents).
+
 ### `pld.tensor.allreduce`
 
 ```text
@@ -311,10 +335,21 @@ dynamic physical target dimension is bound from that tensor parameter.
   counter before store-back, preventing write-after-read races.
 - **`"ring"`** — NCCL-style chunked reduce-scatter + allgather schedule with
   O(1) HCCL windows.  Signal shape `[2 * (NR − 1), NR]` (one row per ring
-  round, one cell per rank).  2(P−1) ring steps with per-round barriers
-  (AtomicAdd 1 → Ge 1).  Chunk size = `SIZE // NR`, and `SIZE` must be an exact
-  multiple of `NR`; `LowerCompositeOps` constant-folds the chunk size when both
-  `SIZE` and `NR` are compile-time constants.
+  round, one cell per rank). A packed ND target is viewed as one logical
+  `[1, SIZE]` stream; a partial valid box must be a contiguous row-major
+  prefix. Lowering keeps the full physical
+  `[1, product(target.shape)]` view and records the logical prefix as
+  `TensorView.valid_shape=[1, product(target.valid_shape)]`. FP32 divides
+  `SIZE` with balanced `floor(i * SIZE / NR)` boundaries. FP16 rounds each
+  interior boundary up to 16 elements (32 bytes) and caps it at `SIZE`, so
+  every non-empty segment begins at an MTE-safe address without changing the
+  packed user-visible layout. Empty segments remain legal for very short
+  inputs. Each segment is processed in at most 16-KiB physical subchunks; an
+  FP16 ragged remote tail rounds only its physical read span to 32 bytes and
+  restores the logical `valid_shape` before reduction or store. Every
+  subchunk uses ready and read-complete barriers on the round's monotonic
+  signal row before store-back, preventing write-after-read races while
+  keeping the signal shape unchanged.
 
 Host-orchestrator user code may omit `signal` outside `for` and `while` loops;
 the [`SynthesizeAllReduceSignals`](passes/38-synthesize_allreduce_signals.md)
@@ -326,11 +361,16 @@ loops are rejected because the current signal protocol is single-use. Explicit
 `signal` remains the internal form used by InCore lowering and by tests that
 intentionally construct the internal protocol. Comm-domain materialisation then
 keeps the signal buffer in the same domain as `src`, even when it is not passed
-to a user chip kernel. The public op currently accepts `ReduceOp.Sum` and
-rejects the reserved reduce variants (`Max`, `Min`, `Prod`) until their
-lowerings land. The host builtin lowering path currently supports the `Sum` +
-FP32 variant and accepts either a rank-1 `[world_size]` signal or the
-synthesized rank-2 `[world_size, 1]` signal.
+to a user chip kernel. Mesh, ring, and host-builtin paths support FP16 and FP32
+with `ReduceOp.Sum`, `Max`, `Min`, and `Prod` for arbitrary positive element
+counts. InCore lowering uses UB-bounded chunks; the host builtin uses
+256-element chunks. InCore mesh and ring round only the physical FP16 remote
+tail span to 32 bytes. The host builtin rounds ragged FP16 and FP32 load spans
+to 32 bytes. Both preserve the logical valid shape. The host builtin accepts either a
+rank-1 `[world_size]` signal or the synthesized rank-2 `[world_size, 1]`
+signal. Ring mode (`mode="ring"`) for the host orchestrator lowers to
+`builtin.tensor.allreduce_ring` and requires an explicit rank-2
+`[2 * (NR - 1) + 1, NR]` INT32 signal (one extra row for the return barrier).
 
 ### `pld.system.notify` (TNOTIFY)
 
@@ -360,7 +400,7 @@ Verifier: `signal` must be `DistributedTensorType`; `expected` must be
 ## Shared codegen infrastructure
 
 All five ops lower through PTO codegen helpers in
-`src/backend/common/pto_ops_common.cpp` and `src/codegen/pto/pto_codegen.cpp`.
+`src/backend/common/pto_ops_distributed.cpp` and `src/codegen/pto/pto_codegen.cpp`.
 The reusable pieces — shared so each op's lowering carries no bespoke peer
 arithmetic — are:
 
@@ -402,7 +442,9 @@ dispatches before the final `Simplify`.
   (each likewise dynamic-NR, P=2/P=4),
   `test_l3_tensor_allreduce_intrinsic.py`, `test_l3_tensor_allreduce_ring_intrinsic.py`,
   `test_l3_allreduce_ring.py` (hand-rolled ring RS+AG), `test_l3_host_tensor_allreduce.py`,
-  `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`, and related L3 STs
+  `test_l3_host_tensor_allreduce_ring.py`,
+  `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`,
+  `test_l3_tensor_all_to_all_v_intrinsic.py`, and related L3 STs
   under `tests/st/distributed/`. **Put/get canonical e2e contracts** are now
   enabled: `test_l3_put.py` (ring overwrite, row-offset put, atomic-add put, and
   chunked/pipelined transfers ✅), `test_l3_get.py` (ring read, row-offset get ✅),

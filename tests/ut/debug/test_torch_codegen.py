@@ -286,14 +286,14 @@ def test_tile_load_store():
     tensor = _tensor_var("t", [256, 256])
     offsets = _make_tuple(_int(0), _int(0))
     shapes = _make_tuple(_int(64), _int(64))
-    valid_shapes = _make_tuple(_int(64), _int(64))
+    valid_shape = _make_tuple(_int(64), _int(64))
     tile = _tile_var("tile", [64, 64])
     output = _tensor_var("out", [256, 256])
     off2 = _make_tuple(_int(64), _int(0))
 
     load_call = _op_call(
         "tile.load",
-        [tensor, offsets, shapes, valid_shapes],
+        [tensor, offsets, shapes, valid_shape],
         {"target_memory": ir.MemorySpace.Vec},
     )
     store_call = _op_call("tile.store", [tile, off2, output])
@@ -334,6 +334,78 @@ def test_tile_compute_ops():
     func = _simple_function("f", [a, b], assign)
     code = torch_codegen(func)
     assert "torch.add(a, b)" in code
+
+
+# (op leaf, expected torch snippet) for the integer bitwise / shift family. The
+# reference map registers these for the `tensor` and `tile` prefixes from one shared
+# loop, so both namespaces are asserted below (issue #2216).
+_BITWISE_REFERENCE = [
+    ("and", "torch.bitwise_and(a, b)"),
+    ("or", "torch.bitwise_or(a, b)"),
+    ("xor", "torch.bitwise_xor(a, b)"),
+    ("shl", "(a << b)"),
+    ("shr", "(a >> b)"),
+]
+
+
+@pytest.mark.parametrize(("op_leaf", "expected"), _BITWISE_REFERENCE)
+def test_tensor_bitwise_ops(op_leaf, expected):
+    """Tensor bitwise/shift ops have a torch reference implementation."""
+    a = _tensor_var("a", [64, 64], DataType.INT16)
+    b = _tensor_var("b", [64, 64], DataType.INT16)
+    out = _tensor_var("out", [64, 64], DataType.INT16)
+
+    call = _op_call(f"tensor.{op_leaf}", [a, b])
+    func = _simple_function("f", [a, b], ir.AssignStmt(out, call, _span()))
+    assert expected in torch_codegen(func)
+
+
+@pytest.mark.parametrize(("op_leaf", "expected"), _BITWISE_REFERENCE)
+def test_tile_bitwise_ops_still_covered(op_leaf, expected):
+    """Moving the tile entries into the shared prefix loop must not drop them."""
+    a = _tile_var("a", [64, 64], DataType.INT16)
+    b = _tile_var("b", [64, 64], DataType.INT16)
+    out = _tile_var("out", [64, 64], DataType.INT16)
+
+    # tile.xor takes a trailing scratch operand that the reference ignores.
+    if op_leaf == "xor":
+        tmp = _tile_var("tmp", [64, 64], DataType.INT16)
+        call = _op_call("tile.xor", [a, b, tmp])
+        func = _simple_function("f", [a, b, tmp], ir.AssignStmt(out, call, _span()))
+    else:
+        call = _op_call(f"tile.{op_leaf}", [a, b])
+        func = _simple_function("f", [a, b], ir.AssignStmt(out, call, _span()))
+    assert expected in torch_codegen(func)
+
+
+@pytest.mark.parametrize(
+    ("op_leaf", "expected"),
+    [
+        ("ands", "torch.bitwise_and(a, 3)"),
+        ("ors", "torch.bitwise_or(a, 3)"),
+        ("xors", "torch.bitwise_xor(a, 3)"),
+        ("shls", "(a << 3)"),
+        ("shrs", "(a >> 3)"),
+    ],
+)
+def test_tensor_bitwise_scalar_ops(op_leaf, expected):
+    """The tensor-scalar bitwise/shift forms have a torch reference too."""
+    a = _tensor_var("a", [64], DataType.INT16)
+    out = _tensor_var("out", [64], DataType.INT16)
+
+    call = _op_call(f"tensor.{op_leaf}", [a, ir.ConstInt(3, DataType.INT16, _span())])
+    func = _simple_function("f", [a], ir.AssignStmt(out, call, _span()))
+    assert expected in torch_codegen(func)
+
+
+def test_bitwise_not_reference():
+    """tensor.not / tile.not map to torch.bitwise_not."""
+    for prefix, var_factory in (("tensor", _tensor_var), ("tile", _tile_var)):
+        a = var_factory("a", [64], DataType.INT16)
+        out = var_factory("out", [64], DataType.INT16)
+        call = _op_call(f"{prefix}.not", [a])
+        func = _simple_function("f", [a], ir.AssignStmt(out, call, _span()))
+        assert "torch.bitwise_not(a)" in torch_codegen(func)
 
 
 def test_tile_matmul_acc():
@@ -1202,8 +1274,8 @@ def test_tensor_fillpad_min_uses_valid_shape():
     result = _tensor_var("result", [8, 64], DataType.FP32)
     shapes = _make_tuple(_int(8), _int(64))
     offsets = _make_tuple(_int(0), _int(0))
-    valid_shapes = _make_tuple(_int(8), _int(32))
-    sliced = _op_call("tensor.slice", [src, shapes, offsets, valid_shapes])
+    valid_shape = _make_tuple(_int(8), _int(32))
+    sliced = _op_call("tensor.slice", [src, shapes, offsets, valid_shape])
     padded = _op_call("tensor.fillpad", [sliced], {"pad_value": ir.PadValue.min})
     assign = ir.AssignStmt(result, padded, _span())
     ret = ir.ReturnStmt([result], _span())
@@ -1221,21 +1293,21 @@ def test_tensor_fillpad_min_uses_valid_shape():
 
 
 # ---------------------------------------------------------------------------
-# Test: valid_shapes masking in tile.load
+# Test: valid_shape masking in tile.load
 # ---------------------------------------------------------------------------
 
 
-def test_tile_load_valid_shapes_masks_invalid():
-    """tile.load should zero out data beyond valid_shapes."""
+def test_tile_load_valid_shape_masks_invalid():
+    """tile.load should zero out data beyond valid_shape."""
     tensor = _tensor_var("t", [8, 8])
     offsets = _make_tuple(_int(0), _int(0))
     shapes = _make_tuple(_int(8), _int(8))
-    valid_shapes = _make_tuple(_int(4), _int(4))
+    valid_shape = _make_tuple(_int(4), _int(4))
     tile = _tile_var("tile", [8, 8])
 
     call = _op_call(
         "tile.load",
-        [tensor, offsets, shapes, valid_shapes],
+        [tensor, offsets, shapes, valid_shape],
         {"target_memory": ir.MemorySpace.Vec},
     )
     assign = ir.AssignStmt(tile, call, _span())
@@ -1256,23 +1328,23 @@ def test_tile_load_valid_shapes_masks_invalid():
     assert result[7, 7] == 0.0
 
 
-def test_tile_load_passes_valid_shapes():
-    """tile.load codegen should pass valid_shapes as 4th arg to _tile_load."""
+def test_tile_load_passes_valid_shape():
+    """tile.load codegen should pass valid_shape as 4th arg to _tile_load."""
     tensor = _tensor_var("t", [64, 64])
     offsets = _make_tuple(_int(0), _int(0))
     shapes = _make_tuple(_int(32), _int(32))
-    valid_shapes = _make_tuple(_int(16), _int(16))
+    valid_shape = _make_tuple(_int(16), _int(16))
     tile = _tile_var("tile", [32, 32])
 
     call = _op_call(
         "tile.load",
-        [tensor, offsets, shapes, valid_shapes],
+        [tensor, offsets, shapes, valid_shape],
         {"target_memory": ir.MemorySpace.Vec},
     )
     assign = ir.AssignStmt(tile, call, _span())
     func = _simple_function("f", [tensor], assign)
     code = torch_codegen(func)
-    # Should pass all 4 args including valid_shapes
+    # Should pass all 4 args including valid_shape
     assert "_tile_load(t, (0, 0), (32, 32), (16, 16))" in code
 
 

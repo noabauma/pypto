@@ -191,7 +191,9 @@ def _load_generated_module(path: Path) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _assemble_chip_callables(compiled: DistributedCompiledProgram) -> tuple[dict[str, Any], str]:
+def _assemble_chip_callables(
+    compiled: DistributedCompiledProgram,
+) -> tuple[dict[str, Any], str, bool]:
     """Build a ChipCallable for each chip-level task under ``next_levels/{name}/``.
 
     Driven entirely by the on-disk layout — each ``next_levels/{name}/`` that
@@ -202,6 +204,7 @@ def _assemble_chip_callables(compiled: DistributedCompiledProgram) -> tuple[dict
     """
     chip_callables: dict[str, Any] = {}
     runtime_name: str | None = None
+    enable_sdma = False
     next_levels_dir = compiled.output_dir / "next_levels"
     if next_levels_dir.is_dir():
         for chip_dir in sorted(next_levels_dir.iterdir()):
@@ -212,8 +215,11 @@ def _assemble_chip_callables(compiled: DistributedCompiledProgram) -> tuple[dict
             # heavy device_runner → simpler toolchain import.
             from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
 
-            chip_callable, chip_runtime, _ = compile_and_assemble(chip_dir, compiled.platform)
+            chip_callable, chip_runtime, chip_runtime_config = compile_and_assemble(
+                chip_dir, compiled.platform
+            )
             chip_callables[chip_dir.name] = chip_callable
+            enable_sdma = enable_sdma or bool(chip_runtime_config.get("enable_sdma", False))
             if runtime_name is None:
                 runtime_name = chip_runtime
             elif chip_runtime != runtime_name:
@@ -230,7 +236,7 @@ def _assemble_chip_callables(compiled: DistributedCompiledProgram) -> tuple[dict
         )
     # Non-empty chip_callables guarantees the loop set runtime_name at least once.
     assert runtime_name is not None
-    return chip_callables, runtime_name
+    return chip_callables, runtime_name, enable_sdma
 
 
 # Sentinel attribute that DistributedCodegen sets on the generated host
@@ -309,6 +315,7 @@ def _construct_worker(
     platform: str,
     runtime_name: str,
     num_sub: int,
+    enable_sdma: bool = False,
 ) -> Any:
     """Construct a simpler ``Worker(level=3)`` from the distributed config."""
     from simpler.worker import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
@@ -321,6 +328,7 @@ def _construct_worker(
         num_sub_workers=num_sub,
         platform=platform,
         runtime=runtime_name,
+        enable_sdma=enable_sdma,
     )
 
 
@@ -439,9 +447,11 @@ def _make_call_config(
     / ``enable_scope_stats`` / ``enable_l2_swimlane``) are likewise read from
     *run_config* and written to the shared ``config`` the host_orch chip dispatch
     forwards to every ``orch.submit_next_level``; their artifacts land under
-    *dfx_base* (``<output_dir>/dfx_outputs``). ``enable_l2_swimlane`` co-enables
-    dep_gen so the converter can resolve task arrows / kernel names (see the
-    inline note on the single-pass timing trade-off vs the L2 two-pass).
+    *dfx_base* (``<output_dir>/dfx_outputs``). By default,
+    ``enable_l2_swimlane`` co-enables dep_gen so a single dispatch still has the
+    task graph needed by the converter. Onboard L3 callers use a two-pass
+    graph/timing protocol and set *co_enable_swimlane_dep_gen* false while
+    building the clean timing pass.
 
     Args:
         dc: The program's distributed configuration (baseline).
@@ -450,6 +460,9 @@ def _make_call_config(
         dfx_base: Directory under which DFX artifacts are written
             (``<output_dir>/dfx_outputs``). Required whenever *run_config*
             enables a DFX flag; created if missing.
+        co_enable_swimlane_dep_gen: Whether swimlane implicitly enables
+            dep_gen. The onboard graph pass and simulator single-pass use the
+            default; the onboard clean timing pass disables it.
 
     Returns:
         A fresh simpler ``CallConfig``.
@@ -458,7 +471,7 @@ def _make_call_config(
         ValueError: a DFX flag is enabled but *dfx_base* is ``None``.
     """
     from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        CallConfig,
+        CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     )
 
     call_config = CallConfig()
@@ -476,12 +489,11 @@ def _make_call_config(
             call_config.enable_dump_args = dfx.enable_dump_args
             call_config.enable_pmu = dfx.enable_pmu
             # Swimlane needs ``deps.json`` so the converter can resolve task
-            # arrows / kernel names. The one-shot path runs a clean two-pass
-            # (pass 1 dep_gen → deps.json, pass 2 swimlane → clean records) and
-            # sets ``co_enable_swimlane_dep_gen=False`` on the timing pass so
-            # dep_gen does not perturb it. Everywhere else (the timing-pass-less
-            # single-pass: prepared worker, or sim where conversion is skipped)
-            # co-enable dep_gen so swimlane still has a graph in one dispatch.
+            # arrows / kernel names. Onboard one-shot and prepared paths run a
+            # clean two-pass (pass 1 dep_gen → deps.json, pass 2 swimlane → clean
+            # records) and set ``co_enable_swimlane_dep_gen=False`` on the timing
+            # pass so dep_gen does not perturb it. Simulator and direct
+            # single-pass builders keep the default co-enable behavior.
             # ``enable_l2_swimlane`` is an int (0/1/2), so the ``or``/``and`` chain
             # can yield an int; the ``CallConfig.enable_dep_gen`` pybind setter
             # only accepts ``bool``. Wrap in ``bool(...)`` to avoid a TypeError.
@@ -498,6 +510,60 @@ def _make_call_config(
     return call_config
 
 
+def _run_l3_swimlane_two_pass(
+    dc: DistributedConfig,
+    config: RunConfig,
+    dfx_base: Path,
+    run_pass: Callable[[Any], None],
+) -> None:
+    """Capture the L3 task graph, then run a dep-gen-free timing pass.
+
+    ``run_pass`` owns the execution lifecycle: the one-shot path creates a
+    fresh Worker for each call, while a prepared ``DistributedWorker`` reuses
+    its existing Worker and issues a new ``Worker.run()`` fence. Both paths
+    reset their per-card dispatch counters, so matching graph/timing dispatches
+    land in the same ``rank{r}/d{k}`` directory.
+
+    Both calls execute the program. As with the existing one-shot L3 protocol,
+    mutable arguments are not snapshotted or restored between passes.
+    """
+    import dataclasses  # noqa: PLC0415
+
+    from .bench import (  # noqa: PLC0415
+        _L3_SWIMLANE_GRAPH_BEGIN,
+        _L3_SWIMLANE_GRAPH_END,
+        _L3_SWIMLANE_TIMING_BEGIN,
+        _L3_SWIMLANE_TIMING_END,
+    )
+
+    print(
+        "[swimlane] L3 swimlane enabled -> running the dispatch twice "
+        "(dep_gen perturbs timing, so the graph and the timing are captured separately):"
+    )
+    print("[swimlane] run 1/2: capturing the per-dispatch task graph (deps.json); its timing is discarded.")
+    deps_cfg = dataclasses.replace(
+        config,
+        enable_l2_swimlane=False,
+        enable_dep_gen=True,
+        enable_pmu=0,
+        enable_scope_stats=False,
+        enable_dump_args=0,
+    )
+    print(_L3_SWIMLANE_GRAPH_BEGIN, file=sys.stderr, flush=True)
+    run_pass(_make_call_config(dc, deps_cfg, dfx_base=dfx_base))
+    print(_L3_SWIMLANE_GRAPH_END, file=sys.stderr, flush=True)
+
+    print("[swimlane] run 2/2: measuring clean per-task timing (these are the reported numbers).")
+    # ``benchmark`` and pypto-lib's resident benchmark capture fd 2 around the
+    # prepared worker. Bracketing the blocking timing run lets their shared
+    # parser retain its child-process STRACE records while discarding graph-pass
+    # records, even when each pass has a data-dependent dispatch count.
+    print(_L3_SWIMLANE_TIMING_BEGIN, file=sys.stderr, flush=True)
+    timing_cfg = dataclasses.replace(config, enable_dep_gen=False)
+    run_pass(_make_call_config(dc, timing_cfg, dfx_base=dfx_base, co_enable_swimlane_dep_gen=False))
+    print(_L3_SWIMLANE_TIMING_END, file=sys.stderr, flush=True)
+
+
 # A dispatch's DFX artifacts live at ``<dfx_base>/<rank label>/d{k}``. The
 # producer (``_submit_chip``) and the consumers (``_clear_dfx_dispatch_dirs``,
 # ``_collect_l3_swimlane``) must agree on that scheme, and drift between them is
@@ -506,6 +572,13 @@ def _make_call_config(
 # builder names the producer's half of the contract in one place.
 _RANK_DIR_GLOB = "rank*"
 _DISPATCH_DIR_GLOB = "d[0-9]*"
+
+# Written by ``_submit_chip`` into each dispatch dir and read back by
+# ``_collect_l3_swimlane``. ``rank{w}/d{k}`` records *where* a dispatch ran but not
+# *what* it ran, and a kernel's ``func_id`` only means something within one
+# ``next_levels/<program>`` — so naming a dispatch's tasks needs this marker
+# (issue #2169).
+_DISPATCH_PROGRAM_FILE = "dispatch_program.json"
 
 
 def _dfx_rank_label(worker: int) -> str:
@@ -544,6 +617,53 @@ def _resolve_chip_worker(orch: Any, worker: int | None) -> int:
     return seq % chip_count
 
 
+def _reset_dfx_dispatch_state(orch: Any, chip_cids: dict[str, Any]) -> None:
+    """Reset the per-run dispatch state :func:`_submit_chip` reads off ``orch``.
+
+    ``_dfx_dispatch_idx`` numbers each card's dispatches ``d0, d1, ...`` fresh per
+    run, so the swimlane two-pass files one dispatch under one directory.
+
+    ``_dfx_chip_names`` reverses the registered ``callables`` mapping so
+    ``_submit_chip`` can name the L2 program behind an otherwise opaque
+    ``CallableHandle``. Keyed by ``id()``: the handle is not required to be
+    hashable, and ``chip_cids`` holds every one alive for the whole run, so the
+    ids are stable and unique.
+    """
+    orch._dfx_dispatch_idx = {}
+    orch._dfx_chip_names = {id(cid): name for name, cid in chip_cids.items()}
+
+
+def _record_dispatch_program(orch: Any, callable_id: Any, disp_dir: Path) -> None:
+    """Record which L2 program a dispatch runs, for the swimlane post-pass.
+
+    A kernel's ``func_id`` is a per-L2-program namespace — every
+    ``next_levels/<program>/kernel_config.py`` numbers its kernels from 0 — so
+    labelling a dispatch's records requires knowing the program that produced
+    them. This wrapper is the only place that sees both the dispatch directory
+    and the callable being dispatched, so it stamps the pairing on disk
+    (:data:`_DISPATCH_PROGRAM_FILE`) for :func:`_collect_l3_swimlane` to read
+    back. Going through the filesystem keeps the two halves independent of where
+    the runtime places the L3 orchestrator, and the marker is rewritten
+    identically by both swimlane passes.
+
+    Best-effort: a marker that cannot be written costs kernel labels, never the
+    run. Silent when the caller bypassed :func:`_reset_dfx_dispatch_state` and
+    left no name table on ``orch``.
+    """
+    name = getattr(orch, "_dfx_chip_names", {}).get(id(callable_id))
+    if name is None:
+        return
+    try:
+        disp_dir.mkdir(parents=True, exist_ok=True)
+        (disp_dir / _DISPATCH_PROGRAM_FILE).write_text(json.dumps({"program": name}), encoding="utf-8")
+    except OSError as e:
+        print(
+            f"Could not record the dispatch program for {disp_dir} ({type(e).__name__}: {e}); "
+            "its swimlane falls back to anonymous task labels unless the build has a single "
+            "L2 program"
+        )
+
+
 def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worker: int | None) -> Any:
     """``orch.submit_next_level`` with per-dispatch DFX ``output_prefix`` isolation.
 
@@ -561,8 +681,11 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
     so it never races the already-queued task.
 
     ``k`` comes from a per-card counter on ``orch`` reset at the top of every
-    run (see ``_dispatch.orch_fn``), so the numbering is deterministic and
-    matches across the swimlane two-pass.
+    run (see :func:`_reset_dfx_dispatch_state`), so the numbering is
+    deterministic and matches across the swimlane two-pass. The dispatched
+    program is stamped into the same directory by
+    :func:`_record_dispatch_program`, so the offline post-pass can label the
+    records with the right program's kernel names.
 
     Every dispatch is namespaced ``rank{worker}/d{k}`` by the chip it runs on.
     When DFX is off (``output_prefix`` unset) the call is forwarded unchanged.
@@ -585,6 +708,7 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
     k = idx_map.get(rank_label, 0)
     idx_map[rank_label] = k + 1
     config.output_prefix = f"{base}/{rank_label}/d{k}"
+    _record_dispatch_program(orch, callable_id, Path(config.output_prefix))
     try:
         return orch.submit_next_level(callable_id, task_args, config, worker=worker)
     finally:
@@ -615,21 +739,87 @@ def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
                 shutil.rmtree(disp_dir, ignore_errors=True)
 
 
+def _read_dispatch_program(disp_dir: Path) -> str | None:
+    """Name of the L2 program that ran this dispatch, or ``None`` if unrecorded.
+
+    Reads back the marker :func:`_record_dispatch_program` wrote. A missing or
+    malformed marker is not an error — it only means the labels for this dispatch
+    cannot be resolved (see :func:`_collect_l3_swimlane`).
+    """
+    marker = disp_dir / _DISPATCH_PROGRAM_FILE
+    if not marker.exists():
+        return None
+    try:
+        program = json.loads(marker.read_text(encoding="utf-8"))["program"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return str(program)
+
+
+def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, dict[str, str]]) -> Path | None:
+    """Write *disp_dir*'s ``name_map.json`` from *chip_dir*'s ``kernel_config.py``.
+
+    The map is the one the L2 path synthesises (:func:`~pypto.runtime.runner._write_name_map`),
+    scoped to a single program: ``func_id`` numbering restarts per
+    ``next_levels/<program>``, so merging several programs' tables would silently
+    relabel one program's tasks with another's names (issue #2169).
+
+    *cache* memoises the per-program table across the dispatches that share a
+    program, so each ``kernel_config.py`` is exec'd once per run.
+
+    Returns the written path, or ``None`` when no table could be resolved (the
+    converter then falls back to anonymous ``task(rXtY)`` labels).
+    """
+    program = chip_dir.name
+    if program not in cache:
+        kc = chip_dir / "kernel_config.py"
+        table: dict[str, str] = {}
+        if kc.exists():
+            try:
+                from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+                    load_kernel_config,
+                )
+
+                table = load_kernel_config(str(kc))
+            except Exception as e:  # noqa: BLE001 - best-effort label resolution, never fatal
+                print(
+                    f"Skipping L3 swimlane name_map for {program} ({type(e).__name__}: {e}); "
+                    "its labels fall back to defaults"
+                )
+        cache[program] = table
+    table = cache[program]
+    if not table:
+        return None
+    name_map_path = disp_dir / "name_map.json"
+    name_map_path.write_text(
+        json.dumps({"level": 2, "orchestrator_name": None, "callable_id_to_name": table}, indent=2),
+        encoding="utf-8",
+    )
+    return name_map_path
+
+
 def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
     """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
 
-    The runtime writes ``rank{r}/d{k}/l2_swimlane_records.json`` +
-    ``rank{r}/d{k}/deps.json`` per dispatch (``_submit_chip`` namespaced the dir
-    by card *and* the card's k-th dispatch; dep_gen is co-enabled with
-    swimlane). Globbing ``rank*`` — rather than iterating a rank count — picks up
+    The runtime writes ``rank{r}/d{k}/deps.json`` in the graph pass and
+    ``rank{r}/d{k}/l2_swimlane_records.json`` in the clean timing pass
+    (``_submit_chip`` namespaces the directory by card *and* the card's k-th
+    dispatch, and both passes reset that counter). Globbing ``rank*`` — rather
+    than iterating a rank count — picks up
     whichever cards actually ran, so a comm-less / single-card L3 program (which never
     creates ``rank{0..n}``) still has its records converted. This best-effort
-    post-pass runs the offline ``swimlane_converter`` once per dispatch dir,
-    resolving kernel names from a merged map of every chip callable's
-    ``kernel_config.py`` (``next_levels/*/``). Each dispatch's records are
-    single-chip, so the L2 converter applies unchanged — and a card that ran
-    several (possibly different) programs keeps one swimlane per dispatch instead
-    of overwriting down to the last.
+    post-pass runs the offline ``swimlane_converter`` once per dispatch dir. Each
+    dispatch's records are single-chip, so the L2 converter applies unchanged —
+    and a card that ran several (possibly different) programs keeps one swimlane
+    per dispatch instead of overwriting down to the last.
+
+    Kernel names are resolved **per dispatch**, from the ``kernel_config.py`` of
+    the ``next_levels/<program>`` that :func:`_record_dispatch_program` stamped on
+    that dispatch. ``func_id`` numbering restarts in every program, so a table
+    merged across programs would relabel one program's tasks with another's names
+    — silently and plausibly (issue #2169). A dispatch whose program cannot be
+    resolved is therefore converted with anonymous labels rather than guessed
+    ones, and says so.
 
     Onboard-only: the simulator emits records but not the task metadata the
     converter joins against, so conversion is skipped there (mirrors the L2
@@ -647,19 +837,18 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
 
     # ``glob("*/")`` directory filtering is only reliable on 3.11+; filter
     # explicitly so this works on the 3.10 baseline too.
-    chip_dirs = sorted(d for d in (output_dir / "next_levels").glob("*") if d.is_dir())
-    merged: dict = {}
-    try:
-        from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-            load_kernel_config,
-        )
-
-        for chip_dir in chip_dirs:
-            kc = chip_dir / "kernel_config.py"
-            if kc.exists():
-                merged.update(load_kernel_config(str(kc)))
-    except Exception as e:  # noqa: BLE001 - best-effort label resolution, never fatal
-        print(f"Skipping L3 swimlane name_map ({type(e).__name__}: {e}); labels fall back to defaults")
+    # A ``next_levels/<name>/`` is an L2 program exactly when it carries a
+    # ``kernel_config.py`` — the same test ``_assemble_chip_callables`` applies,
+    # so both halves count the same programs and a stray subdir cannot make the
+    # single-program fallback below look ambiguous.
+    chip_dirs = {
+        d.name: d
+        for d in sorted((output_dir / "next_levels").glob("*"))
+        if d.is_dir() and (d / "kernel_config.py").exists()
+    }
+    # program name -> its ``func_id`` table; filled on first use by
+    # ``_write_dispatch_name_map`` so each config is loaded once per run.
+    name_map_cache: dict[str, dict[str, str]] = {}
 
     dfx_base = output_dir / "dfx_outputs"
     # See the docstring for why we glob rather than iterate a rank count.
@@ -678,19 +867,39 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
             # dispatch must not turn a successful run into a post-processing
             # crash. The raw records remain on disk for manual conversion.
             try:
-                name_map_path: Path | None = None
-                if merged:
-                    name_map_path = disp_dir / "name_map.json"
-                    name_map_path.write_text(
-                        json.dumps(
-                            {"level": 2, "orchestrator_name": None, "callable_id_to_name": merged},
-                            indent=2,
-                        ),
-                        encoding="utf-8",
+                # A dispatch must be rendered from a map this run wrote, so drop
+                # any left by an earlier one before deciding what to write. When
+                # no map is passed, the converter falls back to a sibling
+                # ``name_map*.json``, and a stale one quietly resurrects the
+                # mislabelling below. Doing it here — rather than per branch —
+                # makes that hold whatever the converter's own precedence
+                # between ``--func-names``, ``-k`` and the sibling turns out to be.
+                for stale in disp_dir.glob("name_map*.json"):
+                    stale.unlink(missing_ok=True)
+                program = _read_dispatch_program(disp_dir)
+                if program is None and len(chip_dirs) == 1:
+                    # One L2 program in the build: no ambiguity to resolve, so an
+                    # unmarked dispatch (e.g. artifacts from an older run) can
+                    # still be named correctly.
+                    program = next(iter(chip_dirs))
+                if program is None or program not in chip_dirs:
+                    print(
+                        f"No L2 program recorded for {rank_dir.name}/{disp_dir.name}; converting with "
+                        "anonymous task labels. For real kernel names, re-run: python -m "
+                        "simpler_setup.tools.swimlane_converter "
+                        f"{records} -k {output_dir / 'next_levels'}/<program>/kernel_config.py"
                     )
-                # ``work_dir`` only feeds the converter's ``-k`` fallback; the
-                # merged ``name_map`` passed as ``func_names`` takes precedence.
-                work_dir = chip_dirs[0] if chip_dirs else output_dir
+                    # No ``kernel_config.py`` here, so ``_generate_swimlane``
+                    # omits ``-k`` rather than pointing the converter at another
+                    # program's table.
+                    work_dir: Path = output_dir
+                    name_map_path: Path | None = None
+                else:
+                    # ``work_dir`` feeds the converter's ``-k`` fallback and the
+                    # ``name_map`` passed as ``func_names`` takes precedence —
+                    # both must name the program that ran this dispatch.
+                    work_dir = chip_dirs[program]
+                    name_map_path = _write_dispatch_name_map(disp_dir, work_dir, name_map_cache)
                 _generate_swimlane(work_dir, disp_dir, records, func_names=name_map_path)
             except Exception as e:  # noqa: BLE001 - best-effort post-pass, never fatal
                 print(
@@ -740,8 +949,10 @@ def _dispatch(
         # ``_submit_chip`` numbers a card's dispatches ``d0, d1, ...`` fresh each
         # pass. Two-pass swimlane reissues the same dispatch order, so pass 1
         # (deps.json) and pass 2 (records) land the same dispatch in the same
-        # ``rank{w}/d{k}`` dir — letting the converter join them.
-        orch._dfx_dispatch_idx = {}
+        # ``rank{w}/d{k}`` dir — letting the converter join them. The same call
+        # publishes the callable -> L2 program names ``_submit_chip`` stamps into
+        # each dispatch dir.
+        _reset_dfx_dispatch_state(orch, chip_cids)
         # Comm-less dispatches carry no rank, so ``_resolve_chip_worker`` hands
         # them out round-robin over the program's chips; both the count and the
         # sequence live on ``orch`` so the wrapper stays a pure function of the
@@ -803,7 +1014,7 @@ def execute_distributed(
     dc = compiled._distributed_config
     output_dir = compiled.output_dir
 
-    chip_callables, runtime_name = _assemble_chip_callables(compiled)
+    chip_callables, runtime_name, enable_sdma = _assemble_chip_callables(compiled)
     entry_fn, alloc_fn = _load_orch_entry(output_dir)
 
     # Build tensor mapping from parameter names. Host torch.Tensor inputs must
@@ -849,7 +1060,13 @@ def execute_distributed(
         """
         w = None
         try:
-            w = _construct_worker(dc, compiled.platform, runtime_name, num_sub)
+            w = _construct_worker(
+                dc,
+                compiled.platform,
+                runtime_name,
+                num_sub,
+                enable_sdma=enable_sdma,
+            )
             sub_ids, chip_cids = _register_callables(w, sub_worker_fns, chip_callables)
             # Prewarm with this dispatch's own config so the single run below hits
             # the prebuilt runtime-arena cache instead of paying the ~800ms cold
@@ -875,28 +1092,7 @@ def execute_distributed(
         # Two-pass for clean timing, mirroring the L2 swimlane workflow: dep_gen
         # collection perturbs timing, so the per-dispatch task graph and the kept
         # timing come from separate dispatches.
-        import dataclasses  # noqa: PLC0415
-
-        print(
-            "[swimlane] L3 swimlane enabled -> running the dispatch twice "
-            "(dep_gen perturbs timing, so the graph and the timing are captured separately):"
-        )
-        print(
-            "[swimlane] run 1/2: capturing the per-dispatch task graph (deps.json); its timing is discarded."
-        )
-        deps_cfg = dataclasses.replace(
-            config,
-            enable_l2_swimlane=False,
-            enable_dep_gen=True,
-            enable_pmu=0,
-            enable_scope_stats=False,
-            enable_dump_args=0,
-        )
-        _run_once(_make_call_config(dc, deps_cfg, dfx_base=dfx_base))
-
-        print("[swimlane] run 2/2: measuring clean per-task timing (these are the reported numbers).")
-        timing_cfg = dataclasses.replace(config, enable_dep_gen=False)
-        _run_once(_make_call_config(dc, timing_cfg, dfx_base=dfx_base, co_enable_swimlane_dep_gen=False))
+        _run_l3_swimlane_two_pass(dc, config, dfx_base, _run_once)
     else:
         _run_once(_make_call_config(dc, config, dfx_base=dfx_base))
 
@@ -1097,6 +1293,7 @@ class DistributedWorker(Worker):
             # must exist before ``init()`` forks so the children inherit them.
             runtime_name: str | None = None
             num_sub = 0
+            enable_sdma = False
             # (program, chip_callables, sub_worker_fns) deferred to phase 2 so all
             # registrations happen on one already-constructed worker.
             loaded: list[tuple[DistributedCompiledProgram, dict[str, Any], dict[str, Any]]] = []
@@ -1110,8 +1307,9 @@ class DistributedWorker(Worker):
             consumed: set[str] = set()
             for program_index, prog in enumerate(programs):
                 self._check_compatible(prog, primary)
-                chip_callables, prog_runtime = _assemble_chip_callables(prog)
+                chip_callables, prog_runtime, prog_enable_sdma = _assemble_chip_callables(prog)
                 runtime_name = self._unify_runtime(runtime_name, prog_runtime)
+                enable_sdma = enable_sdma or prog_enable_sdma
                 entry_fn, alloc_fn = _load_orch_entry(prog.output_dir)
                 loaded_subs = _load_sub_worker_fns(prog.output_dir)
                 prog_callbacks = {name: fn for name, fn in callbacks.items() if name in loaded_subs}
@@ -1148,7 +1346,13 @@ class DistributedWorker(Worker):
             # Phase 2: one worker for all programs. Register every program's
             # callables before ``init()`` so the L3 fork inherits the whole
             # registry via COW; each program keeps its own cids in its state.
-            self._w = _construct_worker(self.dc, primary.platform, runtime_name, num_sub)
+            self._w = _construct_worker(
+                self.dc,
+                primary.platform,
+                runtime_name,
+                num_sub,
+                enable_sdma=enable_sdma,
+            )
             self._validate_persistent_runtime_hooks()
             for prog, chip_callables, sub_worker_fns in loaded:
                 sub_ids, chip_cids = _register_callables(self._w, sub_worker_fns, chip_callables)
@@ -1331,7 +1535,7 @@ class DistributedWorker(Worker):
                     program_domains = domains_by_program.get(program_id)
                     if program_domains and self._reset_persistent_windows:
                         self._reset_persistent_domains(orch, program_domains)
-                    orch._dfx_dispatch_idx = {}
+                    _reset_dfx_dispatch_state(orch, request.state["chip_cids"])
                     request.state["entry_fn"](
                         orch,
                         None,
@@ -1688,7 +1892,7 @@ class DistributedWorker(Worker):
     # ------------------------------------------------------------------
 
     def __call__(self, *args: Any, config: RunConfig | None = None) -> None:
-        """Dispatch one run on the primary compiled program, reusing all setup.
+        """Dispatch the primary compiled program, reusing all setup.
 
         Pass one argument per program parameter (in-place). Each argument is
         either:
@@ -1713,7 +1917,12 @@ class DistributedWorker(Worker):
         ``ring_dep_pool``, each a scalar or a per-ring list of 4 ints) size this
         dispatch's runtime ring buffers without
         touching the prepared program's shared config, so consecutive dispatches
-        can use different ring sizes. ``None`` reuses the program's baseline.
+        can use different ring sizes. Its runtime DFX fields are also applied per
+        dispatch. On onboard L3, ``enable_l2_swimlane`` executes the workload
+        twice on the same prepared worker: first with dep-gen only, then with
+        swimlane enabled and dep-gen disabled. Mutable host/resident arguments
+        are not restored between those profiling passes and can therefore be
+        updated twice. ``None`` reuses the program's baseline.
         """
         if self._multi_program:
             raise TypeError(
@@ -1728,11 +1937,13 @@ class DistributedWorker(Worker):
         """Dispatch *compiled* on the shared Worker via its per-program state.
 
         ``config`` is an optional per-dispatch :class:`RunConfig` whose per-task
-        ring-sizing overrides size this dispatch's runtime ring buffers. When
-        given, a fresh ``CallConfig`` is built for this dispatch only (from the
-        program's ``aicpu_thread_num`` baseline plus the ring
-        overrides), leaving the prepared, shared ``call_config`` untouched. When
-        ``None``, the prepared baseline is reused with zero extra allocation.
+        ring sizing and runtime DFX fields apply to this dispatch. When given, a
+        fresh ``CallConfig`` is built from the program's ``aicpu_thread_num``
+        baseline, leaving the prepared shared config untouched. ``None`` reuses
+        that baseline with zero extra allocation. Onboard L3 swimlane capture
+        runs a dep-gen graph pass followed by a dep-gen-disabled timing pass on
+        the same prepared Worker; mutable arguments are not restored between
+        the two executions.
         """
         self._require_open("run")
         from pypto.ir.compiled_program import (  # noqa: PLC0415
@@ -1751,9 +1962,13 @@ class DistributedWorker(Worker):
         # CallConfig for this call only (the prepared, shared one is never
         # mutated). With no RunConfig the prepared baseline is reused as-is.
         call_config = state["call_config"]
+        dfx_base: Path | None = None
+        two_pass_swimlane = False
         if config is not None:
             dfx_base = compiled.output_dir / "dfx_outputs"
-            call_config = _make_call_config(compiled._distributed_config, config, dfx_base=dfx_base)
+            two_pass_swimlane = bool(config.enable_l2_swimlane) and not compiled.platform.endswith("sim")
+            if not two_pass_swimlane:
+                call_config = _make_call_config(compiled._distributed_config, config, dfx_base=dfx_base)
             # This worker reuses one output_dir across dispatches, so stale
             # ``rank*/d{k}`` dirs from an earlier, larger run must be cleared
             # before this run rewrites ``d0, d1, ...`` (see _clear_dfx_dispatch_dirs).
@@ -1795,16 +2010,19 @@ class DistributedWorker(Worker):
                 )
             tensors[info.name] = arg
 
-        self._dispatch_prepared(state, tensors, call_config)
+        if two_pass_swimlane:
+            assert config is not None
+            assert dfx_base is not None
+            _run_l3_swimlane_two_pass(
+                compiled._distributed_config,
+                config,
+                dfx_base,
+                lambda pass_config: self._dispatch_prepared(state, tensors, pass_config),
+            )
+        else:
+            self._dispatch_prepared(state, tensors, call_config)
 
         # Offline post-pass (reads the per-dispatch records on disk; no worker needed).
-        # Note: unlike the one-shot ``execute_distributed`` path, the prepared
-        # worker reuses its forked chip children across dispatches, so it cannot
-        # re-fork between a deps pass and a timing pass without tripping the
-        # per-child ``halHostRegister`` cap (rc 8). It therefore runs swimlane
-        # single-pass (dep_gen co-enabled), so the on-disk records include
-        # dep_gen collection overhead. Use ``execute_distributed`` (one-shot) for
-        # clean two-pass swimlane timing.
         if config is not None and config.enable_l2_swimlane:
             _collect_l3_swimlane(compiled.output_dir, compiled.platform)
 
@@ -1869,11 +2087,12 @@ class DistributedWorker(Worker):
         ``ValueError``.
 
         ``config`` is an optional per-dispatch :class:`RunConfig`; its per-task
-        ring-sizing overrides size this dispatch's runtime ring buffers without
-        touching the prepared program's shared config. In a multi-program worker
-        each program can therefore be dispatched with its own ring sizes (e.g.
-        a larger ``ring_task_window`` for prefill than for decode). ``None``
-        reuses the program's baseline.
+        ring sizing and runtime DFX fields apply without touching the prepared
+        program's shared config. In a multi-program worker each program can
+        therefore use its own ring sizes and diagnostics. On onboard L3,
+        ``enable_l2_swimlane`` executes a dep-gen graph pass followed by a
+        dep-gen-disabled timing pass; mutable arguments are not restored between
+        them. ``None`` reuses the program's baseline.
         """
         return self._run_compiled(compiled, *args, config=config)
 

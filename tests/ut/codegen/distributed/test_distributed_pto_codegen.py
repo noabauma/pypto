@@ -214,7 +214,7 @@ def test_remote_load_rejects_type_only_dynamic_partition_extent():
             )
             return pl.store(tile, [0, 0], out)
 
-    with pytest.raises(Exception, match="depends on unbound symbol 'REMOTE_VALID_N'"):
+    with pytest.raises(ValueError, match="depends on unbound symbol 'REMOTE_VALID_N'"):
         _generate_mlir(P)
 
 
@@ -497,11 +497,9 @@ def test_remote_load_emits_func_call_to_offset_helper_with_addptr_at_call_site()
     assert f"func.call @{helper_name}(" in kernel
     assert "(!pto.ptr<i64>, index) -> index" in kernel, kernel
     assert "pto.addptr" in kernel, "addptr must live at the call site"
-    # The addptr's direct downstream is a make_tensor_view in the same
-    # func — that's what makes PTOAS happy.
+    # The addptr's direct downstream is a make_tensor_view in the same func —
+    # that's what makes PTOAS happy.
     addptr_line_idx = next(i for i, line in enumerate(kernel.splitlines()) if "pto.addptr" in line)
-    # The next non-trivial line should be a make_tensor_view (allowing one
-    # arith.muli in between for the dynamic stride[0] computation).
     following = "\n".join(kernel.splitlines()[addptr_line_idx + 1 : addptr_line_idx + 4])
     assert "pto.make_tensor_view" in following, (
         f"addptr must be followed shortly by make_tensor_view, but next lines were:\n{following}"
@@ -671,6 +669,108 @@ def test_remote_load_peer_view_preserves_explicit_tensor_view_layout_and_strides
     assert "{layout = #pto.layout<dn>}" in peer_view_line, peer_view_line
 
 
+def test_remote_load_peer_view_matches_column_vector_layout():
+    """A column-vector peer view uses the same forced-DN metadata as its local view."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[1, 1], pl.FP32],
+            out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            tile = pld.tile.remote_load(
+                data,
+                peer=peer,
+                offsets=[0, 0],
+                shape=[8, 1],
+                valid_shape=[1, 1],
+            )
+            return pl.store(tile, [0, 0], out)
+
+    mlir = _generate_mlir(P)
+    funcs = _split_module(mlir)
+    kernel = funcs["kernel"]
+    addptr_line = next(line for line in kernel.splitlines() if "pto.addptr %arg0" in line)
+    peer_ptr = re.search(r"(%\d+) = pto\.addptr", addptr_line)
+    assert peer_ptr is not None, addptr_line
+    peer_view_line = next(
+        line for line in kernel.splitlines() if f"pto.make_tensor_view {peer_ptr.group(1)}" in line
+    )
+    assert "shape = [%c1_index, %c1_index]" in peer_view_line, peer_view_line
+    assert "strides = [%c1_index, %c1_index]" in peer_view_line, peer_view_line
+    assert "{layout = #pto.layout<dn>}" in peer_view_line, peer_view_line
+
+
+def test_remote_load_peer_view_respects_explicit_nd_column_vector_view():
+    """An explicit ND identity view overrides the default column-vector convention."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[8, 1], pl.FP32],
+            out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            viewed: pld.DistributedTensor[
+                [8, 1],
+                pl.FP32,
+                pl.TensorView(stride=[1, 1], layout=pl.TensorLayout.ND),
+            ] = pl.tensor.view(data, [8, 1], layout=pl.TensorLayout.ND)
+            tile = pld.tile.remote_load(
+                viewed,
+                peer=peer,
+                offsets=[0, 0],
+                shape=[8, 1],
+                valid_shape=[8, 1],
+            )
+            return pl.store(tile, [0, 0], out)
+
+    mlir = _generate_mlir(P)
+    funcs = _split_module(mlir)
+    kernel = funcs["kernel"]
+    addptr_line = next(line for line in kernel.splitlines() if "pto.addptr %arg0" in line)
+    peer_ptr = re.search(r"(%\d+) = pto\.addptr", addptr_line)
+    assert peer_ptr is not None, addptr_line
+    peer_view_line = next(
+        line for line in kernel.splitlines() if f"pto.make_tensor_view {peer_ptr.group(1)}" in line
+    )
+    assert "shape = [%c8_index, %c1_index]" in peer_view_line, peer_view_line
+    assert "strides = [%c1_index, %c1_index]" in peer_view_line, peer_view_line
+    assert "{layout = #pto.layout<nd>}" in peer_view_line, peer_view_line
+
+
+def test_remote_store_rank3_implicit_column_vector_matches_local_view_strides():
+    """Rank-3 implicit column-vector peer and local views use identical DN strides."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            inp: pl.Tensor[[3, 1], pl.FP32],
+            data: pld.DistributedTensor[[2, 3, 1], pl.FP32],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            tile = pl.load(inp, [0, 0], [3, 1])
+            pld.tile.remote_store(tile, data, peer=peer, offsets=[0, 0, 0])
+
+    mlir = _generate_mlir(P)
+    kernel = _split_module(mlir)["kernel"]
+    rank3_views = [
+        line
+        for line in kernel.splitlines()
+        if "pto.make_tensor_view" in line and "shape = [%c2_index, %c3_index, %c1_index]" in line
+    ]
+    assert len(rank3_views) == 2, kernel
+    assert all("strides = [%c3_index, %c1_index, %c1_index]" in line for line in rank3_views), rank3_views
+    assert all("{layout = #pto.layout<dn>}" in line for line in rank3_views), rank3_views
+
+
 def test_notify_emits_comm_tnotify_with_attr():
     """notify codegen emits pto.comm.tnotify with #pto<notify_op …> attr."""
 
@@ -687,6 +787,11 @@ def test_notify_emits_comm_tnotify_with_attr():
     mlir = _generate_mlir(P)
     assert "pto.comm.tnotify(" in mlir
     assert "#pto<notify_op set>" in mlir
+    lines = mlir.splitlines()
+    notify_idx = next(i for i, line in enumerate(lines) if "pto.comm.tnotify(" in line)
+    assert "pto.barrier <PIPE_ALL>" in lines[notify_idx - 1], (
+        f"expected a PIPE_ALL drain immediately before tnotify, got: {lines[notify_idx - 1]}"
+    )
     # AtomicAdd variant should also lower correctly.
 
     @pl.program
@@ -701,6 +806,42 @@ def test_notify_emits_comm_tnotify_with_attr():
 
     mlir_add = _generate_mlir(PAdd)
     assert "#pto<notify_op atomic_add>" in mlir_add
+
+
+def test_remote_store_cacheinvalid_fence_before_releasing_notify():
+    """A remote_store followed by a notify lowers to a peer-region
+    ``pto.cmo.cacheinvalid`` + GM ``pto.fence.barrier_all`` (emitted by the
+    remote_store codegen at the peer address), in that order, before the
+    ``pto.comm.tnotify`` that releases it (data-before-signal)."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            inp: pl.Tensor[[1, 32], pl.FP32],
+            dst: pld.DistributedTensor[[1, 32], pl.FP32],
+            signal: pld.DistributedTensor[[16, 16], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            local = pl.load(inp, [0, 0], [1, 32])
+            pld.tile.remote_store(local, target=dst, peer=peer, offsets=[0, 0])
+            pld.system.notify(signal, peer=peer, offsets=[0, 0], value=1, op=pld.NotifyOp.Set)
+
+    mlir = _generate_mlir(P)
+    lines = mlir.splitlines()
+    store_idx = next(i for i, line in enumerate(lines) if "pto.tstore" in line)
+    cinv_idx = next(i for i, line in enumerate(lines) if "pto.cmo.cacheinvalid" in line)
+    fence_idx = next(i for i, line in enumerate(lines) if "pto.fence.barrier_all" in line)
+    tnotify_idx = next(i for i, line in enumerate(lines) if "pto.comm.tnotify(" in line)
+    # Order: publishing store -> cacheinvalid -> GM fence -> tnotify.
+    assert store_idx < cinv_idx < fence_idx < tnotify_idx, (
+        f"expected store({store_idx}) < cacheinvalid({cinv_idx}) < fence({fence_idx}) "
+        f"< tnotify({tnotify_idx})"
+    )
+    assert "#pto.fence_scope<gm>" in lines[fence_idx], lines[fence_idx]
+    # Whole-tensor cacheinvalid: the region form addresses the dst via a partition view.
+    assert "single_cache_line" in lines[cinv_idx], lines[cinv_idx]
 
 
 def test_wait_emits_comm_twait_with_attr():
@@ -761,6 +902,58 @@ def test_notify_value_type_matches_value_ir_dtype():
     # The element type tag inside the partition_tensor_view is the signal dtype
     # (i32) — confirm it survived the lowering.
     assert "!pto.partition_tensor_view<1x1xi32>" in tnotify_line
+
+
+def test_wait_casts_loop_induction_expected_to_i32():
+    """A pl.range loop induction variable used as ``expected`` is cast to i32.
+
+    ``pl.range``'s induction variable defaults to DataType.INDEX; arithmetic
+    on it (``step + 1``) stays INDEX. PTOAS's TWaitOp declares ``cmpValue``
+    as AnySignlessInteger with a 32-bit-width verifier check, so an
+    uncast ``index`` operand fails to parse ("invalid kind of type
+    specified"). Regression for issue #2222.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            signal: pld.DistributedTensor[[16, 16], pl.INT32],
+        ):
+            for step in pl.range(4):
+                pld.system.wait(signal, offsets=[0, 0], expected=step + 1, cmp=pld.WaitCmp.Ge)
+
+    mlir = _generate_mlir(P)
+    twait_line = next(line for line in mlir.splitlines() if "pto.comm.twait(" in line)
+    assert twait_line.rstrip().endswith("i32) {cmp = #pto<wait_cmp ge>}"), twait_line
+    body = mlir.split("func.func @kernel", 1)[1]
+    assert "arith.index_cast" in body and "to i32" in body, body
+
+
+def test_notify_casts_loop_induction_value_to_i32():
+    """A pl.range loop induction variable used as ``value`` is cast to i32.
+
+    Same root cause as ``test_wait_casts_loop_induction_expected_to_i32``,
+    for TNotifyOp's ``value`` operand. Regression for issue #2222.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            signal: pld.DistributedTensor[[16, 16], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            for step in pl.range(4):
+                pld.system.notify(signal, peer=peer, offsets=[0, 0], value=step + 1, op=pld.NotifyOp.Set)
+
+    mlir = _generate_mlir(P)
+    tnotify_line = next(line for line in mlir.splitlines() if "pto.comm.tnotify(" in line)
+    assert tnotify_line.rstrip().endswith("i32) {notifyOp = #pto<notify_op set>}"), tnotify_line
+    body = mlir.split("func.func @kernel", 1)[1]
+    assert "arith.index_cast" in body and "to i32" in body, body
 
 
 def test_get_comm_ctx_emits_no_mlir_aliases_ctx_arg():
@@ -1051,13 +1244,15 @@ def test_put_chunk_shrinks_staging_tile_keeping_full_partition_view():
     assert "rows=4" in stage_alloc_line and "cols=32" in stage_alloc_line, (
         f"staging tile must be the [4, 32] chunk, got: {stage_alloc_line}"
     )
-    # A drain barrier is emitted immediately after the tput so a following
-    # cross-rank notify can't race the chunked stores (PTOAS#872 workaround).
+    # After the tput: a tail `pto.barrier <PIPE_ALL>` to drain the DMA pipe (the GM
+    # fence does not drain the MTE pipe — without this, atomic/subregion put flakes
+    # on device), then the peer-region `pto.cmo.cacheinvalid` + GM
+    # `pto.fence.barrier_all` (data-before-signal at the peer address).
     lines = mlir.splitlines()
     tput_idx = next(i for i, line in enumerate(lines) if "pto.comm.tput(" in line)
-    assert "pto.barrier <PIPE_ALL>" in lines[tput_idx + 1], (
-        f"expected a PIPE_ALL drain right after tput, got: {lines[tput_idx + 1]}"
-    )
+    assert "pto.barrier <PIPE_ALL>" in lines[tput_idx + 1], lines[tput_idx + 1]
+    assert "pto.cmo.cacheinvalid" in lines[tput_idx + 2], lines[tput_idx + 2]
+    assert "pto.fence.barrier_all #pto.fence_scope<gm>" in lines[tput_idx + 3], lines[tput_idx + 3]
 
 
 def test_put_pipeline_emits_two_staging_buffers_in_one_buf_group():

@@ -657,13 +657,13 @@ class TensorToTileMutator : public TypePropagatingMutator {
 
     const auto& shape_arg = call->args_[1];
     const auto& offset_arg = call->args_[2];
-    ExprPtr valid_shapes = (call->args_.size() == 4) ? call->args_[3] : shape_arg;
+    ExprPtr valid_shape = (call->args_.size() == 4) ? call->args_[3] : shape_arg;
 
     // The consumer-driven load is always natural; a transposed (b_trans/a_trans)
     // operand gets a zero-copy tile.transpose_view at the matmul site instead.
     std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space}};
     auto load_call =
-        MarkCompilerMatBridge(op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shapes},
+        MarkCompilerMatBridge(op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shape},
                                                   load_kwargs, call->span_),
                               req.space);
 
@@ -913,6 +913,18 @@ ExprPtr GetWriteTargetExpr(const CallPtr& call) {
   if (IsOp(call, "pld.tensor.broadcast") && !call->args_.empty()) {
     return call->args_[0];
   }
+  // pld.tensor.all_to_all(input, target, signal): 3-arg push-based
+  // window-as-result.  target (args_[1]) receives peers' writes via TPUT.
+  if (IsOp(call, "pld.tensor.all_to_all") && call->args_.size() >= 2) {
+    return call->args_[1];
+  }
+  // pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts):
+  // 5-arg variable-size push-based window-as-result.  target (args_[1]) receives
+  // peers' writes; recv_counts (args_[4]) receives per-source valid-row counts;
+  // send_counts is read-only.
+  if (IsOp(call, "pld.tensor.all_to_all_v") && call->args_.size() >= 2) {
+    return call->args_[1];
+  }
   return nullptr;
 }
 
@@ -1112,6 +1124,24 @@ void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, st
       auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
       MarkAccess(origins, has_read);
       MarkAccess(origins, has_write);
+    }
+    return;
+  }
+
+  if (IsOp(call, "pld.tensor.all_to_all") || IsOp(call, "pld.tensor.all_to_all_v")) {
+    // Push-based window-as-result: input (arg[0]) is read-only (Tensor or
+    // DistributedTensor); target (arg[1]) receives peer writes via TPUT and
+    // is returned in-place; signal (arg[2]) is read+written by notify/wait.
+    // all_to_all_v carries two more operands — send_counts (arg[3], read-only
+    // via ``tensor.read``) and recv_counts (arg[4], written by peer count
+    // notify) — so only arg[3] stays read-only among the trailing operands.
+    for (size_t i = 0; i < call->args_.size(); ++i) {
+      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
+      MarkAccess(origins, has_read);
+      const bool is_write_target = (i == 1 || i == 2 || (IsOp(call, "pld.tensor.all_to_all_v") && i == 4));
+      if (is_write_target) {
+        MarkAccess(origins, has_write);
+      }
     }
     return;
   }

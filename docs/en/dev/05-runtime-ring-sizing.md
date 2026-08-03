@@ -95,9 +95,10 @@ with compiled.prepare(prefill_cfg) as rt:              # setup once + prewarm
 compiled(a, b, c, config=RunConfig(platform="a2a3", ring_heap=8 * 1024 * 1024))
 ```
 
-On the L3 dispatch path only the `ring_*` fields of `RunConfig` are consumed;
-the compile-side and DFX fields are ignored (they are set at compile / prepare
-time, not per dispatch).
+The L3 dispatch path consumes both the `ring_*` fields and runtime DFX fields
+from `RunConfig`. DFX artifacts are namespaced under
+`<output_dir>/dfx_outputs/rank{r}/d{k}/`; see
+[Runtime DFX](03-runtime-dfx.md). Other compile-side fields are ignored.
 
 Set only the fields you want to override; the rest stay unset and fall back per
 the precedence above.

@@ -214,8 +214,8 @@ def replay(
     print("[execute] running on device...")
     if is_l3:
         # L3: reconstruct the distributed program from the build dir and dispatch
-        # via simpler Worker(level=3). DFX flags on ``config`` are not yet plumbed
-        # through the distributed dispatch path (tracked separately).
+        # via simpler Worker(level=3); per-dispatch ring and DFX settings are
+        # forwarded through its CallConfig.
         from pypto.runtime.distributed_runner import (  # noqa: PLC0415
             execute_distributed_compiled,
         )

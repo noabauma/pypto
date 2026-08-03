@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-Decomposes composite tile / distributed ops into compositions of primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and distributed primitives, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). Mesh allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window. New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
+Decomposes composite tile / distributed ops into compositions of primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.maximum`, `tile.minimum`, `tile.cast`) and distributed primitives, so codegen never has to emit a high-level intrinsic. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner) and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). Mesh and ring allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window. New composite ops add a lowering rule to the dispatch table inside the pass file without touching the dispatcher.
 
 ## Overview
 
@@ -8,9 +8,9 @@ Decomposes composite tile / distributed ops into compositions of primitive tile 
 
 Host-orchestrator `pld.tensor.allreduce` calls are skipped by this pass: `SynthesizeAllReduceSignals` first normalizes optional-signal host calls to the explicit-signal form, `MaterializeCommDomainScopes` places the data and signal windows into comm domains, and then `LowerHostTensorCollectives` lowers them to internal builtin dispatches.
 
-The pass is **FP32-only**. Non-FP32 inputs are rejected at op-construction time by the shared `DeduceTileFP32OnlyType` deducer (see `src/ir/op/tile_ops/unary.cpp:94`), so the lowering pass itself only sees well-typed FP32 operands and never has to fail on dtype.
+The `tile.sin` / `tile.cos` rules are **FP32-only**. Non-FP32 trig inputs are rejected at op-construction time by the shared `DeduceTileFP32OnlyType` deducer (see `src/ir/op/tile_ops/unary.cpp:94`), so those rules only see well-typed FP32 operands. Distributed rules have their own dtype contracts; allreduce supports FP16 and FP32 as documented below.
 
-The pass is **structural no-op** on programs that contain no registered composite call such as `tile.sin`, `tile.cos`, or `pld.tensor.*` distributed collectives: every other statement passes through `IRMutator::VisitStmt_`. The decomposition emits only primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.cast`) and distributed primitives, none of which the mutator rewrites — so the pass is also **idempotent**.
+The pass is **structural no-op** on programs that contain no registered composite call such as `tile.sin`, `tile.cos`, or `pld.tensor.*` distributed collectives: every other statement passes through `IRMutator::VisitStmt_`. The decomposition emits only primitive tile ops (`tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.maximum`, `tile.minimum`, `tile.cast`) and distributed primitives, none of which the mutator rewrites — so the pass is also **idempotent**.
 
 **Requires**: nothing.
 
@@ -18,7 +18,7 @@ The pass is **structural no-op** on programs that contain no registered composit
 
 **Invalidates**: nothing.
 
-The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/pypto/ir/transforms/pass_properties.h`) reflects that the lowering operates within the existing tile/distributed vocabulary plus shape-only tensor views (`tensor.view`) used to expose canonical flattened windows; it neither establishes nor breaks any `IRProperty`.
+The empty `PassProperties` contract (`kLowerCompositeOpsProperties` in `include/pypto/ir/transforms/pass_properties.h`) reflects that the lowering operates within the existing tile/distributed vocabulary plus metadata-only tensor views (`tensor.view`) used to expose canonical flattened windows; a partial-prefix ring view also carries a flattened `valid_shape`. The pass neither establishes nor breaks any `IRProperty`.
 
 ## When It Runs
 
@@ -31,7 +31,8 @@ The pass is a single translation unit, `src/ir/transforms/lower_composite_ops_pa
 ```text
 src/ir/transforms/lower_composite_ops_pass.cpp
   LoweringBuilder           — per-call scratchpad (Bind + primitive tile-op builders:
-                              tile.muls, tile.adds, tile.add, tile.sub, tile.mul, tile.cast
+                              tile.muls, tile.adds, tile.add, tile.sub, tile.mul,
+                              tile.maximum, tile.minimum, tile.cast
                               + structured control-flow: EmitFor / EmitForReduce
                               / EmitIf / EmitIfExpr + NotEq scalar guard)
   CompositeLoweringFn       — (call, visited_args, builder) -> result expr
@@ -183,11 +184,11 @@ All constants are FP32 literals (the `k*` literals near the top of `src/ir/trans
 
 ## Idempotency
 
-Running `LowerCompositeOps` twice produces identical IR after the first run: the tile recipes emit only `tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, and `tile.cast`, while the distributed recipes emit only the distributed primitives listed below. The mutator only rewrites registered composite calls (`tile.sin`, `tile.cos`, `pld.tensor.*` distributed collectives, ...), so the second invocation visits the body and changes nothing. This is verified by the sin/cos and distributed-collective idempotency tests in `tests/ut/ir/transforms/test_lower_composite_ops.py`.
+Running `LowerCompositeOps` twice produces identical IR after the first run: the recipes emit only primitives such as `tile.muls`, `tile.adds`, `tile.add`, `tile.sub`, `tile.mul`, `tile.maximum`, `tile.minimum`, and `tile.cast`, plus the distributed primitives listed below. The mutator only rewrites registered composite calls (`tile.sin`, `tile.cos`, `pld.tensor.*` distributed collectives, ...), so the second invocation visits the body and changes nothing. This is verified by the sin/cos and distributed-collective idempotency tests in `tests/ut/ir/transforms/test_lower_composite_ops.py`.
 
 ## `pld.tensor.*` distributed collectives
 
-The pass also lowers the `pld.tensor.*` family of window-bound distributed collectives. Each collective is a single composite `Call` that expands into a notify / wait + data-movement recipe. The data-movement primitive differs by op: `allgather` uses `pld.tile.put` (TPUT-based, auto-chunks through a VEC staging tile), `broadcast` relocates window data with `pld.tile.get` (GM→GM copy), while `allreduce` and `reduce_scatter` pull peer chunks into a UB tile with `pld.tile.remote_load` and accumulate with `tile.add`. The rules share the same signal-buffer discipline: a window-bound INT32 `signal` matrix is used as a cross-rank barrier, and the buffer is **single-shot per call**.
+The pass also lowers the `pld.tensor.*` family of window-bound distributed collectives. Each collective is a single composite `Call` that expands into a notify / wait + data-movement recipe. The data-movement primitive differs by op: `allgather` uses `pld.tile.put` (TPUT-based, auto-chunks through a VEC staging tile), `broadcast` relocates window data with `pld.tile.get` (GM→GM copy), while `allreduce` and `reduce_scatter` pull peer chunks into a UB tile with `pld.tile.remote_load`. Allreduce selects `tile.add`, `tile.maximum`, `tile.minimum`, or `tile.mul`; reduce-scatter currently accumulates with `tile.add`. The rules share the same signal-buffer discipline: a window-bound INT32 `signal` matrix is used as a cross-rank barrier, and the buffer is **single-shot per call**.
 
 ### `pld.tensor.allreduce`
 
@@ -195,13 +196,16 @@ The allreduce rule starts with a cross-rank ready barrier on shared `signal` cel
 
 For a fully-valid packed target, mesh lowering creates a logical `[1, product(all dimensions)]` view and traverses it with physical tiles of at most 16 KiB. A statically known extent smaller than the budget shrinks the chunk to the smallest 32-byte-aligned physical width that covers it, so small allreduces do not reserve a full 16-KiB tile while remaining legal PTO tiles. The tail carries `valid_shape=[1, min(chunk, remaining)]` through both `tile.load` and `pld.tile.remote_load`, so the allocation stays static while the read/store extent is exact. If an ND target carries a partial `TensorView.valid_shape`, the pass preserves and reduces the representable `[rows, cols]` rectangle through the established single-rectangle path. Constant valid rectangles use their compact shape; symbolic valid extents fall back to the source's physical rectangle when that statically bounded rectangle fits within one 16-KiB chunk. Oversized partial rectangles, strided targets, DN partial views, and partial boxes that cannot be represented by the leading-dimension collapse are rejected explicitly.
 
+Ring lowering uses one packed 2D view for its reduce-scatter and allgather phases. A fully valid target becomes `[1, SIZE]`; a contiguous partial prefix keeps physical shape `[1, product(target.shape)]` and carries logical `TensorView.valid_shape=[1, product(target.valid_shape)]`. FP32 retains balanced `floor(i * SIZE / NR)` segment boundaries. FP16 rounds each interior boundary up to 16 elements and caps it at `SIZE`; consequently every non-empty segment and every UB subchunk starts at a 32-byte-aligned address. A ragged FP16 remote load may read the aligned physical tail reserved by the communication domain, then `tile.set_validshape` restores the logical extent before reduction and store. This supports non-divisible inputs and `SIZE < NR` without inserting holes into the public tensor layout.
+
 Any symbolic target or partial-valid extent that survives lowering must be runtime-bound by a kernel scalar, loop variable, or physical tensor-shape parameter; a type-metadata-only symbol is rejected during PTO codegen. A fully dynamic physical target dimension is bound from that tensor parameter.
 
 **Signal buffers must NOT be reused for back-to-back allreduce calls.** A stale positive counter in any waited-on non-self row would let the next call's Phase 2b `wait ≥1` pass immediately on the leftover value, breaking the barrier and racing the next Phase 3 reads against the previous reduction's stores. Callers issuing multiple allreduces must allocate a fresh signal buffer (via `alloc_window_buffer` + `window`) for each call. The user-facing DSL docstring at `python/pypto/language/distributed/op/tensor_ops.py::allreduce` carries the same warning.
 
 `kGe` (not `kEq`) is the load-bearing choice for every wait predicate. Each waited-on cell is monotonically increasing within a single call, so a slow rank may first poll after a faster peer has already advanced it beyond that wait's expected value. Equality would then deadlock; greater-than-or-equal does not.
 
-Only `ReduceOp::kSum` is supported in the first version; the C++ deducer rejects `Max` / `Min` / `Prod`.
+Mesh and ring lowering support FP16 and FP32 with `ReduceOp::kSum`, `kMax`,
+`kMin`, and `kProd` for arbitrary positive element counts.
 
 ### `pld.tensor.allgather`
 

@@ -53,6 +53,13 @@ def remote_load(
     is a *remote* slice of a window-bound :class:`pld.DistributedTensor`.
     Address translation happens at codegen via ``CommRemoteOffset`` + addptr + make_tensor_view.
 
+    .. code-block:: python
+
+       # Barrier example — after notify/wait, all windows are visible.
+       peer_tile = pld.tile.remote_load(
+           data, peer=peer, offsets=[0, 0], shape=[1, SIZE]
+       )
+
     All arguments are positional-or-keyword (mirroring :func:`pl.tile.load`),
     so the printed IR — which emits them positionally — round-trips through
     the parser. Callers may still pass them by keyword for readability.
@@ -72,7 +79,6 @@ def remote_load(
             inference must be runtime-bound by a kernel scalar, loop variable,
             or physical tensor-shape parameter; a type-metadata-only symbol is
             rejected during PTO codegen.
-
     Returns:
         A local :class:`pl.Tile` of the requested shape, dtype equal to
         ``target.dtype``.
@@ -97,6 +103,33 @@ def remote_load(
     return Tile(expr=call)
 
 
+def _remote_load_with_physical_tail_padding(
+    target: DistributedTensor,
+    peer: IntLike,
+    offsets: Sequence[IntLike],
+    shape: Sequence[IntLike],
+    valid_shape: Sequence[IntLike],
+) -> Tile:
+    """Reparse a compiler-generated aligned FP16 remote-load tail."""
+    target_expr = _unwrap(target)
+    if not isinstance(target_expr, Expr) or not isinstance(target_expr.type, _ir.DistributedTensorType):
+        got = (
+            _ir.python_print_type(target_expr.type)
+            if isinstance(target_expr, Expr)
+            else type(target_expr).__name__
+        )
+        raise TypeError(f"pld.tile.remote_load expects a DistributedTensor target (window-bound); got {got}")
+
+    call = _ir_tile._remote_load_with_physical_tail_padding(
+        target_expr,
+        _unwrap(peer),
+        _normalize_intlike(offsets),
+        _normalize_intlike(shape),
+        _normalize_intlike(valid_shape),
+    )
+    return Tile(expr=call)
+
+
 def remote_store(
     src_tile: Tile,
     target: DistributedTensor,
@@ -109,6 +142,13 @@ def remote_store(
     destination is a *remote* slice of a window-bound
     :class:`pld.DistributedTensor`. Address translation happens at codegen
     via ``CommRemoteOffset`` + addptr + make_tensor_view.
+
+    .. code-block:: python
+
+       # Write a computed tile into peer rank 1's data window.
+       pld.tile.remote_store(tile, data, peer=1, offsets=[0, 0])
+       # remote_store is a raw write with no synchronization of its own —
+       # pair it with pld.system.notify()/wait() to signal completion.
 
     All arguments are positional-or-keyword (mirroring :func:`pl.tile.store`),
     so the printed IR — which emits them positionally — round-trips through

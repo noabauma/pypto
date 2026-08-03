@@ -230,9 +230,11 @@ std::vector<std::pair<std::string, std::any>> ConvertAttrsFromPython(const nb::o
   } else {
     throw pypto::TypeError("attrs must be a dict, list of (key, value) tuples, or None");
   }
-  // Ergonomic auto-wrap: Function attrs["core_num"] is typed as ExprPtr, but
-  // users and text-parser reparse sites commonly supply a plain int — wrap it
-  // as ConstInt(DataType::INDEX) so the codegen-side ExprPtr read is uniform.
+  // Ergonomic auto-wrap: attrs["core_num"] is typed as ExprPtr, but users and
+  // text-parser reparse sites commonly supply a plain int — wrap it as
+  // ConstInt(DataType::INDEX) so the codegen-side ExprPtr read is uniform.
+  // Load-bearing for the dispatch Call attrs the outliner now emits, as well as
+  // a legacy Function-level spec.
   for (auto& [key, value] : attrs) {
     if (key == "core_num" && value.type() == typeid(int)) {
       auto n = std::any_cast<int>(value);
@@ -248,6 +250,16 @@ std::vector<std::pair<std::string, std::any>> ConvertAttrsFromPython(const nb::o
 /// When false, returns `code` unchanged — useful for tests that match exact substrings.
 std::string MaybeFormat(const std::string& code, bool format) {
   return format ? ApplyFormatCallback(code) : code;
+}
+
+/// Reject a slot count of zero at construction.
+///
+/// The parser validates the `slots=` kwarg it parses out of an annotation, but a
+/// declaration built as a plain Python object (`l0c = pl.MemRef(slots=N)`) reaches
+/// the constructor directly. Zero would otherwise survive as `slot_count_ == 0`
+/// and only surface much later as a zero-sized allocation.
+void CheckSlotCount(uint64_t slots) {
+  CHECK(slots >= 1) << "A declared allocation must have at least one slot, got slots=" << slots;
 }
 
 void BindIR(nb::module_& m) {
@@ -359,6 +371,8 @@ void BindIR(nb::module_& m) {
       .value("ND", TensorLayout::ND, "ND layout")
       .value("DN", TensorLayout::DN, "DN layout")
       .value("NZ", TensorLayout::NZ, "NZ layout")
+      .value("MX_A_ZZ", TensorLayout::MX_A_ZZ, "MX Left/A scale GM pack (ZZ)")
+      .value("MX_B_NN", TensorLayout::MX_B_NN, "MX Right/B scale GM pack (NN)")
       .export_values();
 
   // PadValue enum - must be before both TensorView and TileView since both carry it
@@ -555,6 +569,38 @@ void BindIR(nb::module_& m) {
   comm_ctx_type_class.def_static("get", &GetCommCtxType, "Get the shared singleton CommCtxType instance.");
   BindFields<CommCtxType>(comm_ctx_type_class);
 
+  // Async-prefetch handle types - singleton markers for the prefetch.* op family.
+  // All three are opaque: the workspace backing a context, the in-flight event and
+  // the session are runtime-side values with no compile-time payload.
+  auto prefetch_async_context_type_class = nb::class_<PrefetchAsyncContextType, Type>(
+      ir, "PrefetchAsyncContextType",
+      "Singleton marker type for prefetch.make_context outputs. Consumed by "
+      "prefetch.async_prefetch and prefetch.session; lowers to PTOAS "
+      "!pto.prefetch_async_context.");
+  prefetch_async_context_type_class.def(nb::init<>(),
+                                        "Create the singleton PrefetchAsyncContextType instance.");
+  prefetch_async_context_type_class.def_static("get", &GetPrefetchAsyncContextType,
+                                               "Get the shared singleton PrefetchAsyncContextType instance.");
+  BindFields<PrefetchAsyncContextType>(prefetch_async_context_type_class);
+
+  auto async_event_type_class = nb::class_<AsyncEventType, Type>(
+      ir, "AsyncEventType",
+      "Singleton marker type for prefetch.async_prefetch outputs. Paired with an "
+      "AsyncSession in prefetch.wait; lowers to PTOAS !pto.async_event.");
+  async_event_type_class.def(nb::init<>(), "Create the singleton AsyncEventType instance.");
+  async_event_type_class.def_static("get", &GetAsyncEventType,
+                                    "Get the shared singleton AsyncEventType instance.");
+  BindFields<AsyncEventType>(async_event_type_class);
+
+  auto async_session_type_class = nb::class_<AsyncSessionType, Type>(
+      ir, "AsyncSessionType",
+      "Singleton marker type for prefetch.session outputs. Paired with an AsyncEvent in "
+      "prefetch.wait; lowers to PTOAS !pto.async_session.");
+  async_session_type_class.def(nb::init<>(), "Create the singleton AsyncSessionType instance.");
+  async_session_type_class.def_static("get", &GetAsyncSessionType,
+                                      "Get the shared singleton AsyncSessionType instance.");
+  BindFields<AsyncSessionType>(async_session_type_class);
+
   // MemorySpace enum
   nb::enum_<MemorySpace>(ir, "MemorySpace", "Memory space enumeration")
       .value("DDR", MemorySpace::DDR, "DDR memory (off-chip)")
@@ -564,6 +610,8 @@ void BindIR(nb::module_& m) {
       .value("Right", MemorySpace::Right, "Right matrix operand buffer")
       .value("Acc", MemorySpace::Acc, "Accumulator buffer")
       .value("Bias", MemorySpace::Bias, "Bias buffer")
+      .value("LeftScale", MemorySpace::LeftScale, "L0A-side MX block-scale buffer (A5)")
+      .value("RightScale", MemorySpace::RightScale, "L0B-side MX block-scale buffer (A5)")
       .value("ScalarLocal", MemorySpace::ScalarLocal, "On-core scalar register file / C stack (ArrayType)")
       .export_values();
 
@@ -610,19 +658,26 @@ void BindIR(nb::module_& m) {
            nb::arg("start_offset") = ExprPtr{}, nb::arg("blayout") = TileLayout::row_major,
            nb::arg("slayout") = TileLayout::none_box, nb::arg("fractal") = static_cast<uint64_t>(512),
            nb::arg("pad") = PadValue::null,
-           "Create a tile view; all fields default to empty/null/row_major/none_box/512/null")
+           "Create a tile view; all fields default to empty/null/row_major/none_box/512/null. "
+           "fractal is a size in bytes, not elements.")
       .def(nb::init<const std::vector<int64_t>&, const std::vector<int64_t>&, ExprPtr, TileLayout, TileLayout,
                     uint64_t, PadValue>(),
            nb::arg("valid_shape"), nb::arg("stride"), nb::arg("start_offset"),
            nb::arg("blayout") = TileLayout::row_major, nb::arg("slayout") = TileLayout::none_box,
            nb::arg("fractal") = static_cast<uint64_t>(512), nb::arg("pad") = PadValue::null,
-           "Create a tile view with integer valid_shape and stride, auto-converted to ConstInt")
+           "Create a tile view with integer valid_shape and stride, auto-converted to ConstInt. "
+           "fractal is a size in bytes, not elements.")
       .def_ro("valid_shape", &TileView::valid_shape, "Valid shape dimensions")
       .def_ro("stride", &TileView::stride, "Stride for each dimension")
       .def_ro("start_offset", &TileView::start_offset, "Starting offset")
       .def_ro("blayout", &TileView::blayout, "Block layout")
       .def_ro("slayout", &TileView::slayout, "Scatter layout")
-      .def_ro("fractal", &TileView::fractal, "Fractal size")
+      .def_ro("fractal", &TileView::fractal,
+              "Fractal size in bytes (not elements). In a boxed (NZ/ZN) layout the inner box is "
+              "M0 = 16 rows by fractal / dtype_bytes / M0 cols; the two matmul-path values are "
+              "16x16 boxes: 512 (Mat/Left/Right operand, FP16) and 1024 (Acc accumulator, "
+              "FP32/INT32). MX scale tiles carry 32, the MX block size (1-byte scale dtype, so "
+              "bytes and elements coincide).")
       .def_ro("pad", &TileView::pad, "Pad mode")
       .def(
           "__eq__", [](const TileView& self, const TileView& other) { return self == other; },
@@ -763,14 +818,73 @@ void BindIR(nb::module_& m) {
   memref_class
       .def(
           "__init__",
-          [](MemRef* self, const VarPtr& base, int64_t byte_offset, uint64_t size, const Span& span) {
-            new (self) MemRef(base, byte_offset, size, span);
+          [](MemRef* self, const VarPtr& base, int64_t byte_offset, uint64_t size, const Span& span,
+             bool is_pinned, uint64_t slots, const ExprPtr& slot) {
+            new (self) MemRef(base, byte_offset, size, span, is_pinned, slots, slot);
           },
           nb::arg("base"), nb::arg("byte_offset"), nb::arg("size"), nb::arg("span") = Span::unknown(),
-          "Create a memory reference with base Ptr, integer byte_offset, and size")
+          nb::arg("is_pinned") = false, nb::arg("slots") = 1, nb::arg("slot") = nb::none(),
+          "Create a memory reference with base Ptr, integer byte_offset, and size. Set is_pinned for an "
+          "author-declared allocation whose size the parser leaves for InitMemRef to derive; slots/slot "
+          "select one slot of a multi-slot declaration")
       .def(nb::init<VarPtr, ExprPtr, uint64_t, Span>(), nb::arg("base"), nb::arg("byte_offset"),
            nb::arg("size"), nb::arg("span") = Span::unknown(),
            "Create a memory reference with base Ptr, byte_offset expression, and size")
+      .def_ro("is_pinned_", &MemRef::is_pinned_,
+              "True for an author-declared allocation, false for a compiler allocation")
+      .def_ro("slot_count_", &MemRef::slot_count_,
+              "How many equally-sized slots the declared allocation holds (1 when unsubscripted)")
+      .def_ro("slot_index_", &MemRef::slot_index_,
+              "Which slot of the declared allocation this MemRef denotes, as an Expr (None when "
+              "unsubscripted); may be a runtime value")
+      // Declaration forms. Both leave size and address for InitMemRef to derive
+      // and are distinguished from the three-argument form purely by arity.
+      //
+      // `MemRef()` leaves the base Ptr unnamed: the parser then takes the name
+      // from the variable the declaration is bound to, so it is written once. An
+      // empty base name means exactly "no name given" — it is not a value the
+      // named forms can produce, since the parser rejects an empty literal.
+      .def(
+          "__init__",
+          [](MemRef* self, const Span& span, uint64_t slots) {
+            CheckSlotCount(slots);
+            auto base = std::make_shared<Var>("", GetPtrType(), Span::unknown());
+            new (self) MemRef(base, static_cast<int64_t>(0), static_cast<uint64_t>(0), span,
+                              /*is_pinned=*/true, slots);
+          },
+          // `slots` goes AFTER `span`: `span` was the first positional parameter
+          // before slots existed, so putting slots first would break
+          // `pl.MemRef(span)`. `slots` is written as a keyword either way.
+          nb::arg("span") = Span::unknown(), nb::arg("slots") = 1,
+          "Declare an allocation of your own, named after the variable it is bound to. Size and "
+          "address are left for InitMemRef to derive, and nothing else is ever packed into it. Pass "
+          "slots=N for N equally-sized slots, selected by subscript in the tile annotation")
+      .def(
+          "__init__",
+          [](MemRef* self, const std::string& name, const Span& span, uint64_t slots) {
+            CheckSlotCount(slots);
+            auto base = std::make_shared<Var>(name, GetPtrType(), Span::unknown());
+            new (self) MemRef(base, static_cast<int64_t>(0), static_cast<uint64_t>(0), span,
+                              /*is_pinned=*/true, slots);
+          },
+          nb::arg("name"), nb::arg("span") = Span::unknown(), nb::arg("slots") = 1,
+          "Declare an allocation of your own under an explicit name, overriding the variable name")
+      // `decl[k]` selects one slot. The result is the same declaration — same base
+      // Ptr, so the slots share one allocation — differing only in slot_index_.
+      .def(
+          "__getitem__",
+          [](const MemRef& self, uint64_t slot) {
+            CHECK(self.is_pinned_) << "Only a declared allocation can be subscripted; a MemRef that "
+                                      "already describes an existing allocation has no slots";
+            CHECK(slot < self.slot_count_)
+                << "Slot index " << slot << " is out of range for a declaration with " << self.slot_count_
+                << " slot(s); declare it with pl.MemRef(slots=" << (slot + 1) << ") or higher";
+            auto index =
+                std::make_shared<ConstInt>(static_cast<int64_t>(slot), DataType::INDEX, Span::unknown());
+            return std::make_shared<MemRef>(self.base_, self.byte_offset_, self.size_, self.span_,
+                                            self.is_pinned_, self.slot_count_, std::move(index));
+          },
+          nb::arg("slot"), "Select one slot of a multi-slot declared allocation by constant index")
       // String base constructor: MemRef("base_name", byte_offset, size) — for forward references
       // in printed IR where the base Ptr variable appears in annotations before its alloc statement
       .def(
@@ -972,8 +1086,8 @@ void BindIR(nb::module_& m) {
         // Used by ScopeStmt attrs["task_id_var"] (single producer TaskId Var).
         result[key.c_str()] = nb::cast(AnyCast<VarPtr>(value, "converting to Python: " + key));
       } else if (value.type() == typeid(ExprPtr)) {
-        // IR expressions stored in attrs (e.g. attrs["device"] on Orchestration
-        // dispatch calls; attrs["core_num"] on Function attrs for outlined Spmd).
+        // IR expressions stored in attrs (e.g. attrs["device"] and
+        // attrs["core_num"] on Orchestration dispatch calls).
         result[key.c_str()] = nb::cast(AnyCast<ExprPtr>(value, "converting to Python: " + key));
       }
     }
@@ -1307,9 +1421,9 @@ void BindIR(nb::module_& m) {
   nb::enum_<ReduceOp>(ir, "ReduceOp", nb::is_arithmetic(),
                       "Reduction operator for collective reductions (pld.tensor.allreduce, ...)")
       .value("Sum", ReduceOp::kSum, "Element-wise sum across ranks")
-      .value("Max", ReduceOp::kMax, "Element-wise max across ranks (reserved; lowering pending)")
-      .value("Min", ReduceOp::kMin, "Element-wise min across ranks (reserved; lowering pending)")
-      .value("Prod", ReduceOp::kProd, "Element-wise product across ranks (reserved; lowering pending)");
+      .value("Max", ReduceOp::kMax, "Element-wise maximum across ranks")
+      .value("Min", ReduceOp::kMin, "Element-wise minimum across ranks")
+      .value("Prod", ReduceOp::kProd, "Element-wise product across ranks");
 
   // ScopeStmt - abstract base class for all scope statements (issue #1047).
   auto scope_stmt_class = nb::class_<ScopeStmt, Stmt>(
@@ -1330,10 +1444,12 @@ void BindIR(nb::module_& m) {
       scope_attrs_doc);
 
   // InCoreScopeStmt
-  auto in_core_scope_stmt_class =
-      nb::class_<InCoreScopeStmt, ScopeStmt>(ir, "InCoreScopeStmt", "InCore scope: AICore sub-graph region");
-  in_core_scope_stmt_class.def(nb::init<std::optional<SplitMode>, std::string, const StmtPtr&, const Span&>(),
-                               nb::arg("split") = nb::none(), nb::arg("name_hint") = "", nb::arg("body"),
+  auto in_core_scope_stmt_class = nb::class_<InCoreScopeStmt, ScopeStmt>(
+      ir, "InCoreScopeStmt",
+      "InCore scope: AICore sub-graph region. split=SplitMode.NONE (the default) is "
+      "the single encoding of 'no split'.");
+  in_core_scope_stmt_class.def(nb::init<SplitMode, std::string, const StmtPtr&, const Span&>(),
+                               nb::arg("split") = SplitMode::None, nb::arg("name_hint") = "", nb::arg("body"),
                                nb::arg("span"), "Create an InCore scope statement");
   BindFields<InCoreScopeStmt>(in_core_scope_stmt_class);
   in_core_scope_stmt_class.def_prop_ro(

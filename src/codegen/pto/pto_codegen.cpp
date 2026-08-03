@@ -297,9 +297,9 @@ std::vector<VarPtr> CollectVarsFromShapeExpr(const ExprPtr& expr) {
 }
 
 // Visitor to collect all MemRef objects from TileType variables. Also
-// piggy-backs SPMD identity detection (tile.get_block_idx / tile.get_block_num
-// / tile.get_subblock_idx) on the same body walk so callers do not need a
-// separate IR traversal.
+// piggy-backs synthetic-parameter detection (prefetch.make_context and the
+// SPMD identity ops) on the same body walk so callers do not need a separate
+// IR traversal.
 class MemRefCollectorVisitor : public ir::IRVisitor {
  public:
   MemRefCollectorVisitor() = default;
@@ -308,6 +308,11 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   [[nodiscard]] const std::map<const ir::Var*, std::shared_ptr<const TileType>>& GetMemRefTileTypes() const {
     return memref_tile_types_;
   }
+
+  /// Returns true when the visited body invokes prefetch.make_context. Drives
+  /// PTOCodegen's decision to append the hidden runtime-owned SDMA workspace
+  /// pointer to the emitted func.func signature.
+  [[nodiscard]] bool UsesSdmaWorkspace() const { return uses_sdma_workspace_; }
 
   /// Returns true when the visited body invokes tile.get_block_idx or
   /// tile.get_block_num. Drives PTOCodegen's decision to append two synthetic
@@ -339,6 +344,9 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
 
   void VisitExpr_(const ir::CallPtr& op) override {
     if (op->op_) {
+      if (!uses_sdma_workspace_ && ir::IsOp(op, "prefetch.make_context")) {
+        uses_sdma_workspace_ = true;
+      }
       if (!uses_spmd_block_ops_ &&
           (ir::IsOp(op, "tile.get_block_idx") || ir::IsOp(op, "tile.get_block_num"))) {
         uses_spmd_block_ops_ = true;
@@ -360,6 +368,7 @@ class MemRefCollectorVisitor : public ir::IRVisitor {
   std::set<const ir::Var*> seen_bases_;
   std::map<const ir::Var*, std::shared_ptr<const TileType>> memref_tile_types_;
   std::set<uint64_t> iter_arg_ids_;
+  bool uses_sdma_workspace_ = false;
   bool uses_spmd_block_ops_ = false;
   bool uses_subblock_op_ = false;
   std::set<const ir::Var*> ffts_workspace_vars_;
@@ -584,21 +593,20 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
 
   BuildVarToMemRefMapping(func);
 
-  // One body walk: collects MemRefs and detects SPMD identity usage. SPMD
-  // identity params are injected at codegen time (not at IR level) when the
-  // function body invokes tile.get_block_idx / tile.get_block_num /
-  // tile.get_subblock_idx; they are appended at the end of the func.func
-  // signature with named SSAs, and the ops lower to arith.index_cast of those
-  // params (the kernel wrapper supplies the runtime values via
-  // intrinsic.h::get_block_idx(args) / get_block_num(args) /
-  // get_sub_block_id(args)).
+  // One body walk: collects MemRefs and detects hidden runtime parameters.
+  // The SDMA workspace and SPMD identity params are injected at codegen time
+  // (not at IR level) when the function body invokes the corresponding ops.
   MemRefCollectorVisitor collector;
   if (func->body_) {
     collector.VisitStmt(func->body_);
   }
+  const bool uses_sdma_workspace = collector.UsesSdmaWorkspace();
   const bool uses_spmd_params = collector.UsesSpmdBlockOps();
   const bool uses_subblock_param = collector.UsesSubblockOp();
   fs_.ffts_workspace_vars = collector.GetFFTSWorkspaceVars();
+  if (uses_sdma_workspace) {
+    fs_.used_ssa_names.insert("arg" + std::to_string(func->params_.size() + dyn_vars.size()));
+  }
   if (uses_spmd_params) {
     fs_.used_ssa_names.insert("__pypto_spmd_block_idx");
     fs_.used_ssa_names.insert("__pypto_spmd_block_num");
@@ -755,10 +763,18 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
     BindVarToMlir(dyn_var, arg_name);
   }
 
-  // Append SPMD identity params after dynamic-dim args, in canonical order
-  // (block_idx, block_num, subblock_idx). Each is appended independently based
-  // on the ops the function actually uses; the Python kernel wrapper
-  // (pto_backend.py) mirrors this exact order when forwarding the call args.
+  // Append the hidden SDMA workspace pointer after user-derived arguments and
+  // before SPMD identity params. The Python wrapper mirrors this exact order.
+  if (uses_sdma_workspace) {
+    if (!first_param) stream_ << ", ";
+    fs_.sdma_workspace_arg_ssa = "%arg" + std::to_string(next_arg_idx++);
+    stream_ << fs_.sdma_workspace_arg_ssa << ": !pto.ptr<i8>";
+  }
+
+  // Append SPMD identity params after the dynamic-dim and SDMA workspace args,
+  // in canonical order (block_idx, block_num, subblock_idx). Each is appended
+  // independently based on the ops the function actually uses; the Python
+  // kernel wrapper mirrors this exact order when forwarding the call args.
   // Named SSAs make the synthetic origin obvious in the emitted MLIR and let
   // lowerings refer to them via PTOCodegen::GetSpmd{Block,Subblock}*ArgSSA().
   if (uses_spmd_params) {
@@ -915,10 +931,10 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
   // time codegen executes, so the IR's TensorView fields can be transcribed
   // verbatim.
   //
-  // The one exception is the ``[M, 1]`` column-vector special case: PTOAS
-  // *infers* DN for shape ``[M, 1]`` with degenerate strides regardless of
-  // the IR-declared layout, so the codegen forces DN + ``[1, M]`` strides
-  // here to match what PTOAS expects.
+  // The one exception is the ordinary ``[M, 1]`` column-vector special case:
+  // PTOAS *infers* DN for shape ``[M, 1]`` with degenerate strides regardless
+  // of an ND declaration, so codegen forces DN + ``[1, M]`` strides. MX
+  // layouts are explicit hardware contracts and bypass this legacy override.
   for (const auto& param : func->params_) {
     auto tensor_type = ir::AsTensorTypeLike(param->GetType());
     if (!tensor_type) continue;
@@ -947,7 +963,8 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
     if (tensor_type->tensor_view_.has_value()) {
       layout = tensor_type->tensor_view_->layout;
     }
-    if (is_column_vector) layout = ir::TensorLayout::DN;
+    const bool force_column_vector_dn = is_column_vector && !IsMxTensorLayout(layout);
+    if (force_column_vector_dn) layout = ir::TensorLayout::DN;
 
     // Materialize one shape dimension as an MLIR SSA value.
     auto get_shape_dim_mlir = [&](size_t dim_idx) -> std::string {
@@ -998,7 +1015,7 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
       for (size_t j = 0; j < rank; ++j) {
         stride_names[j] = get_stride_mlir(strides[j]);
       }
-    } else if (is_column_vector) {
+    } else if (force_column_vector_dn) {
       // Forced-DN ``[..., M, 1]`` legacy stride pattern (PTOAS column-vector
       // convention): trailing pair degenerates to ``stride[rank-2]=1`` and
       // ``stride[rank-1]=shape[rank-1]=1``; outer dims walk row-major over the
@@ -1073,6 +1090,12 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
       case ir::TensorLayout::NZ:
         layout_str = "nz";
         break;
+      case ir::TensorLayout::MX_A_ZZ:
+        layout_str = "mx_a_zz";
+        break;
+      case ir::TensorLayout::MX_B_NN:
+        layout_str = "mx_b_nn";
+        break;
       case ir::TensorLayout::ND:
         break;
     }
@@ -1106,6 +1129,21 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
     std::string idx = NewTemp();
     Emit(idx + " = arith.index_cast " + ssa + " : " + GetTypeString(scalar_type->dtype_) + " to index");
     return idx;
+  };
+
+  // Widen an address expression to the `i64` the alloc_tile addr operand takes.
+  // Mirrors cast_to_index above, in the other direction.
+  auto cast_to_i64 = [&](const std::string& ssa, const ir::ExprPtr& expr) -> std::string {
+    auto scalar_type = As<ScalarType>(expr->GetType());
+    CHECK(scalar_type && (scalar_type->dtype_.IsInt() || scalar_type->dtype_ == DataType::INDEX))
+        << "alloc_tile addr operand must be integer or index typed, got "
+        << (scalar_type ? GetTypeString(scalar_type->dtype_) : std::string("non-scalar"));
+    if (scalar_type->dtype_ == DataType::INT64) return ssa;
+    std::string wide = NewTemp();
+    const std::string from =
+        scalar_type->dtype_ == DataType::INDEX ? "index" : GetTypeString(scalar_type->dtype_);
+    Emit(wide + " = arith.index_cast " + ssa + " : " + from + " to i64");
+    return wide;
   };
 
   // Lower a single valid_shape dim expression to an `index` SSA value.
@@ -1144,6 +1182,12 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   if (memref && emit_tile_addr_) {
     if (auto const_offset = As<ir::ConstInt>(memref->byte_offset_)) {
       fields.addr_ssa = GetOrEmitConstant(const_offset->value_, const_offset->dtype());
+    } else if (memref->byte_offset_) {
+      // A runtime address: a declared allocation's slot index scaled to a byte
+      // offset (`l0c[i % 2]`) and added to the base by AllocateMemoryAddr. The
+      // `alloc_tile` addr operand is i64, and PTOAS lowers it to a runtime
+      // `TASSIGN(tile, addr)`, so an SSA value is as valid here as a constant.
+      fields.addr_ssa = cast_to_i64(GetExprAsCode(memref->byte_offset_), memref->byte_offset_);
     }
   }
   return fields;

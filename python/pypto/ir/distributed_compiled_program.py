@@ -58,8 +58,21 @@ if TYPE_CHECKING:
 class DistributedConfig:
     """Configuration for L3 distributed execution.
 
-    ``aicpu_thread_num=4`` matches the ``tensormap_and_ringbuffer`` runtime's
-    3-scheduler-plus-1-dispatcher layout.
+    Attributes:
+        device_ids: List of NPU device indices to use. Defaults to ``[0]``
+            (single-card). Pass ``[0, 1, 2, 3]`` for a 4-card ring. Must be
+            a non-empty list of distinct ints.
+        num_sub_workers: Number of sub-workers to request per chip process.
+            ``0`` (default) does not force a specific count — the runtime
+            instead uses ``max(num_sub_workers, len(sub_worker_fns))``, i.e.
+            exactly as many sub-workers as the program's declared sub-worker
+            functions. Set this explicitly only when requesting more
+            sub-workers than are declared, e.g. for multi-slice or internal
+            pipelining scenarios.
+        runtime: Simpler runtime flavour. ``"tensormap_and_ringbuffer"`` (default)
+            enables the tensor-map helpers and the ring-buffer DMA driver.
+        aicpu_thread_num: Number of aiCPU threads allocated to the simpler
+            runtime (3 schedulers + 1 dispatcher = 4 by default). Must be ≥ 1.
     """
 
     device_ids: list[int] = field(default_factory=lambda: [0])
@@ -83,6 +96,18 @@ class DistributedCompiledProgram:
     **Return** (program has a return value)::
 
         c = compiled(a, b)
+
+    **One-shot dispatch**::
+
+        compiled = ir.compile(MyProgram, platform="a2a3", distributed_config=dc)
+        compiled(inputs, outputs)   # blocks until all ranks finish
+
+    **Persistent dispatch** (repeated launches without re-registering)::
+
+        with compiled.prepare() as rt:
+            for step in steps:
+                rt(host_x, host_out)
+        # rt.close() on exit — releases buffers and shuts down workers
     """
 
     __test__ = False
@@ -308,8 +333,10 @@ class DistributedCompiledProgram:
         ``enable_dep_gen`` / ``enable_scope_stats`` / ``enable_l2_swimlane``) are
         written per dispatch under ``<output_dir>/dfx_outputs/rank{r}/d{k}/``
         (``d{k}`` is the card's k-th dispatch, so multiple dispatches to one card
-        keep separate artifacts; swimlane co-enables dep_gen and emits
-        ``merged_swimlane_*.json`` per dispatch, onboard only). Other compile-side
+        keep separate artifacts). Onboard swimlane runs a dep-gen-only graph
+        pass followed by a dep-gen-disabled timing pass and emits
+        ``merged_swimlane_*.json`` per dispatch. Both passes execute the program
+        and do not restore mutable arguments between them. Other compile-side
         fields are not consumed on the dispatch path.
         """
         from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415

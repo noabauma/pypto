@@ -278,11 +278,26 @@ ExprPtr IRMutator::VisitExpr_(const MemRefPtr& op) {
   if (op->byte_offset_) {
     new_offset = ExprFunctor<ExprPtr>::VisitExpr(op->byte_offset_);
   }
-  if (new_base.get() == op->base_.get() && new_offset.get() == op->byte_offset_.get()) {
+  // A declared allocation's slot index is an ordinary expression over SSA values,
+  // so substitution has to follow it — otherwise a renamed loop variable leaves the
+  // index pointing at the old Var.
+  std::optional<ExprPtr> new_slot_index = op->slot_index_;
+  if (op->slot_index_.has_value() && *op->slot_index_) {
+    new_slot_index = ExprFunctor<ExprPtr>::VisitExpr(*op->slot_index_);
+  }
+  const bool slot_index_changed =
+      new_slot_index.has_value() != op->slot_index_.has_value() ||
+      (new_slot_index.has_value() && new_slot_index->get() != op->slot_index_->get());
+  if (new_base.get() == op->base_.get() && new_offset.get() == op->byte_offset_.get() &&
+      !slot_index_changed) {
     return op;
   }
-  auto fresh = std::make_shared<const MemRef>(op->name_hint_, std::move(new_base), std::move(new_offset),
-                                              op->size_, op->span_);
+  // Carry is_pinned_ / slot_count_ / slot_index_ through: a substituted MemRef
+  // denotes the same storage as its source, and dropping them would silently turn
+  // an author's declaration into a compiler allocation mid-pipeline.
+  auto fresh =
+      std::make_shared<const MemRef>(op->name_hint_, std::move(new_base), std::move(new_offset), op->size_,
+                                     op->span_, op->is_pinned_, op->slot_count_, std::move(new_slot_index));
   var_remap_[op.get()] = fresh;
   return fresh;
 }
@@ -385,22 +400,21 @@ ExprPtr IRMutator::VisitExpr_(const CallPtr& op) {
           continue;
         }
       }
-    } else if (k == kAttrDevice) {
-      // The distributed dispatch ``device=`` attr holds a single ExprPtr (a
-      // ConstInt rank or a Var loop index). It references a Var defined
-      // elsewhere (the host-orch ``for r in pl.range(P)`` loop var), so it must
-      // be remapped alongside the args — otherwise a loop-var substitution
-      // (e.g. the P==1 unroll folding ``r`` -> ``0``) rewrites the slice
-      // subscripts but leaves ``device=r`` dangling to the now-undefined loop
-      // var, and codegen emits an unbound index -> NameError. Mirrors the
-      // kAttrDevice handling in the SSA pass.
-      const auto* dev = std::any_cast<ExprPtr>(&v);
-      if (dev && *dev) {
-        auto new_dev = ExprFunctor<ExprPtr>::VisitExpr(*dev);
-        INTERNAL_CHECK_SPAN(new_dev, op->span_) << "Call device attribute mutated to null";
-        if (new_dev.get() != dev->get()) {
+    } else if (IsExprValuedCallAttr(k)) {
+      // Expr-valued dispatch attrs (``device=`` selector, ``core_num`` launch
+      // width) hold a single ExprPtr over Vars defined elsewhere in this
+      // function, so they must be remapped alongside the args — otherwise a
+      // substitution (e.g. the P==1 unroll folding ``r`` -> ``0``) rewrites the
+      // slice subscripts but leaves ``device=r`` dangling to the now-undefined
+      // loop var, and codegen emits an unbound index -> NameError. Mirrors the
+      // SSA pass's SubstCallAttrs and ``Submit::core_num_`` below.
+      const auto* attr_expr = std::any_cast<ExprPtr>(&v);
+      if (attr_expr && *attr_expr) {
+        auto new_expr = ExprFunctor<ExprPtr>::VisitExpr(*attr_expr);
+        INTERNAL_CHECK_SPAN(new_expr, op->span_) << "Call '" << k << "' attribute mutated to null";
+        if (new_expr.get() != attr_expr->get()) {
           attrs_changed = true;
-          new_attrs.emplace_back(k, std::any(std::move(new_dev)));
+          new_attrs.emplace_back(k, std::any(std::move(new_expr)));
           continue;
         }
       }

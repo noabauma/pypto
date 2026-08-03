@@ -17,6 +17,7 @@ and verifies the generated orchestration code.
 
 import warnings
 
+import pypto
 import pypto.language as pl
 import pytest
 from pypto import DataType, backend, codegen, ir
@@ -935,6 +936,31 @@ class TestTileReadWriteOffsetCodegen:
         # emits arith.muli/arith.addi (offset = 0 * stride + col).
         assert "arith.muli" in mlir, f"Expected arith.muli for 2D partial-constant index, got:\n{mlir}"
         assert "arith.addi" in mlir, f"Expected arith.addi for 2D partial-constant index, got:\n{mlir}"
+
+    def test_store_dynamic_offset_clamped_to_non_negative(self):
+        """pl.store with a dynamic offset emits arith.maxsi clamp against zero.
+
+        A runtime INT32 scalar used as a store offset (e.g. a rank-derived ring
+        index) could evaluate to a negative value.  The offset must be clamped
+        to non-negative before it reaches pto.partition_view, which does not
+        handle negative indices.  Regression for issue #2201.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[1, 8], pl.FP32],
+                config: pl.Tensor[[1], pl.INT32],
+                out: pl.Tensor[[1, 32], pl.FP32],
+            ) -> pl.Tensor[[1, 32], pl.FP32]:
+                offset: pl.Scalar[pl.INT32] = pl.read(config, [0])
+                ones: pl.Tile[[1, 8], pl.FP32] = pl.load(src, [0, 0], [1, 8])
+                return pl.store(ones, [0, offset], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "arith.maxsi" in mlir, f"Expected arith.maxsi clamp for dynamic store offset, got:\n{mlir}"
 
 
 class TestBroadcastOpsCodegen:
@@ -2722,7 +2748,7 @@ class TestTileStoreAtomicCodegen:
             funcs = list(optimized.functions.values())
             target = next((f for f in funcs if ir.is_incore_type(f.func_type)), funcs[0])
             single = ir.Program([target], target.name, optimized.span)
-            with pytest.raises(Exception, match="bf16 atomic-add requires the Ascend910B"):
+            with pytest.raises(ValueError, match="bf16 atomic-add requires the Ascend910B"):
                 codegen.PTOCodegen().generate(single)
         finally:
             backend.reset_for_testing()
@@ -2818,7 +2844,7 @@ class TestTensorAssembleAtomicCodegen:
                 out = pl.assemble(out, target, [0, 0])
                 return out
 
-        with pytest.raises(Exception, match="global-memory destination"):
+        with pytest.raises(pypto.InternalError, match="global-memory destination"):
             self._generate_mlir(Prog)
 
 
@@ -3096,7 +3122,7 @@ def _cmo_cacheinvalid_line(mlir: str) -> str:
 
 
 class TestCacheInvalidCodegen:
-    """Tests that pl.system.cacheinvalid lowers to a ptr or partition-view cmo."""
+    """Tests that pl.system.cacheinvalid lowers to a partition-view or whole-GM cmo."""
 
     def _generate_mlir(self, program_cls) -> str:
         backend.reset_for_testing()
@@ -3110,31 +3136,22 @@ class TestCacheInvalidCodegen:
         single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
         return codegen_instance.generate(single)
 
-    def test_cacheinvalid_scalar_write_emits_ptr(self):
-        """All-ones shapes (scalar write) lower to pto.addptr + a ptr-form cmo."""
+    @pytest.mark.parametrize(
+        "shapes, offsets, expected_dims",
+        [
+            # A single element is not special-cased: it is a 1x1 region.
+            ([1, 1], [0, 8], "1x1"),
+            ([16, 16], [0, 0], "16x16"),
+        ],
+        ids=["single_element", "full_region"],
+    )
+    def test_cacheinvalid_region_emits_partition_view(self, shapes, offsets, expected_dims):
+        """Every region size lowers through the same partition_tensor_view cmo.
 
-        @pl.program
-        class Prog:
-            @pl.function(type=pl.FunctionType.InCore)
-            def kernel_cacheinvalid(
-                self,
-                x: pl.Tensor[[16, 16], pl.FP32],
-                out: pl.Tensor[[16, 16], pl.FP32],
-            ) -> pl.Tensor[[16, 16], pl.FP32]:
-                tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
-                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
-                pl.system.cacheinvalid(updated, [1, 1], [0, 8])
-                return updated
-
-        mlir = self._generate_mlir(Prog)
-        assert "pto.addptr" in mlir, f"pto.addptr not found in MLIR:\n{mlir}"
-        cmo_line = _cmo_cacheinvalid_line(mlir)
-        # The ptr form emits a bare pointer operand, no partition_tensor_view annotation.
-        assert "single_cache_line" in cmo_line
-        assert "partition_tensor_view" not in cmo_line, f"unexpected partition view in ptr form: {cmo_line}"
-
-    def test_cacheinvalid_region_emits_partition_view(self):
-        """A multi-element region (tile store) lowers to a partition_tensor_view cmo."""
+        A raw `!pto.ptr` operand is rejected by ptoas — at parse without a type
+        annotation, and by the lowering pass with one — so the all-ones case must
+        take the partition-view path too, not a scalar `pto.addptr` shortcut.
+        """
 
         @pl.program
         class Prog:
@@ -3146,18 +3163,19 @@ class TestCacheInvalidCodegen:
             ) -> pl.Tensor[[16, 16], pl.FP32]:
                 tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
                 updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
-                pl.system.cacheinvalid(updated, [16, 16], [0, 0])
+                pl.system.cacheinvalid(updated, shapes, offsets)
                 return updated
 
         mlir = self._generate_mlir(Prog)
         assert "pto.partition_view" in mlir, f"pto.partition_view not found in MLIR:\n{mlir}"
         cmo_line = _cmo_cacheinvalid_line(mlir)
-        # The region form addresses a partition_tensor_view, not a raw pointer.
         assert "single_cache_line" in cmo_line
-        assert "partition_tensor_view" in cmo_line, f"partition view not in cmo line: {cmo_line}"
+        assert f"!pto.partition_tensor_view<{expected_dims}xf32>" in cmo_line, (
+            f"expected a {expected_dims} partition view operand, got: {cmo_line}"
+        )
 
     def test_cacheinvalid_dynamic_offset(self):
-        """A runtime offset expression (loop-var arithmetic) reaches the flattened ptr offset."""
+        """A runtime offset expression (loop-var arithmetic) reaches the partition view."""
 
         @pl.program
         class Prog:
@@ -3175,10 +3193,34 @@ class TestCacheInvalidCodegen:
                 return updated
 
         mlir = self._generate_mlir(Prog)
-        # The dynamic row index feeds the flattened offset, then pto.addptr.
-        assert "pto.addptr" in mlir, f"pto.addptr not found in MLIR:\n{mlir}"
-        assert "pto.cmo.cacheinvalid" in mlir, f"pto.cmo.cacheinvalid not found in MLIR:\n{mlir}"
-        assert "single_cache_line" in mlir, f"single_cache_line not found in MLIR:\n{mlir}"
+        # The dynamic row index feeds the partition view's offsets operand.
+        assert "pto.partition_view" in mlir, f"pto.partition_view not found in MLIR:\n{mlir}"
+        cmo_line = _cmo_cacheinvalid_line(mlir)
+        assert "single_cache_line" in cmo_line
+        assert "!pto.partition_tensor_view<1x1xf32>" in cmo_line, f"unexpected cmo operand: {cmo_line}"
+
+    def test_cacheinvalid_whole_gm_no_args_emits_all(self):
+        """The no-argument form invalidates the whole GM address space."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel_cacheinvalid_all(
+                self,
+                x: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                tile: pl.Tile[[16, 16], pl.FP32] = pl.load(x, [0, 0], [16, 16])
+                updated: pl.Tensor[[16, 16], pl.FP32] = pl.store(tile, [0, 0], out)
+                pl.system.cacheinvalid()
+                return updated
+
+        mlir = self._generate_mlir(Prog)
+        cmo_line = _cmo_cacheinvalid_line(mlir)
+        # Whole-GM form: `all #pto.address_space<gm>`, no ptr / partition view.
+        assert "all #pto.address_space<gm>" in cmo_line, f"whole-GM form not emitted: {cmo_line}"
+        assert "single_cache_line" not in cmo_line
+        assert "partition_tensor_view" not in cmo_line
 
 
 if __name__ == "__main__":

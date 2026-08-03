@@ -339,10 +339,7 @@ class TestInferTileMemorySpaceCubeOps:
                 )
 
         marked = _MarkMatmulDump().visit_program(Before)
-        # Builtin-call dump attrs are compiler-internal and have no DSL
-        # print/parse surface, so inspect the transformed IR directly.
-        with passes.PassContext([]):
-            after = passes.infer_tile_memory_space()(marked)
+        after = passes.infer_tile_memory_space()(marked)
         matmuls = []
 
         class _CollectMatmul(ir.IRVisitor):
@@ -391,8 +388,7 @@ class TestInferTileMemorySpaceCubeOps:
                 )
 
         marked = _MarkMatmulDump().visit_program(Before)
-        with passes.PassContext([]):
-            after = passes.infer_tile_memory_space()(marked)
+        after = passes.infer_tile_memory_space()(marked)
         matmuls = []
 
         class _CollectMatmul(ir.IRVisitor):
@@ -2388,10 +2384,7 @@ class RetargetedBridgeAttrs:
 
         before = _StampFirstLoad().visit_program(before)
         backend.set_backend_type(BackendType.Ascend910B)
-        # The sentinel is deliberately not a DSL-printable compiler attr, so
-        # disable the global print/parse instrument for this attr-lifetime test.
-        with passes.PassContext([]):
-            after = passes.infer_tile_memory_space()(before)
+        after = passes.infer_tile_memory_space()(before)
         load_attrs = []
 
         class _CollectLoadAttrs(ir.IRVisitor):
@@ -2444,8 +2437,7 @@ class MarkerOnlyScalarCall:
 
         before = _StampScalarCall().visit_program(before)
         backend.set_backend_type(BackendType.Ascend910B)
-        with passes.PassContext([]):
-            after = passes.infer_tile_memory_space()(before)
+        after = passes.infer_tile_memory_space()(before)
         scalar_attrs = []
 
         class _CollectScalarAttrs(ir.IRVisitor):

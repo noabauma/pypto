@@ -81,6 +81,13 @@ _RING_DEPTH = 4
 class RunConfig:
     """Configuration for a :func:`run` invocation or harness test execution.
 
+    When passed to :meth:`pypto.jit.decorator.JITFunction.lower`, only
+    ``platform``, ``strategy``, diagnostics, dependency analysis, and
+    ``memory_planner`` affect pass execution. Runtime and artifact fields such
+    as ``device_id``, ``dump_passes``, ``save_kernels_dir``, and
+    ``compile_profiling`` are ignored; ``lower()`` does not execute or write
+    compilation artifacts.
+
     Attributes:
         platform: Target execution platform — ``"a2a3sim"`` / ``"a2a3"``
             (Ascend 910B) or ``"a5sim"`` / ``"a5"`` (Ascend 950).
@@ -105,12 +112,15 @@ class RunConfig:
             platforms, ``swimlane_converter`` then produces
             ``merged_swimlane_*.json`` alongside it. Because the converter joins
             the timing against a task graph that only ``deps.json`` carries,
-            enabling this on an onboard platform runs the kernel **twice**: a
-            first dep_gen pass to capture ``deps.json`` (run in a subprocess so
-            its device/SVM state is fully reclaimed before the timing pass — a
-            failed capture is logged, not fatal), then a clean in-process
-            swimlane pass (dep_gen off, since dep_gen collection perturbs the
-            timing). Simulator platforms (``*sim``) stay single-pass
+            enabling this on an onboard platform runs the workload **twice**: a
+            first dep_gen pass captures ``deps.json``, then a clean swimlane pass
+            runs with dep_gen off because collection perturbs timing. L2 runs
+            the graph pass in a subprocess so its device/SVM state is fully
+            reclaimed before the timing pass (a failed capture is logged, not
+            fatal). L3 one-shot uses separate Worker lifecycles; a prepared L3
+            worker uses two ``Worker.run()`` fences and keeps resident handles
+            alive. Both L3 passes execute the program without restoring mutable
+            arguments between them. Simulator platforms (``*sim``) stay single-pass
             and only emit ``l2_swimlane_records.json`` — the merged swimlane file
             is intentionally skipped because the simulator does not yet ship the
             task metadata the converter needs. Mirrors runtime's
@@ -836,6 +846,7 @@ def _execute_on_device(
     dfx: _DfxOpts = _DfxOpts(),
     validate: bool = True,
     actual_out_dir: "Path | None" = None,
+    enable_sdma: bool = False,
 ) -> None:
     """Load inputs, execute on device, and validate against golden.
 
@@ -852,6 +863,8 @@ def _execute_on_device(
         runtime_name: Runtime name from ``compile_and_assemble``.
         platform: Target execution platform.
         device_id: Hardware device index.
+        enable_sdma: Whether execution requires an SDMA-capable worker.
+            Defaults to ``False`` for legacy and hand-built callables.
         dfx: Runtime DFX toggles. When any flag is enabled the artefacts
             land under ``<work_dir>/dfx_outputs/`` and the matching
             post-run converter is invoked.
@@ -893,6 +906,7 @@ def _execute_on_device(
             platform,
             runtime_name,
             device_id,
+            enable_sdma=enable_sdma,
             output_prefix=str(dfx_dir) if dfx_dir is not None else None,
             enable_l2_swimlane=pass_dfx.enable_l2_swimlane,
             enable_dump_args=pass_dfx.enable_dump_args,
@@ -1120,7 +1134,9 @@ def _generate_swimlane(
     Output is written to *swimlane_dir* alongside the input ``l2_swimlane_records_*.json``.
 
     Args:
-        work_dir: Directory containing ``kernel_config.py``.
+        work_dir: Directory containing ``kernel_config.py``. Passed to the
+            converter as ``-k`` when the file exists, and omitted when it does
+            not (the converter rejects a missing path).
         swimlane_dir: Directory where swimlane JSON files are written.
         perf_file: Path to the ``l2_swimlane_records_*.json`` file produced by
             CodeRunner and already moved into *swimlane_dir*.  When ``None``,
@@ -1153,9 +1169,13 @@ def _generate_swimlane(
         str(perf_file),
         "-o",
         str(output_path),
-        "-k",
-        str(kernel_config_path),
     ]
+    # The converter *errors out* on a ``-k`` path that does not exist, so only
+    # pass it when there is a config to read: a caller with no single owning
+    # program (see ``_collect_l3_swimlane``) still gets a swimlane, just with
+    # anonymous task labels.
+    if kernel_config_path.exists():
+        cmd += ["-k", str(kernel_config_path)]
     # ``--func-names`` (the synthesised name_map) takes precedence over ``-k``
     # for label resolution; ``-k`` stays as the fallback when no map was written.
     if func_names is not None:
@@ -1291,6 +1311,7 @@ def execute_compiled(  # noqa: PLR0913
     )
 
     chip_callable, runtime_name, runtime_config = compile_and_assemble(work_dir, platform)
+    enable_sdma = bool(runtime_config.get("enable_sdma", False))
 
     # Caller-supplied values take precedence over the RUNTIME_CONFIG baked
     # into kernel_config.py. When neither is provided, the simpler runtime's
@@ -1316,6 +1337,7 @@ def execute_compiled(  # noqa: PLR0913
             device_id,
             level=level,
             aicpu_thread_num=effective_aicpu_thread_num,
+            enable_sdma=enable_sdma,
             output_prefix=str(dfx_dir) if dfx_dir is not None else None,
             enable_l2_swimlane=pass_dfx.enable_l2_swimlane,
             enable_dump_args=pass_dfx.enable_dump_args,

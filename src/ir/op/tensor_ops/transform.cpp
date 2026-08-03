@@ -89,6 +89,14 @@ ExprPtr LeadingProduct(const std::vector<ExprPtr>& dims) {
   return product;
 }
 
+ExprPtr ShapeProduct(const std::vector<ExprPtr>& dims) {
+  ExprPtr product = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+  for (const auto& dim : dims) {
+    product = MakeIndexMul(product, dim);
+  }
+  return product;
+}
+
 bool IsNdLeadingCollapseTo2D(const std::vector<ExprPtr>& source_shape,
                              const std::vector<ExprPtr>& source_valid_shape,
                              const std::vector<ExprPtr>& target_shape,
@@ -97,15 +105,22 @@ bool IsNdLeadingCollapseTo2D(const std::vector<ExprPtr>& source_shape,
       target_valid_shape.size() != 2) {
     return false;
   }
-  if (!ExprEqual(target_shape[0], LeadingProduct(source_shape)) ||
-      !ExprEqual(target_shape[1], source_shape.back()) ||
-      !ExprEqual(target_valid_shape[0], LeadingProduct(source_valid_shape)) ||
-      !ExprEqual(target_valid_shape[1], source_valid_shape.back())) {
+  const bool is_leading_collapse = ExprEqual(target_shape[0], LeadingProduct(source_shape)) &&
+                                   ExprEqual(target_shape[1], source_shape.back()) &&
+                                   ExprEqual(target_valid_shape[0], LeadingProduct(source_valid_shape)) &&
+                                   ExprEqual(target_valid_shape[1], source_valid_shape.back());
+  const auto one = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+  const bool is_linear_prefix_collapse = ExprEqual(target_shape[0], one) &&
+                                         ExprEqual(target_shape[1], ShapeProduct(source_shape)) &&
+                                         ExprEqual(target_valid_shape[0], one) &&
+                                         ExprEqual(target_valid_shape[1], ShapeProduct(source_valid_shape));
+  if (!is_leading_collapse && !is_linear_prefix_collapse) {
     return false;
   }
 
   bool past_boundary = false;
-  for (size_t i = 0; i + 1 < source_shape.size(); ++i) {
+  const size_t checked_rank = is_linear_prefix_collapse ? source_shape.size() : source_shape.size() - 1;
+  for (size_t i = 0; i < checked_rank; ++i) {
     const bool is_full = ExprEqual(source_valid_shape[i], source_shape[i]);
     if (past_boundary && !is_full) return false;
     auto valid_dim = As<ConstInt>(source_valid_shape[i]);
@@ -132,6 +147,9 @@ TypePtr DeduceTensorReshapeType(const std::vector<ExprPtr>& args,
   auto tensor_type = As<TensorType>(args[0]->GetType());
   CHECK(tensor_type) << "tensor.reshape requires first argument to be a TensorType, but got "
                      << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!tensor_type->tensor_view_ || !IsMxTensorLayout(tensor_type->tensor_view_->layout),
+             args[0]->span_)
+      << "tensor.reshape does not support MX-layout tensors";
 
   // Second argument must be TupleType (shape)
   auto shape_tuple_type = As<TupleType>(args[1]->GetType());
@@ -239,6 +257,9 @@ TypePtr DeduceTensorReinterpretViewType(const std::vector<ExprPtr>& args,
   auto tensor_type = As<TensorType>(args[0]->GetType());
   CHECK_SPAN(tensor_type, args[0]->span_)
       << kOpName << " requires data to be a TensorType, but got " << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!tensor_type->tensor_view_ || !IsMxTensorLayout(tensor_type->tensor_view_->layout),
+             args[0]->span_)
+      << kOpName << " does not support MX-layout tensors";
   CHECK_SPAN(!tensor_type->shape_.empty(), args[0]->span_) << kOpName << " requires a tensor rank >= 1";
 
   const DataType target_dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
@@ -299,6 +320,9 @@ TypePtr DeduceTensorTransposeType(const std::vector<ExprPtr>& args,
   auto tensor_type = As<TensorType>(args[0]->GetType());
   CHECK(tensor_type) << "tensor.transpose requires first argument to be a TensorType, but got "
                      << args[0]->GetType()->TypeName();
+  CHECK_SPAN(!tensor_type->tensor_view_ || !IsMxTensorLayout(tensor_type->tensor_view_->layout),
+             args[0]->span_)
+      << "tensor.transpose does not support MX-layout tensors";
 
   const auto& input_shape = tensor_type->shape_;
   size_t ndim = input_shape.size();
@@ -456,6 +480,8 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
   TensorLayout src_layout =
       src_type->tensor_view_.has_value() ? src_type->tensor_view_->layout : TensorLayout::ND;
   TensorLayout new_layout = requested_layout.value_or(src_layout);
+  CHECK_SPAN(!IsMxTensorLayout(src_layout) && !IsMxTensorLayout(new_layout), args[0]->span_)
+      << "tensor.view does not support MX layouts";
   CHECK(new_layout != TensorLayout::NZ)
       << "tensor.view: NZ layout is not allowed on TensorType (NZ is tile-only)";
   CHECK(src_layout != TensorLayout::NZ)
@@ -603,8 +629,8 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
           << "tensor.view: explicit valid_shape shape reinterpretation only supports ND layout";
       CHECK(IsNdLeadingCollapseTo2D(src_type->shape_, src_type->tensor_view_->valid_shape, new_shape,
                                     valid_shape))
-          << "tensor.view: explicit valid_shape must describe an ND leading-dimension collapse to 2D "
-             "that preserves the final shape and valid_shape dimensions";
+          << "tensor.view: explicit valid_shape must describe an ND leading-dimension collapse or "
+             "contiguous-prefix linear collapse to 2D";
     } else if (source_has_valid_shape) {
       CHECK(false) << "tensor.view: a partial source valid_shape requires a non-empty target valid_shape";
     }
@@ -766,12 +792,21 @@ TypePtr DeduceTensorSetValidShapeType(const std::vector<ExprPtr>& args,
 }
 
 // NOTE: Internal op for compiler-generated code only; should not be exposed to end users in future releases.
+// The result aliases the input's storage, so it inherits the input's memory
+// space — the same relation `tile.set_validshape` already declares. Without it,
+// ConvertTensorToTileOps cannot propagate a consumer's memory-space requirement
+// back through set_validshape to the load-like producer, so a matmul operand
+// wrapped in set_validshape is materialised in Vec and bridged to Mat with a
+// tile.move. That move is a vector->cube boundary, which flips an otherwise
+// pure-CUBE InCore scope to MIXED and makes ExpandMixedKernel split it into an
+// AIC/AIV pair (issue #2227).
 REGISTER_OP("tensor.set_validshape")
     .set_op_category("TensorOp")
     .set_description("Update valid-shape metadata of a tensor without data movement (internal)")
     .add_argument("tensor", "Input tensor (TensorType, 2D)")
     .add_argument("valid_rows", "Number of valid rows (ScalarType INDEX/INT64/UINT64)")
     .add_argument("valid_cols", "Number of valid columns (ScalarType INDEX/INT64/UINT64)")
+    .set_output_memory_inherit_input()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorSetValidShapeType(args, kwargs);

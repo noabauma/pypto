@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Codegen smoke tests for dynamic valid_shape branch selection.
+"""Lowering smoke tests for dynamic valid_shape branch selection.
 
 The pre-JIT version of this test exercised a single-call kernel that
 selected ``vlen`` via an in-DSL ``if/else`` based on an ``is_last`` flag.
@@ -31,7 +31,7 @@ from examples.kernels.dyn_valid_shape import BLOCK_COL, Q_TILE, dyn_valid_shape
 
 
 class TestDynValidShapeIfElse:
-    """Codegen smoke for the two branches of the (now caller-side) if/else.
+    """Lowering smoke for the two branches of the (now caller-side) if/else.
 
     The original kernel computed ``vlen`` from an ``is_last`` flag inside
     the kernel.  Each test below picks the same ``vlen`` value the kernel
@@ -40,10 +40,9 @@ class TestDynValidShapeIfElse:
 
     def test_last_block(self):
         """is_last=True path: partial valid_len (48) -- vlen < physical."""
-        dyn_valid_shape._cache.clear()
         data = torch.zeros((Q_TILE, BLOCK_COL), dtype=torch.float32)
         out = torch.zeros((Q_TILE, BLOCK_COL), dtype=torch.float32)
-        program = dyn_valid_shape.compile_for_test(data, 2.0, 48, out)
+        program = dyn_valid_shape.lower(data, 2.0, 48, out)
         assert program is not None
         assert len(program.functions) >= 1, (
             f"expected >= 1 function in post-pass IR, got {len(program.functions)}"
@@ -51,10 +50,9 @@ class TestDynValidShapeIfElse:
 
     def test_full_block(self):
         """is_last=False path: full valid_len (= BLOCK_COL) -- fillpad no-op."""
-        dyn_valid_shape._cache.clear()
         data = torch.zeros((Q_TILE, BLOCK_COL), dtype=torch.float32)
         out = torch.zeros((Q_TILE, BLOCK_COL), dtype=torch.float32)
-        program = dyn_valid_shape.compile_for_test(data, 2.0, BLOCK_COL, out)
+        program = dyn_valid_shape.lower(data, 2.0, BLOCK_COL, out)
         assert program is not None
         assert len(program.functions) >= 1, (
             f"expected >= 1 function in post-pass IR, got {len(program.functions)}"

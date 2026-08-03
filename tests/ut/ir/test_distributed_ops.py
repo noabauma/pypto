@@ -84,7 +84,7 @@ def test_alloc_window_buffer_returns_ptr_type():
 def test_alloc_window_buffer_requires_non_empty_name():
     span = ir.Span.unknown()
     size = ir.ConstInt(4, DataType.INT64, span)
-    with pytest.raises(Exception, match="non-empty 'name'"):
+    with pytest.raises(ValueError, match="non-empty 'name'"):
         ir.create_op_call(
             "pld.tensor.alloc_window_buffer",
             [size],
@@ -146,7 +146,7 @@ def test_window_rejects_non_ptr_arg():
     tensor_type = ir.TensorType([ir.ConstInt(64, DataType.INT64, span)], DataType.FP32)
     bad = ir.Var("x", tensor_type, span)
     shape = _make_shape_tuple([64], span)
-    with pytest.raises(Exception, match="Ptr"):
+    with pytest.raises(ValueError, match="Ptr"):
         ir.create_op_call("pld.tensor.window", [bad, shape], {"dtype": DataType.FP32}, span)
 
 
@@ -154,7 +154,7 @@ def test_window_rejects_non_make_tuple_shape():
     span = ir.Span.unknown()
     base = ir.Var("buf", ir.PtrType(), span)
     bad_shape = ir.ConstInt(8, DataType.INT64, span)
-    with pytest.raises(Exception, match="shape tuple"):
+    with pytest.raises(ValueError, match="shape tuple"):
         ir.create_op_call("pld.tensor.window", [base, bad_shape], {"dtype": DataType.FP32}, span)
 
 
@@ -208,13 +208,13 @@ def test_world_size_returns_int64_scalar():
 
 def test_world_size_rejects_positional_args():
     span = ir.Span.unknown()
-    with pytest.raises(Exception, match="no positional arguments"):
+    with pytest.raises(ValueError, match="no positional arguments"):
         ir.create_op_call("pld.system.world_size", [ir.ConstInt(0, DataType.INT64, span)], {}, span)
 
 
 def test_world_size_rejects_kwargs():
     span = ir.Span.unknown()
-    with pytest.raises(Exception, match="no kwargs"):
+    with pytest.raises(ValueError, match="no kwargs"):
         ir.create_op_call("pld.system.world_size", [], {"foo": 1}, span)
 
 
@@ -230,6 +230,32 @@ def test_tensor_allreduce_returns_src_type():
     call = dist_tensor_ops.allreduce(src, signal, op=ir.ReduceOp.Sum, span=span)
     assert call.type is src.type
     assert call.kwargs["op"] == int(ir.ReduceOp.Sum)
+
+
+@pytest.mark.parametrize(
+    "reduce_op",
+    [ir.ReduceOp.Sum, ir.ReduceOp.Max, ir.ReduceOp.Min, ir.ReduceOp.Prod],
+)
+def test_tensor_allreduce_accepts_every_reduce_op(reduce_op):
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    call = dist_tensor_ops.allreduce(src, signal, op=reduce_op, span=span)
+    assert call.type is src.type
+    assert call.kwargs["op"] == int(reduce_op)
+
+
+def test_tensor_allreduce_rejects_unknown_reduce_op_value():
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    with pytest.raises(ValueError, match=r"ReduceOp\.Sum, Max, Min, or Prod"):
+        ir.create_op_call(
+            "pld.tensor.allreduce",
+            [src, signal],
+            {"op": 99, "mode": "mesh"},
+            span,
+        )
 
 
 def test_tensor_allreduce_defaults_to_sum():
@@ -277,7 +303,7 @@ def test_tensor_allreduce_rejects_plain_tensor_src():
     span = ir.Span.unknown()
     src = ir.Var("src", ir.TensorType([ir.ConstInt(16, DataType.INT64, span)], DataType.FP32), span)
     signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
-    with pytest.raises(Exception, match="DistributedTensor"):
+    with pytest.raises(ValueError, match="DistributedTensor"):
         dist_tensor_ops.allreduce(src, signal, op=ir.ReduceOp.Sum, span=span)
 
 
@@ -285,7 +311,7 @@ def test_tensor_allreduce_rejects_non_int32_signal():
     span = ir.Span.unknown()
     src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
     signal = _make_distributed_tensor_var("signal", [4], DataType.FP32, span)
-    with pytest.raises(Exception, match="signal must have INT32 element type"):
+    with pytest.raises(ValueError, match="signal must have INT32 element type"):
         dist_tensor_ops.allreduce(src, signal, op=ir.ReduceOp.Sum, span=span)
 
 
@@ -297,7 +323,7 @@ def test_tensor_allreduce_accepts_non_rank1_signal():
     assert call.type is src.type
 
 
-def test_tensor_allreduce_accepts_non_fp32_target_dtype():
+def test_tensor_allreduce_accepts_fp16_target_dtype():
     span = ir.Span.unknown()
     src = _make_distributed_tensor_var("src", [16], DataType.FP16, span)
     signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
@@ -305,11 +331,19 @@ def test_tensor_allreduce_accepts_non_fp32_target_dtype():
     assert call.type is src.type
 
 
+def test_tensor_allreduce_rejects_unsupported_target_dtype():
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.BF16, span)
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    with pytest.raises(ValueError, match="target dtype must be FP16 or FP32"):
+        dist_tensor_ops.allreduce(src, signal, op=ir.ReduceOp.Sum, span=span)
+
+
 def test_builtin_tensor_allreduce_is_internal_only():
     span = ir.Span.unknown()
     src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
     signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
-    with pytest.raises(Exception, match="internal-only"):
+    with pytest.raises(ValueError, match="internal-only"):
         ir.create_op_call(
             "builtin.tensor.allreduce",
             [src, signal],
@@ -359,13 +393,74 @@ def test_remote_load_returns_tile_type_with_target_dtype():
     assert call.type.shape[0].value == 32
 
 
+@pytest.mark.parametrize("layout", [ir.TensorLayout.MX_A_ZZ, ir.TensorLayout.MX_B_NN])
+def test_remote_load_rejects_mx_layout(layout):
+    span = ir.Span.unknown()
+    shape_exprs = [ir.ConstInt(8, DataType.INT64, span), ir.ConstInt(8, DataType.INT64, span)]
+    view = ir.TensorView([], layout)
+    target = ir.Var(
+        "data",
+        ir.DistributedTensorType(shape_exprs, DataType.FP8E8M0, None, view),
+        span,
+    )
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    with pytest.raises(ValueError, match="does not support MX-layout tensors"):
+        ir.create_op_call(
+            "pld.tile.remote_load",
+            [target, peer, _make_shape_tuple([0, 0], span), _make_shape_tuple([8, 8], span)],
+            {},
+            span,
+        )
+
+
+def test_remote_load_infers_col_major_for_single_column_tile():
+    """A [M, 1] remote Vec tile follows the standard implicit col-major layout."""
+    span = ir.Span.unknown()
+    target = _make_distributed_tensor_var("data", [8, 1], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    call = ir.create_op_call(
+        "pld.tile.remote_load",
+        [target, peer, _make_shape_tuple([0, 0], span), _make_shape_tuple([8, 1], span)],
+        {},
+        span,
+    )
+
+    assert isinstance(call.type, ir.TileType)
+    assert call.type.get_effective_tile_view().blayout == ir.TileLayout.col_major
+
+
+def test_remote_load_respects_explicit_nd_layout_for_single_column_tile():
+    """An explicit ND source keeps a row-major remote tile for [M, 1]."""
+    span = ir.Span.unknown()
+    shape = [ir.ConstInt(8, DataType.INT64, span), ir.ConstInt(1, DataType.INT64, span)]
+    view = ir.TensorView(
+        valid_shape=[],
+        stride=[ir.ConstInt(1, DataType.INT64, span), ir.ConstInt(8, DataType.INT64, span)],
+        layout=ir.TensorLayout.ND,
+    )
+    target = ir.Var("data", ir.DistributedTensorType(shape, DataType.FP32, None, view), span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    call = ir.create_op_call(
+        "pld.tile.remote_load",
+        [target, peer, _make_shape_tuple([0, 0], span), _make_shape_tuple([8, 1], span)],
+        {},
+        span,
+    )
+
+    assert isinstance(call.type, ir.TileType)
+    assert call.type.get_effective_tile_view().blayout == ir.TileLayout.row_major
+
+
 def test_remote_load_four_arg_form_rejects_out_of_bounds_window():
     """Omitting valid_shape still enforces the requested physical window."""
     span = ir.Span.unknown()
     target = _make_distributed_tensor_var("data", [1, 17], DataType.FP32, span)
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
 
-    with pytest.raises(Exception, match="reads past the end of dimension 1"):
+    with pytest.raises(ValueError, match="reads past the end of dimension 1"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [target, peer, _make_shape_tuple([0, 0], span), _make_shape_tuple([1, 8192], span)],
@@ -419,13 +514,34 @@ def test_remote_load_valid_shape_preserves_physical_tile_and_narrows_tail():
     assert call.type.tile_view.valid_shape == [1, 17]
 
 
+def test_remote_load_internal_fp16_tail_allows_one_aligned_padding_block():
+    """The allreduce-only mode may read the hidden aligned tail padding."""
+    span = ir.Span.unknown()
+    target = _make_distributed_tensor_var("data", [1, 17], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    call = dist_tile_ops._remote_load_with_physical_tail_padding(
+        target,
+        peer,
+        [0, 0],
+        [1, 32],
+        [1, 32],
+        span=span,
+    )
+
+    assert isinstance(call.type, ir.TileType)
+    assert call.kwargs["allow_physical_tail_padding"] is True
+    assert call.type.shape == [1, 32]
+    assert call.type.get_effective_tile_view().valid_shape == [1, 32]
+
+
 def test_remote_load_rejects_mismatched_valid_shape_rank():
     """The optional valid_shape must use the target coordinate rank."""
     span = ir.Span.unknown()
     target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
 
-    with pytest.raises(Exception, match="valid_shape rank"):
+    with pytest.raises(ValueError, match="valid_shape rank"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [
@@ -446,7 +562,7 @@ def test_remote_load_rejects_negative_valid_shape():
     target = _make_distributed_tensor_var("data", [64], DataType.FP32, span)
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
 
-    with pytest.raises(Exception, match="valid_shape 0 is provably negative"):
+    with pytest.raises(ValueError, match="valid_shape 0 is provably negative"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [
@@ -468,7 +584,7 @@ def test_remote_load_rejects_non_integer_valid_shape():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     float_valid_shape = ir.MakeTuple([ir.ConstFloat(1.0, DataType.FP32, span)], span)
 
-    with pytest.raises(Exception, match="valid_shape 0 must be an integer scalar"):
+    with pytest.raises(ValueError, match="valid_shape 0 must be an integer scalar"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [target, peer, _make_shape_tuple([0], span), _make_shape_tuple([32], span), float_valid_shape],
@@ -489,7 +605,7 @@ def test_remote_load_rejects_plain_tensor_target():
     offsets = _make_shape_tuple([0], span)
     shape = _make_shape_tuple([32], span)
 
-    with pytest.raises(Exception, match="DistributedTensor"):
+    with pytest.raises(ValueError, match="DistributedTensor"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [plain, peer, offsets, shape],
@@ -506,7 +622,7 @@ def test_remote_load_rejects_non_scalar_peer():
     offsets = _make_shape_tuple([0], span)
     shape = _make_shape_tuple([32], span)
 
-    with pytest.raises(Exception, match="peer must be a scalar"):
+    with pytest.raises(ValueError, match="peer must be a scalar"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [target, bad_peer, offsets, shape],
@@ -523,7 +639,7 @@ def test_remote_load_rejects_mismatched_offsets_rank():
     bad_offsets = _make_shape_tuple([0], span)  # 1-D, but target is 2-D
     shape = _make_shape_tuple([32, 16], span)
 
-    with pytest.raises(Exception, match="offsets rank"):
+    with pytest.raises(ValueError, match="offsets rank"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [target, peer, bad_offsets, shape],
@@ -540,7 +656,7 @@ def test_remote_load_rejects_mismatched_shape_rank():
     offsets = _make_shape_tuple([0, 0], span)
     bad_shape = _make_shape_tuple([16], span)  # 1-D, but target is 2-D
 
-    with pytest.raises(Exception, match="shape rank"):
+    with pytest.raises(ValueError, match="shape rank"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [target, peer, offsets, bad_shape],
@@ -557,7 +673,7 @@ def test_remote_load_rejects_non_make_tuple_offsets():
     bad_offsets = ir.ConstInt(0, DataType.INT64, span)
     shape = _make_shape_tuple([32], span)
 
-    with pytest.raises(Exception, match="offsets must be a tuple"):
+    with pytest.raises(ValueError, match="offsets must be a tuple"):
         ir.create_op_call(
             "pld.tile.remote_load",
             [target, peer, bad_offsets, shape],
@@ -600,7 +716,7 @@ def test_remote_store_rejects_plain_tensor_target():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     offsets = _make_shape_tuple([0], span)
 
-    with pytest.raises(Exception, match="DistributedTensor"):
+    with pytest.raises(ValueError, match="DistributedTensor"):
         ir.create_op_call(
             "pld.tile.remote_store",
             [tile_var, plain, peer, offsets],
@@ -617,7 +733,7 @@ def test_remote_store_rejects_non_scalar_peer():
     bad_peer = _make_shape_tuple([0, 0], span)  # MakeTuple, not a scalar
     offsets = _make_shape_tuple([0, 0], span)
 
-    with pytest.raises(Exception, match="peer must be a scalar"):
+    with pytest.raises(ValueError, match="peer must be a scalar"):
         ir.create_op_call(
             "pld.tile.remote_store",
             [tile_var, target, bad_peer, offsets],
@@ -634,7 +750,7 @@ def test_remote_store_rejects_mismatched_offsets_rank():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     bad_offsets = _make_shape_tuple([0], span)  # 1-D, but target is 2-D
 
-    with pytest.raises(Exception, match="offsets rank"):
+    with pytest.raises(ValueError, match="offsets rank"):
         ir.create_op_call(
             "pld.tile.remote_store",
             [tile_var, target, peer, bad_offsets],
@@ -651,7 +767,7 @@ def test_remote_store_rejects_non_make_tuple_offsets():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     bad_offsets = ir.ConstInt(0, DataType.INT64, span)
 
-    with pytest.raises(Exception, match="offsets must be a tuple"):
+    with pytest.raises(ValueError, match="offsets must be a tuple"):
         ir.create_op_call(
             "pld.tile.remote_store",
             [tile_var, target, peer, bad_offsets],
@@ -672,7 +788,7 @@ def test_remote_store_rejects_non_tile_src():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     offsets = _make_shape_tuple([0], span)
 
-    with pytest.raises(Exception, match="src_tile must be a TileType"):
+    with pytest.raises(ValueError, match="src_tile must be a TileType"):
         ir.create_op_call(
             "pld.tile.remote_store",
             [not_a_tile, target, peer, offsets],
@@ -689,7 +805,7 @@ def test_remote_store_rejects_dtype_mismatch():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     offsets = _make_shape_tuple([0], span)
 
-    with pytest.raises(Exception, match="dtype"):
+    with pytest.raises(ValueError, match="dtype"):
         ir.create_op_call(
             "pld.tile.remote_store",
             [tile_var, target, peer, offsets],
@@ -707,7 +823,7 @@ def test_remote_store_rejects_extra_positional():
     offsets = _make_shape_tuple([0, 0], span)
     extra_shapes = _make_shape_tuple([32, 16], span)
 
-    with pytest.raises(Exception, match="4 positional argument"):
+    with pytest.raises(ValueError, match="4 positional argument"):
         ir.create_op_call(
             "pld.tile.remote_store",
             [tile_var, target, peer, offsets, extra_shapes],
@@ -741,14 +857,14 @@ def test_get_comm_ctx_rejects_plain_tensor():
     span = ir.Span.unknown()
     shape: list[ir.Expr] = [ir.ConstInt(64, DataType.INT64, span)]
     plain = ir.Var("x", ir.TensorType(shape, DataType.FP32), span)
-    with pytest.raises(Exception, match="DistributedTensor"):
+    with pytest.raises(ValueError, match="DistributedTensor"):
         ir.create_op_call("pld.system.get_comm_ctx", [plain], {}, span)
 
 
 def test_get_comm_ctx_rejects_kwargs():
     span = ir.Span.unknown()
     target = _make_distributed_tensor_var("data", [64], DataType.FP32, span)
-    with pytest.raises(Exception, match="no kwargs"):
+    with pytest.raises(ValueError, match="no kwargs"):
         ir.create_op_call("pld.system.get_comm_ctx", [target], {"peer": 0}, span)
 
 
@@ -756,7 +872,7 @@ def test_get_comm_ctx_rejects_extra_positional():
     span = ir.Span.unknown()
     target = _make_distributed_tensor_var("data", [64], DataType.FP32, span)
     extra = ir.ConstInt(0, DataType.INT32, span)
-    with pytest.raises(Exception, match="exactly 1 positional"):
+    with pytest.raises(ValueError, match="exactly 1 positional"):
         ir.create_op_call("pld.system.get_comm_ctx", [target, extra], {}, span)
 
 
@@ -781,14 +897,14 @@ def test_comm_ctx_nranks_returns_int32_scalar():
 def test_comm_ctx_rank_rejects_non_comm_ctx_arg():
     span = ir.Span.unknown()
     not_ctx = ir.Var("n", ir.ScalarType(DataType.INT64), span)
-    with pytest.raises(Exception, match="CommCtx"):
+    with pytest.raises(ValueError, match="CommCtx"):
         ir.create_op_call("pld.system.rank", [not_ctx], {}, span)
 
 
 def test_comm_ctx_nranks_rejects_non_comm_ctx_arg():
     span = ir.Span.unknown()
     not_ctx = ir.Var("n", ir.ScalarType(DataType.INT64), span)
-    with pytest.raises(Exception, match="CommCtx"):
+    with pytest.raises(ValueError, match="CommCtx"):
         ir.create_op_call("pld.system.nranks", [not_ctx], {}, span)
 
 
@@ -822,7 +938,7 @@ def test_notify_rejects_plain_tensor_target():
     offsets = _make_shape_tuple([0], span)
     value = ir.Var("v", ir.ScalarType(DataType.INT32), span)
 
-    with pytest.raises(Exception, match="DistributedTensor"):
+    with pytest.raises(ValueError, match="DistributedTensor"):
         ir.create_op_call(
             "pld.system.notify",
             [plain, peer, offsets, value],
@@ -839,7 +955,7 @@ def test_notify_rejects_mismatched_offsets_rank():
     bad_offsets = _make_shape_tuple([0], span)  # 1-D, target is 2-D
     value = ir.Var("v", ir.ScalarType(DataType.INT32), span)
 
-    with pytest.raises(Exception, match="offsets rank"):
+    with pytest.raises(ValueError, match="offsets rank"):
         ir.create_op_call(
             "pld.system.notify",
             [target, peer, bad_offsets, value],
@@ -871,7 +987,7 @@ def test_wait_rejects_plain_tensor_signal():
     offsets = _make_shape_tuple([0], span)
     expected = ir.Var("e", ir.ScalarType(DataType.INT32), span)
 
-    with pytest.raises(Exception, match="DistributedTensor"):
+    with pytest.raises(ValueError, match="DistributedTensor"):
         ir.create_op_call(
             "pld.system.wait",
             [plain, offsets, expected],
@@ -933,7 +1049,7 @@ def test_put_subregion_dynamic_shape_requires_chunk():
     dyn_shape = ir.MakeTuple([n, ir.ConstInt(64, DataType.INT64, span)], span)
 
     # Without chunk_rows → rejected (can't size the staging tile).
-    with pytest.raises(Exception, match="dynamic leading transfer dim needs a static chunk_rows"):
+    with pytest.raises(ValueError, match="dynamic leading transfer dim needs a static chunk_rows"):
         ir.create_op_call(
             "pld.tensor.put", [dst, peer, src, dst_offsets, src_offsets, dyn_shape], {"atomic": 0}, span
         )
@@ -967,7 +1083,7 @@ def test_put_full_slice_dynamic_window_requires_chunk():
     src = _make_dynamic_window_var("src", n, span)  # same dynamic extent
 
     # Dynamic leading window dim, no chunk_rows → rejected.
-    with pytest.raises(Exception, match="dynamic leading transfer dim needs a static chunk_rows"):
+    with pytest.raises(ValueError, match="dynamic leading transfer dim needs a static chunk_rows"):
         ir.create_op_call("pld.tensor.put", [dst, peer, src], {"atomic": 0}, span)
 
     # With chunk_rows → accepted.
@@ -976,7 +1092,7 @@ def test_put_full_slice_dynamic_window_requires_chunk():
 
     # Mismatched dynamic dst/src extents → rejected by the full-slice same-shape check.
     src_mismatch = _make_dynamic_window_var("src2", ir.Var("m", ir.ScalarType(DataType.INT32), span), span)
-    with pytest.raises(Exception, match="must have the same shape"):
+    with pytest.raises(ValueError, match="must have the same shape"):
         ir.create_op_call("pld.tensor.put", [dst, peer, src_mismatch], {"atomic": 0, "chunk_rows": 4}, span)
 
 
@@ -1036,9 +1152,9 @@ def test_negative_chunk_rejected_by_deducer():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16, 64], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="chunk_rows must be non-negative"):
+    with pytest.raises(ValueError, match="chunk_rows must be non-negative"):
         ir.create_op_call("pld.tensor.put", [dst, peer, src], {"atomic": 0, "chunk_rows": -1}, span)
-    with pytest.raises(Exception, match="chunk_cols must be non-negative"):
+    with pytest.raises(ValueError, match="chunk_cols must be non-negative"):
         ir.create_op_call("pld.tensor.get", [dst, peer, src], {"chunk_cols": -1}, span)
 
     # 0 = full is accepted (no raise).
@@ -1078,7 +1194,7 @@ def test_pipeline_packs_attr_and_requires_chunk():
     assert call.kwargs["pipeline"] is True
 
     # Deducer rejects pipeline without both chunk dims.
-    with pytest.raises(Exception, match="pipeline=True requires both chunk_rows>0 and chunk_cols>0"):
+    with pytest.raises(ValueError, match="pipeline=True requires both chunk_rows>0 and chunk_cols>0"):
         ir.create_op_call(
             "pld.tensor.put", [dst, peer, src], {"atomic": 0, "pipeline": True, "chunk_rows": 4}, span
         )
@@ -1131,7 +1247,7 @@ def test_tile_put_rejects_non_2d_stage():
     src = _make_distributed_tensor_var("src", [1, 64], DataType.FP16, span)
     stage = _make_tile_var("stage", [1, 1, 64], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="stage must be a 2D VEC staging tile"):
+    with pytest.raises(ValueError, match="stage must be a 2D VEC staging tile"):
         dist_tile_ops.put(dst, peer, src, stage, atomic=ir.AtomicType.None_, span=span)
 
 
@@ -1156,7 +1272,7 @@ def test_tile_put_rejects_stage_larger_than_transfer():
     # 128 cols > 64 transfer cols.
     stage = _make_tile_var("stage", [16, 128], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="must fit within"):
+    with pytest.raises(ValueError, match="must fit within"):
         dist_tile_ops.put(dst, peer, src, stage, atomic=ir.AtomicType.None_, span=span)
 
 
@@ -1184,7 +1300,7 @@ def test_tile_put_rejects_second_stage_shape_mismatch():
     ping = _make_tile_var("ping", [4, 32], DataType.FP16, span)
     pong = _make_tile_var("pong", [8, 32], DataType.FP16, span)  # different rows
 
-    with pytest.raises(Exception, match="ping/pong staging tiles must have identical shape"):
+    with pytest.raises(ValueError, match="ping/pong staging tiles must have identical shape"):
         dist_tile_ops.put(dst, peer, src, ping, atomic=ir.AtomicType.None_, stage2=pong, span=span)
 
 
@@ -1197,7 +1313,7 @@ def test_tile_put_rejects_second_stage_dtype_mismatch():
     ping = _make_tile_var("ping", [4, 32], DataType.FP16, span)
     pong = _make_tile_var("pong", [4, 32], DataType.FP32, span)  # wrong dtype
 
-    with pytest.raises(Exception, match="stage2 dtype must match dst dtype"):
+    with pytest.raises(ValueError, match="stage2 dtype must match dst dtype"):
         dist_tile_ops.put(dst, peer, src, ping, atomic=ir.AtomicType.None_, stage2=pong, span=span)
 
 
@@ -1208,7 +1324,7 @@ def test_put_rejects_plain_tensor_dst():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="DistributedTensor"):
+    with pytest.raises(ValueError, match="DistributedTensor"):
         ir.create_op_call(
             "pld.tensor.put",
             [plain, peer, src],
@@ -1241,7 +1357,7 @@ def test_put_rejects_dtype_mismatch():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
 
-    with pytest.raises(Exception, match="element type"):
+    with pytest.raises(ValueError, match="element type"):
         ir.create_op_call(
             "pld.tensor.put",
             [dst, peer, src],
@@ -1257,7 +1373,7 @@ def test_put_rejects_shape_mismatch():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16, 32], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="static shape"):
+    with pytest.raises(ValueError, match="static shape"):
         ir.create_op_call(
             "pld.tensor.put",
             [dst, peer, src],
@@ -1276,7 +1392,7 @@ def test_put_subregion_rejects_mismatched_offsets_rank():
     src_offsets = _make_shape_tuple([0, 0], span)
     shape = _make_shape_tuple([1, 64], span)
 
-    with pytest.raises(Exception, match="dst_offsets rank"):
+    with pytest.raises(ValueError, match="dst_offsets rank"):
         ir.create_op_call(
             "pld.tensor.put",
             [dst, peer, src, bad_dst_offsets, src_offsets, shape],
@@ -1295,7 +1411,7 @@ def test_put_subregion_rejects_negative_offsets():
     src_offsets = _make_shape_tuple([0, 0], span)
     shape = _make_shape_tuple([1, 64], span)
 
-    with pytest.raises(Exception, match="dst_offsets dimension 0 must be non-negative"):
+    with pytest.raises(ValueError, match="dst_offsets dimension 0 must be non-negative"):
         ir.create_op_call(
             "pld.tensor.put",
             [dst, peer, src, dst_offsets, src_offsets, shape],
@@ -1314,7 +1430,7 @@ def test_put_subregion_rejects_out_of_bounds_dst():
     src_offsets = _make_shape_tuple([0, 0], span)
     shape = _make_shape_tuple([2, 64], span)
 
-    with pytest.raises(Exception, match="dst subregion dimension 0 exceeds dst shape"):
+    with pytest.raises(ValueError, match="dst subregion dimension 0 exceeds dst shape"):
         ir.create_op_call(
             "pld.tensor.put",
             [dst, peer, src, dst_offsets, src_offsets, shape],
@@ -1333,7 +1449,7 @@ def test_put_subregion_rejects_out_of_bounds_src():
     src_offsets = _make_shape_tuple([15, 0], span)
     shape = _make_shape_tuple([2, 64], span)
 
-    with pytest.raises(Exception, match="src subregion dimension 0 exceeds src shape"):
+    with pytest.raises(ValueError, match="src subregion dimension 0 exceeds src shape"):
         ir.create_op_call(
             "pld.tensor.put",
             [dst, peer, src, dst_offsets, src_offsets, shape],
@@ -1349,7 +1465,7 @@ def test_put_rejects_non_scalar_peer():
     bad_peer = _make_distributed_tensor_var("p", [16], DataType.FP16, span)
     src = _make_distributed_tensor_var("src", [16], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="scalar"):
+    with pytest.raises(ValueError, match="scalar"):
         ir.create_op_call(
             "pld.tensor.put",
             [dst, bad_peer, src],
@@ -1411,7 +1527,7 @@ def test_get_subregion_dynamic_shape_requires_chunk():
     dyn_shape = ir.MakeTuple([ir.ConstInt(16, DataType.INT64, span), m], span)
 
     # Without chunk_cols → rejected.
-    with pytest.raises(Exception, match="dynamic innermost transfer dim needs a static chunk_cols"):
+    with pytest.raises(ValueError, match="dynamic innermost transfer dim needs a static chunk_cols"):
         ir.create_op_call("pld.tensor.get", [dst, peer, src, dst_offsets, src_offsets, dyn_shape], {}, span)
 
     # With chunk_cols → accepted.
@@ -1433,7 +1549,7 @@ def test_get_full_slice_dynamic_window_requires_chunk():
     dst = _make_dynamic_window_var("dst", n, span)
     src = _make_dynamic_window_var("src", n, span)
 
-    with pytest.raises(Exception, match="dynamic leading transfer dim needs a static chunk_rows"):
+    with pytest.raises(ValueError, match="dynamic leading transfer dim needs a static chunk_rows"):
         ir.create_op_call("pld.tensor.get", [dst, peer, src], {}, span)
 
     call = ir.create_op_call("pld.tensor.get", [dst, peer, src], {"chunk_rows": 4}, span)
@@ -1485,7 +1601,7 @@ def test_tile_get_rejects_stage_dtype_mismatch():
     src = _make_distributed_tensor_var("src", [16, 64], DataType.FP16, span)
     stage = _make_tile_var("stage", [16, 64], DataType.FP32, span)
 
-    with pytest.raises(Exception, match="stage dtype must match dst dtype"):
+    with pytest.raises(ValueError, match="stage dtype must match dst dtype"):
         dist_tile_ops.get(dst, peer, src, stage, span=span)
 
 
@@ -1511,7 +1627,7 @@ def test_tile_get_rejects_stage_larger_than_transfer():
     # 32 rows > 16 transfer rows.
     stage = _make_tile_var("stage", [32, 64], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="must fit within"):
+    with pytest.raises(ValueError, match="must fit within"):
         dist_tile_ops.get(dst, peer, src, stage, span=span)
 
 
@@ -1523,7 +1639,7 @@ def test_tile_get_rejects_non_2d_stage():
     src = _make_distributed_tensor_var("src", [1, 64], DataType.FP16, span)
     stage = _make_tile_var("stage", [1, 1, 64], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="stage must be a 2D VEC staging tile"):
+    with pytest.raises(ValueError, match="stage must be a 2D VEC staging tile"):
         dist_tile_ops.get(dst, peer, src, stage, span=span)
 
 
@@ -1534,7 +1650,7 @@ def test_get_rejects_unexpected_kwargs():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="Unknown kwarg 'atomic'"):
+    with pytest.raises(ValueError, match="Unknown kwarg 'atomic'"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src],
@@ -1597,7 +1713,7 @@ def test_tile_get_rejects_second_stage_shape_mismatch():
     ping = _make_tile_var("ping", [4, 32], DataType.FP16, span)
     pong = _make_tile_var("pong", [4, 16], DataType.FP16, span)  # different cols
 
-    with pytest.raises(Exception, match="ping/pong staging tiles must have identical shape"):
+    with pytest.raises(ValueError, match="ping/pong staging tiles must have identical shape"):
         dist_tile_ops.get(dst, peer, src, ping, stage2=pong, span=span)
 
 
@@ -1608,7 +1724,7 @@ def test_get_rejects_plain_tensor_src():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     plain = ir.Var("x", ir.TensorType([ir.ConstInt(16, DataType.INT64, span)], DataType.FP16), span)
 
-    with pytest.raises(Exception, match="DistributedTensor"):
+    with pytest.raises(ValueError, match="DistributedTensor"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, plain],
@@ -1624,7 +1740,7 @@ def test_get_rejects_dtype_mismatch():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
 
-    with pytest.raises(Exception, match="element type"):
+    with pytest.raises(ValueError, match="element type"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src],
@@ -1640,7 +1756,7 @@ def test_get_rejects_shape_mismatch():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16, 32], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="static shape"):
+    with pytest.raises(ValueError, match="static shape"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src],
@@ -1659,7 +1775,7 @@ def test_get_subregion_rejects_mismatched_offsets_rank():
     src_offsets = _make_shape_tuple([0, 0], span)
     shape = _make_shape_tuple([1, 64], span)
 
-    with pytest.raises(Exception, match="dst_offsets rank"):
+    with pytest.raises(ValueError, match="dst_offsets rank"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src, bad_dst_offsets, src_offsets, shape],
@@ -1678,7 +1794,7 @@ def test_get_subregion_rejects_negative_offsets():
     src_offsets = _make_shape_tuple([0, 0], span)
     shape = _make_shape_tuple([1, 64], span)
 
-    with pytest.raises(Exception, match="dst_offsets dimension 0 must be non-negative"):
+    with pytest.raises(ValueError, match="dst_offsets dimension 0 must be non-negative"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src, dst_offsets, src_offsets, shape],
@@ -1697,7 +1813,7 @@ def test_get_subregion_rejects_out_of_bounds_dst():
     src_offsets = _make_shape_tuple([0, 0], span)
     shape = _make_shape_tuple([2, 64], span)
 
-    with pytest.raises(Exception, match="dst subregion dimension 0 exceeds dst shape"):
+    with pytest.raises(ValueError, match="dst subregion dimension 0 exceeds dst shape"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src, dst_offsets, src_offsets, shape],
@@ -1716,7 +1832,7 @@ def test_get_subregion_rejects_out_of_bounds_src():
     src_offsets = _make_shape_tuple([15, 0], span)
     shape = _make_shape_tuple([2, 64], span)
 
-    with pytest.raises(Exception, match="src subregion dimension 0 exceeds src shape"):
+    with pytest.raises(ValueError, match="src subregion dimension 0 exceeds src shape"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src, dst_offsets, src_offsets, shape],
@@ -1732,7 +1848,7 @@ def test_get_rejects_rank_mismatch():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16, 64, 4], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="rank"):
+    with pytest.raises(ValueError, match="rank"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src],
@@ -1748,7 +1864,7 @@ def test_get_rejects_non_positive_static_shape():
     peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
     src = _make_distributed_tensor_var("src", [16, 0], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="positive"):
+    with pytest.raises(ValueError, match="positive"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, peer, src],
@@ -1764,13 +1880,143 @@ def test_get_rejects_non_scalar_peer():
     bad_peer = _make_distributed_tensor_var("p", [16], DataType.FP16, span)
     src = _make_distributed_tensor_var("src", [16], DataType.FP16, span)
 
-    with pytest.raises(Exception, match="scalar"):
+    with pytest.raises(ValueError, match="scalar"):
         ir.create_op_call(
             "pld.tensor.get",
             [dst, bad_peer, src],
             {},
             span,
         )
+
+
+# ---------------------------------------------------------------------------
+# pld.tensor.all_to_all_v — type deduction (5-arg, send_counts + recv_counts)
+# ---------------------------------------------------------------------------
+
+_AAV_NR = 2
+_AAV_MAX_RECV = 4
+_AAV_TOTAL = _AAV_NR * _AAV_MAX_RECV
+_AAV_SIZE = 64
+
+
+def _make_tensor_var(name: str, shape: list[int], dtype: DataType, span: ir.Span) -> ir.Var:
+    shape_exprs: list[ir.Expr] = [ir.ConstInt(v, DataType.INT64, span) for v in shape]
+    return ir.Var(name, ir.TensorType(shape_exprs, dtype), span)
+
+
+def _make_all_to_all_v_args(
+    span: ir.Span,
+    *,
+    counts_shape: list[int] | None = None,
+    counts_dtype: DataType = DataType.INT32,
+    recv_shape: list[int] | None = None,
+) -> list[ir.Expr]:
+    """Build a valid 5-arg operand list, with the counts operands overridable."""
+    shape = counts_shape or [_AAV_NR, 1]
+    # recv_counts is always [NR, 1] (same layout as the barrier signal).
+    return [
+        _make_tensor_var("inp", [_AAV_TOTAL, _AAV_SIZE], DataType.FP32, span),
+        _make_distributed_tensor_var("target", [_AAV_TOTAL, _AAV_SIZE], DataType.FP32, span),
+        _make_distributed_tensor_var("signal", [_AAV_NR, 1], DataType.INT32, span),
+        _make_tensor_var("counts", shape, counts_dtype, span),
+        _make_distributed_tensor_var("recv_counts", recv_shape or [_AAV_NR, 1], DataType.INT32, span),
+    ]
+
+
+def test_all_to_all_v_returns_target_window_type():
+    """Positive: window-as-result — the deduced type is the target window's."""
+    span = ir.Span.unknown()
+    call = ir.create_op_call("pld.tensor.all_to_all_v", _make_all_to_all_v_args(span), {}, span)
+    assert isinstance(call.type, ir.DistributedTensorType)
+    assert call.type.dtype == DataType.FP32
+
+
+def test_all_to_all_v_accepts_1d_send_counts():
+    """send_counts may be 1D [NR] as well as 2D [NR, 1]; recv_counts stays [NR, 1]."""
+    span = ir.Span.unknown()
+    call = ir.create_op_call(
+        "pld.tensor.all_to_all_v",
+        _make_all_to_all_v_args(span, counts_shape=[_AAV_NR]),
+        {},
+        span,
+    )
+    assert isinstance(call.type, ir.DistributedTensorType)
+
+
+def test_all_to_all_v_accepts_window_bound_send_counts():
+    """Counts published into a window by a preceding exchange are accepted."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    args[3] = _make_distributed_tensor_var("counts_win", [_AAV_NR, 1], DataType.INT32, span)
+    call = ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+    assert isinstance(call.type, ir.DistributedTensorType)
+
+
+def test_all_to_all_v_accepts_window_bound_input():
+    """Input published into a window by a preceding exchange is accepted."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    args[0] = _make_distributed_tensor_var("inp_win", [_AAV_TOTAL, _AAV_SIZE], DataType.FP32, span)
+    call = ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+    assert isinstance(call.type, ir.DistributedTensorType)
+
+
+def test_all_to_all_v_rejects_1d_signal():
+    """Signal must be 2D [NR, 1] — lowering emits 2-D MakeSignalOffsets."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    args[2] = _make_distributed_tensor_var("signal_1d", [_AAV_NR], DataType.INT32, span)
+    with pytest.raises(ValueError, match="signal must be 2D"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
+def test_all_to_all_v_requires_recv_counts_operand():
+    """The 4-arg form is rejected — recv_counts exposes the receive-side counts."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)[:4]
+    with pytest.raises(ValueError, match="requires 5 args"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
+def test_all_to_all_v_rejects_recv_counts_bad_width():
+    """recv_counts second dim must be 1 (same layout as the barrier signal)."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span, recv_shape=[_AAV_NR, 8])
+    with pytest.raises(ValueError, match="recv_counts second dimension must be 1"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
+def test_all_to_all_v_rejects_non_int32_send_counts():
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span, counts_dtype=DataType.FP32)
+    with pytest.raises(ValueError, match="send_counts must have INT32 element type"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
+def test_all_to_all_v_rejects_send_counts_rank_mismatch():
+    """send_counts dim 0 must be NR — otherwise a destination has no count."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span, counts_shape=[_AAV_NR + 1, 1])
+    with pytest.raises(ValueError, match="send_counts dim 0"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
+def test_all_to_all_v_rejects_3d_send_counts():
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span, counts_shape=[_AAV_NR, 1, 1])
+    with pytest.raises(ValueError, match="send_counts must be 1D"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
+
+
+def test_all_to_all_v_rejects_non_divisible_target_rows():
+    """NR must divide target dim 0 — MAX_RECV is that quotient."""
+    span = ir.Span.unknown()
+    args = _make_all_to_all_v_args(span)
+    odd_rows = _AAV_NR * _AAV_MAX_RECV + 1
+    args[0] = _make_tensor_var("inp", [odd_rows, _AAV_SIZE], DataType.FP32, span)
+    args[1] = _make_distributed_tensor_var("target", [odd_rows, _AAV_SIZE], DataType.FP32, span)
+    with pytest.raises(ValueError, match="must divide target dim 0"):
+        ir.create_op_call("pld.tensor.all_to_all_v", args, {}, span)
 
 
 if __name__ == "__main__":

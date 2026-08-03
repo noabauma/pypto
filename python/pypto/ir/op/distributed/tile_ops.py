@@ -52,16 +52,54 @@ def remote_load(
         :class:`ir.Call` with result type :class:`ir.TileType` (shape =
         ``shape``, dtype = ``target.dtype``).
     """
-    actual_span = _get_span_or_capture(span, frame_offset=1)
+    return _build_remote_load(target, peer, offsets, shape, valid_shape, span=span)
+
+
+def _remote_load_with_physical_tail_padding(
+    target: Expr,
+    peer: Expr,
+    offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    *,
+    span: Span | None = None,
+) -> Call:
+    """Build the lowering-only FP16 remote-load tail variant."""
+    return _build_remote_load(
+        target,
+        peer,
+        offsets,
+        shape,
+        valid_shape,
+        allow_physical_tail_padding=True,
+        span=span,
+    )
+
+
+def _build_remote_load(
+    target: Expr,
+    peer: Expr,
+    offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None,
+    *,
+    allow_physical_tail_padding: bool = False,
+    span: Span | None = None,
+) -> Call:
+    """Build a public or lowering-only remote-load call."""
+    actual_span = _get_span_or_capture(span, frame_offset=2)
     offsets_tuple = _to_make_tuple(offsets, actual_span)
     shape_tuple = _to_make_tuple(shape, actual_span)
     args = [target, peer, offsets_tuple, shape_tuple]
     if valid_shape is not None:
         args.append(_to_make_tuple(valid_shape, actual_span))
+    kwargs = {}
+    if allow_physical_tail_padding:
+        kwargs["allow_physical_tail_padding"] = True
     return _ir_core.create_op_call(
         "pld.tile.remote_load",
         args,
-        {},
+        kwargs,
         actual_span,
     )
 

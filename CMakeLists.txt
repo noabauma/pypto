@@ -123,6 +123,7 @@ set(PYPTO_SOURCES
     src/ir/op/distributed/system.cpp
     src/ir/op/distributed/allreduce.cpp
     src/ir/op/distributed/intrinsics.cpp
+    src/ir/op/prefetch/prefetch_async.cpp
     src/ir/op/tensor_ops/broadcast.cpp
     src/ir/op/tensor_ops/elementwise.cpp
     src/ir/op/tensor_ops/matmul.cpp
@@ -154,6 +155,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/canonicalize_tile_slice_pass.cpp
     src/ir/transforms/fold_no_op_reshape_pass.cpp
     src/ir/transforms/stamp_tfree_split_pass.cpp
+    src/ir/transforms/insert_comm_fence_pass.cpp
     src/ir/transforms/materialize_runtime_scopes_pass.cpp
     src/ir/transforms/classify_iter_arg_carry_pass.cpp
     src/ir/transforms/fuse_create_assemble_to_slice_pass.cpp
@@ -251,6 +253,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_pipeline_resolved.cpp
     src/ir/verifier/verify_unroll_resolved.cpp
     src/ir/verifier/verify_iter_arg_carry_classified.cpp
+    src/ir/verifier/verify_runtime_scopes_materialized.cpp
     src/ir/verifier/verify_call_directions.cpp
     src/ir/verifier/verify_tile_type_coherence.cpp
     src/ir/verifier/verify_assign_type_symmetry.cpp
@@ -301,6 +304,7 @@ set(PYPTO_SOURCES
     src/backend/common/pto_ops_memory.cpp
     src/backend/common/pto_ops_crosscore.cpp
     src/backend/common/pto_ops_distributed.cpp
+    src/backend/common/pto_ops_prefetch.cpp
     src/backend/common/soc.cpp
 )
 

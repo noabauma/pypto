@@ -105,16 +105,34 @@ std::string MakePartitionTensorViewType(const std::vector<std::string>& dims, co
 // emitted as index constants; loop vars are already index (EmitCastToIndex is
 // a no-op). Used for every pto.partition_view offset (load/store/remote_store/
 // notify/wait/put), so all paths coerce offsets identically.
+//
+// After coercion, every runtime offset is clamped to non-negative via
+// arith.maxsi(offset, 0). A negative offset (e.g. a ring-neighbour computation
+// that passes through -1 before a conditional adjust) would otherwise reach
+// PTOAS as a signed index value that partition_view does not handle, silently
+// dropping or misdirecting the access. ConstInt offsets are clamped at emit
+// time so compile-time provably-negative offsets also become safe codegen
+// (the verifier rejects those independently).
 std::vector<std::string> GetIndexOffsetCodes(const std::vector<ir::ExprPtr>& exprs,
                                              codegen::PTOCodegen& codegen) {
   std::vector<std::string> codes;
   codes.reserve(exprs.size());
   for (const auto& expr : exprs) {
+    std::string offset_idx;
     if (auto ci = As<ir::ConstInt>(expr)) {
-      codes.push_back(codegen.GetOrEmitConstant(ci->value_, DataType::INDEX));
+      // Clamp compile-time negative constants to zero at codegen time.
+      offset_idx = codegen.GetOrEmitConstant(std::max(ci->value_, static_cast<int64_t>(0)), DataType::INDEX);
     } else {
-      codes.push_back(codegen.EmitCastToIndex(expr, codegen.GetExprAsCode(expr)));
+      // For runtime expressions, insert an arith.maxsi(offset, 0) clamp so
+      // that a negative dynamic value cannot reach pto.partition_view, where
+      // it would silently misbehave.
+      auto raw_idx = codegen.EmitCastToIndex(expr, codegen.GetExprAsCode(expr));
+      auto zero_idx = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX);
+      auto clamped = codegen.NewTemp();
+      codegen.Emit(clamped + " = arith.maxsi " + raw_idx + ", " + zero_idx + " : index");
+      offset_idx = clamped;
     }
+    codes.push_back(std::move(offset_idx));
   }
   return codes;
 }
