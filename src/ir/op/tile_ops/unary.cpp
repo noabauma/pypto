@@ -174,6 +174,7 @@ TypePtr DeduceTileCastType(const std::vector<ExprPtr>& args,
 
 REGISTER_OP("tile.neg")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Negation of a tile (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
@@ -185,6 +186,7 @@ REGISTER_OP("tile.neg")
 
 REGISTER_OP("tile.exp")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Exponential function of a tile (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
@@ -196,6 +198,7 @@ REGISTER_OP("tile.exp")
 
 REGISTER_OP("tile.sin")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Element-wise sine of a tile (radians). FP32 only.")
     .add_argument("tile", "Input tile (TileType, FP32)")
     .set_input_memory(0, MemorySpace::Vec)
@@ -207,6 +210,7 @@ REGISTER_OP("tile.sin")
 
 REGISTER_OP("tile.cos")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Element-wise cosine of a tile (radians). FP32 only.")
     .add_argument("tile", "Input tile (TileType, FP32)")
     .set_input_memory(0, MemorySpace::Vec)
@@ -218,18 +222,27 @@ REGISTER_OP("tile.cos")
 
 REGISTER_OP("tile.recip")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Reciprocal (1/x) of a tile (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
+    .set_attr<bool>("high_precision")
     .set_input_memory(0, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileUnaryType(args, kwargs, "tile.recip");
+      auto result_type = DeduceTileUnaryType(args, kwargs, "tile.recip");
+      auto tile_type = As<TileType>(args[0]->GetType());
+      CHECK(!GetKwargOr<bool>(kwargs, "high_precision", false) || tile_type->dtype_ == DataType::FP16 ||
+            tile_type->dtype_ == DataType::FP32)
+          << "The operator tile.recip supports high_precision only for FP16 or FP32 because the PTOAS "
+             "high-precision template does not implement other dtypes";
+      return result_type;
     });
 
 REGISTER_OP("tile.sqrt")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Square root of a tile (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
@@ -260,6 +273,7 @@ REGISTER_OP("tile.rsqrt")
 
 REGISTER_OP("tile.cast")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Cast tile to target data type (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
     .set_attr<DataType>("target_type")
@@ -273,6 +287,7 @@ REGISTER_OP("tile.cast")
 
 REGISTER_OP("tile.log")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Natural logarithm of a tile (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
     .set_attr<bool>("high_precision")
@@ -289,6 +304,7 @@ REGISTER_OP("tile.log")
 
 REGISTER_OP("tile.abs")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Absolute value of a tile (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
@@ -300,6 +316,7 @@ REGISTER_OP("tile.abs")
 
 REGISTER_OP("tile.relu")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("ReLU activation function of a tile (element-wise)")
     .add_argument("tile", "Input tile (TileType)")
     .set_input_memory(0, MemorySpace::Vec)
@@ -311,6 +328,7 @@ REGISTER_OP("tile.relu")
 
 REGISTER_OP("tile.not")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Element-wise bitwise NOT of a tile")
     .add_argument("tile", "Input tile (TileType) with int16 or uint16 dtype")
     .set_input_memory(0, MemorySpace::Vec)

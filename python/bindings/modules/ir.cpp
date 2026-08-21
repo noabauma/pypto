@@ -194,13 +194,36 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
           vars.push_back(nb::cast<VarPtr>(elem));
         }
         kwargs.emplace_back(key, std::move(vars));
+      } else if (nb::len(seq) > 0 && nb::isinstance<Var>(*seq.begin())) {
+        // Open-world key holding a Var list — ``pl.func_attr({"operands": [x, w]})``.
+        // Function attrs are an open key namespace, so no reserved-key list can
+        // cover them; a non-empty list of Vars is unambiguous by element type.
+        // Reserved keys are matched above, and an EMPTY list still falls through
+        // to the ArgDirection default below, since element type says nothing
+        // there and the key is what carries the intended type.
+        std::vector<VarPtr> vars;
+        for (auto elem : seq) {
+          if (!nb::isinstance<Var>(elem)) {
+            throw pypto::TypeError("Mixed list element types for key: " + key +
+                                   " (expected all Var, matching the first element)");
+          }
+          vars.push_back(nb::cast<VarPtr>(elem));
+        }
+        kwargs.emplace_back(key, std::move(vars));
       } else {
         // Default: kAttrArgDirections and any future ArgDirection list key.
+        // Naming only ArgDirection here misleads: reaching this arm usually
+        // means the value's element type is supported for some OTHER key, or
+        // is not a list attr type at all. Report what a list under this key may
+        // hold so the message names something the caller could actually write.
         std::vector<ArgDirection> dirs;
         for (auto elem : seq) {
           if (!nb::isinstance<ArgDirection>(elem)) {
-            throw pypto::TypeError("Unsupported list element type for key: " + key +
-                                   " (expected ArgDirection)");
+            throw pypto::TypeError(
+                "Unsupported list element type for key: " + key +
+                ". A list-valued attr under an arbitrary key may hold Var (a reference) or "
+                "ArgDirection. Integer lists are accepted only for the reserved key '" +
+                std::string(kAttrArgDirectionOverrides) + "'.");
           }
           dirs.push_back(nb::cast<ArgDirection>(elem));
         }
@@ -643,6 +666,11 @@ void BindIR(nb::module_& m) {
       .value("col_major", TileLayout::col_major, "Column-major layout")
       .export_values();
 
+  // CompactMode enum - must be before TileView.
+  nb::enum_<CompactMode>(ir, "CompactMode", "Partial-tile compact mode enumeration")
+      .value("null", CompactMode::null, "Ordinary non-compact layout")
+      .value("normal", CompactMode::normal, "Compact valid-region layout");
+
   // TileView - immutable struct for tile view information.
   //
   // Fields are read-only from Python so that hash and equality remain stable
@@ -650,21 +678,23 @@ void BindIR(nb::module_& m) {
   // constructor, not by mutating fields.
   nb::class_<TileView>(
       ir, "TileView",
-      "Tile view representation with valid shape, stride, start offset, layouts, fractal, and pad. "
+      "Tile view representation with valid shape, stride, start offset, layouts, fractal, pad, and "
+      "compact mode. "
       "Immutable from Python — set all fields at construction time.")
       .def(nb::init<const std::vector<ExprPtr>&, const std::vector<ExprPtr>&, ExprPtr, TileLayout, TileLayout,
-                    uint64_t, PadValue>(),
+                    uint64_t, PadValue, CompactMode>(),
            nb::arg("valid_shape") = std::vector<ExprPtr>{}, nb::arg("stride") = std::vector<ExprPtr>{},
            nb::arg("start_offset") = ExprPtr{}, nb::arg("blayout") = TileLayout::row_major,
            nb::arg("slayout") = TileLayout::none_box, nb::arg("fractal") = static_cast<uint64_t>(512),
-           nb::arg("pad") = PadValue::null,
-           "Create a tile view; all fields default to empty/null/row_major/none_box/512/null. "
+           nb::arg("pad") = PadValue::null, nb::arg("compact") = CompactMode::null,
+           "Create a tile view; fields default to empty/null/row_major/none_box/512/null/null. "
            "fractal is a size in bytes, not elements.")
       .def(nb::init<const std::vector<int64_t>&, const std::vector<int64_t>&, ExprPtr, TileLayout, TileLayout,
-                    uint64_t, PadValue>(),
+                    uint64_t, PadValue, CompactMode>(),
            nb::arg("valid_shape"), nb::arg("stride"), nb::arg("start_offset"),
            nb::arg("blayout") = TileLayout::row_major, nb::arg("slayout") = TileLayout::none_box,
            nb::arg("fractal") = static_cast<uint64_t>(512), nb::arg("pad") = PadValue::null,
+           nb::arg("compact") = CompactMode::null,
            "Create a tile view with integer valid_shape and stride, auto-converted to ConstInt. "
            "fractal is a size in bytes, not elements.")
       .def_ro("valid_shape", &TileView::valid_shape, "Valid shape dimensions")
@@ -679,6 +709,7 @@ void BindIR(nb::module_& m) {
               "FP32/INT32). MX scale tiles carry 32, the MX block size (1-byte scale dtype, so "
               "bytes and elements coincide).")
       .def_ro("pad", &TileView::pad, "Pad mode")
+      .def_ro("compact", &TileView::compact, "Partial-tile compact mode")
       .def(
           "__eq__", [](const TileView& self, const TileView& other) { return self == other; },
           nb::arg("other"), "Structural equality comparison")
@@ -696,7 +727,8 @@ void BindIR(nb::module_& m) {
   // codegen. Values come from offsetof(::CommContext, ...) and are pinned by
   // static_assert in include/pypto/codegen/distributed/comm_layout.h. Exposed
   // to Python so unit tests can assert no drift between bindings and the
-  // literal numbers that codegen embeds into emitted CommRemoteOffset kernels.
+  // literal numbers that codegen embeds into the inline peer-offset arithmetic
+  // of emitted distributed kernels.
   nb::module_ comm_layout_mod = ir.def_submodule(
       "comm_layout", "Compile-time locked CommContext field offsets consumed by distributed codegen.");
   comm_layout_mod.attr("RANK_ID_OFFSET") = pypto::codegen::distributed::comm_layout::kRankIdOffset;
@@ -820,6 +852,7 @@ void BindIR(nb::module_& m) {
           "__init__",
           [](MemRef* self, const VarPtr& base, int64_t byte_offset, uint64_t size, const Span& span,
              bool is_pinned, uint64_t slots, const ExprPtr& slot) {
+            CheckSlotCount(slots);
             new (self) MemRef(base, byte_offset, size, span, is_pinned, slots, slot);
           },
           nb::arg("base"), nb::arg("byte_offset"), nb::arg("size"), nb::arg("span") = Span::unknown(),
@@ -827,9 +860,18 @@ void BindIR(nb::module_& m) {
           "Create a memory reference with base Ptr, integer byte_offset, and size. Set is_pinned for an "
           "author-declared allocation whose size the parser leaves for InitMemRef to derive; slots/slot "
           "select one slot of a multi-slot declaration")
-      .def(nb::init<VarPtr, ExprPtr, uint64_t, Span>(), nb::arg("base"), nb::arg("byte_offset"),
-           nb::arg("size"), nb::arg("span") = Span::unknown(),
-           "Create a memory reference with base Ptr, byte_offset expression, and size")
+      .def(
+          "__init__",
+          [](MemRef* self, const VarPtr& base, const ExprPtr& byte_offset, uint64_t size, const Span& span,
+             uint64_t slots, const ExprPtr& slot) {
+            CheckSlotCount(slots);
+            new (self) MemRef(base, byte_offset, size, span, /*is_pinned=*/false, slots, slot);
+          },
+          nb::arg("base"), nb::arg("byte_offset"), nb::arg("size"), nb::arg("span") = Span::unknown(),
+          nb::arg("slots") = 1, nb::arg("slot") = nb::none(),
+          "Create a memory reference with base Ptr, byte_offset expression, and size. slots/slot record "
+          "which slot of a multi-slot allocation this is, which outlives InitMemRef resolving the index "
+          "into the offset")
       .def_ro("is_pinned_", &MemRef::is_pinned_,
               "True for an author-declared allocation, false for a compiler allocation")
       .def_ro("slot_count_", &MemRef::slot_count_,
@@ -1056,6 +1098,8 @@ void BindIR(nb::module_& m) {
         result[key.c_str()] = AnyCast<TileLayout>(value, "converting to Python: " + key);
       } else if (value.type() == typeid(PadValue)) {
         result[key.c_str()] = AnyCast<PadValue>(value, "converting to Python: " + key);
+      } else if (value.type() == typeid(ArgDirection)) {
+        result[key.c_str()] = AnyCast<ArgDirection>(value, "converting to Python: " + key);
       } else if (value.type() == typeid(std::vector<ArgDirection>)) {
         const auto& dirs = AnyCast<std::vector<ArgDirection>>(value, "converting to Python: " + key);
         nb::list lst;
@@ -1627,6 +1671,7 @@ void BindIR(nb::module_& m) {
       .value("Group", FunctionType::Group, "Co-scheduled group of AIC + AIV kernels")
       .value("Spmd", FunctionType::Spmd, "SPMD data-parallel dispatch")
       .value("Inline", FunctionType::Inline, "Whole-body substitution at every call site")
+      .value("Graph", FunctionType::Graph, "Recordable/replayable orchestration fragment")
       .export_values();
 
   // Level enum — hierarchy level in the Linqu machine model
@@ -1725,38 +1770,10 @@ void BindIR(nb::module_& m) {
       nb::arg("attrs") = nb::none(), nb::arg("requires_runtime_binding") = false,
       "Create a function definition");
   BindFields<Function>(function_class);
-  // Custom attrs property: convert vector<pair<string, any>> to Python dict
+  // Use the shared attr converter so Function readback covers every value type
+  // accepted by ConvertKwargsDict, including enum, list, Var, and Expr attrs.
   function_class.def_prop_ro(
-      "attrs",
-      [](const FunctionPtr& self) {
-        nb::dict result;
-        for (const auto& [key, value] : self->attrs_) {
-          if (value.type() == typeid(int)) {
-            result[key.c_str()] = AnyCast<int>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(bool)) {
-            result[key.c_str()] = AnyCast<bool>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(std::string)) {
-            result[key.c_str()] = AnyCast<std::string>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(double)) {
-            result[key.c_str()] = AnyCast<double>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(float)) {
-            result[key.c_str()] = AnyCast<float>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(DataType)) {
-            result[key.c_str()] = AnyCast<DataType>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(MemorySpace)) {
-            result[key.c_str()] = AnyCast<MemorySpace>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(TensorLayout)) {
-            result[key.c_str()] = AnyCast<TensorLayout>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(TileLayout)) {
-            result[key.c_str()] = AnyCast<TileLayout>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(PadValue)) {
-            result[key.c_str()] = AnyCast<PadValue>(value, "converting to Python: " + key);
-          } else if (value.type() == typeid(ExprPtr)) {
-            result[key.c_str()] = nb::cast(AnyCast<ExprPtr>(value, "converting to Python: " + key));
-          }
-        }
-        return result;
-      },
+      "attrs", [kwargs_to_pydict](const FunctionPtr& self) { return kwargs_to_pydict(self->attrs_); },
       "Function-level attributes as a dictionary");
   // Backward-compat split property: extract SplitMode from attrs
   function_class.def_prop_ro(

@@ -10,9 +10,11 @@
 """Utility functions for IR construction."""
 
 import inspect
+import os
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+from pathlib import Path
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
@@ -202,6 +204,54 @@ def has_partial_valid_region(expr: _ir.Expr) -> bool:
     return view is not None and bool(view.valid_shape)
 
 
+# Directory holding the ``pypto`` package, with a trailing separator so the
+# match is on a path *component*. A frame whose file lives under it is library
+# code, never the call site a user-facing warning should name. Without the
+# separator a sibling like ``<parent>/pypto_kernels/k.py`` would prefix-match
+# ``<parent>/pypto`` and a real user frame would be skipped.
+#
+# Normalized with ``abspath``, never ``resolve()``: this is compared against
+# frames' ``co_filename``, which keeps the spelling the import used and does
+# *not* follow symlinks. Resolving only this side makes the two disagree
+# whenever the package is reached through a symlinked path -- every library
+# frame then reads as user code, the walk below stops at 1, and the warning
+# names its own line. ``abspath`` normalizes without following links, so both
+# sides stay in the spelling the import system recorded.
+_PYPTO_PACKAGE_PREFIX = f"{Path(os.path.abspath(__file__)).parent.parent}{os.sep}"
+
+
+def caller_warning_stacklevel() -> int:
+    """``stacklevel`` naming the nearest frame outside the ``pypto`` package.
+
+    A literal ``stacklevel=2`` names the *immediate* caller, which is user code
+    only when the warning site is called directly. Reached through a wrapper —
+    ``pl.slice`` dispatching to ``tensor.slice``, say — that frame is library
+    code instead, and the damage is worse than a misleading filename: Python's
+    default filter dedupes on ``(text, category, lineno)`` recorded in the
+    frame at ``stacklevel``, so every user call site collapses onto one fixed
+    library line and only the first warning of many is ever shown.
+
+    Walking out to the first non-``pypto`` frame keeps one warning per real
+    call site through any depth of forwarding. Call it from the frame that
+    invokes :func:`warnings.warn`.
+
+    Returns:
+        A ``stacklevel`` for :func:`warnings.warn`, at least 1
+    """
+    frame = inspect.currentframe()
+    if frame is not None:
+        frame = frame.f_back  # the caller, i.e. the frame that will warn
+    level = 1
+    while frame is not None:
+        if not frame.f_code.co_filename.startswith(_PYPTO_PACKAGE_PREFIX):
+            return level
+        frame = frame.f_back
+        level += 1
+    # Every frame is library code (e.g. the DSL parser drives the wrapper with
+    # no user frame below it). Name the outermost one rather than a bare 1.
+    return max(level - 1, 1)
+
+
 def _to_int32_scalar(value: int | _ir.Expr, span: _ir.Span) -> _ir.Expr:
     """Normalize a seed value to an INT32 scalar expression.
 
@@ -292,6 +342,7 @@ def _normalize_scalar_operand(
     *,
     fallback_int_dtype: DataType = DataType.INT32,
     fallback_float_dtype: DataType = DataType.FP32,
+    retype_constants: bool = False,
 ) -> _ir.Expr:
     """Normalize an untyped scalar constant to the paired tile/tensor element dtype.
 
@@ -302,10 +353,13 @@ def _normalize_scalar_operand(
     treated as "dtype not yet decided" and re-stamped to the ``operand`` element
     dtype, alongside raw Python literals which carry no dtype at all.
 
-    Any constant that already carries a real dtype is left untouched -- an explicit
-    ``pl.const(42, pl.INT32)`` is a deliberate user annotation, not a placeholder.
-    A float literal paired with an integer operand keeps ``fallback_float_dtype``
-    so existing promotion semantics (``int32_tensor * 2.5 -> fp32``) are preserved.
+    Any constant that already carries a real dtype is normally left untouched -- an
+    explicit ``pl.const(42, pl.INT32)`` is a deliberate user annotation, not a
+    placeholder. Operators whose instruction contract requires immediate constants
+    to match the paired operand can opt into retyping all constants.
+    Unless ``retype_constants`` is enabled, a float literal paired with an integer
+    operand keeps ``fallback_float_dtype`` so existing promotion semantics
+    (``int32_tensor * 2.5 -> fp32``) are preserved.
 
     Args:
         operand: The tile/tensor the scalar is paired with.
@@ -313,6 +367,7 @@ def _normalize_scalar_operand(
         span: Span for any constant created here.
         fallback_int_dtype: Int dtype used when ``operand`` is not statically typed.
         fallback_float_dtype: Float dtype used when ``operand`` is not statically typed.
+        retype_constants: Restamp typed integer/float constants to the operand dtype.
 
     Returns:
         An expression whose dtype matches the operand element dtype where the rule
@@ -323,15 +378,24 @@ def _normalize_scalar_operand(
             ``_check_not_index_scalar``) -- convert it with ``pl.cast``.
     """
     target = _elem_dtype(operand)
-    value = _placeholder_value(scalar, target)
+    if retype_constants and isinstance(scalar, (_ir.ConstInt, _ir.ConstFloat)):
+        value = scalar.value
+    else:
+        value = _placeholder_value(scalar, target)
     if value is None:
         assert isinstance(scalar, _ir.Expr)  # _placeholder_value returns None only for exprs
         return scalar  # already-typed expr, kept as-is
 
     # Unknown operand type, or a float constant on an integer operand: fall back
     # to the literal-kind default so promotion behaviour is unchanged.
-    if target is None or (isinstance(value, float) and target.is_int()):
+    if target is None or (not retype_constants and isinstance(value, float) and target.is_int()):
         target = fallback_float_dtype if isinstance(value, float) else fallback_int_dtype
+
+    if retype_constants and target.is_int() and isinstance(value, float) and not value.is_integer():
+        raise ValueError(
+            f"Cannot retype non-integral floating-point constant {value} to integer dtype "
+            f"{target}; use an integral value or an explicit cast"
+        )
 
     if target.is_float() or target.is_int():
         return _const_at_dtype(value, target, span)

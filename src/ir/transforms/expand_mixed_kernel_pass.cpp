@@ -38,19 +38,21 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
+#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/core_side_ops.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
 #include "pypto/ir/transforms/utils/dead_code_elimination.h"
 #include "pypto/ir/transforms/utils/deep_clone_utils.h"
+#include "pypto/ir/transforms/utils/deferred_wait_contract.h"
 #include "pypto/ir/transforms/utils/loop_state_repair.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/op_predicates.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
-#include "pypto/ir/transforms/utils/scope_outline_utils.h"
 #include "pypto/ir/transforms/utils/split_axis_utils.h"
 #include "pypto/ir/transforms/utils/tpop_tfree_finalizer.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
@@ -62,8 +64,6 @@ namespace pypto {
 namespace ir {
 
 namespace {
-
-constexpr const char* kDualAivDispatchAttr = "dual_aiv_dispatch";
 
 using core_affinity::ClassifyCallAffinity;
 using core_affinity::ClassifyMoveDirection;
@@ -85,6 +85,62 @@ using tpop_tfree::FinalizeTpopTfrees;
 
 // Use the shared utility; local alias preserves call sites.
 const auto& FlattenBody = transform_utils::FlattenToStmts;
+
+/// Validate that a deferred waiter is reached only through the task-level
+/// orchestration dispatch shape produced by ScopeOutliner. The marker is
+/// printable and therefore cannot be treated as provenance by itself.
+class DeferredWaiterCallSiteValidator : public IRVisitor {
+ public:
+  DeferredWaiterCallSiteValidator(const std::unordered_set<std::string>& waiter_names, FunctionPtr caller)
+      : waiter_names_(waiter_names), caller_(std::move(caller)) {}
+
+  [[nodiscard]] const std::unordered_set<std::string>& called_waiters() const { return called_waiters_; }
+
+ protected:
+  void VisitExpr_(const CallPtr& call) override {
+    if (IsWaiter(call->op_)) {
+      RecordCall(call->op_, call->GetAttr<bool>("allow_early_resolve", false), call->HasAttr(kAttrPredicate),
+                 call->HasAttr(kAttrCoreNum) || call->GetAttr<bool>(kAttrSyncStart, false), call->span_);
+    }
+    IRVisitor::VisitExpr_(call);
+  }
+
+  void VisitExpr_(const SubmitPtr& submit) override {
+    if (IsWaiter(submit->op_)) {
+      RecordCall(submit->op_, submit->allow_early_resolve_, submit->predicate_.has_value(),
+                 submit->core_num_.has_value() || submit->sync_start_, submit->span_);
+    }
+    IRVisitor::VisitExpr_(submit);
+  }
+
+ private:
+  [[nodiscard]] bool IsWaiter(const OpPtr& op) const {
+    auto global = As<GlobalVar>(op);
+    return global && waiter_names_.count(global->name_) != 0;
+  }
+
+  void RecordCall(const OpPtr& op, bool allow_early_resolve, bool predicate, bool has_launch_shape,
+                  const Span& span) {
+    auto global = As<GlobalVar>(op);
+    INTERNAL_CHECK_SPAN(global, span) << "Internal error: deferred waiter call target is not a GlobalVar";
+    CHECK_SPAN(caller_->func_type_ == FunctionType::Orchestration, span)
+        << "deferred waiter '" << global->name_
+        << "' must be dispatched directly from an Orchestration function via a task-level "
+           "pl.at(CORE_GROUP) scope";
+    CHECK_SPAN(!allow_early_resolve, span)
+        << "deferred waiter '" << global->name_ << "' cannot use allow_early_resolve=True";
+    CHECK_SPAN(!predicate, span) << "deferred waiter '" << global->name_
+                                 << "' cannot use a dispatch predicate";
+    CHECK_SPAN(!has_launch_shape, span)
+        << "deferred waiter '" << global->name_
+        << "' must be a single-block task and cannot use core_num or sync_start";
+    called_waiters_.insert(global->name_);
+  }
+
+  const std::unordered_set<std::string>& waiter_names_;
+  FunctionPtr caller_;
+  std::unordered_set<std::string> called_waiters_;
+};
 
 // ============================================================================
 // Explicit split-reshape op helpers (tile.aiv_shard / tile.aic_gather)
@@ -1085,11 +1141,11 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // user controls this perf decision (drop the split, or remove the transpose).
   //
   // Explicit ``pl.split_aiv`` regions are validated per-region by
-  // LowerAutoVectorSplit (pass 21), where each region's mode is unambiguous; skip
+  // LowerAutoVectorSplit (pass 20), where each region's mode is unambiguous; skip
   // the single-func-mode check for them. A multi-mode function carries no single
   // ``func->GetSplitMode()`` and this whole-function check would mis-check the
   // other region's axis (critique #2).
-  if (!func->HasAttr("split_aiv_region_validated")) {
+  if (!func->HasAttr(kAttrSplitAivRegionValidated)) {
     if (auto mode = func->GetSplitMode(); mode.has_value() && *mode != SplitMode::None) {
       int split_dim = (*mode == SplitMode::UpDown) ? 0 : 1;
       auto hazard = split_axis::FindTransposeSplitHazard(func->body_, split_dim);
@@ -1262,7 +1318,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // references to the fresh parameter corresponding to the store's output tensor.
   {
     // Collect all vars defined in the AIV body
-    outline_utils::VarDefUseCollector aiv_def_collector;
+    var_collectors::VarDefUseCollector aiv_def_collector;
     auto aiv_body_stmt = MakeBody(aiv_final, func->span_);
     aiv_def_collector.VisitStmt(aiv_body_stmt);
 
@@ -1306,9 +1362,9 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   auto aiv_attrs = func->attrs_;
   if (needs_dual_aiv_dispatch) {
     aiv_attrs.erase(std::remove_if(aiv_attrs.begin(), aiv_attrs.end(),
-                                   [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+                                   [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
                     aiv_attrs.end());
-    aiv_attrs.emplace_back(kDualAivDispatchAttr, true);
+    aiv_attrs.emplace_back(kAttrDualAivDispatch, true);
   }
   auto aiv_func = std::make_shared<Function>(aiv_name, aiv_params, func->param_directions_,
                                              func->return_types_, aiv_cloned_body, func->span_,
@@ -1466,7 +1522,7 @@ bool FunctionCallsFunction(const FunctionPtr& func, const std::string& callee_na
 // Hand-written Group ABI normalization
 // ============================================================================
 
-/// Runtime MixedKernels subslots share one L0TaskArgs payload. Auto-expanded
+/// Runtime MixedKernels subslots share one CoreTaskArgs payload. Auto-expanded
 /// Groups already satisfy that contract because both member calls forward the
 /// complete Group signature. A hand-written Group may call AIC/AIV functions
 /// with different subsets, however, so normalize both members to the Group ABI
@@ -1529,7 +1585,7 @@ bool NeedsInferredNoSplitDualAivDispatch(const FunctionPtr& func) {
   const auto* backend_handler = pass_context ? pass_context->GetBackendHandler()
                                              : pypto::backend::BackendConfig::GetBackend()->GetHandler();
   if (!backend_handler->RequiresNoSplitDualAivDispatch() ||
-      func->GetAttr<bool>(kDualAivDispatchAttr, false) || func->HasAttr("external_source") ||
+      func->GetAttr<bool>(kAttrDualAivDispatch, false) || func->HasAttr(kAttrExternalSource) ||
       func->requires_runtime_binding_) {
     return false;
   }
@@ -1546,9 +1602,9 @@ FunctionPtr WithDualAivDispatch(const FunctionPtr& func) {
   auto result = MutableCopy(func);
   auto attrs = result->attrs_;
   attrs.erase(std::remove_if(attrs.begin(), attrs.end(),
-                             [](const auto& kv) { return kv.first == kDualAivDispatchAttr; }),
+                             [](const auto& kv) { return kv.first == kAttrDualAivDispatch; }),
               attrs.end());
-  attrs.emplace_back(kDualAivDispatchAttr, true);
+  attrs.emplace_back(kAttrDualAivDispatch, true);
   result->attrs_ = std::move(attrs);
   return result;
 }
@@ -1763,10 +1819,11 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
     if (!needs_abi_normalization && !needs_dual_aiv_dispatch) continue;
 
     if (needs_abi_normalization) {
-      CHECK_SPAN(
-          !aic.inner_callee->HasAttr("external_source") && !aiv.inner_callee->HasAttr("external_source") &&
-              !aic.inner_callee->requires_runtime_binding_ && !aiv.inner_callee->requires_runtime_binding_,
-          group->span_)
+      CHECK_SPAN(!aic.inner_callee->HasAttr(kAttrExternalSource) &&
+                     !aiv.inner_callee->HasAttr(kAttrExternalSource) &&
+                     !aic.inner_callee->requires_runtime_binding_ &&
+                     !aiv.inner_callee->requires_runtime_binding_,
+                 group->span_)
           << "Mixed Group '" << group->name_
           << "' has AIC/AIV members with different argument layouts. External or runtime-bound members "
              "cannot be adapted; declare both members with the same signature and forward the Group's full "
@@ -1813,12 +1870,80 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
   return {std::move(result)};
 }
 
+// Removes the pl.split_aiv region placement stamp LowerAutoVectorSplit left on
+// each region call once this pass has consumed it (see the Phase 5 comment in
+// ExpandMixedKernel, and kCorePlacementAttr in attrs.h for the full lifecycle).
+//
+// Returns the input Call unchanged when the attr is absent, so a program with
+// no regions in it walks through at the cost of the traversal alone.
+class CorePlacementStripper : public IRMutator {
+ protected:
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto mutated = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(mutated);
+    if (!call || !call->HasAttr(kCorePlacementAttr)) return mutated;
+    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_,
+                                  StripAttr(call->attrs_, kCorePlacementAttr), call->GetType(), call->span_);
+  }
+};
+
+FunctionPtr StripCorePlacement(const FunctionPtr& func) {
+  if (!func || !func->body_) return func;
+  auto new_body = CorePlacementStripper().VisitStmt(func->body_);
+  if (new_body.get() == func->body_.get()) return func;
+  auto stripped = MutableCopy(func);
+  stripped->body_ = new_body;
+  return stripped;
+}
+
 }  // namespace
 
 namespace pass {
 
 Pass ExpandMixedKernel() {
   auto pass_func = [](const ProgramPtr& program) -> ProgramPtr {
+    // Audit every function before filtering to InCore below. A hand-authored
+    // AIV/AIC function, or a user-stamped marker without a validated waiter
+    // body and task-level call site, must not bypass the deferred contract.
+    std::unordered_set<std::string> deferred_waiter_names;
+    for (const auto& [gvar, func] : program->functions_) {
+      // Detect the real op independently of the printable compiler marker.
+      if (!outline_utils::ContainsDeferredWait(func->body_)) continue;
+      CHECK_SPAN(func->GetAttr<bool>(kAttrDeferredCompletionWaiter, false), func->span_)
+          << "pld.system.defer_wait in function '" << func->name_
+          << "' bypasses the deferred-waiter task contract. Use a task-level "
+             "`with pl.at(level=pl.Level.CORE_GROUP)` scope; capture its TaskId and use "
+             "`deps=[wait_tid]` only when a later consumer must be gated.";
+      CHECK_SPAN(func->func_type_ == FunctionType::InCore || func->func_type_ == FunctionType::AIV,
+                 func->span_)
+          << "deferred waiter '" << func->name_
+          << "' must be an outlined InCore function or its pure-AIV expanded form";
+      CHECK_SPAN(
+          !func->GetAttr<ExprPtr>(kAttrCoreNum, nullptr) && !func->GetAttr<bool>(kAttrSyncStart, false),
+          func->span_)
+          << "deferred waiter '" << func->name_
+          << "' must be a single-block task and cannot carry core_num or sync_start";
+      auto contract = outline_utils::DeferredWaitContractValidator::Validate(func->body_, func->span_);
+      INTERNAL_CHECK_SPAN(contract.has_deferred_wait, func->span_)
+          << "Internal error: deferred-wait finder/contract-validator disagreement";
+      deferred_waiter_names.insert(func->name_);
+    }
+
+    if (!deferred_waiter_names.empty()) {
+      std::unordered_set<std::string> called_waiters;
+      for (const auto& [gvar, func] : program->functions_) {
+        DeferredWaiterCallSiteValidator validator(deferred_waiter_names, func);
+        validator.VisitStmt(func->body_);
+        called_waiters.insert(validator.called_waiters().begin(), validator.called_waiters().end());
+      }
+      for (const auto& waiter_name : deferred_waiter_names) {
+        CHECK_SPAN(called_waiters.count(waiter_name) != 0, program->span_)
+            << "deferred waiter '" << waiter_name
+            << "' has no task-level Orchestration call site; a printable function attr alone is not a "
+               "valid deferred-completion contract";
+      }
+    }
+
     // Phase 1: Pre-scan — find InCore functions that have existing callers.
     std::unordered_set<std::string> incore_names;
     for (const auto& [gvar, func] : program->functions_) {
@@ -1864,6 +1989,14 @@ Pass ExpandMixedKernel() {
       std::unordered_map<const Stmt*, CoreAffinity> stmt_map;
       std::unordered_map<const Var*, CoreAffinity> var_affinity;
       auto combined = AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs);
+
+      const bool is_deferred_waiter = deferred_waiter_names.count(func->name_) != 0;
+
+      if (is_deferred_waiter) {
+        CHECK_SPAN(combined != CoreAffinity::CUBE && combined != CoreAffinity::MIXED, func->span_)
+            << "deferred waiter '" << func->name_
+            << "' must lower to a pure AIV kernel; AIC and mixed AIC/AIV waiters are not supported";
+      }
 
       // A function is mixed if combined affinity says so. Leaf boundary moves
       // (tile.move across the C/V divide) classify as MIXED via ClassifyCallAffinity,
@@ -1920,6 +2053,25 @@ Pass ExpandMixedKernel() {
     // callee scan sees the final AIC/AIV functions.
     auto rewritten_program = std::make_shared<Program>(new_functions, program->name_, program->span_);
     new_functions = NormalizeHandWrittenGroupAbis(rewritten_program, new_functions).functions;
+
+    // Phase 5: the region placement stamp is consumed — drop it.
+    //
+    // ``core_placement`` exists solely to carry pl.split_aiv region membership
+    // across the wrapper erasure in LowerAutoVectorSplit, and every reader of
+    // it (ClassifyCallAffinity, via the affinity roll-up above) has now run. It
+    // is stripped rather than left in place because Call::attrs_ is a
+    // reflection UsualField and the python printer serialises attrs open-world:
+    // an un-stripped stamp would show up in every downstream pass dump, in the
+    // print -> parse round-trip, and in every ir.assert_structural_equal a
+    // later pass's tests make — noise that describes a region that no longer
+    // exists. Same lifecycle as ``pipeline_stages`` (set by LowerPipelineLoops,
+    // stripped by CanonicalizeIOOrder).
+    //
+    // The sweep covers EVERY emitted function, not just the split pair: a
+    // region in a function that turned out not to be mixed (converted straight
+    // to AIV, or left alone because it was not InCore) carries the same stamp
+    // and must not keep it either.
+    for (auto& func : new_functions) func = StripCorePlacement(func);
 
     return std::make_shared<Program>(new_functions, program->name_, program->span_);
   };

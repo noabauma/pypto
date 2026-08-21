@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
+from pypto._function_attrs import AUTO_SCOPE_ATTR, EXTERNAL_SOURCE_ATTR
 from pypto.ir import IRBuilder
 from pypto.ir import op as ir_op
 from pypto.ir.printer import python_print
@@ -29,11 +30,13 @@ from pypto.language.op import system_ops as _dsl_system
 from pypto.language.op import tensor_ops as _dsl_tensor
 from pypto.language.op import tile_ops as _dsl_tile
 from pypto.language.optimizations import SPLIT_SLOT_NUM_DEPRECATION
+from pypto.language.typing.dynamic import DynVar
 from pypto.pypto_core import DataType, ir
 from pypto.pypto_core import arith as _arith
 
 from ._dsl_invoker import invoke_dsl
 from .diagnostics import (
+    BUG_CLASS_EXCEPTIONS,
     InvalidOperationError,
     ParserError,
     ParserSyntaxError,
@@ -66,6 +69,43 @@ if TYPE_CHECKING:
 # submodules exposed by pypto.language.distributed.op (system_ops / tensor_ops
 # / tile_ops); also surfaced as the hint in _parse_pld_category_op.
 _PLD_CATEGORIES: frozenset[str] = frozenset({"system", "tensor", "tile"})
+
+# ``pl.func_attr({...})`` — the body-prologue directive carrying function-level
+# attributes. Body position is what lets an attribute reference a parameter: a
+# decorator is evaluated before the signature binds any name.
+_FUNC_ATTR_DIRECTIVE = "func_attr"
+
+# The ``split`` attr stores an int but is spelled (and printed) as the
+# ``pl.SplitMode.X`` enum, so it needs enum handling on both attr paths.
+_SPLIT_ATTR = "split"
+
+# Sentinel: a parsed attr value that must not be stored at all. ``None`` cannot
+# serve here — it is a legitimate attr value — so identity against this object
+# is the signal.
+_OMIT_ATTR: Any = object()
+
+# Function attrs the parser consumes BEFORE it walks the body, so a body-position
+# declaration would arrive too late to have any effect. These keep their
+# dedicated ``@pl.function(...)`` keyword and are rejected in ``pl.func_attr``:
+#   - ``auto_scope``      gates implicit scope insertion during the body walk
+#   - ``external_source`` selects the no-DSL-body path entirely (the body must
+#                         be a bare ``...``, so there is nowhere to put a
+#                         prologue in the first place)
+_DECORATOR_ONLY_FUNC_ATTRS: frozenset[str] = frozenset({AUTO_SCOPE_ATTR, EXTERNAL_SOURCE_ATTR})
+
+# Enum values that op wrappers and printed ``attrs={...}`` dicts take verbatim.
+# ``parse_expression`` cannot represent these: it either rejects the standalone
+# attribute form outright or (for MemorySpace) lowers it to a ConstInt that the
+# IR builders then reject, so every path that reads such a value must recognize
+# it before falling back to expression parsing.
+_ENUM_VALUE_TYPES: tuple[type, ...] = (
+    DataType,
+    ir.MemorySpace,
+    ir.TensorLayout,
+    ir.TileLayout,
+    ir.PadValue,
+    ir.ArgDirection,
+)
 
 
 def _is_empty_body(body: list[ast.stmt]) -> bool:
@@ -120,6 +160,15 @@ def _is_pld_call(node: object, attr_name: str) -> TypeGuard[ast.Call]:
         and parent.attr in _PLD_CATEGORIES
         and isinstance(parent.value, ast.Name)
         and parent.value.id == "pld"
+    )
+
+
+def _is_docstring_stmt(node: ast.stmt) -> bool:
+    """True when ``node`` is a bare string expression, i.e. a docstring."""
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
     )
 
 
@@ -256,6 +305,35 @@ def _get_source_valid_shape(source_type: ir.Type) -> list[ir.Expr] | None:
     return None
 
 
+def _collect_type_symbol_ids(param_type: ir.Type) -> set[int]:
+    """Return ``id()`` of every Var read by a parameter type's shape metadata.
+
+    Used to detect a scalar parameter that shadows a ``pl.dynamic()`` symbol an
+    earlier parameter annotation already resolved, which cannot be rebound.
+    """
+    symbol_ids: set[int] = set()
+
+    def walk(expr: ir.Expr | None) -> None:
+        if expr is None:
+            return
+        if isinstance(expr, ir.Var):
+            symbol_ids.add(id(expr))
+            return
+        for attr in ("left", "right", "operand"):
+            operand = getattr(expr, attr, None)
+            if isinstance(operand, ir.Expr):
+                walk(operand)
+
+    if isinstance(param_type, ir.TensorType):
+        for dim in param_type.shape:
+            walk(dim)
+        view = param_type.tensor_view
+        if view is not None:
+            for dim in list(view.valid_shape) + list(view.stride):
+                walk(dim)
+    return symbol_ids
+
+
 def _shape_exprs_match(lhs: Sequence[ir.Expr], rhs: Sequence[ir.Expr]) -> bool:
     """Return whether two shape-like expression lists are statically identical."""
     if len(lhs) != len(rhs):
@@ -292,6 +370,8 @@ def _has_printable_tile_view(
     if tile_view.fractal != default_fractal:
         return True
     if tile_view.pad != ir.PadValue.null:
+        return True
+    if tile_view.compact != ir.CompactMode.null:
         return True
     return False
 
@@ -497,6 +577,10 @@ _AT_STASH_KWARGS = {
 # rejects them on every other op. Accepting either from a generic attrs dict
 # would build IR that cannot be printed back.
 _TASK_DUMMY_ONLY_ATTRS = frozenset({"manual_dep_edges", "dummy_task"})
+
+# The op a bare ``predicate=None`` lowers to. Resolved through the registry getter so a rename
+# fails at import instead of silently dropping the hint from the error message below.
+_TASK_INVALID_OP = ir.get_op("system.task_invalid").name
 
 
 def _split_spmd_for_loop_name_hints(name_hint: str) -> tuple[str, str]:
@@ -806,6 +890,67 @@ class ASTParser:
             self._loop_kind_stack.pop()
             self._split_aiv_mode_stack.pop()
 
+    def _bind_dynvar_to_scalar_param(
+        self,
+        param_name: str,
+        param_type: ir.Type,
+        param_var: ir.Var,
+        param_span: ir.Span,
+        symbols_used_so_far: set[int],
+    ) -> None:
+        """Re-point a same-named ``pl.dynamic()`` symbol at this scalar parameter.
+
+        A ``pl.Scalar[pl.INDEX]`` parameter that shadows a ``pl.dynamic()`` symbol
+        of the same name IS that symbol. ``MaterializeValidShapeSymbols`` turns an
+        unbindable valid_shape symbol into a parameter, and the printer keeps its
+        ``pl.dynamic()`` declaration so the annotations naming it still resolve
+        (Python evaluates annotations in the enclosing scope, before parameters
+        exist). Without this, the annotation would read a second, unbound Var of
+        the same name.
+
+        Only ``INDEX`` scalars qualify: a ``DynVar`` is an INDEX-valued dimension,
+        so rebinding one to, say, a ``pl.Scalar[pl.FP32]`` parameter would put an
+        FP32 Var in a shape expression.
+
+        Annotations resolve in declaration order, so the parameter has to precede
+        every annotation that names it. When an earlier parameter's type already
+        read the symbol, rebinding now would leave that earlier type pointing at a
+        different Var — which later reads as an unbound symbol and materializes a
+        second, redundant argument. Reject that ordering instead.
+
+        Args:
+            param_name: Parameter name as written in the signature
+            param_type: Resolved parameter type
+            param_var: The Var just created for the parameter
+            param_span: Span of the parameter, for diagnostics
+            symbols_used_so_far: ``id()`` of every Var already read by an earlier
+                parameter's type annotation
+
+        Raises:
+            ParserTypeError: If an earlier parameter annotation already read the
+                shadowed symbol.
+        """
+        declared = self.expr_evaluator.closure_vars.get(param_name)
+        if not isinstance(declared, DynVar):
+            return
+        if not isinstance(param_type, ir.ScalarType) or param_type.dtype != DataType.INDEX:
+            return
+        previous = declared._ir_var
+        if previous is not None and id(previous) in symbols_used_so_far:
+            raise ParserTypeError(
+                f"Parameter '{param_name}' shadows the dynamic symbol '{param_name}', "
+                f"which an earlier parameter's type annotation already uses",
+                span=param_span,
+                hint=(
+                    f"Declare '{param_name}: pl.Scalar[pl.INDEX]' before the parameter whose "
+                    f"pl.TensorView(valid_shape=...) names it, so the annotation resolves to "
+                    f"the parameter"
+                ),
+            )
+        declared._ir_var = param_var
+        declared.expr = param_var
+        self.expr_evaluator.dynvar_cache[param_name] = param_var
+
     def parse_function(
         self,
         func_def: ast.FunctionDef,
@@ -837,8 +982,8 @@ class ASTParser:
         func_name = func_def.name
         self._func_name = func_name
         self._func_level = func_level
-        # auto_scope rides in func_attrs (key "auto_scope"); absent ⇒ default True.
-        self._func_auto_scope = bool((func_attrs or {}).get("auto_scope", True))
+        # auto_scope rides in func_attrs; absent ⇒ default True.
+        self._func_auto_scope = bool((func_attrs or {}).get(AUTO_SCOPE_ATTR, True))
         self._func_type = func_type
         self._param_dim_symbols = set()
         func_span = self.span_tracker.get_span(func_def)
@@ -869,6 +1014,10 @@ class ASTParser:
             attrs=func_attrs,
             requires_runtime_binding=requires_runtime_binding,
         ) as f:
+            # Vars already read by an earlier parameter's type annotation, by id().
+            # A scalar parameter shadowing one of these arrives too late to bind it.
+            symbols_used_so_far: set[int] = set()
+
             # Parse parameters (skip 'self' if it's the first parameter without annotation)
             for arg in func_def.args.args:
                 param_name = arg.arg
@@ -889,6 +1038,11 @@ class ASTParser:
 
                 # Add parameter to function with direction
                 param_var = f.param(param_name, param_type, param_span, direction=param_direction)
+
+                self._bind_dynvar_to_scalar_param(
+                    param_name, param_type, param_var, param_span, symbols_used_so_far
+                )
+                symbols_used_so_far.update(_collect_type_symbol_ids(param_type))
 
                 # A bare ``pl.dynamic()`` Var in a tensor param's shape names that
                 # argument's runtime extent. Orchestration codegen defines exactly
@@ -912,9 +1066,17 @@ class ASTParser:
                 else:
                     f.return_type(return_type)
 
+            # ``pl.func_attr({...})`` prologue. Merged here — after the params
+            # are bound above, which is what lets an attr reference one — and
+            # stripped from the body so no later stage sees the directives.
+            # Consumed before the body-shape dispatch below so that a
+            # signature-only external kernel carrying other attrs still counts
+            # as having an empty body.
+            body_stmts = self._consume_func_attr_prologue(func_def.body, func_name)
+
             # Parse function body. HOST SubWorkers carry pure-Python source
             # via ``inline_body`` and are not parsed as DSL.
-            external_source = (func_attrs or {}).get("external_source")
+            external_source = (func_attrs or {}).get(EXTERNAL_SOURCE_ATTR)
             if external_source is not None:
                 # Header-only external C++ kernel: no DSL body to parse. The
                 # signature (params + directions + return types) is the contract
@@ -927,7 +1089,7 @@ class ASTParser:
                         span=func_span,
                         hint="Declare the external kernel as pl.FunctionType.AIC or pl.FunctionType.AIV.",
                     )
-                if not _is_empty_body(func_def.body):
+                if not _is_empty_body(body_stmts):
                     raise ParserSyntaxError(
                         f"External kernel '{func_name}' must have an empty '...' body "
                         "(signature only) — its implementation is the C++ source "
@@ -938,13 +1100,147 @@ class ASTParser:
             elif inline_body is not None:
                 self.builder.inline_stmt(inline_body, ir.InlineLanguage.Python, func_span)
             else:
-                self._parse_body_siblings(func_def.body)
+                self._parse_body_siblings(body_stmts)
                 self._discard_tail_block_comments(func_def.body, upper_line=None)
 
         # Exit function scope
         self.scope_manager.exit_scope()
 
         return f.get_result()
+
+    def _consume_func_attr_prologue(self, body: list[ast.stmt], func_name: str) -> list[ast.stmt]:
+        """Merge leading ``pl.func_attr({...})`` directives, return the rest of the body.
+
+        ``pl.func_attr`` is a parse-time directive, not a statement: the dict is
+        merged into the function's attrs and no IR node is emitted. It must
+        appear in the **prologue** — before every other statement — because an
+        attribute describes the whole function and must not appear to start
+        applying partway down a body. That restriction is also what bounds the
+        referenceable names to the parameters, which are the only bindings in
+        scope at this point.
+
+        A leading docstring is not "another statement": it precedes the prologue
+        in ordinary Python style and carries no semantics here. It is skipped and
+        kept in the returned body, so comment rerouting still sees it.
+
+        Args:
+            body: The function's AST body statements
+            func_name: Enclosing function name, for diagnostics
+
+        Returns:
+            The body statements after the prologue, to be parsed as DSL. Any
+            leading docstring is retained at the front.
+        """
+        index = 0
+        docstring: list[ast.stmt] = []
+        if body and _is_docstring_stmt(body[0]):
+            docstring = [body[0]]
+            index = 1
+
+        while index < len(body) and _is_pl_call(getattr(body[index], "value", None), _FUNC_ATTR_DIRECTIVE):
+            self._merge_func_attr_directive(cast(ast.Expr, body[index]), func_name)
+            index += 1
+
+        # Anything further down the body is a misplacement, not a second prologue.
+        for stmt in body[index:]:
+            if _is_pl_call(getattr(stmt, "value", None), _FUNC_ATTR_DIRECTIVE):
+                raise ParserSyntaxError(
+                    f"pl.{_FUNC_ATTR_DIRECTIVE}() must appear before every other statement in '{func_name}'",
+                    span=self.span_tracker.get_span(stmt),
+                    hint=(
+                        f"Move the pl.{_FUNC_ATTR_DIRECTIVE}(...) call to the top of the function "
+                        "body. A function attribute describes the whole function, so it is "
+                        "declared in the prologue; only parameters are referenceable there."
+                    ),
+                )
+        return docstring + body[index:]
+
+    def _merge_func_attr_directive(self, stmt: ast.Expr, func_name: str) -> None:
+        """Evaluate one ``pl.func_attr({...})`` call and merge it into the function."""
+        call = cast(ast.Call, stmt.value)
+        span = self.span_tracker.get_span(stmt)
+
+        if len(call.args) != 1 or call.keywords:
+            raise ParserSyntaxError(
+                f"pl.{_FUNC_ATTR_DIRECTIVE}() takes exactly one positional dict argument (no keywords)",
+                span=span,
+                hint=f'Use: pl.{_FUNC_ATTR_DIRECTIVE}({{"split": pl.SplitMode.UP_DOWN}})',
+            )
+        if not isinstance(call.args[0], ast.Dict):
+            raise ParserSyntaxError(
+                f"pl.{_FUNC_ATTR_DIRECTIVE}() argument must be a dict literal",
+                span=self.span_tracker.get_span(call.args[0]),
+                hint=f'Use: pl.{_FUNC_ATTR_DIRECTIVE}({{"split": pl.SplitMode.UP_DOWN}})',
+            )
+
+        attrs: dict[str, Any] = {}
+        for key_node, value_node in zip(call.args[0].keys, call.args[0].values):
+            if key_node is None:
+                raise ParserSyntaxError(
+                    f"Unsupported `**` unpacking in pl.{_FUNC_ATTR_DIRECTIVE}({{...}})",
+                    span=span,
+                    hint="Use only string literal keys in the attrs dict.",
+                )
+            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+                raise ParserSyntaxError(
+                    f"pl.{_FUNC_ATTR_DIRECTIVE}() key must be a string literal, got {ast.unparse(key_node)}",
+                    span=self.span_tracker.get_span(key_node),
+                    hint=f'Use string literal keys, e.g. pl.{_FUNC_ATTR_DIRECTIVE}({{"split": ...}}).',
+                )
+            key = key_node.value
+            if key in attrs:
+                raise ParserSyntaxError(
+                    f"Duplicate function attribute '{key}' in pl.{_FUNC_ATTR_DIRECTIVE}({{...}})",
+                    span=span,
+                    hint="Each attribute may be declared only once.",
+                )
+            if key in _DECORATOR_ONLY_FUNC_ATTRS:
+                raise ParserSyntaxError(
+                    f"'{key}' cannot be set with pl.{_FUNC_ATTR_DIRECTIVE}()",
+                    span=span,
+                    hint=(
+                        f"Pass it as the '{key}=' keyword of @pl.function(...) instead. The parser "
+                        "reads it before the body is parsed, so a body-position declaration comes "
+                        "too late to take effect."
+                    ),
+                )
+            value = self._parse_func_attr_value(key, value_node)
+            if value is _OMIT_ATTR:
+                continue
+            attrs[key] = value
+
+        # The builder rejects a key already present, which covers a duplicate
+        # across two pl.func_attr calls as well as one between the body and a
+        # decorator attrs= (those were merged in at begin_function).
+        try:
+            self.builder.add_function_attrs(attrs)
+        except ValueError as exc:
+            # The duplicate-key rejection is a C++ ``CHECK`` in IRBuilder::AddFunctionAttrs,
+            # so strip FatalLogger's implementation-facing tail before it reaches the header.
+            raise ParserSyntaxError(concise_error_message(exc), span=span, hint=None) from exc
+
+    def _parse_func_attr_value(self, key: str, value_node: ast.expr) -> Any:
+        """Reconstruct one ``pl.func_attr`` value from its Python AST node.
+
+        Shares ``_parse_attr_value``'s syntax-inference contract with the
+        printer, so a printed prologue reparses to the same attrs. The one rule
+        worth stating outright: a **bare name is always a parameter reference**,
+        never the value of a same-named Python variable in the enclosing scope.
+        The decorator form evaluated its dict as Python and could capture such a
+        value; body position resolves names against the signature instead.
+        """
+        if key == _SPLIT_ATTR:
+            # ``split`` is an enum whose printed spelling (pl.SplitMode.X) the
+            # generic path would resolve to its int value, changing the stored
+            # attr type. Mirrors the decorator's dedicated handling, including
+            # dropping ``SplitMode.NONE``: storing the 0 would be a non-canonical
+            # spelling of "no split" that the printer filters, so print -> parse
+            # would lose the key and structural round-trip would fail.
+            split_mode = extract_enum_value(value_node, SPLIT_MODE_MAP, "SplitMode", "pl.SplitMode")
+            if split_mode == ir.SplitMode.NONE:
+                return _OMIT_ATTR
+            return split_mode.value
+        return self._parse_attr_value(f"pl.{_FUNC_ATTR_DIRECTIVE}", key, value_node)
 
     def parse_statement(self, stmt: ast.stmt) -> None:
         """Parse a statement node.
@@ -1438,6 +1734,19 @@ class ASTParser:
                     and value_expr.type.dtype == DataType.INDEX
                 ):
                     override_type = resolved
+        # A bare int literal parses as an untyped placeholder (``ConstInt(v,
+        # INDEX)`` — see ``_normalize_scalar_operand``), so the scalar branch
+        # above would otherwise bind an annotated Var to a constant of a
+        # different dtype: ``acc: pl.Scalar[pl.INT64] = 0`` produced
+        # ``AssignStmt(Var[INT64], ConstInt[INDEX])``, violating
+        # AssignTypeSymmetry. The mismatch only surfaces much later — Simplify
+        # propagates the constant into a loop's ``iter_arg`` init, where
+        # TypeCheck compares it against the declared carry dtype. Re-stamp the
+        # placeholder to the annotated dtype instead. The dtype stays integral:
+        # ``validate_annotation_consistency`` already rejected an int literal
+        # under a float annotation (float literals never carry INDEX).
+        if isinstance(override_type, ir.ScalarType) and isinstance(value_expr, ir.ConstInt):
+            value_expr = ir.ConstInt(value_expr.value, override_type.dtype, value_expr.span)
         # If annotation syntax determines the result type more precisely than the
         # raw call inference, rebuild the Call with that type so structural
         # equality sees the same IR after print→parse.
@@ -4722,23 +5031,36 @@ class ASTParser:
 
         # Build a first-class SplitAivScopeStmt region. The region body begins
         # with ``aiv_id = pl.tile.get_subblock_idx()`` and carries the requested
-        # SplitMode on the node; LowerAutoVectorSplit (pass 18) consumes it.
+        # SplitMode on the node; LowerAutoVectorSplit (pass 20) consumes it.
         #
-        # FLATTEN: when already inside a CORE_GROUP InCore scope — directly or
-        # through an intervening pl.range/pl.pipeline/if — emit the region in
-        # place; it nests inside the open context. OutlineIncoreScopes outlines the
-        # enclosing core function and the nested region survives.
-        if self._is_inside_scope(ir.ScopeKind.InCore):
+        # FLATTEN: when the region is ALREADY in a core context, emit it in place.
+        # The wrapper below exists only to give OutlineIncoreScopes something to
+        # outline, so it is meaningless once we are core-side. Two ways to be:
+        #   1. Inside an open CORE_GROUP InCore scope (directly, or through an
+        #      intervening pl.range/pl.pipeline/if): the region nests in the open
+        #      context and survives the enclosing function's outlining.
+        #   2. The enclosing FUNCTION is already InCore, so no scope is open and
+        #      the open-scope test alone reads False.
+        #
+        # Arm 2 is what makes print -> parse a fixed point: after outlining, the
+        # region is bare at the top of an InCore ``*_incore_0``, and reparsing that
+        # printed form must rebuild it bare. Emitting what the syntax means is the
+        # parser's job; whether a region is ALLOWED in this function is a placement
+        # rule, enforced by AivSplitValid check (h) — which keys on the ``split_aiv``
+        # attr OutlineIncoreScopes stamps, so a hand-authored InCore function (no
+        # such attr) is still rejected while the outlined one is accepted.
+        if self._is_inside_scope(ir.ScopeKind.InCore) or self._func_type == ir.FunctionType.InCore:
             self._emit_split_aiv_region(stmt, loop_var_name, split_mode)
             return
 
-        # Bare top-level form (no enclosing InCore): a top-level split_aiv must
-        # live inside a core function, so synthesize an InCore wrapper first and
-        # nest the region inside it (keeps it eligible for OutlineIncoreScopes —
-        # else the region would have no enclosing InCore to outline). Merge any
-        # forward-sticky pl.dump_tag tensors onto the wrapper (mirrors the other
-        # InCore-creating paths); the split mode + split_aiv marker ride the
-        # nested SplitAivScopeStmt region node, not the InCore wrapper.
+        # Bare top-level form (no enclosing InCore scope, and the function is not
+        # itself InCore — e.g. a plain ``@pl.function`` / ``@pl.jit`` Opaque body):
+        # a top-level split_aiv must live inside a core function, so synthesize an
+        # InCore wrapper first and nest the region inside it (keeps it eligible for
+        # OutlineIncoreScopes — else the region would have no enclosing InCore to
+        # outline). Merge any forward-sticky pl.dump_tag tensors onto the wrapper
+        # (mirrors the other InCore-creating paths); the split mode + split_aiv
+        # marker ride the nested SplitAivScopeStmt region node, not the wrapper.
         span = self.span_tracker.get_span(stmt)
         incore_attrs = self._merge_forward_sticky_dump(None, ir.ScopeKind.InCore)
         with self.builder.scope(ir.ScopeKind.InCore, span, attrs=incore_attrs):
@@ -6780,7 +7102,7 @@ class ASTParser:
             got = type(predicate).__name__
             extra = (
                 " (to dispatch unconditionally, omit predicate= entirely)"
-                if isinstance(predicate, ir.Call) and predicate.op.name == "system.task_invalid"
+                if isinstance(predicate, ir.Call) and predicate.op.name == _TASK_INVALID_OP
                 else ""
             )
             raise ParserSyntaxError(
@@ -7261,10 +7583,11 @@ class ASTParser:
         (``src/ir/transforms/python_printer.cpp``). The value type is inferred
         from syntax (the "syntax inference only" round-trip contract): scalars
         from constants, ``[int, ...]`` -> index list, ``[pl.adir.X, ...]`` ->
-        direction list, ``[name, ...]`` / bare ``name`` -> Var(s), anything else
-        -> an IR expression. Syntactically ambiguous shapes (empty / mixed-kind
-        lists) are REJECTED rather than guessed — never silently dropped —
-        mirroring the printer's fail-loud behaviour.
+        direction list, printed enum attributes -> their original enum values,
+        and ``[name, ...]`` / bare ``name`` -> Var(s). Anything else becomes an
+        IR expression. Syntactically ambiguous shapes (empty / mixed-kind lists)
+        are REJECTED rather than guessed — never silently dropped — mirroring
+        the printer's fail-loud behaviour.
         """
         from pypto.language.arg_direction import NAME_TO_DIRECTION  # noqa: PLC0415
 
@@ -7322,10 +7645,16 @@ class ASTParser:
                 "unsupported kind (expected all ints, all pl.adir.<name>, or all names)",
                 span=node_span,
             )
-        # ``pl.<DTYPE>`` -> DataType. The printer emits DataType attrs in this
-        # form (PrintAttrValue's DataType arm), and ``parse_expression`` has no
-        # way to represent a dtype, so resolve it before the generic fallback.
+        # Printed enum attrs must remain enum attrs. ``parse_expression`` either
+        # rejects these standalone attribute forms or, for MemorySpace, lowers
+        # them to ConstInt and silently changes the stored attr type.
         if isinstance(value_node, ast.Attribute):
+            success, value = self.expr_evaluator.try_eval_expr(value_node)
+            if success and isinstance(value, _ENUM_VALUE_TYPES):
+                return value
+
+            # Keep the dtype resolver's diagnostic for unknown ``pl.<DTYPE>``
+            # spellings when expression evaluation cannot resolve the value.
             try:
                 return self.type_resolver.resolve_dtype(value_node)
             except ParserTypeError:
@@ -7651,17 +7980,50 @@ class ASTParser:
     def _parse_op_positional_arg(self, arg: ast.expr) -> Any:
         """Parse a positional op argument.
 
+        Positional and keyword op arguments must agree: ``pl.fillpad(t,
+        pl.PadValue.zero)`` means exactly what ``pl.fillpad(t,
+        pad_value=pl.PadValue.zero)`` means. Wrappers have non-Expr parameter
+        slots (dtypes, memory spaces, pad modes) that ``parse_expression``
+        cannot represent, so those spellings are resolved here the same way
+        ``_parse_op_kwargs`` resolves them.
+
         For ``ast.Attribute`` nodes (e.g. ``pl.INDEX``, ``pl.FP32``), try
         dtype resolution first so wrappers receive a ``DataType`` for slots
-        like ``pl.cast(value, dtype)``. Falls through to ``parse_expression``
-        for everything else, which keeps Tensor/Tile/Scalar var lookups,
-        list literals, etc. on the existing path.
+        like ``pl.cast(value, dtype)``, then closure evaluation for enum and
+        numeric constants (``pl.PadValue.zero``, ``math.inf``) — neither of
+        which ``parse_expression`` accepts. ``ast.Name`` resolves enums from
+        the closure only when the name is not an IR variable; numeric closure
+        names stay on the existing path, which materializes them as
+        ``ConstInt`` / ``ConstFloat`` carrying the parser's chosen dtype.
+        Everything else falls through to ``parse_expression``, which keeps
+        Tensor/Tile/Scalar var lookups, list literals, etc. unchanged.
         """
         if isinstance(arg, ast.Attribute):
             try:
                 return self.type_resolver.resolve_dtype(arg)
             except ParserError:
                 pass
+            success, value = self.expr_evaluator.try_eval_expr(arg)
+            # bool subclasses int — a positional ``True`` is not a numeric
+            # constant slot, so leave it on the expression path.
+            if success and (
+                isinstance(value, _ENUM_VALUE_TYPES)
+                or (isinstance(value, (int, float)) and not isinstance(value, bool))
+            ):
+                return value
+        elif isinstance(arg, ast.Name) and self.scope_manager.lookup_var(arg.id) is None:
+            success, value = self.expr_evaluator.try_eval_expr(arg)
+            if success and isinstance(value, _ENUM_VALUE_TYPES):
+                return value
+        elif isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
+            # ``-math.inf`` — parse_expression would descend into the operand
+            # and hit the standalone-attribute rejection. Only attributes are
+            # intercepted; ``-<name>`` and ``-<literal>`` keep their existing
+            # expression handling.
+            if isinstance(arg.operand, ast.Attribute):
+                success, value = self.expr_evaluator.try_eval_expr(arg.operand)
+                if success and isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return -value
         return self.parse_expression(arg)
 
     def _parse_op_kwargs(self, call: ast.Call) -> dict[str, Any]:
@@ -7884,6 +8246,9 @@ class ASTParser:
             return self._attach_op_attrs(invoke_dsl(op_func, args, kwargs, span), attrs)
         except ParserError:
             raise
+        except BUG_CLASS_EXCEPTIONS:
+            # Compiler bug, not a bad kernel - surface it with its type and trace intact.
+            raise
         except (TypeError, ValueError) as e:
             # Wrapper may have prefixed its message (``pl.<op>:`` from
             # ``_raise_type_dispatch_error`` or ``pl.<module>.<op>:``) or raised
@@ -7891,14 +8256,31 @@ class ASTParser:
             # rounding mode ...")``). Make sure the surfaced error always names
             # the op so users can locate the bad call. When any operand was a
             # Scalar, append a hint pointing at Python operators.
-            msg = str(e)
+            #
+            # Sanitize first: most ops type-check in C++, and a ``CHECK`` throws
+            # ``pypto::ValueError`` -- so backend op-validation failures land *here*, not
+            # in the ``except Exception`` branch below. Their message still carries
+            # FatalLogger's "Check failed: <C++ expr> at <absolute path>.cpp:<line>" tail,
+            # which the renderer would splice into the bold ``Error:`` header ahead of the
+            # ``-->`` source arrow. It stays reachable through ``__cause__`` under
+            # PTO_BACKTRACE=1. A pure-Python ValueError has no tail, so this is a no-op.
+            # ``strip_trailing_span`` additionally drops the ``[<file>:<line>:<col>]`` a
+            # ``CHECK_SPAN`` leaves in the payload: we raise with ``span=`` below, so the
+            # arrow and snippet locate the call anyway, and the inline copy is an absolute
+            # path in the middle of the header (often naming an operand's *definition*,
+            # not the call, which reads as a contradiction against the arrow).
+            msg = concise_error_message(e, strip_trailing_span=True)
             if not msg.startswith(f"pl.{op_name}") and not msg.startswith(f"{module_name}.{op_name}"):
                 msg = f"{module_name} operation '{op_name}': {msg}"
             hint = self._scalar_operand_hint(args, kwargs)
             raise InvalidOperationError(msg, span=span, hint=hint) from e
         except Exception as e:
+            # ``span=`` below gives the renderer its ``-->`` arrow, so strip the inline
+            # ``[<file>:<line>:<col>]`` a ``CHECK_SPAN`` leaves in the payload rather than
+            # printing an absolute path inside the bold ``Error:`` header.
             raise InvalidOperationError(
-                f"Error in {module_name} operation '{op_name}': {concise_error_message(e)}",
+                f"Error in {module_name} operation '{op_name}': "
+                f"{concise_error_message(e, strip_trailing_span=True)}",
                 span=span,
             ) from e
 
@@ -8044,9 +8426,16 @@ class ASTParser:
             return self._attach_op_attrs(op_func(*args, **kwargs, span=span), attrs)
         except ParserError:
             raise
+        except BUG_CLASS_EXCEPTIONS:
+            # Compiler bug, not a bad kernel - surface it with its type and trace intact.
+            raise
         except Exception as e:
+            # ``span=`` below gives the renderer its ``-->`` arrow, so strip the inline
+            # ``[<file>:<line>:<col>]`` a ``CHECK_SPAN`` leaves in the payload rather than
+            # printing an absolute path inside the bold ``Error:`` header.
             raise InvalidOperationError(
-                f"Error in {module_name} operation '{op_name}': {concise_error_message(e)}",
+                f"Error in {module_name} operation '{op_name}': "
+                f"{concise_error_message(e, strip_trailing_span=True)}",
                 span=span,
             ) from e
 
@@ -8192,7 +8581,8 @@ class ASTParser:
                 f"Unknown distributed operation 'pld.{op_name}'",
                 span=span,
                 hint="Available short forms: pld.world_size, pld.get_comm_ctx, pld.rank, "
-                "pld.nranks, pld.alloc_window_buffer, pld.window, pld.remote_load",
+                "pld.nranks, pld.alloc_window_buffer, pld.window, pld.remote_load, "
+                "pld.remote_store",
             )
 
         return self._dispatch_op(_dsl_pld, "pld", op_name, call)
@@ -8357,6 +8747,11 @@ class ASTParser:
             value = self.expr_evaluator.eval_expr(attr)
             if isinstance(value, ir.MemorySpace):
                 return ir.ConstInt(value.value, DataType.INDEX, self.span_tracker.get_span(attr))
+        except BUG_CLASS_EXCEPTIONS:
+            # This eval is speculative, so its failure is normally not worth reporting - but a
+            # failed internal invariant is, and swallowing it here would replace the diagnostic
+            # with the unrelated "standalone attribute access" error raised below.
+            raise
         except Exception:
             pass
         # This might be accessing a DataType enum or similar

@@ -77,6 +77,28 @@ def _create_tile_binary_call(
     return _ir_core.create_op_call(tile_op_name, [lhs, rhs_expr], {}, span)
 
 
+def _normalize_sels_scalar_operand(src: Expr, scalar: int | float | Expr, span: Span) -> Expr:
+    """Normalize TSELS scalar constants to the PTOAS-compatible element dtype."""
+    scalar_expr = _normalize_scalar_operand(src, scalar, span, retype_constants=True)
+    src_type = src.type
+    if not isinstance(src_type, _ir_core.TileType) or not isinstance(scalar_expr, ConstInt):
+        return scalar_expr
+
+    signed_dtype_and_bits = {
+        DataType.UINT8: (DataType.INT8, 8),
+        DataType.UINT16: (DataType.INT16, 16),
+        DataType.UINT32: (DataType.INT32, 32),
+    }.get(src_type.dtype)
+    if signed_dtype_and_bits is None:
+        return scalar_expr
+
+    signed_dtype, bits = signed_dtype_and_bits
+    value = scalar_expr.value
+    if value >= 1 << (bits - 1):
+        value -= 1 << bits
+    return ConstInt(value, signed_dtype, span)
+
+
 # ============================================================================
 # Memory Operations
 # ============================================================================
@@ -139,10 +161,8 @@ def create(
             slayout=none_box) L1/cbuf tile — a contiguous byte-staging buffer
             rather than the boxed NZ layout Mat tiles normally carry. Requires
             ``target_memory=Mat`` and is mutually exclusive with ``transpose``.
-            Used for the mix/aic_only soft ``system.syncall`` L1 scratch, whose
-            counter slots must be contiguous. Default ``None`` keeps the
-            canonical layout. Kept keyword-only so it does not shift ``span``'s
-            positional slot for existing callers.
+            Default ``None`` keeps the canonical layout. Kept keyword-only so
+            it does not shift ``span``'s positional slot for existing callers.
 
     Returns:
         Call expression that returns a TileType with the created tile
@@ -434,6 +454,79 @@ def mscatter(
     return _ir_core.create_op_call("tile.mscatter", [src, idx, output_tensor], {}, actual_span)
 
 
+_MGATHER_COALESCE = {"row": 0, "elem": 1}
+_MGATHER_GATHER_OOB = {"undefined": 0, "clamp": 1, "wrap": 2, "zero": 3}
+
+
+def _resolve_mgather_coalesce(coalesce: str | int) -> int:
+    if isinstance(coalesce, str):
+        try:
+            return _MGATHER_COALESCE[coalesce]
+        except KeyError as e:
+            raise ValueError(f"mgather coalesce must be 'row', 'elem', 0, or 1, got {coalesce!r}") from e
+    if isinstance(coalesce, int) and not isinstance(coalesce, bool) and coalesce in (0, 1):
+        return coalesce
+    raise ValueError(f"mgather coalesce must be 'row', 'elem', 0, or 1, got {coalesce!r}")
+
+
+def _resolve_mgather_gather_oob(gather_oob: str | int) -> int:
+    if isinstance(gather_oob, str):
+        try:
+            return _MGATHER_GATHER_OOB[gather_oob]
+        except KeyError as e:
+            raise ValueError(
+                "mgather gather_oob must be 'undefined', 'clamp', 'wrap', 'zero', or int 0-3, "
+                f"got {gather_oob!r}"
+            ) from e
+    if isinstance(gather_oob, int) and not isinstance(gather_oob, bool) and gather_oob in range(4):
+        return gather_oob
+    raise ValueError(
+        f"mgather gather_oob must be 'undefined', 'clamp', 'wrap', 'zero', or int 0-3, got {gather_oob!r}"
+    )
+
+
+def mgather(
+    mem: Expr,
+    idx: Expr,
+    coalesce: str | int = "row",
+    span: Span | None = None,
+    *,
+    gather_oob: str | int = "undefined",
+    target_memory: MemorySpace = MemorySpace.Vec,
+    scratch: Expr | None = None,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+) -> Call:
+    """Gather-load indexed rows or elements from a GM tensor into Vec or Mat.
+
+    Vec output uses a 2D INT32 index tile. Mat output uses a GM INT32 index
+    tensor and produces canonical NZ layout; its element mode additionally
+    requires a same-dtype GM scratch tensor.
+    ``gather_oob`` selects undefined, clamp, wrap, or zero handling.
+    """
+    if target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
+        raise ValueError(
+            f"mgather target_memory must be MemorySpace.Vec or MemorySpace.Mat, got {target_memory}"
+        )
+    actual_span = _get_span_or_capture(span)
+    kwargs: dict[str, Any] = {"coalesce": _resolve_mgather_coalesce(coalesce)}
+    if target_memory != MemorySpace.Vec:
+        kwargs["target_memory"] = target_memory
+    resolved_gather_oob = _resolve_mgather_gather_oob(gather_oob)
+    if resolved_gather_oob != 0:
+        kwargs["gather_oob"] = resolved_gather_oob
+    args = [mem, idx]
+    if scratch is not None:
+        args.append(scratch)
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
+    return _ir_core.create_op_call(
+        "tile.mgather",
+        args,
+        kwargs,
+        actual_span,
+    )
+
+
 def concat(
     src0: Expr,
     src1: Expr,
@@ -629,6 +722,43 @@ def ci(
 arange = ci
 
 
+def tri(
+    diagonal: int | Expr,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    dtype: DataType = DataType.INT32,
+    upper: bool = False,
+    span: Span | None = None,
+) -> Call:
+    """Generate a lower- or upper-triangular mask tile (``pto.ttri``).
+
+    Args:
+        diagonal: INT32 diagonal offset, matching ``torch.tril``/``torch.triu``.
+        shape: Static two-dimensional physical destination shape.
+        valid_shape: Optional written region, bounded by ``shape``.
+        dtype: One of INT16, INT32, UINT16, UINT32, FP16, or FP32.
+        upper: Generate the upper triangle when true; lower otherwise.
+        span: Optional source span.
+    """
+    actual_span = _get_span_or_capture(span)
+    if isinstance(diagonal, Expr):
+        if isinstance(diagonal, ConstInt) and diagonal.dtype != DataType.INT32:
+            diagonal_expr: Expr = ConstInt(diagonal.value, DataType.INT32, actual_span)
+        else:
+            diagonal_expr = diagonal
+    else:
+        diagonal_expr = ConstInt(diagonal, DataType.INT32, actual_span)
+    args: list[Expr] = [diagonal_expr, _to_make_tuple(shape, actual_span)]
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
+    return _ir_core.create_op_call(
+        "tile.tri",
+        args,
+        {"dtype": dtype, "upper": upper},
+        actual_span,
+    )
+
+
 def random(  # noqa: PLR0913
     key0: int | Expr,
     key1: int | Expr,
@@ -817,7 +947,9 @@ def div(
     rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     if isinstance(rhs_expr.type, ScalarType):
         if high_precision:
-            raise ValueError("tile.div(high_precision=True) requires a Tile rhs")
+            # TypeError, matching the unified pl.* guards: a kwarg this operand
+            # combination cannot honour is a wrong-arguments error, not a bad value.
+            raise TypeError("tile.div(high_precision=True) requires a Tile rhs")
         return _ir_core.create_op_call("tile.divs", [lhs, rhs_expr], {}, actual_span)
     kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
     return _ir_core.create_op_call("tile.div", [lhs, rhs_expr], kwargs, actual_span)
@@ -1306,25 +1438,33 @@ def sel(mask: Expr, lhs: Expr, rhs: Expr, tmp: Expr, span: Span | None = None) -
     return _ir_core.create_op_call("tile.sel", [mask, lhs, rhs, tmp], {}, actual_span)
 
 
-def sels(lhs: Expr, rhs: Expr, select_mode: int | float | Expr, span: Span | None = None) -> Call:
-    """Select between two tiles based on a scalar mode.
+def sels(
+    mask: Expr,
+    src: Expr,
+    tmp: Expr,
+    scalar: int | float | Expr,
+    span: Span | None = None,
+) -> Call:
+    """Per-element selection between a source tile and a scalar.
 
-    Maps to the TSELS hardware intrinsic. The interpretation of select_mode values
-    is target-dependent and enforced by codegen.
+    For each element (i, j): dst[i,j] = src[i,j] if mask[i,j] is true,
+    else scalar. Maps to the TSELS hardware intrinsic.
 
     Args:
-        lhs: Source tile 0 (TileType)
-        rhs: Source tile 1 (TileType)
-        select_mode: Scalar select mode
+        mask: Predicate mask tile (TileType); encoding is target-defined
+        src: Source tile, selected where mask is true (TileType)
+        tmp: Scratch tile required by TSELS (TileType)
+        scalar: Scalar value, selected where mask is false. For an unsigned
+            integer src, constants use the same-width signed PTOAS scalar type
+            while preserving their bit pattern.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for tile select
+        Call expression for per-element tile/scalar selection
     """
     actual_span = _get_span_or_capture(span)
-    # select_mode is a mode flag interpreted by codegen, not a tile element value.
-    select_mode_expr = _normalize_const_to_dtype(select_mode, DataType.INT32, actual_span)
-    return _ir_core.create_op_call("tile.sels", [lhs, rhs, select_mode_expr], {}, actual_span)
+    scalar_expr = _normalize_sels_scalar_operand(src, scalar, actual_span)
+    return _ir_core.create_op_call("tile.sels", [mask, src, tmp, scalar_expr], {}, actual_span)
 
 
 def muls(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -1505,18 +1645,20 @@ def cos(tile: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.cos", [tile], {}, actual_span)
 
 
-def recip(tile: Expr, span: Span | None = None) -> Call:
+def recip(tile: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
     """Element-wise reciprocal (1/x) of a tile.
 
     Args:
         tile: Input tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision reciprocal mode (FP16/FP32 only)
 
     Returns:
         Call expression for element-wise reciprocal
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.recip", [tile], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tile.recip", [tile], kwargs, actual_span)
 
 
 def sqrt(tile: Expr, span: Span | None = None) -> Call:
@@ -1659,24 +1801,39 @@ def matmul(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.matmul", [lhs, rhs], {}, actual_span)
 
 
-def matmul_acc(acc: Expr, lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+def matmul_acc(
+    acc: Expr,
+    lhs: Expr,
+    rhs: Expr,
+    span: Span | None = None,
+    *,
+    init_cond: Expr | None = None,
+) -> Call:
     """Matrix multiplication with accumulation.
 
     Performs matrix multiplication and accumulates the result: acc = acc + lhs @ rhs.
     This is commonly used in loop-based matrix multiplication where results are
     accumulated over the K dimension.
 
+    With ``init_cond``, the accumulator's initial value is conditional: on the
+    steps where the predicate holds, ``acc`` is overwritten with ``lhs @ rhs``
+    instead of accumulated into. This is the split-K ``k == 0`` idiom, and it
+    keeps the accumulator single-def where a hand-written if/else would put a
+    phi on an in-place Acc buffer.
+
     Args:
         acc: Accumulator tile (TileType) to accumulate into
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
+        init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
     Returns:
         Call expression for matrix multiplication with accumulation
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.matmul_acc", [acc, lhs, rhs], {}, actual_span)
+    args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
+    return _ir_core.create_op_call("tile.matmul_acc", args, {}, actual_span)
 
 
 def matmul_bias(lhs: Expr, rhs: Expr, bias: Expr, span: Span | None = None) -> Call:
@@ -1685,7 +1842,8 @@ def matmul_bias(lhs: Expr, rhs: Expr, bias: Expr, span: Span | None = None) -> C
     Args:
         lhs: Left-hand side tile (TileType [M, K])
         rhs: Right-hand side tile (TileType [K, N])
-        bias: Bias tile (TileType [1, N])
+        bias: Bias tile (TileType [1, N]) with the accumulator dtype (FP32 for
+            floating-point matrix operands, INT32 for integer matrix operands)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1693,6 +1851,54 @@ def matmul_bias(lhs: Expr, rhs: Expr, bias: Expr, span: Span | None = None) -> C
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.matmul_bias", [lhs, rhs, bias], {}, actual_span)
+
+
+def matmul_mx(
+    lhs: Expr,
+    lhs_scale: Expr,
+    rhs: Expr,
+    rhs_scale: Expr,
+    span: Span | None = None,
+) -> Call:
+    """MX block-scale matrix multiplication: C = matmul_mx(A, A_scale, B, B_scale)."""
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.matmul_mx", [lhs, lhs_scale, rhs, rhs_scale], {}, actual_span)
+
+
+def matmul_mx_acc(
+    acc: Expr,
+    lhs: Expr,
+    lhs_scale: Expr,
+    rhs: Expr,
+    rhs_scale: Expr,
+    span: Span | None = None,
+) -> Call:
+    """MX block-scale matmul with accumulation: acc += matmul_mx(...)."""
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call(
+        "tile.matmul_mx_acc", [acc, lhs, lhs_scale, rhs, rhs_scale], {}, actual_span
+    )
+
+
+def matmul_mx_bias(
+    lhs: Expr,
+    lhs_scale: Expr,
+    rhs: Expr,
+    rhs_scale: Expr,
+    bias: Expr,
+    span: Span | None = None,
+) -> Call:
+    """MX block-scale matmul with bias: C = matmul_mx(...) + bias."""
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call(
+        "tile.matmul_mx_bias", [lhs, lhs_scale, rhs, rhs_scale, bias], {}, actual_span
+    )
+
+
+def tget_scale_addr(dst_scale: Expr, src: Expr, span: Span | None = None) -> Call:
+    """Build the compiler-internal MX scale-address binding operation."""
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.tget_scale_addr", [dst_scale, src], {}, actual_span)
 
 
 def batch_matmul(
@@ -1742,51 +1948,80 @@ def batch_matmul_acc(
     return _ir_core.create_op_call("tile.batch_matmul_acc", [acc, lhs, rhs], {}, actual_span)
 
 
-def gemv(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+def gemv(lhs: Expr, rhs: Expr, span: Span | None = None, *, acc_phase: str = "unspecified") -> Call:
     """General Matrix-Vector multiplication: C[1,N] = A[1,K] @ B[K,N].
+
+    ``lhs`` must have exactly one physical and logical row. The rhs logical K
+    must cover the lhs logical K. Inputs must use the same INT8, FP16, BF16, or FP32
+    dtype; the output is INT32 for INT8 inputs and FP32 otherwise.
 
     Args:
         lhs: Row vector tile (TileType [1, K])
         rhs: Right-hand side tile (TileType [K, N])
+        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for GEMV
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gemv", [lhs, rhs], {}, actual_span)
+    return _ir_core.create_op_call("tile.gemv", [lhs, rhs], {"acc_phase": acc_phase}, actual_span)
 
 
-def gemv_acc(acc: Expr, lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
+def gemv_acc(
+    acc: Expr,
+    lhs: Expr,
+    rhs: Expr,
+    span: Span | None = None,
+    *,
+    acc_phase: str = "unspecified",
+) -> Call:
     """GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N].
+
+    ``acc`` must use the GEMV output dtype. The logical K extents and lhs/rhs
+    dtype requirements are identical to :func:`gemv`.
 
     Args:
         acc: Accumulator tile (TileType [1, N])
         lhs: Row vector tile (TileType [1, K])
         rhs: Right-hand side tile (TileType [K, N])
+        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for GEMV with accumulation
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gemv_acc", [acc, lhs, rhs], {}, actual_span)
+    return _ir_core.create_op_call("tile.gemv_acc", [acc, lhs, rhs], {"acc_phase": acc_phase}, actual_span)
 
 
-def gemv_bias(lhs: Expr, rhs: Expr, bias: Expr, span: Span | None = None) -> Call:
+def gemv_bias(
+    lhs: Expr,
+    rhs: Expr,
+    bias: Expr,
+    span: Span | None = None,
+    *,
+    acc_phase: str = "unspecified",
+) -> Call:
     """GEMV with bias add: C[1,N] = A[1,K] @ B[K,N] + bias[1,N].
+
+    ``bias`` must use the GEMV output dtype and its valid shape must cover the
+    logical output shape ``[1, N]``. The logical K extents and lhs/rhs dtype
+    requirements are identical to :func:`gemv`.
 
     Args:
         lhs: Row vector tile (TileType [1, K])
         rhs: Right-hand side tile (TileType [K, N])
-        bias: Bias tile (TileType [1, N])
+        bias: Bias tile (TileType [1, N]) with the accumulator dtype (FP32 for
+            floating-point matrix operands, INT32 for integer matrix operands)
+        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for GEMV with bias
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gemv_bias", [lhs, rhs, bias], {}, actual_span)
+    return _ir_core.create_op_call("tile.gemv_bias", [lhs, rhs, bias], {"acc_phase": acc_phase}, actual_span)
 
 
 # ============================================================================
@@ -2674,8 +2909,9 @@ def set_validshape(
     """Update valid-shape metadata of a tile without data movement.
 
     .. note::
-        Internal API — this op is intended for compiler-generated code only
-        and should not be exposed to end users in future releases.
+        The operand must not be a view (a ``pl.tile.slice`` or reshape result): a
+        view carries its valid extent in its type, so there is nothing to update.
+        Narrow at the slice with ``valid_shape=`` instead.
 
     Args:
         tile: Input tile expression (must be 2D TileType)
@@ -2752,13 +2988,15 @@ def tpush_to_aic(tile: Expr, *, split: int, id: int | None = None, span: Span | 
 
 
 def aiv_shard(tile: Expr, *, split: int, span: Span | None = None) -> Call:
-    """Shard a 2D tile into half along the split axis (full -> half).
+    """Cross the AIC -> AIV boundary, halving on the split axis (full -> half).
 
-    The result is a TileType with the split axis halved.
+    ``split=1`` / ``2`` halve the named axis. ``split=0`` (a task-parallel
+    ``mode=NONE`` region) has no split axis: the op still marks the crossing and
+    the result type preserves the operand's shape.
 
     Args:
-        tile: Input tile (TileType, 2D)
-        split: Split mode (1=up-down/axis0, 2=left-right/axis1)
+        tile: Input tile (TileType; 2D unless split=0)
+        split: Split mode (0=no split axis, 1=up-down/axis0, 2=left-right/axis1)
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
@@ -2766,13 +3004,15 @@ def aiv_shard(tile: Expr, *, split: int, span: Span | None = None) -> Call:
 
 
 def aic_gather(tile: Expr, *, split: int, span: Span | None = None) -> Call:
-    """Gather a 2D tile into full along the split axis (half -> full).
+    """Cross the AIV -> AIC boundary, rejoining on the split axis (half -> full).
 
-    Inverse of :func:`aiv_shard`: the result is a TileType with the split axis doubled.
+    Inverse of :func:`aiv_shard`: ``split=1`` / ``2`` double the named axis, while
+    ``split=0`` (a task-parallel ``mode=NONE`` region) marks the crossing and
+    preserves the operand's shape.
 
     Args:
-        tile: Input tile (TileType, 2D)
-        split: Split mode (1=up-down/axis0, 2=left-right/axis1)
+        tile: Input tile (TileType; 2D unless split=0)
+        split: Split mode (0=no split axis, 1=up-down/axis0, 2=left-right/axis1)
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
@@ -2888,6 +3128,24 @@ def gather(
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.gather", [src, indices, tmp], {}, actual_span)
+
+
+def gatherb(
+    src: Expr,
+    offset: Expr,
+    span: Span | None = None,
+    *,
+    output_dtype: int | DataType | None = None,
+) -> Call:
+    """Gather 32-byte source blocks by UINT32 byte offsets (``pto.tgatherb``).
+
+    Each offset selects the first byte of one 32-byte block. The output shape
+    is ``[offset_rows, offset_cols * (32 / sizeof(output_dtype))]``; the offset
+    valid shape is expanded by the same factor.
+    """
+    actual_span = _get_span_or_capture(span)
+    kwargs = {} if output_dtype is None else {"output_dtype": output_dtype}
+    return _ir_core.create_op_call("tile.gatherb", [src, offset], kwargs, actual_span)
 
 
 def gather_mask(

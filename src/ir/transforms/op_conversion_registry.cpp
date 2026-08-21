@@ -36,6 +36,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/storage_size.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/type.h"
@@ -420,12 +421,33 @@ void OpConversionRegistry::RegisterMemoryOps() {
       "tensor.slice",
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
          const Span& span) -> ConversionResult {
-        INTERNAL_CHECK_SPAN(args.size() == 3 || args.size() == 4, span)
-            << "tensor.slice conversion expects 3 or 4 args (tensor, shape, offset[, valid_shape])";
+        INTERNAL_CHECK_SPAN(args.size() >= 3 && args.size() <= 5, span)
+            << "tensor.slice conversion expects 3-5 args "
+               "(tensor, shape, offset[, valid_shape[, drop_dims]])";
         auto& op_reg = OpRegistry::GetInstance();
         const auto& input = args[0];
         const auto& shape = args[1];
         const auto& offset = args[2];
+        auto shape_type = As<TupleType>(shape->GetType());
+        INTERNAL_CHECK_SPAN(shape_type, span) << "tensor.slice shape must be a tuple";
+        auto full_shape = ExtractTupleElements(shape, shape_type->types_.size());
+        auto offset_type = As<TupleType>(offset->GetType());
+        INTERNAL_CHECK_SPAN(offset_type, span) << "tensor.slice offset must be a tuple";
+        auto offsets = ExtractTupleElements(offset, offset_type->types_.size());
+        auto drop_dims =
+            ParseSliceDropDims(args.size() == 5 ? args[4] : nullptr, full_shape, "tensor.slice conversion");
+        CHECK_SPAN(drop_dims.size() < full_shape.size(), span)
+            << "tensor.slice conversion does not support rank-0 tiles; keep one unit axis or use "
+               "tensor.read for a scalar result";
+        auto reduced_shape = MakeShapeTuple(ApplyDropDims(full_shape, drop_dims), span);
+
+        auto apply_drop_dims = [&](const ExprPtr& value) -> ConversionResult {
+          if (drop_dims.empty()) return ConversionResult{value};
+          auto loaded_var = std::make_shared<Var>("slice_load", value->GetType(), span);
+          std::vector<StmtPtr> prologue = {std::make_shared<AssignStmt>(loaded_var, value, span)};
+          auto reshape_call = op_reg.Create("tile.reshape", {loaded_var, reduced_shape}, {}, span);
+          return ConversionResult{std::move(prologue), reshape_call};
+        };
 
         // Extract pad_value kwarg (if any) to forward to the emitted tile.slice.
         std::vector<std::pair<std::string, std::any>> forward_kwargs;
@@ -450,18 +472,27 @@ void OpConversionRegistry::RegisterMemoryOps() {
           // pad_value on a tensor.slice over a TensorType input, the pad intent is
           // lost here — a follow-up tile.fillpad is the workaround until tile.load
           // grows its own pad_value kwarg.
-          auto valid_shape = (args.size() == 4) ? args[3] : shape;
+          std::vector<ExprPtr> requested_valid;
+          if (args.size() >= 4) {
+            auto valid_shape_tuple = As<MakeTuple>(args[3]);
+            INTERNAL_CHECK_SPAN(valid_shape_tuple, span)
+                << "tensor.slice valid_shape must be a MakeTuple during conversion";
+            requested_valid = valid_shape_tuple->elements_;
+          }
+          auto valid_shape = MakeShapeTuple(
+              InferTensorSliceFullValidShape(*tensor_type, full_shape, offsets, requested_valid,
+                                             GetKwargOr<bool>(kwargs, "clamp", false), span),
+              span);
           std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
           auto load_call = op_reg.Create("tile.load", {input, offset, shape, valid_shape}, load_kwargs, span);
-          return ConversionResult{load_call};
+          return apply_drop_dims(load_call);
         }
 
         if (tile_type) {
-          std::vector<ExprPtr> slice_args = {input, shape, offset};
-          if (args.size() == 4) {
-            slice_args.push_back(args[3]);
-          }
-          auto slice_call = op_reg.Create("tile.slice", slice_args, forward_kwargs, span);
+          // tile.slice natively understands valid_shape and drop_dims. Keep the
+          // full-rank window operands intact so it can validate against the
+          // source tile before reducing the result rank.
+          auto slice_call = op_reg.Create("tile.slice", args, forward_kwargs, span);
           return ConversionResult{slice_call};
         }
 
@@ -510,13 +541,13 @@ void OpConversionRegistry::RegisterMemoryOps() {
         }
 
         if (source_tile_type && target_tile_type) {
-          INTERNAL_CHECK_SPAN(!atomic_add, span) << kAtomicTileToTileMsg;
+          CHECK_SPAN(!atomic_add, span) << kAtomicTileToTileMsg;
           auto assemble_call = op_reg.Create("tile.assemble", {target, source, offset}, span);
           return ConversionResult{assemble_call};
         }
 
         if (target_tile_type && !source_tile_type) {
-          INTERNAL_CHECK_SPAN(!atomic_add, span) << kAtomicTileToTileMsg;
+          CHECK_SPAN(!atomic_add, span) << kAtomicTileToTileMsg;
           // A window (DistributedTensorType) source stages into the tile target
           // through the same local tile.load path as a plain tensor (issue #1694).
           auto source_tensor_type = AsTensorTypeLike(source->GetType());
@@ -534,6 +565,16 @@ void OpConversionRegistry::RegisterMemoryOps() {
           auto assemble_call = op_reg.Create("tile.assemble", {target, source_tile_var, offset}, span);
           return ConversionResult{std::move(prologue), assemble_call};
         }
+
+        // Neither target nor source is a tile: the assemble stays a tensor-level op,
+        // so there is no store to carry the atomic combine and the kwarg would be
+        // forwarded to a node that has no consumer for it. Same user-facing
+        // limitation as the orchestration-level guard in HandleTensorAssembleAssign.
+        CHECK_SPAN(!atomic_add, span)
+            << "tensor.assemble with atomic=AtomicType.Add requires a tile source stored into a "
+               "global-memory target: the source must be an on-chip compute result (the split-K "
+               "partial product), not a plain tensor. This assemble copies one tensor into "
+               "another, so there is no store to carry the atomic combine.";
 
         if (kwargs.empty()) {
           return ConversionResult{op_reg.Create("tensor.assemble", args, span)};
@@ -698,12 +739,12 @@ void OpConversionRegistry::RegisterMemoryOps() {
             }
           }
           if (all_const) {
-            uint64_t tile_bytes = static_cast<uint64_t>(total_elements) * dtype.GetBit() / 8;
+            auto tile_bytes = storage_size::StaticStorageBytes(static_cast<uint64_t>(total_elements), dtype);
             const auto* be = backend::GetBackend();
-            if (be) {
+            if (be && tile_bytes.has_value()) {
               uint64_t mem_size = be->GetMemSize(target_mem);
-              INTERNAL_CHECK_SPAN(mem_size == 0 || tile_bytes <= mem_size, span)
-                  << "tensor.create: tile size (" << tile_bytes << " bytes) exceeds buffer capacity ("
+              INTERNAL_CHECK_SPAN(mem_size == 0 || *tile_bytes <= mem_size, span)
+                  << "tensor.create: tile size (" << *tile_bytes << " bytes) exceeds buffer capacity ("
                   << mem_size << " bytes) for memory space " << static_cast<int>(target_mem) << " at "
                   << span.to_string();
             }
@@ -1078,11 +1119,22 @@ void OpConversionRegistry::RegisterMatmulOps() {
       [rank_of](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
                 const Span& span) -> ConversionResult {
         (void)kwargs;
-        INTERNAL_CHECK_SPAN(args.size() == 3, span)
-            << "tensor.matmul_acc conversion expects 3 args (acc, lhs, rhs)";
+        INTERNAL_CHECK_SPAN(args.size() == 3 || args.size() == 4, span)
+            << "tensor.matmul_acc conversion expects 3 args (acc, lhs, rhs) or 4 with init_cond";
         const bool nd = rank_of(args[0]) > 2 || rank_of(args[1]) > 2 || rank_of(args[2]) > 2;
         const std::string out_op = nd ? "tile.batch_matmul_acc" : "tile.matmul_acc";
-        return ConversionResult{OpRegistry::GetInstance().Create(out_op, {args[0], args[1], args[2]}, span)};
+        std::vector<ExprPtr> out_args = {args[0], args[1], args[2]};
+        if (args.size() == 4) {
+          // The batched form expands into several tile.matmul_acc calls inside
+          // FlattenTileNdTo2D, which has no place to thread a per-call
+          // predicate; only the 2D path carries init_cond.
+          CHECK_SPAN(!nd, span)
+              << "tensor.matmul_acc does not support init_cond on operands of rank > 2 (got acc rank "
+              << rank_of(args[0]) << ", lhs rank " << rank_of(args[1]) << ", rhs rank " << rank_of(args[2])
+              << "). Loop over the batch dimension and accumulate with 2D operands instead.";
+          out_args.push_back(args[3]);
+        }
+        return ConversionResult{OpRegistry::GetInstance().Create(out_op, out_args, span)};
       },
       {{1, {MemorySpace::Mat, "a_trans"}}, {2, {MemorySpace::Mat, "b_trans"}}});
 }
@@ -2493,6 +2545,20 @@ std::vector<std::pair<std::string, std::any>> StripChunkKwargs(
 }  // namespace
 
 void OpConversionRegistry::RegisterDistributedOps() {
+  // pld.tensor.remote_store -> pld.tile.remote_store, 1:1 (the same shape as
+  // tensor.aiv_shard -> tile.aiv_shard: one op, two IR levels, identical
+  // argument surface, so no argument can be silently dropped by the lowering).
+  //
+  // The InputSpaceReq is what makes the op total on its src. BridgeInputSpaces
+  // only rewrites TensorType operands, so:
+  //   - a computed value has already been lowered to a tile by its producer
+  //     earlier in this pass and passes straight through, keeping whatever space
+  //     it computed in (Vec or Acc — both are legal pto.tstore sources);
+  //   - a src still resident in GM is auto-bridged with a natural tile.load into
+  //     Vec, and a tensor.slice producer is loaded directly into Vec by the
+  //     consumer-driven path.
+  RegisterSimple("pld.tensor.remote_store", "pld.tile.remote_store", {{0, {MemorySpace::Vec, std::nullopt}}});
+
   // pld.tensor.put -> tile.create(stage) + pld.tile.put(dst, peer, src, stage).
   // Stage shape is [rows, cols] with rows = product(leading dims), cols =
   // innermost dim: the 2-D-flattened transfer extent codegen previously
@@ -2513,6 +2579,20 @@ void OpConversionRegistry::RegisterDistributedOps() {
         INTERNAL_CHECK_SPAN(dst_type, span)
             << "pld.tensor.put conversion: dst must be DistributedTensorType, got "
             << args[0]->GetType()->TypeName();
+
+        // A tile-typed src means the author pushed a *computed* value: its
+        // producer lowered to a tile earlier in this pass. TPUT needs two GM
+        // descriptors (the staging tile it takes is its own bounce buffer, not a
+        // data source), so there is no lowering here. Reject at the op the author
+        // actually wrote — deferring to pld.tile.put's deducer produces
+        // "pld.tile.put src must be a Tensor..." naming an internal op, and the
+        // put-only args below (atomic, chunking, src_offsets) would be silently
+        // dropped by any tile-level fallback.
+        CHECK_SPAN(!As<TileType>(args[2]->GetType()), span)
+            << "pld.tensor.put src must be a GM tensor, but got a computed value that lowers to a "
+               "tile: TPUT transfers between two GM regions, and a UB tile has no GM address. "
+               "Use pld.tensor.remote_store(src, target, peer, offsets) to push a computed value "
+               "straight to a peer (pld.remote_store dispatches to it automatically).";
         std::vector<ExprPtr> transfer_shape = dst_type->shape_;
         if (args.size() == 6) {
           auto shape_tuple_arg = As<MakeTuple>(args[5]);
@@ -2626,7 +2706,7 @@ void OpConversionRegistry::RegisterDistributedOps() {
 // High-level (@pl.jit / pl.spmd) author-facing shard / gather emitted inside a
 // ``for aiv_id in pl.split_aiv(...)`` region. Each lowers 1:1 to its tile op
 // (tile.aiv_shard / tile.aic_gather) so the result is byte-identical to what the
-// AUTO ``pl.split`` path produces via LowerAutoVectorSplit (pass 18).
+// AUTO ``pl.split`` path produces via LowerAutoVectorSplit (pass 20).
 //
 // Boundary memory space. The tile-level split deducer (DeduceSplitReshape)
 // intentionally leaves it null (returns a TileType with a null memref / null

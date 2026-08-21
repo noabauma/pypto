@@ -17,13 +17,14 @@ The persistent path is opt-in. The default `prepare()` behavior is unchanged.
 
 ## Lifecycle
 
-The PyPTO worker starts one background dispatcher and sends requests to it
-through a Python queue. Every request executes inside its own Simpler
-`Worker.run()` completion fence. The first use of a generated CommDomain
-allocates its physical window; later calls receive a retained lease for the
-same handle. Closing the prepared worker stops the dispatcher and releases all
-retained domains. Request or domain-release errors are propagated to the
-caller instead of being silently discarded by the background thread.
+Each PyPTO submission builds its persistent orchestration synchronously in the
+calling thread and calls Simpler `Worker.submit()` directly. The returned
+`DistributedRunHandle` owns that request until its native completion fence and
+cleanup finish. The first use of a generated CommDomain allocates its physical
+window; later calls receive a retained lease for the same handle. Closing the
+prepared worker stops admission, drains every published handle, and then
+releases all retained domains. Request and domain-release errors are propagated
+to the caller.
 
 Generated HOST orchestration entries accept an internal `_domain_provider`
 keyword. Normal dispatch leaves it unset and continues to call
@@ -56,10 +57,20 @@ before reuse or use a protocol such as epochs that safely manages all retained
 signal and data state. Reusing stale state without either mechanism can produce
 incorrect results or deadlock.
 
-With the default reset enabled, PyPTO synchronously zeros every local window
-before reuse. A 1 MiB read-only host chunk is allocated before the chip workers
-fork and is copied repeatedly for larger windows. The reset copy is part of
-each repeated request's host overhead.
+With the default reset enabled, PyPTO synchronously zeros every named local
+buffer before reuse. For each reset request, it creates one zero-filled
+POSIX-shared-memory host `Buffer` per distinct named-buffer size and reuses that
+staging `Buffer` across all matching domains and workers. The staging buffers
+remain live until the `Worker.run()` fence returns, so peak staging memory is
+the sum of those distinct sizes. The reset copies are part of each repeated
+request's host overhead.
+
+This whole-buffer staging is required by the current Simpler Buffer API: `copy_to`
+derives the transfer length from the source `Buffer` and exposes neither a
+destination offset nor a public Buffer subview. Generated PyPTO domains cover
+their windows exactly with named buffers. Reset rejects artifacts with unnamed
+window slack because the Buffer API cannot restore that slack to fresh-window
+state.
 
 ## Multiple compiled programs
 
@@ -77,14 +88,19 @@ Domains are isolated by `(compiled program, generated domain name)`. Prefill's
 generated names match. All prepared programs still must satisfy the normal
 platform, runtime, and device-ID compatibility checks.
 
-Requests execute serially through one queue. Persistent mode does not make one
-worker execute multiple L3 DAGs concurrently.
+Graph construction remains serialized by `DistributedWorker.submit()` and
+Simpler. Once accepted, persistent runs follow the same bounded asynchronous
+dispatch contract as ordinary runs: up to two PyPTO metadata frames may be
+published, while the backend's negotiated depth determines how many device
+runs can actually overlap.
 
 ## Runtime dependency
 
-This implementation does not modify Simpler. Each queued request uses the
-public `Worker.run()` completion boundary. PyPTO detaches retained CommDomains
+This implementation does not modify Simpler. Each request uses the public
+`Worker.submit()` boundary, and its native handle remains attached to PyPTO's
+bounded dispatch handle until completion. PyPTO detaches retained CommDomains
 from Simpler's per-run release set and releases them when the prepared worker
-closes. That retention currently depends on Simpler's private live-domain and
-deferred-release hooks; a future public retention API should encapsulate this
-lifecycle.
+closes. That retention currently depends on Simpler's private Worker-level
+live-domain registry and active run-resource journal (`_live_domains` and
+`_building_run_resources.live_domains`); a future public retention API should
+encapsulate this lifecycle.

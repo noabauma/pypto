@@ -257,6 +257,22 @@ void CheckGatherRowOperands(const std::vector<ExprPtr>& args,
                             const std::string& op_name);
 
 /**
+ * @brief Validate the optional ``init_cond`` operand of an accumulating matmul
+ *
+ * ``matmul_acc(acc, lhs, rhs, init_cond)`` overwrites ``acc`` with ``lhs @ rhs``
+ * on the steps where ``init_cond`` holds and accumulates into it otherwise. The
+ * predicate is an ordinary SSA value rather than a kwarg because it may be
+ * loop-dependent (the split-K ``k == 0`` idiom); registry kwargs only carry
+ * compile-time constants.
+ *
+ * @param args Operand list; the operand at @p index is validated when present
+ * @param index Position of ``init_cond``. Nothing is checked when the operand
+ *              list is shorter, since the predicate is optional.
+ * @param op_name Operator name used in diagnostics
+ */
+void CheckMatmulInitCond(const std::vector<ExprPtr>& args, size_t index, const std::string& op_name);
+
+/**
  * @brief Read the elements of a tuple-typed operand
  *
  * A ``MakeTuple`` operand yields its elements directly, which preserves the
@@ -285,7 +301,7 @@ enum class WindowReadKind {
   ///
   /// ``tensor.slice``: PTO codegen emits the view shape already clamped to
   /// ``min(shape, parent - offset)``, because the strided-Tensor runtime enforces
-  /// ``offset + shape <= parent`` in ``Tensor::view``. A padded fixed-width window
+  /// ``offset + shape <= parent`` in ``ChipTensor::view``. A padded fixed-width window
   /// with an explicit ``valid_shape`` naming the real extent is the standard idiom.
   ///
   /// ``tile.load``: the DMA fetches only the valid extent, so the destination tile
@@ -362,6 +378,29 @@ struct WindowReadValidShapeParams {
  *         provable physical-bounds violation of a non-clamping read
  */
 std::vector<ExprPtr> InferWindowReadValidShape(const WindowReadValidShapeParams& params);
+
+/**
+ * @brief Derive the full-rank valid region of a tensor.slice window
+ *
+ * This is the shared tensor.slice validity rule used by type deduction and
+ * tensor-to-tile lowering before any ``drop_dims`` axes are erased. When the
+ * slice window uses the source rank, it intersects the requested valid region
+ * with the source validity. Lower-rank reinterpret views retain their explicit
+ * validity because their axes do not map directly to source coordinates.
+ *
+ * @param source_type Source tensor type
+ * @param full_shape Slice window shape before rank reduction
+ * @param offsets Slice window offsets in source coordinates
+ * @param requested_valid Explicit full-rank valid shape; empty means none
+ * @param clamp Whether the slice may clamp a window crossing the source edge
+ * @param span IR source location used in diagnostics
+ * @return Full-rank valid shape before applying ``drop_dims``
+ */
+std::vector<ExprPtr> InferTensorSliceFullValidShape(const TensorType& source_type,
+                                                    const std::vector<ExprPtr>& full_shape,
+                                                    const std::vector<ExprPtr>& offsets,
+                                                    const std::vector<ExprPtr>& requested_valid, bool clamp,
+                                                    const Span& span);
 
 /**
  * @brief Return the effective valid shape of a tensor type
@@ -584,10 +623,10 @@ bool IsBroadcastable(const ExprPtr& source_dim, const ExprPtr& target_dim);
 std::string FormatShape(const std::vector<ExprPtr>& shape);
 
 /**
- * @brief Propagate blayout and pad from a source TileType's tile_view into a new TileView
+ * @brief Propagate layout/config metadata from a source TileType's tile_view into a new TileView
  *
  * Many tile ops preserve the layout properties of their primary input. This helper copies
- * blayout and pad when the source has a tile_view, avoiding repeated inline checks.
+ * the metadata those operations preserve, avoiding repeated inline checks.
  *
  * @param dst Destination TileView (valid_shape should already be set)
  * @param src Source TileType whose tile_view properties are inherited
@@ -599,6 +638,7 @@ inline void InheritTileViewLayout(TileView& dst, const std::shared_ptr<const Til
   dst.blayout = eff.blayout;
   dst.slayout = eff.slayout;
   dst.pad = eff.pad;
+  dst.compact = eff.compact;
 }
 
 namespace detail {

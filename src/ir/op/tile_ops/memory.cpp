@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -184,8 +185,7 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
   // ``tile.load`` of a DN source produces the transposed (ZN) Mat layout.
   // A transposed matmul operand is realised by a zero-copy ``tile.transpose_view``
   // at the matmul site, not by the load.
-  bool source_is_dn =
-      tensor_type->tensor_view_.has_value() && tensor_type->tensor_view_->layout == TensorLayout::DN;
+  bool source_is_dn = tensor_type->tensor_view_.value_or(TensorView{}).layout == TensorLayout::DN;
   TileView tile_view;
   if (is_mx_load) {
     // A5 TLoadMxCubeCheck: MX_A_* → row-major ZZ (SFractal=32); MX_B_* → col-major NN.
@@ -204,6 +204,21 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
       tile_view.slayout = TileLayout::row_major;
       if (source_is_dn) {
         std::swap(tile_view.blayout, tile_view.slayout);
+      }
+      // A single-row 2-D Mat operand (cube GEMV lhs / bias) is an ND row
+      // vector, not the NZ fractal used by multi-row matmul operands. PTO-ISA
+      // declares it as Tile<Mat, 1, K, BLayout::RowMajor, ...,
+      // SLayout::NoneBox>; that pair routes the Mat->Left move through the
+      // rows==1 vector path instead of the regular extraction path, whose row
+      // alignment excludes M=1. In a rank-3+ Mat load, shape[0] is a batch
+      // dimension, so keep the canonical NZ view.
+      const auto& shape = shapes_tuple->elements_;
+      if (shape.size() == 2) {
+        const ExprPtr& row_dim = source_is_dn ? shape[1] : shape[0];
+        if (auto rows = As<ConstInt>(row_dim); rows && rows->value_ == 1) {
+          tile_view.blayout = TileLayout::row_major;
+          tile_view.slayout = TileLayout::none_box;
+        }
       }
     } else if (auto last_dim = As<ConstInt>(shapes_tuple->elements_.back());
                last_dim && last_dim->value_ == 1) {
@@ -567,9 +582,7 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
   bool transpose_layout = false;
   // `flat_layout=true` requests a flat (non-fractal, slayout=none_box) L1/cbuf
   // tile: a contiguous byte-staging buffer rather than the boxed NZ layout Mat
-  // tiles normally carry. Used for the mix/aic_only soft `system.syncall` L1
-  // scratch (pto-isa `Tile<TileType::Mat, ..., SLayout::NoneBox>`), whose 8
-  // int32 counter slots must be contiguous — a fractal layout mis-places them.
+  // tiles normally carry.
   bool flat_layout = false;
   for (const auto& [k, v] : kwargs) {
     if (k == "transpose") transpose_layout = AnyCast<bool>(v, "transpose");
@@ -578,14 +591,12 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
   // The transposed Mat (ZN) layout is a 2D L1 matmul-`b_trans` operand layout; it
   // is meaningless for a non-Mat space or a non-2D shape. Fail fast rather than
   // emit an invalid tile (mirrors tile.load's Mat-only transpose guard).
-  CHECK(!transpose_layout ||
-        (tile_shape.size() == 2 && target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat))
+  CHECK(!transpose_layout || (tile_shape.size() == 2 && target_memory_opt == MemorySpace::Mat))
       << "The operator " << op_name
       << " supports transpose=true only for a 2D tile with target_memory=Mat (L1)";
   // flat_layout is a Mat (L1/cbuf) staging layout and mutually exclusive with the
   // transposed NZ layout.
-  CHECK(!flat_layout ||
-        (target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat && !transpose_layout))
+  CHECK(!flat_layout || (target_memory_opt == MemorySpace::Mat && !transpose_layout))
       << "The operator " << op_name
       << " supports flat_layout=true only for target_memory=Mat (L1) without transpose";
 
@@ -722,6 +733,73 @@ TypePtr DeduceTileCiType(const std::vector<ExprPtr>& args,
 
   TileView tile_view;
   tile_view.valid_shape = tile_shape;
+  return std::make_shared<TileType>(tile_shape, dtype, std::nullopt, tile_view);
+}
+
+TypePtr DeduceTileTriType(const std::vector<ExprPtr>& args,
+                          const std::vector<std::pair<std::string, std::any>>& kwargs,
+                          const std::string& op_name) {
+  CHECK(args.size() == 2 || args.size() == 3)
+      << "The operator " << op_name << " requires 2 or 3 arguments (diagonal, shape, [valid_shape]), but got "
+      << args.size();
+
+  DataType dtype = GetKwarg<DataType>(kwargs, "dtype");
+  CHECK(dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+        dtype == DataType::INT32 || dtype == DataType::UINT16 || dtype == DataType::UINT32 ||
+        dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32)
+      << "The operator " << op_name
+      << " requires dtype to be one of {INT8, UINT8, INT16, INT32, UINT16, UINT32, FP16, BF16, FP32}, "
+         "but got "
+      << dtype.ToString();
+
+  auto diagonal_type = As<ScalarType>(args[0]->GetType());
+  CHECK(diagonal_type) << "The operator " << op_name << " requires diagonal to be a scalar, but got "
+                       << args[0]->GetType()->TypeName();
+  CHECK(diagonal_type->dtype_ == DataType::INT32)
+      << "The operator " << op_name << " requires diagonal to be an INT32 scalar, but got "
+      << diagonal_type->dtype_.ToString();
+
+  auto shape_tuple = As<MakeTuple>(args[1]);
+  CHECK(shape_tuple) << "The operator " << op_name
+                     << " requires shape to be a MakeTuple of compile-time constants, but got "
+                     << args[1]->TypeName();
+  CHECK(shape_tuple->elements_.size() == 2)
+      << "The operator " << op_name << " requires a 2D shape, but got rank " << shape_tuple->elements_.size();
+
+  std::vector<ExprPtr> tile_shape;
+  tile_shape.reserve(2);
+  for (size_t i = 0; i < shape_tuple->elements_.size(); ++i) {
+    auto dim = As<ConstInt>(shape_tuple->elements_[i]);
+    CHECK(dim) << "The operator " << op_name << " shape element " << i << " must be a compile-time constant";
+    CHECK(dim->value_ > 0) << "The operator " << op_name << " shape element " << i
+                           << " must be positive, got " << dim->value_;
+    tile_shape.push_back(shape_tuple->elements_[i]);
+  }
+
+  std::vector<ExprPtr> valid_shape = tile_shape;
+  if (args.size() == 3) {
+    auto valid_tuple = As<MakeTuple>(args[2]);
+    CHECK(valid_tuple) << "The operator " << op_name
+                       << " requires valid_shape to be a MakeTuple of compile-time constants";
+    CHECK(valid_tuple->elements_.size() == tile_shape.size())
+        << "The operator " << op_name << " requires valid_shape rank " << tile_shape.size() << ", but got "
+        << valid_tuple->elements_.size();
+    valid_shape.clear();
+    for (size_t i = 0; i < valid_tuple->elements_.size(); ++i) {
+      auto valid_dim = As<ConstInt>(valid_tuple->elements_[i]);
+      auto physical_dim = As<ConstInt>(tile_shape[i]);
+      CHECK(valid_dim) << "The operator " << op_name << " valid_shape element " << i
+                       << " must be a compile-time constant";
+      CHECK(valid_dim->value_ > 0 && valid_dim->value_ <= physical_dim->value_)
+          << "The operator " << op_name << " requires 0 < valid_shape[" << i << "] <= shape[" << i
+          << "], but got " << valid_dim->value_ << " and " << physical_dim->value_;
+      valid_shape.push_back(valid_tuple->elements_[i]);
+    }
+  }
+
+  (void)GetKwarg<bool>(kwargs, "upper", false);
+  TileView tile_view;
+  tile_view.valid_shape = valid_shape;
   return std::make_shared<TileType>(tile_shape, dtype, std::nullopt, tile_view);
 }
 
@@ -911,6 +989,7 @@ REGISTER_OP("tile.write")
 
 REGISTER_OP("tile.get_block_idx")
     .set_op_category("TileOp")
+    .no_execution_memory_access()
     .set_description("Get the current block index")
     .set_core_affinity(core_affinity::CoreAffinity::SHARED)
     .no_argument()
@@ -922,6 +1001,7 @@ REGISTER_OP("tile.get_block_idx")
 
 REGISTER_OP("tile.get_subblock_idx")
     .set_op_category("TileOp")
+    .no_execution_memory_access()
     .set_description("Get the current sub-block (vector core) index")
     .set_core_affinity(core_affinity::CoreAffinity::VECTOR)
     .no_argument()
@@ -933,6 +1013,7 @@ REGISTER_OP("tile.get_subblock_idx")
 
 REGISTER_OP("tile.get_block_num")
     .set_op_category("TileOp")
+    .no_execution_memory_access()
     .set_description("Get the total number of blocks in the current SPMD task")
     .set_core_affinity(core_affinity::CoreAffinity::SHARED)
     .no_argument()
@@ -962,6 +1043,7 @@ REGISTER_OP("tile.create")
     .set_attr<MemorySpace>("target_memory")
     .set_attr<bool>("transpose")
     .set_attr<bool>("flat_layout")
+    .no_execution_memory_access()
     // No fallback: when target_memory is absent, memory_space stays unresolved and
     // InferTileMemorySpace picks the space from consumer demand.
     .set_output_memory_from_kwarg("target_memory")
@@ -972,6 +1054,7 @@ REGISTER_OP("tile.create")
 
 REGISTER_OP("tile.load")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Copy data from tensor to unified buffer (tile)")
     .add_argument("tensor", "Source tensor (TensorType)")
     .add_argument("offsets",
@@ -1085,13 +1168,236 @@ REGISTER_OP("tile.mscatter")
       return DeduceTileMscatterType(args, kwargs, "tile.mscatter");
     });
 
+namespace {
+constexpr int kMgatherGatherOobUndefined = 0;
+constexpr int kMgatherGatherOobZero = 3;
+
+bool IsMgatherElementDtype(const DataType& dtype) {
+  return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+         dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
+         dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32 ||
+         dtype == DataType::FP8E4M3FN || dtype == DataType::FP8E5M2 || dtype == DataType::HF8;
+}
+
+bool IsStaticContiguousTensor(const TensorType& type) {
+  if (!type.tensor_view_.has_value()) return true;
+  const TensorView& view = *type.tensor_view_;
+  if (view.layout != TensorLayout::ND) return false;
+  if (view.stride.empty()) return true;
+  if (view.stride.size() != type.shape_.size()) return false;
+
+  int64_t expected_stride = 1;
+  for (size_t offset = 0; offset < type.shape_.size(); ++offset) {
+    const size_t dim_index = type.shape_.size() - 1 - offset;
+    auto stride = As<ConstInt>(view.stride[dim_index]);
+    auto dim = As<ConstInt>(type.shape_[dim_index]);
+    if (!stride || !dim) return false;
+    if (dim->value_ != 1 && stride->value_ != expected_stride) return false;
+    expected_stride *= dim->value_;
+  }
+  return true;
+}
+
+bool IsNdTensor(const TensorType& type) {
+  return !type.tensor_view_.has_value() || type.tensor_view_->layout == TensorLayout::ND;
+}
+}  // namespace
+
+TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs,
+                              const std::string& op_name) {
+  CHECK(args.size() >= 2 && args.size() <= 4)
+      << "The operator " << op_name
+      << " requires (mem, idx), optionally followed by scratch and/or valid_shape, but got " << args.size()
+      << " arguments";
+
+  auto mem_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(mem_type) << "The operator " << op_name
+                  << " requires mem to be a TensorType or DistributedTensorType, but got "
+                  << args[0]->GetType()->TypeName();
+  CHECK(IsMgatherElementDtype(mem_type->dtype_))
+      << "The operator " << op_name
+      << " requires mem dtype in {I8, U8, I16, U16, I32, U32, FP16, BF16, FP32, "
+         "FP8E4M3FN, FP8E5M2, HF8}, but got "
+      << mem_type->dtype_.ToString();
+  CHECK(!mem_type->shape_.empty()) << "The operator " << op_name
+                                   << " requires mem to have at least one dimension";
+
+  int coalesce = GetKwarg<int>(kwargs, "coalesce", static_cast<int>(MgatherCoalesceMode::kRow));
+  CHECK(coalesce == static_cast<int>(MgatherCoalesceMode::kRow) ||
+        coalesce == static_cast<int>(MgatherCoalesceMode::kElem))
+      << "The operator " << op_name << " requires coalesce in {0 (row), 1 (elem)}, but got " << coalesce;
+  int gather_oob = GetKwarg<int>(kwargs, "gather_oob", kMgatherGatherOobUndefined);
+  CHECK(gather_oob >= kMgatherGatherOobUndefined && gather_oob <= kMgatherGatherOobZero)
+      << "The operator " << op_name
+      << " requires gather_oob in {0 (undefined), 1 (clamp), 2 (wrap), 3 (zero)}, but got " << gather_oob;
+  MemorySpace target_memory = GetKwarg<MemorySpace>(kwargs, "target_memory", MemorySpace::Vec);
+  CHECK(target_memory == MemorySpace::Vec || target_memory == MemorySpace::Mat)
+      << "The operator " << op_name << " requires target_memory to be Vec or Mat";
+
+  std::vector<ExprPtr> output_shape;
+  std::vector<ExprPtr> output_valid_shape;
+  TileView tile_view;
+  if (target_memory == MemorySpace::Vec) {
+    CHECK(args.size() == 2) << "The operator " << op_name << " permits scratch only for Mat elem mode";
+    auto idx_type = As<TileType>(args[1]->GetType());
+    CHECK(idx_type) << "The operator " << op_name
+                    << " with Vec output requires idx to be a TileType, but got "
+                    << args[1]->GetType()->TypeName();
+    CHECK(idx_type->dtype_ == DataType::INT32)
+        << "The operator " << op_name << " requires idx dtype to be INT32, but got "
+        << idx_type->dtype_.ToString();
+    CHECK(idx_type->shape_.size() == 2)
+        << "The operator " << op_name << " requires a 2D idx tile, but got rank " << idx_type->shape_.size();
+    const TileView idx_view = tile_view_semantics::GetEffectiveTileView(*idx_type);
+    if (coalesce == static_cast<int>(MgatherCoalesceMode::kElem)) {
+      output_shape = idx_type->shape_;
+      output_valid_shape = idx_view.valid_shape;
+    } else {
+      CHECK(mem_type->shape_.size() >= 2)
+          << "The operator " << op_name
+          << " row mode requires mem rank >= 2 so rows have an element dimension, but got rank "
+          << mem_type->shape_.size();
+      auto first_dim = As<ConstInt>(idx_type->shape_[0]);
+      auto second_dim = As<ConstInt>(idx_type->shape_[1]);
+      CHECK(first_dim && second_dim) << "The operator " << op_name
+                                     << " row mode requires a static [1, R] or [R, 1] idx shape";
+      const bool row_vector = first_dim->value_ == 1;
+      const bool column_vector = second_dim->value_ == 1;
+      CHECK(row_vector || column_vector)
+          << "The operator " << op_name << " row mode requires a [1, R] or [R, 1] idx shape, but got ["
+          << first_dim->value_ << ", " << second_dim->value_ << "]";
+      const size_t row_dim = row_vector ? 1 : 0;
+      output_shape = {idx_type->shape_[row_dim], mem_type->shape_.back()};
+      CHECK(idx_view.valid_shape.size() == 2)
+          << "The operator " << op_name << " requires a 2D idx valid shape";
+      output_valid_shape = {idx_view.valid_shape[row_dim], mem_type->shape_.back()};
+    }
+    tile_view.blayout = TileLayout::row_major;
+  } else {
+    CHECK(IsNdTensor(*mem_type)) << "The operator " << op_name
+                                 << " with Mat output requires mem to use ND tensor layout";
+    auto idx_type = AsTensorTypeLike(args[1]->GetType());
+    CHECK(idx_type) << "The operator " << op_name
+                    << " with Mat output requires idx to be a GM TensorType, but got "
+                    << args[1]->GetType()->TypeName();
+    CHECK(IsNdTensor(*idx_type)) << "The operator " << op_name
+                                 << " with Mat output requires idx to use ND tensor layout";
+    CHECK(idx_type->dtype_ == DataType::INT32)
+        << "The operator " << op_name << " requires Mat idx dtype to be INT32, but got "
+        << idx_type->dtype_.ToString();
+    CHECK(idx_type->shape_.size() == 2)
+        << "The operator " << op_name << " requires a 2D Mat idx tensor, but got rank "
+        << idx_type->shape_.size();
+    if (coalesce == static_cast<int>(MgatherCoalesceMode::kElem)) {
+      CHECK(args.size() == 3 || args.size() == 4)
+          << "The operator " << op_name
+          << " Mat elem mode requires GM scratch and optionally accepts valid_shape";
+      CHECK(args[2].get() != args[0].get() && args[2].get() != args[1].get())
+          << "The operator " << op_name
+          << " Mat elem scratch must not alias mem or idx; use a distinct GM tensor";
+      auto scratch_type = AsTensorTypeLike(args[2]->GetType());
+      CHECK(scratch_type) << "The operator " << op_name << " Mat elem scratch must be a GM tensor";
+      CHECK(scratch_type->dtype_ == mem_type->dtype_)
+          << "The operator " << op_name << " Mat elem scratch dtype must match mem dtype";
+      CHECK(IsStaticContiguousTensor(*scratch_type))
+          << "The operator " << op_name << " Mat elem scratch must be a contiguous ND tensor";
+      output_shape = idx_type->shape_;
+      int64_t output_elements = 1;
+      for (const auto& dim : output_shape) {
+        auto constant = As<ConstInt>(dim);
+        CHECK(constant) << "The operator " << op_name << " Mat elem output shape must be static";
+        output_elements *= constant->value_;
+      }
+      int64_t scratch_elements = 1;
+      for (const auto& dim : scratch_type->shape_) {
+        auto constant = As<ConstInt>(dim);
+        CHECK(constant) << "The operator " << op_name << " Mat elem scratch shape must be static";
+        scratch_elements *= constant->value_;
+      }
+      CHECK(scratch_elements >= output_elements)
+          << "The operator " << op_name << " Mat elem scratch requires at least " << output_elements
+          << " elements, but got " << scratch_elements;
+    } else {
+      CHECK(args.size() == 2 || args.size() == 3)
+          << "The operator " << op_name << " Mat row mode accepts only an optional valid_shape";
+      CHECK(mem_type->shape_.size() >= 2)
+          << "The operator " << op_name << " Mat row mode requires mem rank >= 2";
+      auto first_dim = As<ConstInt>(idx_type->shape_[0]);
+      CHECK(first_dim && first_dim->value_ == 1)
+          << "The operator " << op_name << " Mat row mode requires a [1, R] GM idx tensor";
+      output_shape = {idx_type->shape_[1], mem_type->shape_.back()};
+    }
+    auto output_rows = As<ConstInt>(output_shape[0]);
+    auto output_cols = As<ConstInt>(output_shape[1]);
+    CHECK(output_rows && output_cols) << "The operator " << op_name << " Mat output shape must be static";
+    const int64_t element_bytes = static_cast<int64_t>(mem_type->dtype_.GetByte());
+    CHECK(element_bytes > 0) << "The operator " << op_name << " requires a byte-addressable mem dtype";
+    const int64_t c0 = 32 / element_bytes;
+    CHECK(output_rows->value_ % 16 == 0)
+        << "The operator " << op_name << " Mat output rows must be a multiple of 16";
+    CHECK(output_cols->value_ % c0 == 0)
+        << "The operator " << op_name << " Mat output cols must be a multiple of " << c0;
+    output_valid_shape = output_shape;
+    const size_t valid_shape_index = coalesce == static_cast<int>(MgatherCoalesceMode::kElem) ? 3 : 2;
+    if (args.size() > valid_shape_index) {
+      auto valid_shape = As<MakeTuple>(args[valid_shape_index]);
+      CHECK(valid_shape) << "The operator " << op_name
+                         << " Mat valid_shape must be a MakeTuple of compile-time constants";
+      CHECK(valid_shape->elements_.size() == output_shape.size())
+          << "The operator " << op_name << " Mat valid_shape must have rank " << output_shape.size()
+          << ", but got " << valid_shape->elements_.size();
+      output_valid_shape.clear();
+      for (size_t i = 0; i < valid_shape->elements_.size(); ++i) {
+        auto valid_dim = As<ConstInt>(valid_shape->elements_[i]);
+        auto physical_dim = As<ConstInt>(output_shape[i]);
+        CHECK(valid_dim) << "The operator " << op_name << " Mat valid_shape element " << i
+                         << " must be a compile-time constant";
+        CHECK(valid_dim->value_ > 0 && valid_dim->value_ <= physical_dim->value_)
+            << "The operator " << op_name << " requires 0 < Mat valid_shape[" << i << "] <= output_shape["
+            << i << "], but got " << valid_dim->value_ << " and " << physical_dim->value_;
+        output_valid_shape.push_back(valid_shape->elements_[i]);
+      }
+    }
+    tile_view.blayout = TileLayout::col_major;
+    tile_view.slayout = TileLayout::row_major;
+  }
+
+  tile_view.valid_shape = output_valid_shape;
+  return std::make_shared<TileType>(output_shape, mem_type->dtype_, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.mgather")
+    .set_op_category("TileOp")
+    .set_description(
+        "Gather-load rows or elements from a GM tensor into a fresh Vec or Mat tile "
+        "(maps to pto.mgather)")
+    .add_argument("mem", "GM source table (TensorType or DistributedTensorType)")
+    .add_argument("idx", "INT32 2D index tile for Vec, or GM tensor for Mat")
+    .add_argument("scratch", "Optional GM scratch tensor for Mat elem mode")
+    .add_argument("valid_shape", "Optional 2D written region for Mat output")
+    .set_attr<int>("coalesce")
+    .set_attr<int>("gather_oob")
+    .set_attr<MemorySpace>("target_memory")
+    .set_output_memory_from_kwarg("target_memory", MemorySpace::Vec)
+    .not_inplace_safe()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileMgatherType(args, kwargs, "tile.mgather");
+    });
+
 REGISTER_OP("tile.move")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Move tile between memory levels (Vec/Mat/Left/Right/LeftScale/RightScale)")
     .add_argument("tile", "Input tile (TileType)")
     .set_attr<MemorySpace>("target_memory")
     .set_attr<TileLayout>("blayout")
     .set_attr<TileLayout>("slayout")
+    // PTO TMOV requires distinct source and destination addresses. Keep memory
+    // planners from placing the result on any input buffer; baked-address PTO
+    // codegen also validates this invariant for explicit or hand-built aliases.
+    .not_inplace_safe()
     .set_output_memory_from_kwarg("target_memory", MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
@@ -1105,13 +1411,15 @@ REGISTER_OP("tile.move")
 // refinement could classify by the memory_space arg if a use case arises.
 REGISTER_OP("tile.alloc")
     .set_op_category("TileOp")
+    .no_execution_memory_access()
     .set_description("Declare on-chip memory allocation, returning a Ptr")
     .set_core_affinity(core_affinity::CoreAffinity::VECTOR)
     .add_argument("memory_space", "Memory space (int enum value)")
     .add_argument("size", "Size in bytes (scalar)")
     // `pinned` marks an author-declared allocation (one-argument `pl.MemRef`).
-    // MemoryReuse leaves such a buffer's membership exactly as the author wrote
-    // it: it neither packs other tiles into it nor moves its tiles elsewhere.
+    // PyPTO memory planners leave such a buffer's membership exactly as the
+    // author wrote it: they neither pack other tiles into it nor move its
+    // tiles elsewhere.
     .set_attr<bool>("pinned")
     .no_memory_spec()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
@@ -1121,6 +1429,7 @@ REGISTER_OP("tile.alloc")
 
 REGISTER_OP("tile.full")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Create a tile of specified shape and filling value in UB")
     .add_argument("shape", "Shape dimensions (TupleType of ScalarType(INT64))")
     .add_argument("value", "Filling value (ConstInt or ConstFloat)")
@@ -1133,6 +1442,7 @@ REGISTER_OP("tile.full")
 
 REGISTER_OP("tile.ci")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Generate a contiguous integer sequence into a destination tile (pto.tci)")
     .add_argument("start", "Starting integer scalar (must match dst dtype)")
     .add_argument("shape", "Destination shape (TupleType of ConstInt)")
@@ -1144,8 +1454,23 @@ REGISTER_OP("tile.ci")
       return DeduceTileCiType(args, kwargs, "tile.ci");
     });
 
+REGISTER_OP("tile.tri")
+    .set_op_category("TileOp")
+    .set_description("Generate a lower/upper triangular mask tile (pto.ttri)")
+    .add_argument("diagonal", "Diagonal offset scalar (INT32)")
+    .add_argument("shape", "Destination shape (2D TupleType of ConstInt)")
+    .add_argument("valid_shape", "Optional written region (2D TupleType of ConstInt, <= shape)")
+    .set_attr<DataType>("dtype")
+    .set_attr<bool>("upper")
+    .set_output_memory(MemorySpace::Vec)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileTriType(args, kwargs, "tile.tri");
+    });
+
 REGISTER_OP("tile.random")
     .set_op_category("TileOp")
+    .functional_execution_memory_access()
     .set_description("Generate counter-based pseudo-random values into a destination tile (pto.trandom)")
     .add_argument("key0", "First key word (INT32 scalar)")
     .add_argument("key1", "Second key word (INT32 scalar)")

@@ -14,7 +14,7 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 
 **原因：** 嵌入分析逻辑的代码生成会变得脆弱——它重复了 Pass 已有的逻辑，且更难以独立测试。保持代码生成为直接的转换，确保其可预测性和可维护性。
 
-**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/24-normalize_return_order.md) pass。
+**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/25-normalize_return_order.md) pass。
 
 ## 概述
 
@@ -137,6 +137,7 @@ print(pto_code)
 | `tile.store(tile, [row, col], tensor)` | `pto.partition_view` + `pto.tstore` |
 | `tile.slice(tile, [h, w], [row, col][, valid_shape=...])` | `pto.subview`（零拷贝视图；仅在传入 `valid_shape` 时输出 `valid [...]` 子句） |
 | `tile.assemble(target, source, [row, col])` | （可选）`pto.tmov target -> dst` + `pto.subview dst[row, col] sizes [src.rows, src.cols]` + `pto.tmov src -> dst_view` |
+| `tile.set_validshape(tile, vr, vc)` | 发 `pto.set_validshape`；操作数是视图时报错（见下） |
 | `tile.mul(lhs, rhs)` | `pto.tmul` |
 | `tile.add(a, b, c)` | `pto.taddc` (三操作数加法) |
 | `tile.adds(tile, scalar)` | `pto.tadds` (Tile + 标量) |
@@ -145,13 +146,13 @@ print(pto_code)
 **`tile.slice` / `tile.assemble` 下沉细节。** 两个 op 都通过 `pto.subview`
 下沉，它是源 tile 的纯视图别名（不搬数据，也不会额外发 `pto.alloc_tile`）。
 `pto.subview` 要求结果 `tile_buf` 与源 `tile_buf` 在 `dtype`、`memory_space`、
-`blayout`、`slayout`、`fractal` 和 `pad` 上完全一致，因此
-`DeduceTileSliceType` 会将源 `TileView` 的这四个字段透传到结果，使新生成的
+`blayout`、`slayout`、`fractal`、`pad` 和 `compact` 上完全一致，因此
+`DeduceTileSliceType` 会将源 `TileView` 的这五个字段透传到结果，使新生成的
 `TileType` 天然满足约束。后端 codegen 还会在下沉时执行 `CheckSubviewTileCompat`
 做兜底校验：
 
 - 源和结果都必须显式携带 `TileView`。
-- `dtype`、`blayout`、`slayout`、`fractal` 与 `pad` 必须严格相等。
+- `dtype`、`blayout`、`slayout`、`fractal`、`pad` 与 `compact` 必须严格相等。
 - `pad` 必须为 `PadValue::null`——`pto.subview` 是视图而不是 fillpad；如果
   需要 zero/min/max 填充，请在切出来的子 tile 上再调用 `tile.fillpad`。
 
@@ -159,6 +160,16 @@ print(pto_code)
 `target` 与目标缓冲合并时才会发出，用于保留写入窗口外的数据；末尾的
 `pto.tmov src → dst_view` 才是真正写入由 `pto.subview` 切出的子窗口的数据
 搬运。
+
+**`tile.set_validshape` 下沉细节。** `pto.set_validshape` 修改的是操作数的
+`valid_row` / `valid_col` 操作数，因此操作数必须是拥有它们的 handle：alloc、
+`scf.if` 结果、跨核 pop slot。而**视图**——`tile.slice` 下沉出的 `pto.subview`，
+或 `pto.treshape`——把有效范围存在自身类型里，ptoas 会拒绝对它执行这条指令，所以
+PyPTO 提前报错，并在信息里指向切片。视图身份在这两个发射点被记录，而不是从渲染出
+的维度推断：带运行时 `valid_shape` 的切片渲染成 `v_row=?, v_col=?`，与由 alloc
+承载的 handle 完全一样。要收窄视图，请给切片传 `valid_shape=`（它会落到
+`pto.subview` 的 `valid [...]` 子句，并且支持运行时范围），或在取视图之前对源
+tile 调用 `set_validshape`。
 
 ### 跨核操作到 PTO 指令
 
@@ -175,7 +186,7 @@ print(pto_code)
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | 预留缓冲区（`memory_planner=PTOAS` 下发射 `auto = true` 且省略 `base`） |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | 导入对等缓冲区 |
 | `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | 跨核全员屏障（hard/FFTS 形态） |
-| `system.syncall(mode="soft", core_type="aiv_only", gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_pview, %scratch, %used : !pto.partition_tensor_view<...xi32>, !pto.tile_buf<loc=vec, ...i32>, i32) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<aiv_only>` | soft/GM 轮询屏障（部分占用即可；`gm_workspace` 下沉为 `pto.partition_view`，scratch tile 由编译器合成） |
+| `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_pview[, %used] : !pto.partition_tensor_view<...xi32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | 当前 PTO-ISA 的 soft/GM 轮询屏障（部分占用即可；GM workspace 至少 64 字节；显式 `N=0` 时从设备启动寄存器推导并省略 `%used`） |
 
 **说明：**
 
@@ -183,17 +194,29 @@ print(pto_code)
 - `id` 是可选属性。省略时 PTOAS 默认使用 frontend pipe id `0`。只有手写多条独立 frontend pipe 时才需要显式 `id`；自动生成的双向 mixed-kernel setup 会保持单条 `dir_mask = 3` pipe。
 - 如果被 push 的 tile 通过动态 `valid_row` / `valid_col` operand 分配，或经
   `tile.set_validshape` 更新，`tpush` 会发射已经更新运行时 valid shape 的同一个
-  tile handle。对于 split `tpush`，codegen 会临时使用完整的非切分传输维度（上下
-  切分使用完整 `cols`，左右切分使用完整 `rows`），随后恢复 producer tile 的逻辑
-  valid shape；消费侧动态 tpop operand 仍携带后续计算和 store 使用的逻辑范围。
-- 当 tpop 结果的 `TileView.valid_shape` 与物理 tile shape 不一致时，PTO codegen 会生成 PTOAS 前端操作数：`%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`。这同时覆盖动态表达式和 `[0, 0]` 这类静态非满形状；operand 携带后续计算和 store 使用的逻辑范围。
+  tile handle。对于 split `tpush`，codegen 会临时使用完整物理传输 box，随后恢复
+  producer tile 的逻辑 valid shape。
+- Cube-to-Vector FIFO 在**任意** split 下都按物理 box stride 搬运：ISA 用被弹出
+  tile 的编译期 rows/cols 以及 producer 的 box 行间距构造 GM 槽位视图，再用该 tile
+  的*运行时* `valid_col` 去 stride 这个视图。因此 TPOP 上的部分 valid shape 会让 GM
+  行间隙塌缩为 0，消费侧读到的是一段连续数据而不是每次一行 box——这会静默破坏
+  *有效*区域的数据，因为 ISA 中对应的断言在 release 构建里被编译掉了。所以部分有效的
+  Acc-to-Vec 传输在无切分以及 `split = 1` / `split = 2` 下，TPUSH 和 TPOP 都使用完整
+  物理 box，并在传输两侧立即恢复逻辑 valid shape——消费侧通过纯元数据的
+  `pto.treshape` 恢复（前端 tpop 结果不是 PTOAS 的本地绑定 tile，`pto.set_validshape`
+  无法就地修改它）。
+- 当 tpop 结果的 `TileView.valid_shape` 与物理 tile shape 不一致时，PTO codegen 会生成 PTOAS 前端操作数：`%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`。这同时覆盖动态表达式和 `[0, 0]` 这类静态非满形状；operand 携带后续计算和 store 使用的逻辑范围。对于静态形状、非空的部分 pop，上述 Cube-to-Vector 完整 box 传输优先，因为 `pto.treshape` 不带 valid-row/valid-col operand，只能恢复*静态*逻辑范围。
 - 对于 split consumer，`SplitVectorKernel` 会按 subblock 本地化这些动态
   tpop valid-shape operand（例如 `[16, 16]` tile 做上下切分时，全局
   `[8, 16]` 会变成 `[8, 16]` 和 `[0, 16]`）。
 - `system.tfree_*` 的 `split` 来自其 tile 参数，因此前端必须释放由 `tile.tpop_*` 产生的那个确切 SSA 值，即使 PTO 指令本身并不显式接收该 tile 作为操作数
 - `ExpandMixedKernel` 现在会在 split 生成的消费侧 `tile.tpop_*` 之后自动补 `system.tfree_*`，保持 `tpop -> direct users -> tfree -> next tpop`
 - `reserve_buffer` 和 `import_reserved_buffer` 返回 `i32` SSA 值；`initialize_pipe` 以操作数引用这些值
-- `memory_planner=PYPTO` 时，`AllocateMemoryAddr` 会在 PTO 输出前解析 `reserve_buffer(base=AUTO)`，因此 PTO 输出 `auto = false, base = <value>`；`memory_planner=PTOAS` 跳过该 pass，PTO 输出 `auto = true` 且省略 `base`（ptoas 不接受两者同时出现），由 ptoas `PlanMemory` 放置该预留区
+- `memory_planner=PYPTO` 或 `DSA_RP` 时，`AllocateMemoryAddr` 会在 PTO 输出前
+  解析 `reserve_buffer(base=AUTO)`，因此 PTO 输出
+  `auto = false, base = <value>`；`memory_planner=PTOAS` 跳过该 pass，PTO 输出
+  `auto = true` 且省略 `base`（ptoas 不接受两者同时出现），由 ptoas
+  `PlanMemory` 放置该预留区
 - `reserve_buffer` location 对于 AIC 函数为 `mat`，对于 AIV/InCore 函数为 `vec`
 - `import_reserved_buffer` 使用 MLIR 符号语法（`@func_name`）表示 `peer_func`
 - 缓冲区名称和 peer_func 字符串由 `CheckSafeIdentifier` 验证（仅允许字母数字和下划线）
@@ -277,24 +300,69 @@ print(pto_code)
 #### 由谁规划内存：`compile(memory_planner=...)`
 
 物理 `addr` 由谁分配，通过 `memory_planner` 选项选择
-（`ir.compile(..., memory_planner=passes.MemoryPlanner.PYPTO | PTOAS)`，默认
-`PYPTO`）。它同时作用于 pass 流水线（经 `PassContext`）与 codegen：
+（`ir.compile(..., memory_planner=passes.MemoryPlanner.PYPTO | DSA_RP | PTOAS)`，
+默认 `PYPTO`）。它同时作用于 pass 流水线（经 `PassContext`）与 codegen：
 
 | 模式 | 流水线 | `pto.alloc_tile` | `pto.reserve_buffer` | ptoas |
 | ---- | ------ | ---------------- | -------------------- | ----- |
 | `PYPTO`（默认） | 运行 `MaterializeSemanticAliases` + `MemoryReuse` + `AllocateMemoryAddr` | 发射 `addr = <const>`（来自 `MemRef.byte_offset_`） | `auto = false, base = <const>` | `--pto-level=level3`（信任已烘焙地址） |
+| `DSA_RP` | 运行 `MaterializeSemanticAliases` + `AllocateMemoryAddr`；跳过 `MemoryReuse` | 发射进程内 canonical-greedy DSA-RP 的 `addr = <const>` | `auto = false, base = <const>` | `--pto-level=level3`（信任已烘焙地址） |
 | `PTOAS` | 运行 `MaterializeSemanticAliases`；**跳过** `MemoryReuse` + `AllocateMemoryAddr` | 省略 `addr`（`PTOCodegen.generate(emit_tile_addr=False)`） | `auto = true`（不带 `base`） | `--pto-level=level2`（ptoas `PlanMemory` 做复用 + 定址） |
 
 内存规划拆成两个 pass：**`MaterializeSemanticAliases`** 把**语义强制**的别名
 （循环累加器、原地算子）归一到同一 MemRef；**`MemoryReuse`** 只做**机会性**的、
-基于生命周期的独立 buffer 合并。`InitMemRef` + `MaterializeSemanticAliases`
-两种模式都跑,所以强制别名得以保留;`PTOAS` 模式下 codegen 把这些共享 MemRef
-渲染成单个 `tile_buf` handle、原地 `outs(%acc)`,由 ptoas `PlanMemory`
-(level2 强制要求、拒绝任何 `addr` 操作数)完成生命周期复用与地址分配。
+基于生命周期的独立 buffer 合并，仅供 `PYPTO` 使用。`DSA_RP` 跳过该合并，
+在 `AllocateMemoryAddr` 中按容量与复用惩罚放置独立身份。
+`InitMemRef` + `MaterializeSemanticAliases` 三种模式都运行，因此强制别名得以
+保留；`PTOAS` 模式由 ptoas `PlanMemory`（level2 强制要求、拒绝任何 `addr`
+操作数）完成生命周期复用与地址分配。
 
 > **注意：** `PTOAS` 模式跳过了 `MemoryReuse` 里的 Ascend910B `load + tpop_from_aic`
 > 原地写冒险守卫,以及 `AllocateMemoryAddr` 的 reserve-buffer 基址解析,这些交由
 > ptoas 处理。`compile()` 会输出告警 —— 相关 kernel 请上机验证。
+
+#### 多槽位声明映射为一块 ptoas 区域（`PTOAS` 模式）
+
+多槽位的声明式分配（`pl.MemRef(slots=N)`，见
+[Python 语法](../language/00-python_syntax.md#槽位)）不会被降为 N 条 `alloc_tile`，而是
+对应到 ptoas 自己的多缓冲二元组：函数头声明一块区域，每个使用点选一个槽位：
+
+```mlir
+%l0c_mb = pto.alloc_multi_tile valid_row = %c64_index valid_col = %c64_index
+        : !pto.multi_tile_buf<!pto.tile_buf<loc=vec, dtype=f32, rows=64, cols=64, ...>, count=2>
+scf.for %i = %c0_index to %c4_index step %c1_index {
+  %0 = arith.remsi %i, %c2_index : index
+  %t = pto.multi_tile_get %l0c_mb[%0]
+     : !pto.multi_tile_buf<..., count=2> -> !pto.tile_buf<loc=vec, ...>
+  ...
+}
+```
+
+有两点关键：
+
+- **不带 `addr`。** 区域由 ptoas `PlanMemory` 放置，且它被禁止合并这些槽位——这正是把作者
+  声明的隔离带进 `level2` 的方式。
+- **操作数是槽位下标，而不是** `InitMemRef` 由它算出的字节偏移。ptoas 通过匹配下标的仿射形态
+  （`i % 2`）判断哪些访问可能落在同一槽位，这才是轮转能拿到按槽位的（动态）event id 的原因
+  ——第 *i* 轮的 load 由此与第 *i-1* 轮的计算重叠。
+
+`PlanMultiBufferRegions` 在遍历函数体之前判定适用性；ptoas 无法描述的形态（各槽位 tile 形状
+不一致、各槽位声明的 valid shape 不一致、循环内有两个槽位同时活跃、内存空间不属于
+Vec / Mat / Acc、valid shape 是运行期值、某个槽位作为 phi 被带出 `if` 或循环、槽位数不在
+ptoas 的 `[2, 16]` 内）会报 `ValueError` 并指明具体形态，因为回退成逐槽位
+`alloc_tile` 会让 ptoas 有机会把这些槽位规划到同一块内存上。
+
+**每轮迭代只用一个槽位。** 共活槽位被拒绝，不是因为 ptoas 无法为它*定型*，而是无法为它
+*同步*：ptoas 0.54 只为一轮迭代中的**第一个** `multi_tile_get` 推导逐槽位 WAR 保护；有两个时，
+第二个 load 前面不会发出任何 `wait_flag`，于是下一轮迭代会在本轮还在读该槽位时覆盖它。真机上
+实测算错，因此代码生成直接拒绝该形态并指向 PyPTO planner——那里由固化地址和 PyPTO 自己发射的
+同步来处理。直线代码不受影响：没有循环就没有跨迭代复用需要保护。已报
+[PTOAS#1118](https://github.com/hw-native-sys/PTOAS/issues/1118)；修好后放宽只需改
+`PlanMultiBufferRegions` 里一个条件。
+
+`PYPTO` 模式下则完全不发射区域：在 `--pto-level=level3` 下 ptoas 不会折叠逐槽位的地址展开，
+区域形式反而会丢掉它赖以存在的槽位分析
+（[PTOAS#1106](https://github.com/hw-native-sys/PTOAS/issues/1106)）。
 
 ### 加载操作转换
 
@@ -367,6 +435,36 @@ pto.tmul ins(%tile_a_buf : !pto.tile_buf<...>,
 - 结果变量的 MemRef 决定输出 tile_buf
 - 输入操作数通过变量名查找解析
 - 所有 `ins`/`outs` 子句包含类型标注
+
+### 源码位置 (`loc`)
+
+每条生成的**操作**都会带上由 IR `Span` 构造的 MLIR 尾随位置, 例如
+`pto.tadd ins(...) outs(...) loc("kernels/attn.py":41:9)`。ptoas 会原样把
+`loc()` 传递到自己的诊断信息里, 因此校验失败时报告的是用户 `.py` 中的行, 而不是
+生成的 `.pto` 中的行 —— 在 `@pl.jit` 下用户根本看不到后者 (该路径上 span 已由
+解析器从合成的 `<jit:name>` 文本重映射回真实源文件)。
+
+**使用哪个 span** —— 在两个层级绑定, 后者细化前者:
+
+| 层级 | 绑定位置 | 来源 |
+| ---- | -------- | ---- |
+| 语句 (主) | `PTOCodegen::VisitStmt` | `Stmt::span_` |
+| Call (细化) | `PTOCodegen::VisitExpr_(CallPtr)` | `Call::span_`, 仅当它嵌套在语句 span 内 |
+
+包含性 (containment) 检查是正确性的关键。`Call::span_` 在被保留时精确到列, 但
+合成 tile 算子的 pass (`ConvertTensorToTileOps`) 会用所在**函数**的 span 重建
+`Call`, 同时保留 `AssignStmt` 自身的 span。这类 span 起始于语句之前, 包含性检查
+不通过, 于是被丢弃并回退到语句 span —— 否则大多数操作都会指向 `def` 行。
+
+**不带位置的内容**: 区域花括号、分隔符和基本块标签 (`loc(...)` 只在一条完整操作
+的末尾合法, 因此这些行走 `EmitStructural()` 而不是 `Emit()`); 常量段中的
+`arith.constant` (在所有使用点之间去重, 没有唯一正确的 span); 以及 span 未知或
+没有文件名的节点。
+
+**关闭方式** —— `Generate(program, emit_tile_addr, emit_source_loc)`、
+`compile(..., emit_source_loc=...)`, 或环境变量 `PYPTO_EMIT_PTO_LOC=0`。关闭后
+输出与不带位置的形式逐字节一致; 由于 ptoas 独立于 PyPTO 发布, 这是应对某个
+ptoas 版本解析器拒绝尾随位置时的应急开关。
 
 ## 完整示例
 
@@ -509,7 +607,8 @@ tile_c = pl.mul(tile_a, tile_b)
 
 ### Tile 缓冲区属性
 
-生成的 `alloc_tile` 操作从 TileType 元数据推导数据类型和维度, 从关联的 TileView 推导布局/分形/填充 (如有):
+生成的 `alloc_tile` 操作从 TileType 元数据推导数据类型和维度，并从关联的 TileView
+推导布局/分形/填充/紧凑模式（如有）：
 
 ```mlir
 !pto.tile_buf<
@@ -522,7 +621,8 @@ tile_c = pl.mul(tile_a, tile_b)
   blayout=row_major,   // Block layout (from TileView, default: row_major)
   slayout=none_box,    // Scatter layout (from TileView, default: none_box)
   fractal=512,         // Fractal size in bytes, not elements (from TileView, default: 512)
-  pad=0                // Pad mode as int (from TileView, default: 0/null)
+  pad=0,               // Pad mode as int (from TileView, default: 0/null)
+  compact=1            // Optional compact mode (normal=1; null=0 时省略)
 >
 ```
 
@@ -534,8 +634,11 @@ tile_c = pl.mul(tile_a, tile_b)
 | `slayout` | `TileView::slayout` | `none_box`, `row_major`, `col_major` | `none_box` |
 | `fractal` | `TileView::fractal` | uint64 | `512` |
 | `pad` | `TileView::pad` | `null(0)`, `zero(1)`, `max(2)`, `min(3)` | `null(0)` |
+| `compact` | `TileView::compact` | `null(0)`, `normal(1)` | `null(0)` |
 
-当 MemRef 没有关联 TileView 时, 代码生成器使用上表中的默认值。
+当 MemRef 没有关联 TileView 时，代码生成器使用上表中的默认值。默认的 null
+`compact` 属性不会输出。进入 L0A/L0B 的部分 `tile.extract` 会自动设置
+`normal(1)`，使 TEXTRACT 仅传输逻辑 `valid_shape`，而不会把 box 对齐填充当作数据。
 
 ## 内核包装器生成 (PTO 后端)
 
@@ -559,6 +662,8 @@ InCore Function -> PTOCodegen -> .pto -> ptoas -> .cpp -> kernel_wrapper -> kern
 ```text
 output_dir/
 ├── passes_dump/                     # IR after each pass
+├── ptoas_passes/                    # 可选：每个 ptoas Pass 后的 IR
+│   └── <kernel-or-group>/            # 由 ptoas/MLIR 管理的转储树
 ├── ptoas/                           # Intermediates
 │   ├── <func_name>.pto              # MLIR from PTOCodegen
 │   └── <func_name>.cpp              # C++ from ptoas
@@ -569,6 +674,9 @@ output_dir/
 └── kernel_config.py                 # Runtime/orchestration/kernel config
 ```
 
+仅当使用 `ir.compile(..., dump_ptoas_passes=True)` 或
+`RunConfig(dump_ptoas_passes=True)` 时才会生成 `ptoas_passes/`。
+
 编排代码生成使用 PTO2 运行时 API (`rt_submit_task`, `make_tensor_external` 等) 生成编排 C++ 代码。
 
 ### 运行时配置 (`kernel_config.py`)
@@ -577,8 +685,22 @@ output_dir/
 
 | 键 | 何时写入 | 备注 |
 | -- | -------- | ---- |
-| `runtime` | 总是 | 目前为 `"tensormap_and_ringbuffer"`——该运行时要求 4 个 AICPU 线程 (3 个调度器 + 1 个编排器位于 thread 3)。 |
-| `aicpu_thread_num` | 总是 (`4`) | 由所选运行时决定。 |
+| `runtime` | 总是 | `"tensormap_and_ringbuffer"`（默认）或 `"host_build_graph"` —— 由 `ir.compile(runtime=...)`（或把调用包在 `PassContext([], runtime=...)` 中）选定的 `RuntimeKind` 所对应的线上名字。 |
+| `aicpu_thread_num` | 总是 (`0`) | `0` 选择 runtime 的架构默认值（a2a3：4；a5：5），调用方也可显式覆盖。 |
+
+runtime 由 `PassContext` 以 `ir::RuntimeKind` 携带，而不是仅作为 codegen 参数，
+这样需要针对特定 runtime 做合法化的 pass 可以 switch `PassContext::GetRuntime()`
+而不是比较字符串。之所以用枚举而非名字：这是一个封闭集合 —— `runtime/src/<arch>/
+runtime/` 下每个实现对应一个枚举值 —— 于是拼错是编译错误，而不是一个要到很晚才以
+晦涩 CCEC 报错（找不到 include 目录）浮现的取值。
+
+线上名字只在两处跨越 ABI 边界：写 `kernel_config.py` 时用 `ir::RuntimeKindToName`，
+读回时用 `ir::RuntimeKindFromName`。两者都以
+`passes.runtime_kind_to_name` / `passes.runtime_kind_from_name` 暴露给 Python。
+
+runtime 同时是 `@pl.jit` 缓存键的一个维度：`host_build_graph` 的调用不能复用为
+`tensormap_and_ringbuffer` 编译出的产物 —— 后者 `kernel_config.py` 里写的
+runtime 没有任何匹配的 worker 会绑定。
 
 ### 参数解包
 
@@ -586,7 +708,7 @@ output_dir/
 
 | 参数类型 | 解包模式 |
 | -------- | -------- |
-| `TensorType` | `Tensor*` -> `buffer.addr` -> 带类型指针 |
+| `TensorType` | `ChipTensor*` -> `buffer.addr` -> 带类型指针 |
 | `ScalarType` | `uint64_t` -> 联合体解码 -> 带类型值 |
 
 ### SPMD 身份参数

@@ -27,7 +27,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-from pypto.runtime.runner import _DfxOpts
+from pypto.pypto_core.passes import MemoryPlanner
+from pypto.runtime import execute_artifact
+from pypto.runtime.runner import RunConfig, _DfxOpts
 
 _ST_DIR = Path(__file__).resolve().parents[2] / "st"
 if str(_ST_DIR) not in sys.path:
@@ -55,6 +57,106 @@ def _proc(returncode, stdout="", stderr=""):
     return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _planner_case():
+    return SimpleNamespace(
+        get_name=lambda: "planner_case",
+        get_program=lambda: object(),
+        get_strategy=lambda: None,
+        get_backend_type=lambda: test_runner.BackendType.Ascend910B,
+        get_memory_planner=lambda: None,
+        get_enable_pypto_l0c_double_buffer=lambda: None,
+        config=RunConfig(memory_planner=None),
+    )
+
+
+def _write_minimal_compile_output(_program, output_dir, **_kwargs):
+    (output_dir / "kernels").mkdir(parents=True)
+    (output_dir / "kernels" / "kernel.cpp").touch()
+    (output_dir / "orchestration").mkdir()
+    (output_dir / "orchestration" / "orch.cpp").touch()
+
+
+# ---------------------------------------------------------------------------
+# System-test memory-planner precedence
+# ---------------------------------------------------------------------------
+
+
+def test_case_memory_planner_is_authoritative():
+    case = SimpleNamespace(
+        get_memory_planner=lambda: MemoryPlanner.PTOAS,
+        config=RunConfig(memory_planner=MemoryPlanner.PYPTO),
+    )
+    assert test_runner._resolve_case_memory_planner(case, MemoryPlanner.DSA_RP) == MemoryPlanner.PTOAS
+
+
+def test_case_run_config_precedes_session_memory_planner():
+    case = SimpleNamespace(
+        get_memory_planner=lambda: None,
+        config=RunConfig(memory_planner=MemoryPlanner.PYPTO),
+    )
+    assert test_runner._resolve_case_memory_planner(case, MemoryPlanner.DSA_RP) == MemoryPlanner.PYPTO
+
+
+def test_session_memory_planner_is_fallback():
+    case = SimpleNamespace(
+        get_memory_planner=lambda: None,
+        config=RunConfig(memory_planner=None),
+    )
+    assert test_runner._resolve_case_memory_planner(case, MemoryPlanner.DSA_RP) == MemoryPlanner.DSA_RP
+
+
+def test_system_test_cache_key_separates_memory_planners():
+    case = SimpleNamespace(
+        get_name=lambda: "case",
+        get_platform=lambda: "a2a3",
+        get_backend_type=lambda: None,
+        get_memory_planner=lambda: None,
+        config=RunConfig(memory_planner=None),
+    )
+    assert test_runner._cache_key(case, "a2a3", MemoryPlanner.PYPTO).endswith("@pypto")
+    assert test_runner._cache_key(case, "a2a3", MemoryPlanner.DSA_RP).endswith("@dsa_rp")
+
+
+def test_precompile_forwards_session_memory_planner(tmp_path):
+    case = _planner_case()
+    with (
+        patch.object(
+            test_runner,
+            "compile_program",
+            side_effect=_write_minimal_compile_output,
+        ) as compile_program,
+        patch.object(test_runner, "_write_golden_for_test_case"),
+    ):
+        test_runner._compile_for_cache(
+            case,
+            tmp_path,
+            dump_passes=False,
+            analyze_auto_scopes_for_deps=False,
+            session_memory_planner=MemoryPlanner.DSA_RP,
+        )
+    assert compile_program.call_args.kwargs["memory_planner"] == MemoryPlanner.DSA_RP
+
+
+def test_inline_compile_forwards_session_memory_planner():
+    case = _planner_case()
+    config = RunConfig(
+        platform="a2a3sim",
+        memory_planner=MemoryPlanner.DSA_RP,
+        codegen_only=True,
+    )
+    with (
+        patch.object(
+            test_runner,
+            "compile_program",
+            side_effect=_write_minimal_compile_output,
+        ) as compile_program,
+        patch.object(test_runner, "_write_golden_for_test_case"),
+    ):
+        result = test_runner.TestRunner(config)._run_inline(case, "a2a3sim")
+    assert result.passed, result.error
+    assert compile_program.call_args.kwargs["memory_planner"] == MemoryPlanner.DSA_RP
+
+
 # ---------------------------------------------------------------------------
 # _dfx_to_cli
 # ---------------------------------------------------------------------------
@@ -65,16 +167,98 @@ def test_dfx_to_cli_empty_for_default():
 
 
 def test_dfx_to_cli_emits_only_enabled_flags():
-    dfx = _DfxOpts(enable_l2_swimlane=True, enable_dump_args=2, enable_pmu=5, enable_dep_gen=True)
+    dfx = _DfxOpts(enable_chip_swimlane=True, enable_dump_args=2, enable_pmu=5, enable_dep_gen=True)
     argv = test_runner._dfx_to_cli(dfx)
     assert argv == [
-        "--enable-l2-swimlane",
+        "--enable-chip-swimlane",
+        "4",
         "--dump-args",
         "2",
         "--enable-pmu",
         "5",
         "--enable-dep-gen",
     ]
+
+
+def _load_st_conftest():
+    """Import tests/st/conftest.py under a private name.
+
+    Loaded by path rather than ``import conftest`` so pytest's own conftest
+    collection is not disturbed.
+    """
+    import importlib.util  # noqa: PLC0415
+
+    path = _ST_DIR / "conftest.py"
+    spec = importlib.util.spec_from_file_location("_st_conftest_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _FakeConfig:
+    """Minimal stand-in for ``pytest.Config.getoption``."""
+
+    def __init__(self, bare=0, level=None, deprecated=False):
+        self._values = {
+            "--enable-chip-swimlane": bare,
+            "--chip-swimlane-level": level,
+            "enable_l2_swimlane_deprecated": deprecated,
+        }
+
+    def getoption(self, name):
+        return self._values[name]
+
+
+def test_st_conftest_resolves_the_swimlane_options():
+    resolve = _load_st_conftest()._resolve_swimlane_option
+    assert resolve(_FakeConfig()) == 0
+    assert resolve(_FakeConfig(bare=4)) == 4
+    assert resolve(_FakeConfig(level=2)) == 2
+    assert resolve(_FakeConfig(level=0)) == 0  # explicit off
+    # An explicit level wins over the bare enable flag.
+    assert resolve(_FakeConfig(bare=4, level=1)) == 1
+
+
+def test_st_conftest_still_accepts_the_deprecated_flag():
+    # CI passes --enable-l2-swimlane, so it must keep resolving (with a warning).
+    resolve = _load_st_conftest()._resolve_swimlane_option
+    with pytest.warns(DeprecationWarning, match="--enable-l2-swimlane is deprecated"):
+        assert resolve(_FakeConfig(deprecated=True)) == 4
+
+
+def test_execute_artifact_accepts_the_deprecated_swimlane_flag():
+    # CI and existing scripts still pass --enable-l2-swimlane; it must keep
+    # working (with a DeprecationWarning) and land on the canonical level.
+    parser = execute_artifact._build_parser()
+    args = parser.parse_args(["--enable-l2-swimlane", "2", "--device-id", "0"])
+    with pytest.warns(DeprecationWarning, match="--enable-l2-swimlane is deprecated"):
+        assert execute_artifact._resolve_swimlane_args(parser, args) == 2
+
+    bare = parser.parse_args(["--enable-l2-swimlane", "--device-id", "0"])
+    with pytest.warns(DeprecationWarning):
+        assert execute_artifact._resolve_swimlane_args(parser, bare) == 4
+
+    absent = parser.parse_args(["--enable-chip-swimlane", "3", "--device-id", "0"])
+    assert execute_artifact._resolve_swimlane_args(parser, absent) == 3
+
+
+def test_execute_artifact_rejects_conflicting_swimlane_flags():
+    parser = execute_artifact._build_parser()
+    args = parser.parse_args(["--enable-chip-swimlane", "1", "--enable-l2-swimlane", "3", "--device-id", "0"])
+    with pytest.raises(SystemExit), pytest.warns(DeprecationWarning):
+        execute_artifact._resolve_swimlane_args(parser, args)
+
+
+def test_dfx_to_cli_round_trips_the_swimlane_level():
+    # Regression (issue #2385): a level 1-3 capture must survive the harness ->
+    # execute_artifact CLI hop instead of being flattened to the bare flag.
+    for level in (1, 2, 3, 4):
+        argv = test_runner._dfx_to_cli(_DfxOpts(enable_chip_swimlane=level))
+        assert argv == ["--enable-chip-swimlane", str(level)]
+        # ``--device-id`` is the parser's only required argument.
+        parsed = execute_artifact._build_parser().parse_args([*argv, "--device-id", "0"])
+        assert parsed.enable_chip_swimlane == level
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +277,7 @@ def test_parse_executed_device():
 
 
 def test_task_submit_argv_and_pass(tmp_path):
-    dfx = _DfxOpts(enable_l2_swimlane=True)
+    dfx = _DfxOpts(enable_chip_swimlane=True)
     with patch.object(
         test_runner.subprocess,
         "run",
@@ -115,7 +299,7 @@ def test_task_submit_argv_and_pass(tmp_path):
     run_cmd = argv[-1]
     assert "pypto.runtime.execute_artifact" in run_cmd
     assert "--device-id $TASK_DEVICE" in run_cmd
-    assert "--enable-l2-swimlane" in run_cmd
+    assert "--enable-chip-swimlane" in run_cmd
     # Device run only; the harness validates with the real tolerance afterwards.
     assert "--no-validate" in run_cmd
     # full child output persisted next to the artifact

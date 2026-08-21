@@ -80,21 +80,11 @@ class TestL3Manual:
     """Drive an L2 PyPTO build from a hand-written L3 using simpler directly."""
 
     def test_manual_l3(self, test_config, device_ids, tmp_path):
-        # Conftest's session fixture inserts ``simpler`` into ``sys.path``;
-        # importing inside the test guarantees the path is in place. Skipped
-        # automatically under --codegen-only since simpler isn't required there.
+        # Conftest's session fixture inserts ``simpler`` into ``sys.path``.
+        # Runtime imports stay below the compile-only exit because Simpler is
+        # neither configured nor required under --codegen-only.
         if not device_ids:
             pytest.skip("manual L3 test needs at least one device")
-
-        from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-            CallConfig,
-            TaskArgs,
-            TensorArgType,
-        )
-        from simpler.worker import Worker  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        from simpler_setup.torch_interop import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-            make_tensor_arg,
-        )
 
         # 1) Compile L2 only. The result is a CompiledProgram; ``output_dir``
         # itself is the chip's work dir (contains kernel_config.py, kernels/,
@@ -104,6 +94,18 @@ class TestL3Manual:
             L2OnlyAddProgram,
             output_dir=str(out_dir),
             platform=test_config.platform,
+        )
+        if test_config.codegen_only:
+            pytest.skip("--codegen-only disables distributed runtime execution")
+
+        from simpler.task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+            CallConfig,
+            TaskArgs,
+            TensorArgType,
+        )
+        from simpler.worker import Worker  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        from simpler_setup.torch_interop import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+            make_tensor_arg,
         )
 
         # 2) Assemble the ChipCallable ourselves — the same call
@@ -125,7 +127,7 @@ class TestL3Manual:
         expected = torch.full((128, 128), 5.0, dtype=torch.float32)
 
         def verify(args) -> None:
-            f_view = _tensor_from_continuous(args.tensor(0))
+            f_view = _tensor_from_continuous(args[0])
             if not torch.allclose(f_view, expected, rtol=1e-5, atol=1e-5):
                 raise AssertionError(
                     f"manual SubWorker verify failed: max diff = {(f_view - expected).abs().max().item()}"
@@ -165,13 +167,13 @@ class TestL3Manual:
         def orch_fn(orch, _unused_args, _unused_cfg) -> None:
             del _unused_args, _unused_cfg  # required by simpler's orch_fn signature
             chip_ta = TaskArgs()
-            chip_ta.add_tensor(make_tensor_arg(a), TensorArgType.INPUT)
-            chip_ta.add_tensor(make_tensor_arg(b), TensorArgType.INPUT)
-            chip_ta.add_tensor(make_tensor_arg(f), TensorArgType.OUTPUT_EXISTING)
+            chip_ta.add_tensor(make_tensor_arg(w, a), TensorArgType.INPUT)
+            chip_ta.add_tensor(make_tensor_arg(w, b), TensorArgType.INPUT)
+            chip_ta.add_tensor(make_tensor_arg(w, f), TensorArgType.OUTPUT_EXISTING)
             orch.submit_next_level(chip_cid, chip_ta, call_config, worker=0)
 
             verify_ta = TaskArgs()
-            verify_ta.add_tensor(make_tensor_arg(f), TensorArgType.INPUT)
+            verify_ta.add_tensor(make_tensor_arg(w, f), TensorArgType.INPUT)
             orch.submit_sub(verify_cid, verify_ta)
 
         try:

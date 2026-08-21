@@ -90,8 +90,13 @@ def test_gather_row_transpose_emits_dn_source_view():
     mlir = _codegen_incore(_build_program(transpose=True))
     assert "pto.gather_row" not in mlir  # lowered to subview + tload, not a single op
     # The transposing source view: a DN make_tensor_view of the GM source.
-    assert "make_tensor_view" in mlir
-    assert "layout = #pto.layout<dn>" in mlir
+    dn_view_lines = [
+        line
+        for line in mlir.splitlines()
+        if "pto.make_tensor_view" in line and "layout = #pto.layout<dn>" in line
+    ]
+    assert len(dn_view_lines) == 1, f"expected exactly one DN source view, got: {dn_view_lines}"
+    assert "} : !pto.tensor_view" in dn_view_lines[0]
     # The row is read as a [c, 1] DN column partition (1x... source partition).
     assert "pto.tload" in mlir
     assert "pto.subview" in mlir

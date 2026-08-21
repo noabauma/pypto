@@ -12,8 +12,8 @@
 The unit test (``tests/ut/runtime/test_benchmark.py``) mocks the worker and the
 stderr capture, so it only proves the parse / warmup-discard / aggregation
 logic. This system test runs a real kernel on device and exercises the full
-on-device path that the UT cannot: ``benchmark`` raising the runtime log level
-to ``v9``, fd-level capturing the host runtime's ``[STRACE]`` stderr markers
+on-device path that the UT cannot: ``benchmark`` setting the runtime log level
+to ``timing``, fd-level capturing the host runtime's ``[STRACE]`` stderr markers
 (simpler PR #1177), and parsing the *measured* per-launch ``device_wall_us``
 out of them.
 
@@ -94,6 +94,37 @@ def test_benchmark_register_once_surfaces_timing(test_config, tmp_path):
     assert stats.device_us_min > 0.0
     assert stats.device_us_max >= stats.device_us_min
     assert stats.device_us_min <= stats.device_us_median <= stats.device_us_max
+
+
+def test_benchmark_from_dir_replay_surfaces_timing(test_config, tmp_path):
+    """``benchmark`` runs against a build-directory replay (#2344).
+
+    The ``--runtime-dir`` tuning loop (edit the generated orchestration cpp /
+    ``.pto``, re-measure) has no live ``CompiledProgram``. This reconstructs one
+    from ``compiled_meta.json`` alone — no pypto recompile, no pass re-run — and
+    asserts the reloaded object drives the *same* on-device path: correct output
+    plus real per-launch ``device_wall_us`` off the ``[STRACE]`` markers.
+    """
+    ir.compile(AddProgram, output_dir=str(tmp_path), platform=test_config.platform)
+
+    # Drop the live object entirely; everything below comes from the directory.
+    compiled = ir.CompiledProgram.from_dir(tmp_path, platform=test_config.platform)
+    assert compiled.program is None, "from_dir must not carry live IR"
+    assert compiled.param_names == ["a", "b", "c"]
+
+    a, b, c = _inputs()
+    worker_cfg = RunConfig(platform=test_config.platform, device_id=test_config.device_id)
+    rounds, warmup = 5, 2
+    stats = benchmark(compiled, [a, b, c], rounds=rounds, warmup=warmup, config=worker_cfg)
+
+    # Output is correct after the final measured launch.
+    torch.testing.assert_close(c, _EXPECTED, rtol=1e-5, atol=1e-5)
+
+    assert len(stats.device_wall_us) == rounds, (
+        f"expected {rounds} measured samples (warmup excluded), got {len(stats.device_wall_us)}"
+    )
+    assert not stats.all_zero_device, "device_wall_us must be > 0 on the default SIMPLER_HOST_STRACE build"
+    assert stats.device_us_min > 0.0
 
 
 _L3_ROWS = 16

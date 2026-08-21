@@ -367,6 +367,22 @@ class IRBuilder:
         actual_span = span if span is not None else self._capture_call_span()
         return self._builder.var(name, type, actual_span)
 
+    def add_function_attrs(self, attrs: dict[str, Any]) -> None:
+        """Merge attributes into the function currently being built.
+
+        Attributes normally arrive at :meth:`function`. A ``pl.func_attr({...})``
+        body prologue is evaluated only after the parameters bind — which is what
+        lets an attribute reference one — so it merges here instead.
+
+        Args:
+            attrs: Attribute dict to merge
+
+        Raises:
+            RuntimeError: If not inside a function context
+            ValueError: If a key is already present (attrs are unique-keyed)
+        """
+        self._builder.add_function_attrs(attrs)
+
     def assign(
         self,
         var: ir.Var,
@@ -690,6 +706,7 @@ class IRBuilder:
         fractal: int = 512,
         pad: ir.PadValue = ir.PadValue.null,
         span: ir.Span | None = None,
+        compact: ir.CompactMode = ir.CompactMode.null,
     ) -> ir.TileView:
         """Create a TileView with normalized expressions.
 
@@ -702,6 +719,7 @@ class IRBuilder:
             fractal: Fractal size in bytes, not elements (default: 512)
             pad: Pad mode (default: null)
             span: Optional explicit span. If None, captured from call site.
+            compact: Partial-tile compact mode (default: null)
 
         Returns:
             TileView: The created tile view
@@ -716,7 +734,16 @@ class IRBuilder:
         valid_shape_exprs = [_normalize_expr(dim, actual_span) for dim in valid_shape]
         stride_exprs = [_normalize_expr(s, actual_span) for s in stride]
         start_offset_expr = _normalize_expr(start_offset, actual_span)
-        return ir.TileView(valid_shape_exprs, stride_exprs, start_offset_expr, blayout, slayout, fractal, pad)
+        return ir.TileView(
+            valid_shape_exprs,
+            stride_exprs,
+            start_offset_expr,
+            blayout,
+            slayout,
+            fractal,
+            pad,
+            compact,
+        )
 
     def tensor_view(
         self,

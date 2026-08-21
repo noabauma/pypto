@@ -60,6 +60,12 @@ enum class AtomicType : int {
   kAdd = 1,
 };
 
+// Underlying values are stored in tile.mgather's integer `coalesce` kwarg.
+enum class MgatherCoalesceMode : int {
+  kRow = 0,
+  kElem = 1,
+};
+
 enum class ReduceOp : int {
   kSum = 0,
   kMax = 1,

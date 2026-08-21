@@ -19,6 +19,14 @@ from pypto import DataType, ir
 from pypto.ir.op import tile
 from pypto.language.parser.diagnostics import InvalidOperationError
 
+_OP_TILE_EXTRACT = ir.get_op("tile.extract").name
+_OP_TILE_FILLPAD_EXPAND = ir.get_op("tile.fillpad_expand").name
+_OP_TILE_MSCATTER = ir.get_op("tile.mscatter").name
+_OP_TILE_ROW_EXPAND_ADD = ir.get_op("tile.row_expand_add").name
+_OP_TILE_SET_VALIDSHAPE = ir.get_op("tile.set_validshape").name
+_OP_TILE_SLICE = ir.get_op("tile.slice").name
+_OP_TILE_TRANSPOSE = ir.get_op("tile.transpose").name
+
 
 def _operand_dtype(expr: ir.Expr) -> DataType:
     """Return a constant operand's dtype, narrowing ``Expr`` for the type checker."""
@@ -153,9 +161,9 @@ class TestTileElementwiseOps:
 
         assert dict(default_call.kwargs) == {}
         assert dict(high_precision_call.kwargs) == {"high_precision": True}
-        assert scalar_call.op.name == "tile.divs"
+        assert scalar_call.op.name == ir.get_op("tile.divs").name
         assert dict(scalar_call.kwargs) == {}
-        with pytest.raises(ValueError, match=r"requires a Tile rhs"):
+        with pytest.raises(TypeError, match=r"requires a Tile rhs"):
             tile.div(lhs, 2.0, high_precision=True)
 
     def test_tile_div_rejects_integer_high_precision_template_gap(self):
@@ -238,6 +246,7 @@ class TestTileElementwiseOps:
         calls = (
             tile.div(lhs, rhs, span),
             tile.log(lhs, span),
+            tile.recip(lhs, span),
         )
 
         assert all(call.span.filename == "tile_precision_compat.py" for call in calls)
@@ -383,6 +392,29 @@ class TestTileUnaryOps:
         expected_kwargs = {"high_precision": True} if high_precision else {}
         assert dict(call.kwargs) == expected_kwargs
 
+    @pytest.mark.parametrize("dtype", [DataType.FP16, DataType.FP32])
+    @pytest.mark.parametrize("high_precision", [False, True])
+    def test_tile_recip_contract_and_precision(self, dtype, high_precision):
+        """Both reciprocal precision modes preserve each supported float dtype."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 8], dtype), span)
+
+        call = tile.recip(src, high_precision=high_precision)
+
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.dtype == dtype
+        expected_kwargs = {"high_precision": True} if high_precision else {}
+        assert dict(call.kwargs) == expected_kwargs
+
+    @pytest.mark.parametrize("dtype", [DataType.INT32, DataType.BF16])
+    def test_tile_recip_rejects_unsupported_high_precision_dtype(self, dtype):
+        """The PTOAS high-precision reciprocal template only supports FP16 and FP32 inputs."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 8], dtype), span)
+
+        with pytest.raises(ValueError, match=r"high_precision only for FP16 or FP32"):
+            tile.recip(src, high_precision=True)
+
     def test_tile_abs(self):
         """Test tile.abs operator - absolute value of all elements."""
 
@@ -524,7 +556,7 @@ class TestTileUnaryOps:
         call = tile.sin(tile_var)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.sin"
+        assert call.op.name == ir.get_op("tile.sin").name
 
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
@@ -540,7 +572,7 @@ class TestTileUnaryOps:
         call = tile.cos(tile_var)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.cos"
+        assert call.op.name == ir.get_op("tile.cos").name
 
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
@@ -1441,7 +1473,7 @@ class TestTileBroadcastOps:
         )
 
         call = tile.row_expand_add(main, packed_row)
-        assert call.op.name == "tile.row_expand_add"
+        assert call.op.name == _OP_TILE_ROW_EXPAND_ADD
         assert len(call.args) == 2
 
     def test_tile_row_expand_add_rejects_invalid_packed_valid_width_and_tmp_type(self):
@@ -1526,7 +1558,7 @@ class TestTileBroadcastOps:
             ir.TileType([8, 1], DataType.FP32, tile_view=matching_row_view),
             span,
         )
-        assert tile.row_expand_add(main, matching_row).op.name == "tile.row_expand_add"
+        assert tile.row_expand_add(main, matching_row).op.name == _OP_TILE_ROW_EXPAND_ADD
 
         unrelated_row_view = ir.TileView(
             valid_shape=[other_rows, 1],
@@ -2026,6 +2058,245 @@ class TestTileBroadcastOps:
 class TestTileMatMulOps:
     """Test suite for tile-level matrix multiplication operators."""
 
+    def test_matmul_and_acc_propagate_padded_operand_valid_shape(self):
+        """Matmul uses logical valid extents inside box-aligned storage.
+
+        A boundary Right tile may require 32 physical INT8 columns even when
+        only 16 columns are in bounds.  The resulting Acc tile must retain the
+        physical width for allocation and the logical width for computation
+        and stores; ``matmul_acc`` must preserve both.
+        """
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        lhs_type = ir.TileType(
+            dims(16, 128),
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=dims(16, 128)),
+            memory_space=ir.MemorySpace.Left,
+        )
+        rhs_type = ir.TileType(
+            dims(128, 32),
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=dims(128, 16)),
+            memory_space=ir.MemorySpace.Right,
+        )
+        lhs = ir.Var("lhs", lhs_type, span)
+        rhs = ir.Var("rhs", rhs_type, span)
+
+        matmul_type = tile.matmul(lhs, rhs).type
+        assert isinstance(matmul_type, ir.TileType)
+        assert _const_values(matmul_type.shape) == [16, 32]
+        assert _valid_of(matmul_type) == [16, 16]
+
+        acc_type = ir.TileType(
+            dims(16, 32),
+            DataType.INT32,
+            tile_view=ir.TileView(valid_shape=dims(16, 16)),
+            memory_space=ir.MemorySpace.Acc,
+        )
+        acc = ir.Var("acc", acc_type, span)
+        matmul_acc_type = tile.matmul_acc(acc, lhs, rhs).type
+        assert isinstance(matmul_acc_type, ir.TileType)
+        assert _const_values(matmul_acc_type.shape) == [16, 32]
+        assert _valid_of(matmul_acc_type) == [16, 16]
+
+    def test_matmul_rejects_mismatched_physical_k_with_matching_valid_k(self):
+        """Logical K agreement does not make incompatible physical boxes legal."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(dims(16, 32), DataType.INT8, tile_view=ir.TileView(valid_shape=dims(16, 16))),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(dims(16, 32), DataType.INT8, tile_view=ir.TileView(valid_shape=dims(16, 16))),
+            span,
+        )
+
+        with pytest.raises(ValueError, match="matching physical inner dimensions"):
+            tile.matmul(lhs, rhs)
+
+    def test_matmul_allows_rhs_valid_k_to_contain_lhs_valid_k(self):
+        """PTO reads lhs valid K and permits a wider valid window on rhs."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(
+                dims(16, 256),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(16, 255)),
+            ),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(
+                dims(256, 16),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(256, 16)),
+            ),
+            span,
+        )
+
+        result = tile.matmul(lhs, rhs).type
+        assert isinstance(result, ir.TileType)
+        assert _const_values(result.shape) == [16, 16]
+        assert _valid_of(result) == [16, 16]
+
+    def test_matmul_rejects_rhs_valid_k_smaller_than_lhs(self):
+        """The rhs valid K window must contain every lhs K element PTO reads."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(
+                dims(16, 256),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(16, 256)),
+            ),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(
+                dims(256, 16),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(255, 16)),
+            ),
+            span,
+        )
+
+        with pytest.raises(ValueError, match="rhs valid K to cover lhs valid K"):
+            tile.matmul(lhs, rhs)
+
+    def test_matmul_acc_allows_acc_valid_shape_to_contain_product(self):
+        """PTO may update a smaller product rectangle inside a wider accumulator."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        acc = ir.Var(
+            "acc",
+            ir.TileType(
+                dims(16, 32),
+                DataType.FP32,
+                tile_view=ir.TileView(valid_shape=dims(16, 32)),
+            ),
+            span,
+        )
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(
+                dims(16, 16),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(16, 16)),
+            ),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(
+                dims(16, 32),
+                DataType.FP16,
+                tile_view=ir.TileView(valid_shape=dims(16, 24)),
+            ),
+            span,
+        )
+
+        result = tile.matmul_acc(acc, lhs, rhs).type
+        assert isinstance(result, ir.TileType)
+        assert _const_values(result.shape) == [16, 32]
+        assert _valid_of(result) == [16, 32]
+
+    @pytest.mark.parametrize(
+        ("acc_valid", "lhs_valid", "rhs_valid", "message"),
+        [
+            ((15, 32), (16, 16), (16, 24), "acc valid M"),
+            ((16, 23), (16, 16), (16, 24), "acc valid N"),
+            ((16, 32), (16, 16), (15, 24), "rhs valid K"),
+        ],
+    )
+    def test_matmul_acc_rejects_valid_shape_not_containing_product(
+        self, acc_valid, lhs_valid, rhs_valid, message
+    ):
+        """Each PTO-computed extent must fit its corresponding valid window."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        acc = ir.Var(
+            "acc",
+            ir.TileType(dims(16, 32), DataType.FP32, tile_view=ir.TileView(valid_shape=dims(*acc_valid))),
+            span,
+        )
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(dims(16, 16), DataType.FP16, tile_view=ir.TileView(valid_shape=dims(*lhs_valid))),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(dims(16, 32), DataType.FP16, tile_view=ir.TileView(valid_shape=dims(*rhs_valid))),
+            span,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            tile.matmul_acc(acc, lhs, rhs)
+
+    @pytest.mark.parametrize(
+        ("acc_shape", "lhs_shape", "rhs_shape", "message"),
+        [
+            ((32, 32), (16, 16), (16, 32), "physical M"),
+            ((16, 64), (16, 16), (16, 32), "physical N"),
+            ((16, 32), (16, 32), (16, 32), "physical K"),
+        ],
+    )
+    def test_matmul_acc_rejects_mismatched_physical_boxes_with_matching_valid_shape(
+        self, acc_shape, lhs_shape, rhs_shape, message
+    ):
+        """All three physical dimensions remain part of the matmul_acc contract."""
+        span = ir.Span.unknown()
+
+        def dims(*values):
+            return [ir.ConstInt(value, DataType.INDEX, span) for value in values]
+
+        valid_shape = dims(16, 16)
+        acc = ir.Var(
+            "acc",
+            ir.TileType(dims(*acc_shape), DataType.INT32, tile_view=ir.TileView(valid_shape=valid_shape)),
+            span,
+        )
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType(dims(*lhs_shape), DataType.INT8, tile_view=ir.TileView(valid_shape=valid_shape)),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType(dims(*rhs_shape), DataType.INT8, tile_view=ir.TileView(valid_shape=valid_shape)),
+            span,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            tile.matmul_acc(acc, lhs, rhs)
+
     def test_tile_matmul(self):
         """Test tile.matmul operator - matrix multiplication."""
 
@@ -2110,7 +2381,7 @@ class TestTileMatMulOps:
             ) -> pl.Tensor[[1, 128], pl.FP32]:
                 tile_a: pl.Tile[[1, 16], pl.FP32] = pl.load(a, [0, 0], [1, 16])
                 tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
-                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.gemv(tile_a, tile_b)
+                tile_c: pl.Tile[[16, 32], pl.FP32] = pl.gemv(tile_a, tile_b)
                 result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
                 return result
 
@@ -2125,15 +2396,15 @@ class TestTileMatMulOps:
             @pl.function(type=pl.FunctionType.InCore)
             def main(
                 self,
-                acc_in: pl.Tensor[[1, 128], pl.FP32],
+                acc_in: pl.Tensor[[16, 128], pl.FP32],
                 a: pl.Tensor[[1, 64], pl.FP32],
                 b: pl.Tensor[[64, 128], pl.FP32],
                 output: pl.Tensor[[1, 128], pl.FP32],
             ) -> pl.Tensor[[1, 128], pl.FP32]:
-                tile_acc: pl.Tile[[1, 32], pl.FP32] = pl.load(acc_in, [0, 0], [1, 32])
+                tile_acc: pl.Tile[[16, 32], pl.FP32] = pl.load(acc_in, [0, 0], [16, 32], valid_shape=[1, 32])
                 tile_a: pl.Tile[[1, 16], pl.FP32] = pl.load(a, [0, 0], [1, 16])
                 tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
-                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.gemv_acc(tile_acc, tile_a, tile_b)
+                tile_c: pl.Tile[[16, 32], pl.FP32] = pl.gemv_acc(tile_acc, tile_a, tile_b)
                 result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
                 return result
 
@@ -2156,12 +2427,206 @@ class TestTileMatMulOps:
                 tile_a: pl.Tile[[1, 16], pl.FP32] = pl.load(a, [0, 0], [1, 16])
                 tile_b: pl.Tile[[16, 32], pl.FP32] = pl.load(b, [0, 0], [16, 32])
                 tile_bias: pl.Tile[[1, 32], pl.FP32] = pl.load(bias, [0, 0], [1, 32])
-                tile_c: pl.Tile[[1, 32], pl.FP32] = pl.gemv_bias(tile_a, tile_b, tile_bias)
+                tile_c: pl.Tile[[16, 32], pl.FP32] = pl.gemv_bias(tile_a, tile_b, tile_bias)
                 result: pl.Tensor[[1, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
                 return result
 
         ir_str = str(Program)
         assert "tile.gemv_bias" in ir_str
+
+    def test_tile_gemv_physical_accumulator_and_logical_valid_shape(self):
+        """GEMV pads Acc rows to 16 while preserving the logical [1, N] extent."""
+        span = ir.Span.unknown()
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType([1, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[1, 64])),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType([128, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[64, 48])),
+            span,
+        )
+        bias = ir.Var(
+            "bias",
+            ir.TileType([1, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[1, 48])),
+            span,
+        )
+
+        result = tile.gemv(lhs, rhs)
+        result_type = result.type
+        assert isinstance(result_type, ir.TileType)
+        assert [d.value for d in result_type.shape if isinstance(d, ir.ConstInt)] == [16, 128]
+        assert _valid_of(result_type) == [1, 48]
+
+        acc_result = tile.gemv_acc(result, lhs, rhs)
+        bias_result = tile.gemv_bias(lhs, rhs, bias)
+        for call in (acc_result, bias_result):
+            call_type = call.type
+            assert isinstance(call_type, ir.TileType)
+            assert [d.value for d in call_type.shape if isinstance(d, ir.ConstInt)] == [16, 128]
+            assert _valid_of(call_type) == [1, 48]
+
+    @pytest.mark.parametrize(
+        ("input_dtype", "output_dtype"),
+        [
+            (DataType.INT8, DataType.INT32),
+            (DataType.FP16, DataType.FP32),
+            (DataType.BF16, DataType.FP32),
+            (DataType.FP32, DataType.FP32),
+        ],
+    )
+    def test_tile_gemv_family_accepts_supported_dtype_triples(self, input_dtype, output_dtype):
+        span = ir.Span.unknown()
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType([1, 128], input_dtype, tile_view=ir.TileView(valid_shape=[1, 64])),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType([128, 128], input_dtype, tile_view=ir.TileView(valid_shape=[64, 48])),
+            span,
+        )
+        acc = ir.Var(
+            "acc",
+            ir.TileType([16, 128], output_dtype, tile_view=ir.TileView(valid_shape=[1, 48])),
+            span,
+        )
+        bias = ir.Var(
+            "bias",
+            ir.TileType([1, 128], output_dtype, tile_view=ir.TileView(valid_shape=[1, 48])),
+            span,
+        )
+
+        for call in (tile.gemv(lhs, rhs), tile.gemv_acc(acc, lhs, rhs), tile.gemv_bias(lhs, rhs, bias)):
+            result_type = call.type
+            assert isinstance(result_type, ir.TileType)
+            assert result_type.dtype == output_dtype
+
+    def test_tile_gemv_rejects_insufficient_rhs_logical_k(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType([1, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[1, 96])),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType([128, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[64, 48])),
+            span,
+        )
+
+        with pytest.raises(ValueError, match="rhs valid K to cover lhs valid K"):
+            tile.gemv(lhs, rhs)
+
+    def test_tile_gemv_rejects_unsupported_input_dtype(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([1, 128], DataType.INT16), span)
+        rhs = ir.Var("rhs", ir.TileType([128, 128], DataType.INT16), span)
+
+        with pytest.raises(ValueError, match="supports only INT8"):
+            tile.gemv(lhs, rhs)
+
+    def test_tile_gemv_rejects_mixed_input_dtypes(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([1, 128], DataType.FP16), span)
+        rhs = ir.Var("rhs", ir.TileType([128, 128], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="identical lhs and rhs data types"):
+            tile.gemv(lhs, rhs)
+
+    def test_tile_gemv_bias_rejects_input_dtype_bias(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([1, 128], DataType.FP16), span)
+        rhs = ir.Var("rhs", ir.TileType([128, 128], DataType.FP16), span)
+        bias = ir.Var("bias", ir.TileType([1, 128], DataType.FP16), span)
+
+        with pytest.raises(ValueError, match="requires bias dtype fp32"):
+            tile.gemv_bias(lhs, rhs, bias)
+
+    def test_tile_gemv_acc_rejects_input_dtype_accumulator(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([1, 128], DataType.FP16), span)
+        rhs = ir.Var("rhs", ir.TileType([128, 128], DataType.FP16), span)
+        acc = ir.Var("acc", ir.TileType([16, 128], DataType.FP16), span)
+
+        with pytest.raises(ValueError, match="requires accumulator dtype fp32"):
+            tile.gemv_acc(acc, lhs, rhs)
+
+    def test_tile_gemv_rejects_multiple_logical_lhs_rows(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType([1, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[2, 64])),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType([128, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[64, 48])),
+            span,
+        )
+
+        with pytest.raises(ValueError, match="logical row extent to be exactly 1"):
+            tile.gemv(lhs, rhs)
+
+    def test_tile_gemv_rejects_padded_physical_lhs_rows(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType([16, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[1, 64])),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType([128, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[64, 48])),
+            span,
+        )
+
+        with pytest.raises(ValueError, match="physical row extent to be exactly 1"):
+            tile.gemv(lhs, rhs)
+
+    def test_tile_gemv_bias_rejects_undersized_valid_shape(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType([1, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[1, 64])),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType([128, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[64, 48])),
+            span,
+        )
+        bias = ir.Var(
+            "bias",
+            ir.TileType([1, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[1, 32])),
+            span,
+        )
+
+        with pytest.raises(ValueError, match=r"bias valid N to cover output valid N=48"):
+            tile.gemv_bias(lhs, rhs, bias)
+
+    def test_tile_gemv_acc_rejects_mismatched_valid_shape(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var(
+            "lhs",
+            ir.TileType([1, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[1, 64])),
+            span,
+        )
+        rhs = ir.Var(
+            "rhs",
+            ir.TileType([128, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[64, 48])),
+            span,
+        )
+        acc = ir.Var(
+            "acc",
+            ir.TileType([16, 128], DataType.FP32, tile_view=ir.TileView(valid_shape=[1, 32])),
+            span,
+        )
+
+        with pytest.raises(ValueError, match="accumulator valid_shape"):
+            tile.gemv_acc(acc, lhs, rhs)
 
 
 class TestTileTransformOps:
@@ -2204,7 +2669,7 @@ class TestTileSliceReshapeOps:
         call = tile.slice(tile_var, [8, 16], [0, 0])
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.slice"
+        assert call.op.name == _OP_TILE_SLICE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP16
@@ -2223,7 +2688,7 @@ class TestTileSliceReshapeOps:
         call = tile.slice(tile_var, [8, 16], [0, 0], valid_shape=[8, valid_n])
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.slice"
+        assert call.op.name == _OP_TILE_SLICE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.tile_view is not None
@@ -2316,7 +2781,7 @@ class TestTileSliceReshapeOps:
         call = tile.slice(tile_var, [8, 16], [0, 0], valid_shape=[8, 4], pad_value=ir.PadValue.zero)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.slice"
+        assert call.op.name == _OP_TILE_SLICE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.tile_view is not None
@@ -2423,7 +2888,7 @@ class TestTileSliceReshapeOps:
         call = tile.reshape(tile_var, [8, 4])
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.reshape"
+        assert call.op.name == ir.get_op("tile.reshape").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP32
@@ -2469,6 +2934,25 @@ class TestTileSliceReshapeOps:
         result_type = tile.reshape(_partial_tile([8, 16], [5, 16]), [16, 8]).type
 
         assert _valid_of(result_type) == [10, 8]
+
+    def test_tile_reshape_preserves_compact_storage_mode(self):
+        """A zero-copy reshape keeps the source tile's compact representation."""
+        span = ir.Span.unknown()
+        source = ir.Var(
+            "src",
+            ir.TileType(
+                [8, 16],
+                DataType.INT8,
+                tile_view=ir.TileView(valid_shape=[5, 16], compact=ir.CompactMode.normal),
+            ),
+            span,
+        )
+
+        result_type = tile.reshape(source, [16, 8]).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert _valid_of(result_type) == [10, 8]
+        assert result_type.get_effective_tile_view().compact == ir.CompactMode.normal
 
     def test_tile_reshape_drops_full_unit_axis_exactly(self):
         """Erasing a provably full unit axis preserves an arbitrary rectangle."""
@@ -2546,7 +3030,7 @@ class TestTileSliceReshapeOps:
         call = tile.fillpad_expand(src, [64, 128], pad_value=ir.PadValue.zero)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.fillpad_expand"
+        assert call.op.name == _OP_TILE_FILLPAD_EXPAND
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP32
@@ -2579,7 +3063,7 @@ class TestTileSliceReshapeOps:
         src = ir.Var("src", src_type, span)
 
         call = tile.fillpad_expand(src, [32, 32], pad_value=ir.PadValue.zero)
-        assert call.op.name == "tile.fillpad_expand"
+        assert call.op.name == _OP_TILE_FILLPAD_EXPAND
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         dim0 = result_type.shape[0]
@@ -2631,7 +3115,7 @@ class TestTileSliceReshapeOps:
         call = tile.transpose(tile_var, 0, 1)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.transpose"
+        assert call.op.name == _OP_TILE_TRANSPOSE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP16
@@ -2652,7 +3136,7 @@ class TestTileSliceReshapeOps:
         call = tile.transpose(tile_var, -2, -1)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.transpose"
+        assert call.op.name == _OP_TILE_TRANSPOSE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
 
@@ -2690,7 +3174,7 @@ class TestTileSliceReshapeOps:
         call = tile.set_validshape(tile_var, 16, 24)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.set_validshape"
+        assert call.op.name == _OP_TILE_SET_VALIDSHAPE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP32
@@ -2711,7 +3195,7 @@ class TestTileSliceReshapeOps:
         call = tile.set_validshape(tile_var, valid_rows, valid_cols)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.set_validshape"
+        assert call.op.name == _OP_TILE_SET_VALIDSHAPE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.tile_view is not None
@@ -2991,7 +3475,7 @@ class TestTileBatchMatMulOps:
         call = tile.batch_matmul(lhs, rhs, span)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.batch_matmul"
+        assert call.op.name == ir.get_op("tile.batch_matmul").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         const_dims = [dim for dim in result_type.shape if isinstance(dim, ir.ConstInt)]
@@ -3089,7 +3573,7 @@ class TestTileBatchMatMulOps:
         call = tile.batch_matmul_acc(acc, lhs, rhs, span)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.batch_matmul_acc"
+        assert call.op.name == ir.get_op("tile.batch_matmul_acc").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         const_dims = [dim for dim in result_type.shape if isinstance(dim, ir.ConstInt)]
@@ -3154,7 +3638,7 @@ class TestTileBatchMatMulOps:
         call = tile.transpose(tile_var, 0, 2)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.transpose"
+        assert call.op.name == _OP_TILE_TRANSPOSE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert len(result_type.shape) == 3
@@ -3175,7 +3659,7 @@ class TestTileBatchMatMulOps:
         call = tile.row_max(tile_var, tmp_tile)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.row_max"
+        assert call.op.name == ir.get_op("tile.row_max").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert len(result_type.shape) == 3
@@ -3197,7 +3681,7 @@ class TestTileBatchMatMulOps:
         call = tile.slice(tile_var, new_shape, offset)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.slice"
+        assert call.op.name == _OP_TILE_SLICE
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert len(result_type.shape) == 3
@@ -3619,8 +4103,8 @@ class TestTileBitwiseArithmeticOps:
                 slope: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
                     [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
-                tmp: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
-                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.tile.create(
+                    [17, 32], dtype=pl.UINT8, target_memory=pl.MemorySpace.Vec
                 )
                 tile_c: pl.Tile[[16, 16], pl.FP32] = pl.prelu(tile_x, slope, tmp)
                 result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
@@ -3628,6 +4112,91 @@ class TestTileBitwiseArithmeticOps:
 
         ir_str = str(Program)
         assert "tile.prelu" in ir_str
+        reparsed = pl.parse_program(ir_str)
+        ir.assert_structural_equal(Program, reparsed)
+
+    def test_tile_prelu_preserves_valid_shape(self):
+        """TPRELU result mirrors the source physical and valid shapes."""
+        src = _partial_tile([16, 16], [8, 12], name="src")
+        slope = _partial_tile([16, 16], [8, 12], name="slope")
+        span = ir.Span.unknown()
+        tmp = ir.Var("tmp", ir.TileType([9, 32], DataType.UINT8), span)
+
+        result = tile.prelu(src, slope, tmp).type
+
+        assert isinstance(result, ir.TileType)
+        assert [dim.value for dim in result.shape if isinstance(dim, ir.ConstInt)] == [16, 16]
+        assert _valid_of(result) == [8, 12]
+
+    def test_tile_prelu_defers_target_specific_tmp_validation(self):
+        """IR deduction accepts a small UINT8 placeholder; A2/A3 validates it in codegen."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        slope = ir.Var("slope", ir.TileType([16, 16], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 1], DataType.UINT8), span)
+
+        result = tile.prelu(src, slope, tmp).type
+
+        assert isinstance(result, ir.TileType)
+        assert result.dtype == DataType.FP32
+
+    def test_tile_prelu_defers_alias_validation_to_target_codegen(self):
+        """Expression identity is not an alias proof, and A5 permits overlapping operands."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([17, 32], DataType.UINT8), span)
+
+        result = tile.prelu(src, src, tmp)
+
+        assert isinstance(result.type, ir.TileType)
+
+    @pytest.mark.parametrize(
+        "slope_type,error",
+        [
+            (ir.TileType([8, 16], DataType.FP32), "physical shape"),
+            (ir.TileType([16, 16], DataType.FP16), "slope dtype"),
+            (
+                ir.TileType([16, 16], DataType.FP32, tile_view=ir.TileView(valid_shape=[8, 16])),
+                "valid_shape",
+            ),
+        ],
+    )
+    def test_tile_prelu_rejects_incompatible_slope(self, slope_type, error):
+        """TPRELU rejects slope contracts that PTOAS cannot assemble."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        slope = ir.Var("slope", slope_type, span)
+        tmp = ir.Var("tmp", ir.TileType([17, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.prelu(src, slope, tmp)
+
+    def test_tile_prelu_rejects_non_rank2_tmp(self):
+        """The target-independent ABI still requires a rank-2 tile placeholder."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        slope = ir.Var("slope", ir.TileType([16, 16], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([16], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match="rank-2 tmp"):
+            tile.prelu(src, slope, tmp)
+
+    @pytest.mark.parametrize(
+        ("src_type", "tmp_type", "error"),
+        [
+            (ir.TileType([16, 16], DataType.INT32), ir.TileType([17, 32], DataType.UINT8), "src dtype"),
+            (ir.TileType([256], DataType.FP32), ir.TileType([17, 32], DataType.UINT8), "rank-2 src"),
+        ],
+    )
+    def test_tile_prelu_rejects_invalid_src_contract(self, src_type, tmp_type, error):
+        """TPRELU rejects unsupported source dtypes and ranks."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", src_type, span)
+        slope = ir.Var("slope", src_type, span)
+        tmp = ir.Var("tmp", tmp_type, span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.prelu(src, slope, tmp)
 
     def test_tile_not(self):
         """Test tile.not operator - element-wise bitwise NOT of a tile (int16/uint16 only)."""
@@ -3756,7 +4325,7 @@ class TestTileBitwiseArithmeticOps:
         assert "tile.lrelu" in ir_str
 
     def test_tile_sels(self):
-        """Test tile.sels operator - select between two tiles via integer scalar mode."""
+        """Test tile.sels operator - select between a tile and scalar via mask."""
 
         @pl.program
         class Program:
@@ -3764,17 +4333,194 @@ class TestTileBitwiseArithmeticOps:
             def main(
                 self,
                 a: pl.Tensor[[128, 128], pl.FP32],
-                b: pl.Tensor[[128, 128], pl.FP32],
                 output: pl.Tensor[[128, 128], pl.FP32],
             ) -> pl.Tensor[[128, 128], pl.FP32]:
                 tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
-                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.sels(tile_a, tile_b, 1)
+                mask: pl.Tile[[32, 32], pl.UINT8] = pl.cmps(tile_a, 0.0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.sels(mask, tile_a, tmp, -1.0)
                 result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], output)
                 return result
 
         ir_str = str(Program)
         assert "tile.sels" in ir_str
+        reparsed = pl.parse_program(ir_str)
+        ir.assert_structural_equal(Program, reparsed)
+
+    def test_tile_sels_preserves_src_type_and_valid_shape(self):
+        """TSELS result mirrors src rather than the packed mask or tmp."""
+        span = ir.Span.unknown()
+        mask = ir.Var(
+            "mask",
+            ir.TileType([16, 32], DataType.UINT8, tile_view=ir.TileView(valid_shape=[8, 2])),
+            span,
+        )
+        src = _partial_tile([16, 16], [8, 12], name="src")
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        result = tile.sels(mask, src, tmp, -2.5).type
+
+        assert isinstance(result, ir.TileType)
+        assert result.dtype == DataType.FP32
+        assert [dim.value for dim in result.shape if isinstance(dim, ir.ConstInt)] == [16, 16]
+        assert _valid_of(result) == [8, 12]
+
+    def test_tile_sels_retypes_constant_to_src_dtype(self):
+        """A parser-produced constant adopts the selected source dtype."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([16, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP16), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+        scalar = ir.ConstFloat(-1.0, DataType.FP32, span)
+
+        call = tile.sels(mask, src, tmp, scalar)
+
+        assert _operand_dtype(call.args[3]) == DataType.FP16
+
+    def test_tile_sels_rejects_fractional_constant_for_integer_src(self):
+        """Retyping a scalar must not silently truncate a fractional value."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([16, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([16, 16], DataType.INT32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match="non-integral"):
+            tile.sels(mask, src, tmp, -1.5)
+
+    def test_tile_sels_rejects_scalar_dtype_mismatch(self):
+        """A non-constant scalar expression must match the selected source dtype."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([16, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP16), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+        scalar = ir.Var("scalar", ir.ScalarType(DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="scalar dtype"):
+            tile.sels(mask, src, tmp, scalar)
+
+    @pytest.mark.parametrize(
+        "mask_type,error",
+        [
+            (ir.TileType([16, 32], DataType.FP32), "integer mask"),
+            (ir.TileType([32], DataType.UINT8), "rank-2 mask"),
+        ],
+    )
+    def test_tile_sels_rejects_invalid_mask(self, mask_type, error):
+        """TSELS requires a rank-2 packed integer predicate tile."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", mask_type, span)
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.sels(mask, src, tmp, -1.0)
+
+    @pytest.mark.parametrize(
+        "mask_type,error",
+        [
+            (
+                ir.TileType([7, 64], DataType.UINT8),
+                "mask carrier rows",
+            ),
+            (
+                ir.TileType([8, 32], DataType.UINT8),
+                "each mask carrier row",
+            ),
+        ],
+    )
+    def test_tile_sels_rejects_mask_too_small_for_src_valid_shape(self, mask_type, error):
+        """A packed mask must cover every valid source row and column bit."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", mask_type, span)
+        src = ir.Var("src", ir.TileType([8, 257], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.sels(mask, src, tmp, -1.0)
+
+    def test_tile_sels_accepts_provable_dynamic_mask_coverage(self):
+        """Shared symbolic rows and the exact packed-byte expression are provably safe."""
+        span = ir.Span.unknown()
+        valid_rows = ir.Var("valid_rows", ir.ScalarType(DataType.INDEX), span)
+        valid_cols = ir.Var("valid_cols", ir.ScalarType(DataType.INDEX), span)
+        packed_cols = (valid_cols + 7) // 8
+        mask = ir.Var(
+            "mask",
+            ir.TileType(
+                [16, 64],
+                DataType.UINT8,
+                tile_view=ir.TileView(valid_shape=[valid_rows, packed_cols]),
+            ),
+            span,
+        )
+        src = ir.Var(
+            "src",
+            ir.TileType(
+                [16, 512],
+                DataType.FP32,
+                tile_view=ir.TileView(valid_shape=[valid_rows, valid_cols]),
+            ),
+            span,
+        )
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        result = tile.sels(mask, src, tmp, -1.0)
+
+        assert isinstance(result.type, ir.TileType)
+
+    @pytest.mark.parametrize(
+        ("mask_dtype", "physical_cols", "valid_cols", "accepted"),
+        [
+            (DataType.INT16, 32, 16, False),
+            (DataType.INT16, 32, 17, True),
+            (DataType.UINT16, 32, 16, False),
+            (DataType.UINT16, 32, 17, True),
+            (DataType.INT32, 16, 8, False),
+            (DataType.INT32, 16, 9, True),
+            (DataType.UINT32, 16, 8, False),
+            (DataType.UINT32, 16, 9, True),
+        ],
+    )
+    def test_tile_sels_packed_mask_capacity_respects_carrier_width(
+        self, mask_dtype, physical_cols, valid_cols, accepted
+    ):
+        """Packed-mask capacity is measured in bytes for every integer carrier."""
+        span = ir.Span.unknown()
+        mask = ir.Var(
+            "mask",
+            ir.TileType(
+                [2, physical_cols],
+                mask_dtype,
+                tile_view=ir.TileView(valid_shape=[2, valid_cols]),
+            ),
+            span,
+        )
+        src = ir.Var("src", ir.TileType([2, 257], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        if accepted:
+            assert isinstance(tile.sels(mask, src, tmp, -1.0).type, ir.TileType)
+        else:
+            with pytest.raises(ValueError, match="each mask carrier row"):
+                tile.sels(mask, src, tmp, -1.0)
+
+    @pytest.mark.parametrize(
+        ("src_type", "tmp_type", "error"),
+        [
+            (ir.TileType([16, 16], DataType.BF16), ir.TileType([1, 32], DataType.UINT8), "src dtype"),
+            (ir.TileType([256], DataType.FP32), ir.TileType([1, 32], DataType.UINT8), "rank-2 src"),
+            (ir.TileType([16, 16], DataType.FP32), ir.TileType([32], DataType.UINT8), "rank-2 tmp"),
+        ],
+    )
+    def test_tile_sels_rejects_invalid_src_and_tmp_contract(self, src_type, tmp_type, error):
+        """TSELS rejects unsupported source dtypes and non-2D operands."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([16, 32], DataType.UINT8), span)
+        src = ir.Var("src", src_type, span)
+        tmp = ir.Var("tmp", tmp_type, span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.sels(mask, src, tmp, -1.0)
 
     def test_tile_sel(self):
         """Test tile.sel operator - per-element selection between two tiles via mask tile."""
@@ -3988,13 +4734,44 @@ class TestTileScalarOperandDtype:
         call = tile.lrelu(ir.Var("t", ir.TileType([32, 32], DataType.FP32), ir.Span.unknown()), 1)
         assert _operand_dtype(call.args[1]) == DataType.FP32
 
-    def test_sels_mode_stays_int32(self):
-        """tile.sels keeps its select-mode flag at INT32 and never index."""
+    @pytest.mark.parametrize(
+        "dtype,scalar,expected_dtype,expected_value",
+        [
+            (DataType.INT8, -2, DataType.INT8, -2),
+            (DataType.UINT8, 0x82, DataType.INT8, -126),
+            (DataType.INT16, -3, DataType.INT16, -3),
+            (DataType.UINT16, 0x8007, DataType.INT16, -32761),
+            (DataType.INT32, 7, DataType.INT32, 7),
+            (DataType.UINT32, 0x8000000B, DataType.INT32, -2147483637),
+            (DataType.FP16, -0.5, DataType.FP16, -0.5),
+            (DataType.FP32, 1.25, DataType.FP32, 1.25),
+        ],
+    )
+    def test_sels_scalar_adopts_ptoas_dtype(self, dtype, scalar, expected_dtype, expected_value):
+        """tile.sels uses signed bit-compatible scalars for unsigned sources."""
         span = ir.Span.unknown()
-        lhs = ir.Var("a", ir.TileType([32, 32], DataType.FP32), span)
-        rhs = ir.Var("b", ir.TileType([32, 32], DataType.FP32), span)
-        call = tile.sels(lhs, rhs, 1)
-        assert _operand_dtype(call.args[2]) == DataType.INT32
+        mask = ir.Var("mask", ir.TileType([32, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([32, 32], dtype), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+        call = tile.sels(mask, src, tmp, scalar)
+        scalar_arg = call.args[3]
+        assert isinstance(scalar_arg, (ir.ConstInt, ir.ConstFloat))
+        assert _operand_dtype(scalar_arg) == expected_dtype
+        assert scalar_arg.value == expected_value
+
+    def test_sels_unsigned_src_accepts_only_signed_same_width_scalar_expr(self):
+        """PTOAS scalar operands are signed even when the selected tile is unsigned."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([32, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([32, 32], DataType.UINT16), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        call = tile.sels(mask, src, tmp, ir.Var("signed_scalar", ir.ScalarType(DataType.INT16), span))
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.dtype == DataType.UINT16
+
+        with pytest.raises(ValueError, match="requires scalar dtype int16 for src dtype uint16"):
+            tile.sels(mask, src, tmp, ir.Var("unsigned_scalar", ir.ScalarType(DataType.UINT16), span))
 
 
 class TestTileLoadOp:
@@ -4244,7 +5021,7 @@ class TestTileAssembleOp:
         call = tile.assemble(target_var, source_var, [0, 0])
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.assemble"
+        assert call.op.name == ir.get_op("tile.assemble").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP32
@@ -4288,7 +5065,7 @@ class TestTileExtractOp:
         call = tile.extract(src_var, 0, 0, shape=[64, 64], target_memory=ir.MemorySpace.Left)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.extract"
+        assert call.op.name == _OP_TILE_EXTRACT
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP16
@@ -4296,6 +5073,56 @@ class TestTileExtractOp:
         rows, cols = result_type.shape
         assert isinstance(rows, ir.ConstInt) and rows.value == 64
         assert isinstance(cols, ir.ConstInt) and cols.value == 64
+        assert result_type.get_effective_tile_view().compact == ir.CompactMode.null
+
+    @pytest.mark.parametrize(
+        ("source_shape", "source_valid", "extract_shape", "target_memory", "expected_valid"),
+        [
+            ((384, 32), (384, 16), (192, 32), ir.MemorySpace.Right, (192, 16)),
+            ((32, 384), (16, 384), (32, 192), ir.MemorySpace.Left, (16, 192)),
+        ],
+        ids=["right-n-tail", "left-m-tail"],
+    )
+    def test_tile_extract_partial_l0_operand_infers_compact_mode(
+        self, source_shape, source_valid, extract_shape, target_memory, expected_valid
+    ):
+        """Partial Mat->L0 extracts select the valid-aware compact transfer."""
+        span = ir.Span.unknown()
+        src_type = ir.TileType(
+            source_shape,
+            DataType.INT8,
+            tile_view=ir.TileView(valid_shape=source_valid),
+            memory_space=ir.MemorySpace.Mat,
+        )
+        src = ir.Var("src", src_type, span)
+
+        call = tile.extract(src, 0, 0, shape=extract_shape, target_memory=target_memory)
+
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.memory_space == target_memory
+        assert _valid_of(result_type) == list(expected_valid)
+        assert result_type.get_effective_tile_view().compact == ir.CompactMode.normal
+
+    def test_tile_extract_partial_non_l0_destination_stays_noncompact(self):
+        """Compact inference is specific to boxed L0 operand transfers."""
+        span = ir.Span.unknown()
+        src = ir.Var(
+            "src",
+            ir.TileType(
+                [64, 64],
+                DataType.FP32,
+                tile_view=ir.TileView(valid_shape=[64, 32]),
+                memory_space=ir.MemorySpace.Acc,
+            ),
+            span,
+        )
+
+        result_type = tile.extract(src, 0, 0, shape=[32, 64], target_memory=ir.MemorySpace.Mat).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert _valid_of(result_type) == [32, 32]
+        assert result_type.get_effective_tile_view().compact == ir.CompactMode.null
 
     def test_tile_extract_acc_to_mat(self):
         """Acc source → Mat target: src lives in Acc, dtype preserved."""
@@ -4306,7 +5133,7 @@ class TestTileExtractOp:
 
         call = tile.extract(src_var, 0, 0, shape=[32, 32], target_memory=ir.MemorySpace.Mat)
 
-        assert call.op.name == "tile.extract"
+        assert call.op.name == _OP_TILE_EXTRACT
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP32
@@ -4323,7 +5150,7 @@ class TestTileExtractOp:
 
         call = tile.extract(src_var, row, col, shape=[16, 16], target_memory=ir.MemorySpace.Left)
 
-        assert call.op.name == "tile.extract"
+        assert call.op.name == _OP_TILE_EXTRACT
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         rows, cols = result_type.shape
@@ -4406,7 +5233,7 @@ class TestTileScatterUpdateOps:
         )
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.scatter_update"
+        assert call.op.name == ir.get_op("tile.scatter_update").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == dtype
@@ -4477,7 +5304,7 @@ class TestTileMscatterOps:
         call = tile.mscatter(src_var, idx_var, out_var)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.mscatter"
+        assert call.op.name == _OP_TILE_MSCATTER
         result_type = call.type
         assert isinstance(result_type, ir.TensorType)
         assert result_type.dtype == DataType.FP32
@@ -4498,7 +5325,7 @@ class TestTileMscatterOps:
         out_var = ir.Var("out", tensor_type, span)
 
         call = tile.mscatter(src_var, idx_var, out_var)
-        assert call.op.name == "tile.mscatter"
+        assert call.op.name == _OP_TILE_MSCATTER
         result_type = call.type
         assert isinstance(result_type, ir.TensorType)
         assert result_type.dtype == DataType.FP16
@@ -4659,7 +5486,7 @@ class TestTileScatterOps:
         )
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.scatter"
+        assert call.op.name == ir.get_op("tile.scatter").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == dtype
@@ -4815,7 +5642,7 @@ class TestTileScatterMaskOps:
         )
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.scatter_mask"
+        assert call.op.name == ir.get_op("tile.scatter_mask").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         const_dims = [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)]
@@ -4904,7 +5731,7 @@ class TestTileConcatOps:
         call = tile.concat(t0_var, t1_var)
 
         assert isinstance(call, ir.Call)
-        assert call.op.name == "tile.concat"
+        assert call.op.name == ir.get_op("tile.concat").name
         result_type = call.type
         assert isinstance(result_type, ir.TileType)
         assert result_type.dtype == DataType.FP32
@@ -5294,7 +6121,7 @@ class TestWindowReadValidRegion:
 
         # And the DSL rejects the flag itself rather than silently dropping it.
         tile_arg = pl.Tile(expr=src)
-        with pytest.raises(ValueError, match="clamp=True is not supported for a Tile"):
+        with pytest.raises(TypeError, match="clamp=True is not supported for a Tile"):
             pl.slice(tile_arg, [64, 64], [64, 0], clamp=True)
 
     def test_slice_drop_dims_rejected_when_axis_is_not_provably_valid(self):
@@ -5656,6 +6483,66 @@ class TestDestinationSpaceLayoutDeduction:
             assert result_type.memory_space == ir.MemorySpace.Acc, name
             assert self._layout_of(result_type) == acc_nz, name
 
+    def test_matmul_bias_propagates_physical_box_and_logical_valid_shape(self):
+        """Biased matmul follows the same padded-box contract as plain matmul."""
+        lhs = _partial_tile([32, 64], [16, 64], name="lhs")
+        rhs = _partial_tile([64, 32], [64, 16], name="rhs")
+        bias = _partial_tile([1, 32], [1, 16], name="bias")
+
+        result_type = tile.matmul_bias(lhs, rhs, bias).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert all(isinstance(dim, ir.ConstInt) for dim in result_type.shape)
+        assert [cast(ir.ConstInt, dim).value for dim in result_type.shape] == [32, 32]
+        assert _valid_of(result_type) == [16, 16]
+
+    def test_gemv_bias_uses_the_shared_product_geometry_contract(self):
+        """Shared bias geometry preserves GEMV's padded Acc box and valid N."""
+        lhs = _partial_tile([1, 64], [1, 48], name="lhs")
+        rhs = _partial_tile([64, 32], [64, 16], name="rhs")
+        bias = _partial_tile([1, 32], [1, 24], name="bias")
+
+        result_type = tile.gemv_bias(lhs, rhs, bias).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [cast(ir.ConstInt, dim).value for dim in result_type.shape] == [16, 32]
+        assert _valid_of(result_type) == [1, 16]
+
+    def test_matmul_bias_rejects_insufficient_valid_bias_n(self):
+        """Bias must cover every valid output column read by the cube."""
+        lhs = _partial_tile([32, 64], [16, 64], name="lhs")
+        rhs = _partial_tile([64, 32], [64, 24], name="rhs")
+        bias = _partial_tile([1, 32], [1, 16], name="bias")
+
+        with pytest.raises(ValueError, match="bias valid N to cover output valid N"):
+            tile.matmul_bias(lhs, rhs, bias)
+
+    def test_matmul_bias_rejects_empty_valid_bias_row(self):
+        """The cube always reads and broadcasts one logical bias row."""
+        lhs = _partial_tile([32, 64], [16, 64], name="lhs")
+        rhs = _partial_tile([64, 32], [64, 16], name="rhs")
+        bias = _partial_tile([1, 32], [0, 16], name="bias")
+
+        with pytest.raises(ValueError, match="bias valid rows to cover one broadcast row"):
+            tile.matmul_bias(lhs, rhs, bias)
+
+    def test_matmul_bias_requires_accumulator_dtype_bias(self):
+        """TMATMUL_BIAS requires FP32/INT32 bias to match its Acc output."""
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([16, 64], DataType.BF16), span)
+        rhs = ir.Var("rhs", ir.TileType([64, 32], DataType.BF16), span)
+        bias = ir.Var("bias", ir.TileType([1, 32], DataType.BF16), span)
+
+        with pytest.raises(ValueError, match="requires bias dtype fp32"):
+            tile.matmul_bias(lhs, rhs, bias)
+
+        int_lhs = ir.Var("int_lhs", ir.TileType([16, 64], DataType.INT8), span)
+        int_rhs = ir.Var("int_rhs", ir.TileType([64, 32], DataType.INT8), span)
+        int_bias = ir.Var("int_bias", ir.TileType([1, 32], DataType.INT32), span)
+        result_type = tile.matmul_bias(int_lhs, int_rhs, int_bias).type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.dtype == DataType.INT32
+
 
 class TestWriteValidRegionUnion:
     """The valid-region union rule shared by tile.assemble and tile.store.
@@ -5931,6 +6818,687 @@ class TestWriteValidRegionUnion:
 
         assert isinstance(result_type, ir.TensorType)
         assert result_type.tensor_view is None
+
+
+class TestB03TriAndGatherOps:
+    """IR contracts for TTRI, TGATHERB, and MGATHER."""
+
+    @staticmethod
+    def _tile(name, shape, dtype, valid_shape=None):
+        span = ir.Span.unknown()
+        view = None if valid_shape is None else ir.TileView(valid_shape=valid_shape)
+        return ir.Var(name, ir.TileType(shape, dtype, tile_view=view), span)
+
+    @staticmethod
+    def _assert_program_round_trip(program):
+        printed = str(program)
+        reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(program, reparsed)
+        return printed
+
+    def test_tri_preserves_physical_and_partial_valid_shape(self):
+        call = tile.tri(1, [16, 32], valid_shape=[9, 21], dtype=DataType.FP16, upper=True)
+
+        assert call.op.name == ir.get_op("tile.tri").name
+        assert dict(call.kwargs) == {"dtype": DataType.FP16, "upper": True}
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 32]
+        assert _valid_of(result_type) == [9, 21]
+        assert result_type.dtype == DataType.FP16
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            DataType.INT16,
+            DataType.INT32,
+            DataType.UINT16,
+            DataType.UINT32,
+            DataType.FP16,
+            DataType.FP32,
+        ],
+    )
+    def test_tri_supported_dtypes(self, dtype):
+        assert _tile_result_dtype(tile.tri(0, [8, 16], dtype=dtype)) == dtype
+
+    def test_tri_rejects_invalid_valid_shape(self):
+        with pytest.raises(ValueError, match="valid_shape"):
+            tile.tri(0, [8, 16], valid_shape=[9, 16])
+
+    def test_tri_print_parse_round_trip(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                out: pl.Tensor[[16, 32], pl.FP16],
+            ) -> pl.Tensor[[16, 32], pl.FP16]:
+                result = pl.tile.tri(
+                    1,
+                    [16, 32],
+                    valid_shape=[9, 21],
+                    dtype=pl.FP16,
+                    upper=True,
+                )
+                return pl.store(result, [0, 0], out)
+
+        printed = self._assert_program_round_trip(Prog)
+        assert "valid_shape=[9, 21]" in printed
+        assert "upper=True" in printed
+
+    def test_tri_rejects_invalid_scalar_shape_and_dtype_contracts(self):
+        span = ir.Span.unknown()
+        fp_diagonal = ir.Var("diagonal", ir.ScalarType(DataType.FP32), span)
+        dynamic_dim = ir.Var("dynamic_dim", ir.ScalarType(DataType.INDEX), span)
+
+        with pytest.raises(ValueError, match="INT32 scalar"):
+            tile.tri(fp_diagonal, [8, 16])
+        with pytest.raises(ValueError, match="requires a 2D shape"):
+            tile.tri(0, [16])
+        with pytest.raises(ValueError, match="compile-time constant"):
+            tile.tri(0, [dynamic_dim, 16])
+        with pytest.raises(ValueError, match="must be positive"):
+            tile.tri(0, [0, 16])
+        with pytest.raises(ValueError, match="requires dtype"):
+            tile.tri(0, [8, 16], dtype=DataType.BOOL)
+        with pytest.raises(ValueError, match="valid_shape rank"):
+            tile.tri(0, [8, 16], valid_shape=[8])
+        with pytest.raises(ValueError, match=r"0 < valid_shape\[0\]"):
+            tile.tri(0, [8, 16], valid_shape=[0, 16])
+
+    def test_gatherb_expands_block_offsets_to_output_elements(self):
+        src = self._tile("src", [16, 64], DataType.FP16, [16, 64])
+        offset = self._tile("offset", [8, 16], DataType.UINT32, [5, 9])
+
+        call = tile.gatherb(src, offset)
+
+        assert call.op.name == ir.get_op("tile.gatherb").name
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 256]
+        assert _valid_of(result_type) == [5, 144]
+        assert result_type.dtype == DataType.FP16
+
+    def test_gatherb_supports_distinct_output_dtype(self):
+        src = self._tile("src", [16, 64], DataType.FP16, [16, 64])
+        offset = self._tile("offset", [8, 16], DataType.UINT32, [5, 9])
+
+        result_type = tile.gatherb(src, offset, output_dtype=DataType.FP32).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 128]
+        assert _valid_of(result_type) == [5, 72]
+        assert result_type.dtype == DataType.FP32
+
+    def test_gatherb_scales_symbolic_valid_columns(self):
+        span = ir.Span.unknown()
+        valid_cols = ir.Var("valid_cols", ir.ScalarType(DataType.INDEX), span)
+        src = self._tile("src", [16, 64], DataType.FP16, [16, 64])
+        offset_type = ir.TileType(
+            [8, 16],
+            DataType.UINT32,
+            tile_view=ir.TileView(valid_shape=[5, valid_cols]),
+        )
+        offset = ir.Var("offset", offset_type, span)
+
+        result_type = tile.gatherb(src, offset).type
+
+        assert isinstance(result_type, ir.TileType)
+        valid_shape = result_type.get_effective_tile_view().valid_shape
+        assert isinstance(valid_shape[1], ir.Mul)
+        assert valid_shape[1].left is valid_cols
+        assert isinstance(valid_shape[1].right, ir.ConstInt)
+        assert valid_shape[1].right.value == 16
+
+    def test_gatherb_rejects_non_uint32_offsets(self):
+        src = self._tile("src", [8, 16], DataType.FP16)
+        offset = self._tile("offset", [8, 16], DataType.INT32)
+        with pytest.raises(ValueError, match="UINT32"):
+            tile.gatherb(src, offset)
+
+    def test_gatherb_rejects_unaligned_offset_rows(self):
+        src = self._tile("src", [8, 16], DataType.FP16)
+        offset = self._tile("offset", [8, 7], DataType.UINT32)
+        with pytest.raises(ValueError, match="multiple of 8"):
+            tile.gatherb(src, offset)
+
+    def test_gatherb_print_parse_round_trip(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 64], pl.FP16],
+                offsets: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 64], pl.FP32],
+            ) -> pl.Tensor[[8, 64], pl.FP32]:
+                src_tile = pl.load(src, [0, 0], [16, 64])
+                offset_tile = pl.load(offsets, [0, 0], [8, 8], valid_shape=[5, 5])
+                gathered = pl.tile.gatherb(src_tile, offset_tile, output_dtype=pl.FP32)
+                return pl.store(gathered, [0, 0], out)
+
+        printed = self._assert_program_round_trip(Prog)
+        assert "output_dtype=pl.FP32" in printed
+
+    def test_gatherb_rejects_invalid_dtype_rank_and_static_shape_contracts(self):
+        span = ir.Span.unknown()
+        dynamic_cols = ir.Var("dynamic_cols", ir.ScalarType(DataType.INDEX), span)
+        valid_src = self._tile("src", [8, 16], DataType.FP16)
+        valid_offset = self._tile("offset", [8, 8], DataType.UINT32)
+
+        with pytest.raises(ValueError, match="src dtype"):
+            tile.gatherb(self._tile("src", [8, 16], DataType.BOOL), valid_offset)
+        with pytest.raises(ValueError, match="output_dtype"):
+            tile.gatherb(valid_src, valid_offset, output_dtype=DataType.BOOL)
+        with pytest.raises(ValueError, match="2D src"):
+            tile.gatherb(self._tile("src", [128], DataType.FP16), valid_offset)
+        with pytest.raises(ValueError, match="2D offset"):
+            tile.gatherb(valid_src, self._tile("offset", [64], DataType.UINT32))
+        dynamic_offset = ir.Var(
+            "dynamic_offset",
+            ir.TileType([ir.ConstInt(8, DataType.INDEX, span), dynamic_cols], DataType.UINT32),
+            span,
+        )
+        with pytest.raises(ValueError, match="static offset columns"):
+            tile.gatherb(valid_src, dynamic_offset)
+        with pytest.raises(ValueError, match="positive multiple of 8"):
+            tile.gatherb(valid_src, self._tile("offset", [8, 0], DataType.UINT32))
+
+    def test_mgather_row_mode_shapes_from_index_and_table(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.BF16), span)
+        idx = self._tile("idx", [1, 16], DataType.INT32, [1, 9])
+
+        call = tile.mgather(mem, idx)
+
+        assert call.op.name == ir.get_op("tile.mgather").name
+        assert dict(call.kwargs) == {"coalesce": 0}
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 32]
+        assert _valid_of(result_type) == [9, 32]
+        assert result_type.dtype == DataType.BF16
+
+    def test_mgather_elem_mode_preserves_index_region(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([256], DataType.INT16), span)
+        idx = self._tile("idx", [8, 32], DataType.INT32, [5, 19])
+
+        call = tile.mgather(mem, idx, coalesce="elem")
+
+        assert dict(call.kwargs) == {"coalesce": 1}
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 32]
+        assert _valid_of(result_type) == [5, 19]
+
+    def test_mgather_mat_row_uses_gm_index_and_nz_result(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+
+        call = tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+        assert dict(call.kwargs) == {
+            "coalesce": 0,
+            "target_memory": ir.MemorySpace.Mat,
+        }
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 32]
+        view = result_type.get_effective_tile_view()
+        assert view.blayout == ir.TileLayout.col_major
+        assert view.slayout == ir.TileLayout.row_major
+
+    @pytest.mark.parametrize("coalesce", ["row", "elem"])
+    def test_mgather_mat_preserves_explicit_valid_shape(self, coalesce):
+        span = ir.Span.unknown()
+        mem_shape = [64, 32] if coalesce == "row" else [512]
+        mem = ir.Var("mem", ir.TensorType(mem_shape, DataType.FP16), span)
+        idx_shape = [1, 16] if coalesce == "row" else [16, 32]
+        idx = ir.Var("idx", ir.TensorType(idx_shape, DataType.INT32), span)
+        scratch = ir.Var("scratch", ir.TensorType([512], DataType.FP16), span) if coalesce == "elem" else None
+
+        result_type = tile.mgather(
+            mem,
+            idx,
+            coalesce=coalesce,
+            target_memory=ir.MemorySpace.Mat,
+            scratch=scratch,
+            valid_shape=[9, 21],
+        ).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 32]
+        assert _valid_of(result_type) == [9, 21]
+
+    def test_mgather_mat_row_valid_shape_round_trips(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP16],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered = pl.tile.mgather(
+                    mem,
+                    idx,
+                    target_memory=pl.MemorySpace.Mat,
+                    valid_shape=[9, 21],
+                )
+                eye_tile = pl.load(
+                    eye, [0, 0], [16, 16], valid_shape=[16, 9], target_memory=pl.MemorySpace.Mat
+                )
+                product = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        printed = self._assert_program_round_trip(Prog)
+        assert "valid_shape=[9, 21]" in printed
+
+    def test_mgather_mat_elem_scratch_round_trips(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[512], pl.FP16],
+                idx: pl.Tensor[[16, 32], pl.INT32],
+                scratch: pl.Tensor[[512], pl.FP16],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                eye_tile = pl.load(
+                    eye, [0, 0], [16, 16], valid_shape=[16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        printed = self._assert_program_round_trip(Prog)
+        assert "scratch=scratch" in printed
+
+    def test_mgather_mat_elem_scratch_and_valid_shape_round_trip(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[512], pl.FP16],
+                idx: pl.Tensor[[16, 32], pl.INT32],
+                scratch: pl.Tensor[[512], pl.FP16],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                    valid_shape=[9, 21],
+                )
+                eye_tile = pl.load(
+                    eye, [0, 0], [16, 16], valid_shape=[16, 9], target_memory=pl.MemorySpace.Mat
+                )
+                product = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        printed = self._assert_program_round_trip(Prog)
+        assert "scratch=scratch" in printed
+        assert "valid_shape=[9, 21]" in printed
+
+    def test_mgather_mat_rejects_invalid_valid_shape(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="valid_shape must have rank 2"):
+            tile.mgather(
+                mem,
+                idx,
+                target_memory=ir.MemorySpace.Mat,
+                valid_shape=[9],
+            )
+        with pytest.raises(ValueError, match=r"0 < Mat valid_shape\[1\]"):
+            tile.mgather(
+                mem,
+                idx,
+                target_memory=ir.MemorySpace.Mat,
+                valid_shape=[9, 33],
+            )
+
+    def test_mgather_mat_rejects_non_nd_source(self):
+        span = ir.Span.unknown()
+        dn_view = ir.TensorView(stride=[], layout=ir.TensorLayout.DN)
+        mem = ir.Var(
+            "mem",
+            ir.TensorType([64, 32], DataType.FP16, tensor_view=dn_view),
+            span,
+        )
+        idx = ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="requires mem to use ND tensor layout"):
+            tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP16), span)
+        idx = ir.Var(
+            "idx",
+            ir.TensorType([1, 16], DataType.INT32, tensor_view=dn_view),
+            span,
+        )
+        with pytest.raises(ValueError, match="requires idx to use ND tensor layout"):
+            tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+    def test_mgather_mat_elem_requires_matching_gm_scratch(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([256], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([16, 16], DataType.INT32), span)
+        scratch = ir.Var("scratch", ir.TensorType([256], DataType.FP16), span)
+
+        result_type = tile.mgather(
+            mem,
+            idx,
+            coalesce="elem",
+            target_memory=ir.MemorySpace.Mat,
+            scratch=scratch,
+        ).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 16]
+        with pytest.raises(ValueError, match="requires GM scratch"):
+            tile.mgather(mem, idx, coalesce="elem", target_memory=ir.MemorySpace.Mat)
+
+        wrong_scratch = ir.Var("wrong", ir.TensorType([256], DataType.INT32), span)
+        with pytest.raises(ValueError, match="dtype must match"):
+            tile.mgather(
+                mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=wrong_scratch,
+            )
+
+        short_scratch = ir.Var("short", ir.TensorType([255], DataType.FP16), span)
+        with pytest.raises(ValueError, match="at least 256 elements"):
+            tile.mgather(
+                mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=short_scratch,
+            )
+
+        noncontiguous_view = ir.TensorView(stride=[32, 1], layout=ir.TensorLayout.ND)
+        noncontiguous_scratch = ir.Var(
+            "noncontiguous",
+            ir.TensorType([16, 16], DataType.FP16, tensor_view=noncontiguous_view),
+            span,
+        )
+        with pytest.raises(ValueError, match="contiguous ND"):
+            tile.mgather(
+                mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=noncontiguous_scratch,
+            )
+
+        singleton_view = ir.TensorView(stride=[512, 1], layout=ir.TensorLayout.ND)
+        singleton_scratch = ir.Var(
+            "singleton",
+            ir.TensorType([1, 256], DataType.FP16, tensor_view=singleton_view),
+            span,
+        )
+        singleton_result = tile.mgather(
+            mem,
+            idx,
+            coalesce="elem",
+            target_memory=ir.MemorySpace.Mat,
+            scratch=singleton_scratch,
+        )
+        assert isinstance(singleton_result.type, ir.TileType)
+
+    def test_mgather_mat_elem_rejects_direct_scratch_aliases(self):
+        span = ir.Span.unknown()
+        fp_mem = ir.Var("fp_mem", ir.TensorType([256], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([16, 16], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="must not alias mem or idx"):
+            tile.mgather(
+                fp_mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=fp_mem,
+            )
+
+        int_mem = ir.Var("int_mem", ir.TensorType([256], DataType.INT32), span)
+        with pytest.raises(ValueError, match="must not alias mem or idx"):
+            tile.mgather(
+                int_mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=idx,
+            )
+
+    def test_mgather_rejects_scratch_outside_mat_elem(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP16), span)
+        vec_idx = self._tile("vec_idx", [1, 16], DataType.INT32)
+        mat_idx = ir.Var("mat_idx", ir.TensorType([1, 16], DataType.INT32), span)
+        scratch = ir.Var("scratch", ir.TensorType([512], DataType.FP16), span)
+
+        with pytest.raises(ValueError, match="permits scratch only for Mat elem mode"):
+            tile.mgather(mem, vec_idx, scratch=scratch)
+        with pytest.raises(ValueError, match="Mat row mode accepts only an optional valid_shape"):
+            tile.mgather(
+                mem,
+                mat_idx,
+                target_memory=ir.MemorySpace.Mat,
+                scratch=scratch,
+                valid_shape=[16, 32],
+            )
+
+    def test_mgather_mat_rejects_non_nz_aligned_result(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 17], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([1, 15], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="rows must be a multiple of 16"):
+            tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+        idx = ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+        with pytest.raises(ValueError, match="cols must be a multiple of 16"):
+            tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+    def test_mgather_memory_space_selects_index_contract(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx_tile = self._tile("idx_tile", [1, 16], DataType.INT32)
+        idx_tensor = ir.Var("idx_tensor", ir.TensorType([1, 16], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="GM TensorType"):
+            tile.mgather(mem, idx_tile, target_memory=ir.MemorySpace.Mat)
+        with pytest.raises(ValueError, match="TileType"):
+            tile.mgather(mem, idx_tensor)
+
+    def test_mgather_rejects_invalid_index_ranks_and_row_orientations(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="requires a 2D idx tile"):
+            tile.mgather(mem, self._tile("vec_rank3", [1, 1, 16], DataType.INT32))
+        with pytest.raises(ValueError, match=r"requires a \[1, R\] or \[R, 1\] idx shape"):
+            tile.mgather(mem, self._tile("vec_matrix", [2, 8], DataType.INT32))
+
+        mat_rank3 = ir.Var("mat_rank3", ir.TensorType([1, 1, 16], DataType.INT32), span)
+        with pytest.raises(ValueError, match="requires a 2D Mat idx tensor"):
+            tile.mgather(mem, mat_rank3, target_memory=ir.MemorySpace.Mat)
+        mat_column = ir.Var("mat_column", ir.TensorType([16, 1], DataType.INT32), span)
+        with pytest.raises(ValueError, match=r"requires a \[1, R\] GM idx tensor"):
+            tile.mgather(mem, mat_column, target_memory=ir.MemorySpace.Mat)
+
+    def test_mgather_mat_elem_rejects_non_gm_or_dynamic_scratch(self):
+        span = ir.Span.unknown()
+        dynamic_dim = ir.Var("dynamic_dim", ir.ScalarType(DataType.INDEX), span)
+        mem = ir.Var("mem", ir.TensorType([512], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([16, 32], DataType.INT32), span)
+
+        tile_scratch = self._tile("tile_scratch", [16, 32], DataType.FP16)
+        with pytest.raises(ValueError, match="scratch must be a GM tensor"):
+            tile.mgather(
+                mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=tile_scratch,
+            )
+
+        dynamic_scratch = ir.Var("dynamic_scratch", ir.TensorType([dynamic_dim], DataType.FP16), span)
+        with pytest.raises(ValueError, match="scratch shape must be static"):
+            tile.mgather(
+                mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=dynamic_scratch,
+            )
+
+    @pytest.mark.parametrize("target_memory", [ir.MemorySpace.Vec, ir.MemorySpace.Mat])
+    def test_mgather_rejects_uint32_index_for_pinned_ptoas(self, target_memory):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = (
+            self._tile("idx", [1, 16], DataType.UINT32)
+            if target_memory == ir.MemorySpace.Vec
+            else ir.Var("idx", ir.TensorType([1, 16], DataType.UINT32), span)
+        )
+
+        with pytest.raises(ValueError, match="INT32"):
+            tile.mgather(mem, idx, target_memory=target_memory)
+
+    def test_mgather_row_rejects_rank_one_mem(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([256], DataType.INT16), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        with pytest.raises(ValueError, match="mem rank >= 2"):
+            tile.mgather(mem, idx, coalesce="row")
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            DataType.INT8,
+            DataType.UINT8,
+            DataType.INT16,
+            DataType.UINT16,
+            DataType.INT32,
+            DataType.UINT32,
+            DataType.FP16,
+            DataType.BF16,
+            DataType.FP32,
+            DataType.FP8E4M3FN,
+            DataType.FP8E5M2,
+            DataType.HF8,
+        ],
+    )
+    @pytest.mark.parametrize("target_memory", [ir.MemorySpace.Vec, ir.MemorySpace.Mat])
+    def test_mgather_supported_payload_dtypes(self, dtype, target_memory):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], dtype), span)
+        idx = (
+            self._tile("idx", [1, 16], DataType.INT32)
+            if target_memory == ir.MemorySpace.Vec
+            else ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+        )
+
+        assert _tile_result_dtype(tile.mgather(mem, idx, target_memory=target_memory)) == dtype
+
+    def test_mgather_row_accepts_a5_column_vector_index(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [8, 1], DataType.INT32, [5, 1])
+
+        result_type = tile.mgather(mem, idx).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 32]
+        assert _valid_of(result_type) == [5, 32]
+
+    @pytest.mark.parametrize(("coalesce", "expected"), [(0, 0), (1, 1)])
+    def test_mgather_accepts_printed_integer_coalesce(self, coalesce, expected):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        call = tile.mgather(mem, idx, coalesce=coalesce)
+
+        assert dict(call.kwargs) == {"coalesce": expected}
+
+    def test_mgather_rejects_invalid_coalesce(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+        with pytest.raises(ValueError, match="coalesce"):
+            tile.mgather(mem, idx, coalesce="invalid")
+        with pytest.raises(ValueError, match="coalesce"):
+            tile.mgather(mem, idx, coalesce=2)
+        with pytest.raises(ValueError, match="coalesce"):
+            tile.mgather(mem, idx, coalesce=True)
+
+    @pytest.mark.parametrize(("gather_oob", "expected"), [("clamp", 1), ("wrap", 2), ("zero", 3), (2, 2)])
+    def test_mgather_accepts_out_of_bounds_modes(self, gather_oob, expected):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        call = tile.mgather(mem, idx, gather_oob=gather_oob)
+
+        assert dict(call.kwargs) == {"coalesce": 0, "gather_oob": expected}
+
+    @pytest.mark.parametrize("gather_oob", ["invalid", 4, True])
+    def test_mgather_rejects_invalid_out_of_bounds_mode(self, gather_oob):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        with pytest.raises(ValueError, match="gather_oob"):
+            tile.mgather(mem, idx, gather_oob=gather_oob)
+
+    def test_mgather_rejects_dynamic_physical_shapes_required_to_be_static(self):
+        span = ir.Span.unknown()
+        dynamic_dim = ir.Var("dynamic_dim", ir.ScalarType(DataType.INDEX), span)
+        one = ir.ConstInt(1, DataType.INDEX, span)
+        thirty_two = ir.ConstInt(32, DataType.INDEX, span)
+        row_mem = ir.Var("row_mem", ir.TensorType([64, 32], DataType.FP16), span)
+        vec_idx = ir.Var("vec_idx", ir.TileType([one, dynamic_dim], DataType.INT32), span)
+        mat_row_idx = ir.Var("mat_row_idx", ir.TensorType([one, dynamic_dim], DataType.INT32), span)
+        elem_mem = ir.Var("elem_mem", ir.TensorType([512], DataType.FP16), span)
+        mat_elem_idx = ir.Var("mat_elem_idx", ir.TensorType([dynamic_dim, thirty_two], DataType.INT32), span)
+        scratch = ir.Var("scratch", ir.TensorType([512], DataType.FP16), span)
+
+        with pytest.raises(ValueError, match=r"static \[1, R\] or \[R, 1\]"):
+            tile.mgather(row_mem, vec_idx)
+        with pytest.raises(ValueError, match="Mat output shape must be static"):
+            tile.mgather(row_mem, mat_row_idx, target_memory=ir.MemorySpace.Mat)
+        with pytest.raises(ValueError, match="Mat elem output shape must be static"):
+            tile.mgather(
+                elem_mem,
+                mat_elem_idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=scratch,
+            )
 
 
 if __name__ == "__main__":

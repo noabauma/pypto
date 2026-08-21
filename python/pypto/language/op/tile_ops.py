@@ -17,7 +17,7 @@ Accessed as ``pl.tile.*``
 
 import warnings
 from collections.abc import Sequence
-from typing import Any, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 __all__ = [
     "MemRefType",
@@ -39,6 +39,7 @@ __all__ = [
     "full",
     "ci",
     "arange",
+    "tri",
     "random",
     "fillpad",
     "fillpad_inplace",
@@ -70,6 +71,9 @@ __all__ = [
     "matmul_acc",
     "batch_matmul_acc",
     "matmul_bias",
+    "matmul_mx",
+    "matmul_mx_acc",
+    "matmul_mx_bias",
     "gemv",
     "gemv_acc",
     "gemv_bias",
@@ -149,17 +153,24 @@ __all__ = [
     "tpop_from_aiv",
     "sort32",
     "gather",
+    "gatherb",
     "gather_mask",
     "gather_compare",
     "scatter",
     "scatter_mask",
     "mscatter",
+    "mgather",
     "MaskPattern",
     "mrgsort",
 ]
 
 from pypto.ir.op import tile_ops as _ir_ops
-from pypto.ir.utils import _get_span_or_capture, _normalize_expr, has_partial_valid_region
+from pypto.ir.utils import (
+    _get_span_or_capture,
+    _normalize_expr,
+    caller_warning_stacklevel,
+    has_partial_valid_region,
+)
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
@@ -172,7 +183,7 @@ from pypto.pypto_core.ir import (
     TileLayout,
 )
 
-from ..typing import IntLike, Scalar, Tensor, Tile
+from ..typing import BoolLike, IntLike, Scalar, Tensor, Tile, predicate_to_expr
 from .system_ops import (  # noqa: F401
     tpop_from_aic,
     tpop_from_aiv,
@@ -205,7 +216,7 @@ class MemRefType:
     the text-parser can ``exec()``.
 
     Note: this is *not* the type of a ``tile.alloc`` / ``tensor.alloc`` result —
-    those produce a base ``Ptr`` (``PtrType``); see :func:`alloc`.
+    those produce a base ``Ptr`` (``PtrType``); see [`alloc`][pypto.language.tile.alloc].
     """
 
 
@@ -245,8 +256,8 @@ def alloc(
         memory_space: Target memory space (e.g. ``pl.Mem.Vec``)
         size: Allocation size in bytes
         pinned: True when the author declared this allocation via a
-            one-argument ``pl.MemRef(...)``. ``MemoryReuse`` then leaves its
-            membership untouched instead of packing other tiles into it.
+            one-argument ``pl.MemRef(...)``. PyPTO memory planners then keep
+            its membership isolated from other allocations.
 
     Returns:
         Opaque ``PtrType`` sentinel (unused at runtime)
@@ -491,7 +502,7 @@ def gather_row(  # noqa: PLR0913
     slot itself, so arbitrary gather logic stays in the kernel. Writes ``dst``
     in place, so a loop-carried accumulator is filled row by row and feeds
     ``pl.matmul`` directly — the tile-level counterpart of
-    :func:`pypto.language.op.tensor_ops.gather_row`.
+    ``pypto.language.op.tensor_ops.gather_row``.
 
     Args:
         dst: Destination on-chip accumulator tile (Mat/L1 or Vec/UB).
@@ -619,7 +630,13 @@ def move(
 
 
 def aiv_shard(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
-    """Shard a 2D operand into half along the split axis (full -> half).
+    """Bring a cube-produced operand onto the AIV lane (AIC -> AIV crossing).
+
+    In a data-parallel region (``UP_DOWN`` / ``LEFT_RIGHT``) the crossing also
+    **halves** the operand along the split axis, so each lane gets one half; in a
+    task-parallel ``mode=NONE`` region there is no split axis, so it crosses and
+    **preserves the shape**. Either way, writing it is how a C->V crossing into a
+    region is named — the ``AivSplitValid`` verifier rejects an unnamed one.
 
     The split mode is **inherited** from the enclosing
     ``for aiv_id in pl.split_aiv(mode=...)`` scope — it is not passed here.
@@ -638,7 +655,8 @@ def aiv_shard(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
         span: Optional source span
 
     Returns:
-        Operand of the same kind with the split axis halved.
+        Operand of the same kind: the split axis halved in a data-parallel region,
+        the shape unchanged in a ``mode=NONE`` one.
     """
     raise RuntimeError(
         "pl.aiv_shard must be used inside a 'for aiv_id in pl.split_aiv(...)' "
@@ -647,9 +665,21 @@ def aiv_shard(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
 
 
 def aic_gather(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
-    """Gather a 2D operand into full along the split axis (half -> full).
+    """Hand a vector-produced operand to the cube (AIV -> AIC crossing).
 
-    Inverse of :func:`aiv_shard`. Like :func:`aiv_shard`, the split mode is
+    Inverse of [`aiv_shard`][pypto.language.tile.aiv_shard]: in a data-parallel region it **rejoins** the two
+    lanes' halves along the split axis, and in a task-parallel ``mode=NONE`` region
+    it crosses and **preserves the shape**. It is how a V->C crossing out of a
+    region is named; an unnamed one is rejected by the ``AivSplitValid`` verifier.
+
+    Out of a ``mode=NONE`` region the two lanes share one destination slot with no
+    per-lane offset and nothing arbitrates between them: both push, so when they
+    hold different values the cube receives an **unspecified** one of the two.
+    Guarding the *production* of the value does not help — lane 1 still reaches
+    the push and still sends its own tile. Gather only a value both lanes agree
+    on; if they must contribute different data, use a data-parallel region.
+
+    Like [`aiv_shard`][pypto.language.tile.aiv_shard], the split mode is
     **inherited** from the enclosing ``for aiv_id in pl.split_aiv(mode=...)``
     scope and must not be passed here. Calling it eagerly (outside a parsed
     program) raises, since there is no scope to read the mode from.
@@ -664,7 +694,8 @@ def aic_gather(x: _SplitOperandT, span: Span | None = None) -> _SplitOperandT:
         span: Optional source span
 
     Returns:
-        Operand of the same kind with the split axis doubled.
+        Operand of the same kind: the split axis doubled in a data-parallel region,
+        the shape unchanged in a ``mode=NONE`` one.
     """
     raise RuntimeError(
         "pl.aic_gather must be used inside a 'for aiv_id in pl.split_aiv(...)' "
@@ -714,6 +745,44 @@ def ci(
 arange = ci
 
 
+def tri(
+    diagonal: int | Scalar,
+    shape: Sequence[int],
+    valid_shape: Sequence[int] | None = None,
+    dtype: DataType = DataType.INT32,
+    upper: bool = False,
+) -> Tile:
+    """Generate a lower- or upper-triangular mask tile.
+
+    ``upper=False`` writes one where ``j <= i + diagonal``; ``upper=True``
+    writes one where ``j >= i + diagonal``. Only the optional valid region is
+    written.
+
+    Args:
+        diagonal: Offset of the boundary from the main diagonal, in columns.
+            0 includes the diagonal; positive shifts it right, negative left.
+            May be a runtime ``Scalar``.
+        shape: Shape of the destination tile (static).
+        valid_shape: Optional written region (each dim ``<= shape``). Elements
+            outside it are not written, so their value is whatever the freshly
+            allocated tile holds. Defaults to the full shape.
+        dtype: Destination dtype. Defaults to ``INT32``.
+        upper: Select the upper triangle instead of the lower.
+
+    Returns:
+        A tile holding 1 inside the selected triangle and 0 outside it.
+    """
+    diagonal_expr = diagonal.unwrap() if isinstance(diagonal, Scalar) else diagonal
+    call_expr = _ir_ops.tri(
+        diagonal_expr,
+        list(shape),
+        valid_shape=list(valid_shape) if valid_shape is not None else None,
+        dtype=dtype,
+        upper=upper,
+    )
+    return Tile(expr=call_expr)
+
+
 def random(
     key0: int | Scalar,
     key1: int | Scalar,
@@ -734,8 +803,12 @@ def random(
     reproduce the same tile. Maps to ``pto.trandom``.
 
     Args:
-        key0, key1: The two INT32 key words (plain ints or Scalars).
-        counter0, counter1, counter2, counter3: The four INT32 counter words.
+        key0: Low INT32 key word (plain int or Scalar).
+        key1: High INT32 key word (plain int or Scalar).
+        counter0: First INT32 counter word.
+        counter1: Second INT32 counter word.
+        counter2: Third INT32 counter word.
+        counter3: Fourth INT32 counter word.
         shape: Shape of the destination tile (static).
         valid_shape: Optional written region (each dim ``<= shape``); ``pto.trandom``
             only fills the valid rows/cols. Defaults to the full shape.
@@ -795,7 +868,7 @@ def fillpad_expand(
 ) -> Tile:
     """Copy a smaller source tile into a larger destination tile, padding the rest.
 
-    Unlike :func:`fillpad` (which keeps the same physical shape and only fills the
+    Unlike [`fillpad`][pypto.language.tile.fillpad] (which keeps the same physical shape and only fills the
     valid-region expansion), this op produces a *larger* output tile: the source's
     valid region is copied to the top-left and every other element is filled with
     ``pad_value``. Equivalent to TFILLPAD_EXPAND on the hardware.
@@ -1063,16 +1136,17 @@ def rsqrt(tile: Tile, tmp: Tile | None = None) -> Tile:
     return Tile(expr=call_expr)
 
 
-def recip(tile: Tile) -> Tile:
+def recip(tile: Tile, high_precision: bool = False) -> Tile:
     """Element-wise reciprocal.
 
     Args:
         tile: Input tile
+        high_precision: Whether to select PTOAS's high-precision reciprocal mode (FP16/FP32 only)
 
     Returns:
         Tile wrapping the recip operation
     """
-    call_expr = _ir_ops.recip(tile.unwrap())
+    call_expr = _ir_ops.recip(tile.unwrap(), high_precision=high_precision)
     return Tile(expr=call_expr)
 
 
@@ -1164,18 +1238,33 @@ def batch_matmul(lhs: Tile, rhs: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile) -> Tile:
+def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = None) -> Tile:
     """Matrix multiplication with accumulation: acc += lhs @ rhs.
+
+    ``init_cond`` makes the accumulator's initial value conditional: on the steps
+    where it holds, ``acc`` is overwritten with ``lhs @ rhs`` rather than
+    accumulated into. This is the split-K idiom, and it removes the need to zero
+    the accumulator or to peel the first K step::
+
+        for k0 in pl.pipeline(0, K, K_TILE):
+            acc_t = pl.tile.slice(acc, [ROW_TILE, N], [t0, 0])
+            pl.tile.matmul_acc(acc_t, a, b, init_cond=(k0 == 0))
+
+    A literal ``True`` / ``False`` selects one form at compile time; a runtime
+    predicate lowers to a branch over the two, with no phi on the accumulator.
 
     Args:
         acc: Accumulator tile
         lhs: Left-hand side tile
         rhs: Right-hand side tile
+        init_cond: Optional predicate selecting overwrite over accumulate
 
     Returns:
         Tile wrapping the matmul_acc operation
     """
-    call_expr = _ir_ops.matmul_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap())
+    call_expr = _ir_ops.matmul_acc(
+        acc.unwrap(), lhs.unwrap(), rhs.unwrap(), init_cond=predicate_to_expr(init_cond)
+    )
     return Tile(expr=call_expr)
 
 
@@ -1204,7 +1293,8 @@ def matmul_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
     Args:
         lhs: Left-hand side tile [M, K]
         rhs: Right-hand side tile [K, N]
-        bias: Bias tile [1, N]
+        bias: Bias tile [1, N] with the accumulator dtype (FP32 for
+            floating-point matrix operands, INT32 for integer matrix operands)
 
     Returns:
         Tile wrapping the matmul_bias operation
@@ -1213,47 +1303,126 @@ def matmul_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def gemv(lhs: Tile, rhs: Tile) -> Tile:
+def matmul_mx(lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile) -> Tile:
+    """MX block-scale matrix multiplication.
+
+    Both data tiles passed to this operation must be FP8E4M3FN. For the
+    supported FP4 x FP8 input form, explicitly cast the FP4 lhs to FP8E4M3FN
+    before calling this operation; native FP4 x FP4 is not supported.
+
+    Args:
+        lhs: Left-hand side data tile (FP8E4M3FN)
+        lhs_scale: Left-hand side scale tile (FP8E8M0)
+        rhs: Right-hand side data tile (FP8E4M3FN)
+        rhs_scale: Right-hand side scale tile (FP8E8M0)
+
+    Returns:
+        Tile wrapping the matmul_mx operation
+    """
+    call_expr = _ir_ops.matmul_mx(lhs.unwrap(), lhs_scale.unwrap(), rhs.unwrap(), rhs_scale.unwrap())
+    return Tile(expr=call_expr)
+
+
+def matmul_mx_acc(acc: Tile, lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile) -> Tile:
+    """MX block-scale matmul with accumulation.
+
+    Data operands follow [`matmul_mx`][pypto.language.tile.matmul_mx]: an FP4 lhs must first be cast to
+    FP8E4M3FN, and the operation itself receives two FP8E4M3FN tiles.
+
+    Args:
+        acc: Accumulator tile
+        lhs: Left-hand side data tile (FP8E4M3FN)
+        lhs_scale: Left-hand side scale tile (FP8E8M0)
+        rhs: Right-hand side data tile (FP8E4M3FN)
+        rhs_scale: Right-hand side scale tile (FP8E8M0)
+
+    Returns:
+        Tile wrapping the matmul_mx_acc operation
+    """
+    call_expr = _ir_ops.matmul_mx_acc(
+        acc.unwrap(), lhs.unwrap(), lhs_scale.unwrap(), rhs.unwrap(), rhs_scale.unwrap()
+    )
+    return Tile(expr=call_expr)
+
+
+def matmul_mx_bias(lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile, bias: Tile) -> Tile:
+    """MX block-scale matmul with bias.
+
+    Data operands follow [`matmul_mx`][pypto.language.tile.matmul_mx]: an FP4 lhs must first be cast to
+    FP8E4M3FN, and the operation itself receives two FP8E4M3FN tiles.
+
+    Args:
+        lhs: Left-hand side data tile (FP8E4M3FN)
+        lhs_scale: Left-hand side scale tile (FP8E8M0)
+        rhs: Right-hand side data tile (FP8E4M3FN)
+        rhs_scale: Right-hand side scale tile (FP8E8M0)
+        bias: Bias tile
+
+    Returns:
+        Tile wrapping the matmul_mx_bias operation
+    """
+    call_expr = _ir_ops.matmul_mx_bias(
+        lhs.unwrap(), lhs_scale.unwrap(), rhs.unwrap(), rhs_scale.unwrap(), bias.unwrap()
+    )
+    return Tile(expr=call_expr)
+
+
+def gemv(lhs: Tile, rhs: Tile, acc_phase: str = "unspecified") -> Tile:
     """General Matrix-Vector multiplication: C[1,N] = A[1,K] @ B[K,N].
+
+    ``lhs`` must have exactly one physical and logical row. The rhs logical K
+    must cover the lhs logical K. Inputs must use the same INT8, FP16, BF16, or FP32
+    dtype; the output is INT32 for INT8 inputs and FP32 otherwise.
 
     Args:
         lhs: Row vector tile [1, K]
         rhs: Right-hand side tile [K, N]
+        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
 
     Returns:
         Tile wrapping the gemv operation
     """
-    call_expr = _ir_ops.gemv(lhs.unwrap(), rhs.unwrap())
+    call_expr = _ir_ops.gemv(lhs.unwrap(), rhs.unwrap(), acc_phase=acc_phase)
     return Tile(expr=call_expr)
 
 
-def gemv_acc(acc: Tile, lhs: Tile, rhs: Tile) -> Tile:
+def gemv_acc(acc: Tile, lhs: Tile, rhs: Tile, acc_phase: str = "unspecified") -> Tile:
     """GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N].
+
+    ``acc`` must use the GEMV output dtype. The logical K extents and lhs/rhs
+    dtype requirements are identical to [`gemv`][pypto.language.tile.gemv].
 
     Args:
         acc: Accumulator tile [1, N]
         lhs: Row vector tile [1, K]
         rhs: Right-hand side tile [K, N]
+        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
 
     Returns:
         Tile wrapping the gemv_acc operation
     """
-    call_expr = _ir_ops.gemv_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap())
+    call_expr = _ir_ops.gemv_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap(), acc_phase=acc_phase)
     return Tile(expr=call_expr)
 
 
-def gemv_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
+def gemv_bias(lhs: Tile, rhs: Tile, bias: Tile, acc_phase: str = "unspecified") -> Tile:
     """GEMV with bias add: C[1,N] = A[1,K] @ B[K,N] + bias[1,N].
+
+    ``bias`` must use the GEMV output dtype and its valid shape must cover the
+    logical output shape ``[1, N]``. The logical K extents and lhs/rhs dtype
+    requirements are identical to [`gemv`][pypto.language.tile.gemv].
 
     Args:
         lhs: Row vector tile [1, K]
         rhs: Right-hand side tile [K, N]
-        bias: Bias tile [1, N]
+        bias: Bias tile [1, N] with the accumulator dtype (FP32 for
+            floating-point matrix operands, INT32 for integer matrix operands)
+        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
 
     Returns:
         Tile wrapping the gemv_bias operation
     """
-    call_expr = _ir_ops.gemv_bias(lhs.unwrap(), rhs.unwrap(), bias.unwrap())
+    call_expr = _ir_ops.gemv_bias(lhs.unwrap(), rhs.unwrap(), bias.unwrap(), acc_phase=acc_phase)
     return Tile(expr=call_expr)
 
 
@@ -1734,8 +1903,8 @@ def cmps(lhs: Tile, rhs: int | float | Expr | Scalar, cmp_type: int = 0) -> Tile
 def max(lhs: Scalar | int | Expr, rhs: Scalar | int | Expr) -> Scalar:
     """Scalar max of two values.
 
-    Tile reductions are direction-specific — use :func:`row_max` (collapses the
-    last axis) or :func:`col_max` (collapses axis 0).
+    Tile reductions are direction-specific — use [`row_max`][pypto.language.tile.row_max] (collapses the
+    last axis) or [`col_max`][pypto.language.tile.col_max] (collapses axis 0).
 
     Args:
         lhs: First scalar operand
@@ -1750,8 +1919,8 @@ def max(lhs: Scalar | int | Expr, rhs: Scalar | int | Expr) -> Scalar:
 def min(lhs: Scalar | int | Expr, rhs: Scalar | int | Expr) -> Scalar:
     """Scalar min of two values.
 
-    Tile reductions are direction-specific — use :func:`row_min` (collapses the
-    last axis) or :func:`col_min` (collapses axis 0).
+    Tile reductions are direction-specific — use [`row_min`][pypto.language.tile.row_min] (collapses the
+    last axis) or [`col_min`][pypto.language.tile.col_min] (collapses axis 0).
 
     Args:
         lhs: First scalar operand
@@ -1792,7 +1961,7 @@ def slice(
             ``None`` means the source's padding mode carries through.
             Accepts ``PadValue.zero`` / ``PadValue.max`` / ``PadValue.min``, or
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (same
-            spelling as :func:`tile.fillpad`). Only meaningful when the
+            spelling as [`tile.fillpad`][pypto.language.tile.fillpad]). Only meaningful when the
             *effective* valid region is smaller than ``shape`` — which an explicit
             ``valid_shape`` or a partially-valid source tile can each bring about.
 
@@ -1800,7 +1969,7 @@ def slice(
         Tile wrapping the slice operation
 
     Note:
-        Unlike :func:`pypto.language.op.tensor.slice`, there is no ``clamp``
+        Unlike [`tensor.slice`][pypto.language.tensor.slice], there is no ``clamp``
         option: an on-chip window has nothing that could clamp it, so
         ``offset + shape`` must stay inside the source tile.
     """
@@ -1820,7 +1989,9 @@ def slice(
             f"If you intend to narrow the valid region later via "
             f"tile.set_validshape, you can ignore this warning; otherwise "
             f"pass valid_shape=... to tile.slice.",
-            stacklevel=2,
+            # Not a literal 2: pl.slice forwards here, and a fixed level would
+            # name the dispatcher and collapse every call site's warning.
+            stacklevel=caller_warning_stacklevel(),
         )
 
     tile_expr = tile.unwrap()
@@ -1930,8 +2101,9 @@ def set_validshape(tile: Tile, valid_rows: IntLike, valid_cols: IntLike) -> Tile
     """Update valid-shape metadata of a tile without data movement.
 
     .. note::
-        Internal API — this op is intended for compiler-generated code only
-        and should not be exposed to end users in future releases.
+        The operand must not be a view (a ``pl.tile.slice`` or reshape result): a
+        view carries its valid extent in its type, so there is nothing to update.
+        Narrow at the slice with ``valid_shape=`` instead.
 
     Args:
         tile: Input tile (must be 2D)
@@ -2433,22 +2605,23 @@ def sel(mask: Tile, lhs: Tile, rhs: Tile, tmp: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def sels(lhs: Tile, rhs: Tile, select_mode: int | float | Expr | Scalar) -> Tile:
-    """Select between two tiles based on a scalar mode.
+def sels(mask: Tile, src: Tile, tmp: Tile, scalar: int | float | Expr | Scalar) -> Tile:
+    """Per-element selection between a source tile and a scalar.
 
-    Maps to the TSELS hardware intrinsic. The interpretation of select_mode values
-    is target-dependent and enforced by codegen.
+    For each element (i, j): dst[i,j] = src[i,j] if mask[i,j] is true,
+    else scalar. Maps to the TSELS hardware intrinsic.
 
     Args:
-        lhs: Source tile 0
-        rhs: Source tile 1
-        select_mode: Scalar select mode
+        mask: Predicate mask tile; encoding is target-defined
+        src: Source tile, selected where mask is true
+        tmp: Scratch tile required by TSELS
+        scalar: Scalar value, selected where mask is false
 
     Returns:
         Tile wrapping the sels operation
     """
-    select_mode_expr = select_mode.unwrap() if isinstance(select_mode, Scalar) else select_mode
-    call_expr = _ir_ops.sels(lhs.unwrap(), rhs.unwrap(), select_mode_expr)
+    scalar_expr = scalar.unwrap() if isinstance(scalar, Scalar) else scalar
+    call_expr = _ir_ops.sels(mask.unwrap(), src.unwrap(), tmp.unwrap(), scalar_expr)
     return Tile(expr=call_expr)
 
 
@@ -2476,7 +2649,7 @@ def gather(src: Tile, indices: Tile, tmp: Tile) -> Tile:
     """Gather elements from src tile by per-element indices (index form).
 
     Computes ``dst[i, j] = src[indices[i, j]]``. Maps to PTOAS ``pto.tgather``
-    index form. For the hardware mask-pattern variant, use :func:`gather_mask`.
+    index form. For the hardware mask-pattern variant, use [`gather_mask`][pypto.language.tile.gather_mask].
 
     Args:
         src: Source tile (FP16, FP32, INT16, or INT32)
@@ -2492,6 +2665,31 @@ def gather(src: Tile, indices: Tile, tmp: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
+def gatherb(
+    src: Tile,
+    offset: Tile,
+    *,
+    output_dtype: int | DataType | None = None,
+) -> Tile:
+    """Gather 32-byte blocks from ``src`` by UINT32 byte offsets.
+
+    Each offset selects one 32-byte source block. One offset column expands to
+    ``32 / sizeof(output_dtype)`` output elements. ``output_dtype`` defaults to
+    ``src.dtype`` and may select another supported byte interpretation.
+    A sliced source must have a byte address that PyPTO can prove is 32-byte
+    aligned; dynamic column offsets are rejected conservatively.
+
+    Args:
+        src: Source tile to gather blocks from.
+        offset: UINT32 tile of **byte** offsets into ``src`` -- not element indices.
+        output_dtype: Byte interpretation of the result. Defaults to ``src.dtype``.
+
+    Returns:
+        Tile wrapping the gatherb operation.
+    """
+    return Tile(expr=_ir_ops.gatherb(src.unwrap(), offset.unwrap(), output_dtype=output_dtype))
+
+
 def gather_mask(
     src: Tile,
     mask_pattern: int,
@@ -2501,11 +2699,11 @@ def gather_mask(
     """Gather elements from src tile by a fixed hardware mask pattern (mask form).
 
     Selects elements according to a stride/mask pattern baked into the hardware.
-    For the per-element indices variant, use :func:`gather`.
+    For the per-element indices variant, use [`gather`][pypto.language.tile.gather].
 
     Args:
         src: Source tile (FP16, FP32, INT16, or INT32)
-        mask_pattern: Mask pattern selector (1-7), see :class:`MaskPattern`.
+        mask_pattern: Mask pattern selector (1-7), see [`MaskPattern`][pypto.language.tile.MaskPattern].
             1=P0101, 2=P1010, 3=P0001, 4=P0010, 5=P0100, 6=P1000, 7=P1111
         output_dtype: Optional output dtype. When provided, the result tile has
             this dtype instead of ``src``'s dtype (bit reinterpretation, no
@@ -2552,8 +2750,8 @@ def gather_compare(
 
     The ``a, b = call(...)`` Python tuple unpack is desugared by the parser
     into ``_tuple = call; a = _tuple[0]; b = _tuple[1]``. The parser
-    consumes the underlying tuple-typed :class:`ir.Call` returned by
-    :func:`pypto.ir.op.tile_ops.gather_compare`; the ``(Tile, Tile)`` split
+    consumes the underlying tuple-typed ``ir.Call`` returned by
+    ``pypto.ir.op.tile_ops.gather_compare``; the ``(Tile, Tile)`` split
     below only runs in interactive Python contexts.
 
     Args:
@@ -2596,7 +2794,7 @@ def scatter(dst: Tile, src: Tile, indexes: Tile) -> Tile:
     **same [rows, cols] shape as** ``src``. Maps to PTOAS ``pto.tscatter`` index
     form. The op is DPS — ``dst`` is the first (in/out) argument, rewritten in
     place, and the returned Tile aliases the same buffer. For the hardware
-    mask-pattern variant, use :func:`scatter_mask`.
+    mask-pattern variant, use [`scatter_mask`][pypto.language.tile.scatter_mask].
 
     Args:
         dst: Destination tile (same dtype as ``src``; rewritten in-place).
@@ -2617,9 +2815,9 @@ def scatter_mask(dst: Tile, src: Tile, mask_pattern: int) -> Tile:
     """Scatter ``src`` rows into mask-marked columns of ``dst`` (mask form).
 
     For each row, the elements of ``src`` are written into the columns of
-    ``dst`` selected by ``mask_pattern`` (the inverse of :func:`gather_mask`).
+    ``dst`` selected by ``mask_pattern`` (the inverse of [`gather_mask`][pypto.language.tile.gather_mask]).
 
-    Unlike :func:`gather_mask` (a real ``pto.tgather`` ISA op on A2/A3 and A5),
+    Unlike [`gather_mask`][pypto.language.tile.gather_mask] (a real ``pto.tgather`` ISA op on A2/A3 and A5),
     mask-pattern scatter is not a distinct pto-isa instruction — PyPTO emits it
     as a ``pto.tscatter`` mask-form construct for A2/A3 / CPU-sim style lowering
     paths.
@@ -2627,7 +2825,7 @@ def scatter_mask(dst: Tile, src: Tile, mask_pattern: int) -> Tile:
     Args:
         dst: Destination tile (rewritten on positions selected by ``mask_pattern``)
         src: Source tile (compact rows; same dtype as ``dst``)
-        mask_pattern: Mask pattern selector (1-7), see :class:`MaskPattern`.
+        mask_pattern: Mask pattern selector (1-7), see [`MaskPattern`][pypto.language.tile.MaskPattern].
             1=P0101, 2=P1010, 3=P0001, 4=P0010, 5=P0100, 6=P1000, 7=P1111
 
     Returns:
@@ -2660,6 +2858,84 @@ def mscatter(src: Tile, idx: Tile, output_tensor: _TensorT) -> _TensorT:
     """
     call_expr = _ir_ops.mscatter(src.unwrap(), idx.unwrap(), output_tensor.unwrap())
     return output_tensor.__class__(expr=call_expr)
+
+
+@overload
+def mgather(
+    mem: Tensor,
+    idx: Tile,
+    coalesce: str | int = ...,
+    *,
+    gather_oob: str | int = ...,
+    target_memory: Literal[MemorySpace.Vec] = ...,
+    scratch: None = ...,
+    valid_shape: None = ...,
+) -> Tile: ...
+
+
+@overload
+def mgather(
+    mem: Tensor,
+    idx: Tensor,
+    coalesce: Literal["row", 0] = ...,
+    *,
+    gather_oob: str | int = ...,
+    target_memory: Literal[MemorySpace.Mat],
+    scratch: None = ...,
+    valid_shape: Sequence[int] | None = ...,
+) -> Tile: ...
+
+
+@overload
+def mgather(
+    mem: Tensor,
+    idx: Tensor,
+    coalesce: Literal["elem", 1],
+    *,
+    gather_oob: str | int = ...,
+    target_memory: Literal[MemorySpace.Mat],
+    scratch: Tensor,
+    valid_shape: Sequence[int] | None = ...,
+) -> Tile: ...
+
+
+def mgather(
+    mem: Tensor,
+    idx: Tile | Tensor,
+    coalesce: str | int = "row",
+    *,
+    gather_oob: str | int = "undefined",
+    target_memory: MemorySpace = MemorySpace.Vec,
+    scratch: Tensor | None = None,
+    valid_shape: Sequence[int] | None = None,
+) -> Tile:
+    """Gather-load rows or elements from a GM tensor into a fresh Vec or Mat tile.
+
+    Args:
+        mem: Source tensor in GM.
+        idx: Two-dimensional INT32 index tile for Vec output, or GM tensor for
+            Mat output.
+        coalesce: ``"row"``/``0`` for row gather or ``"elem"``/``1`` for flat
+            element gather. Integer values support printed-IR round trips.
+        gather_oob: Out-of-bounds handling: ``"undefined"``, ``"clamp"``,
+            ``"wrap"``, ``"zero"``, or the corresponding integer ``0..3``.
+        target_memory: ``MemorySpace.Vec`` (default) or ``MemorySpace.Mat``.
+        scratch: Same-dtype GM workspace required by Mat element gather and
+            forbidden by the other forms.
+        valid_shape: Optional two-dimensional written region for Mat output.
+            Vec output derives its valid region from the index tile.
+    """
+    return Tile(
+        expr=_ir_ops.mgather(
+            mem.unwrap(),
+            idx.unwrap(),
+            coalesce=coalesce,
+            gather_oob=gather_oob,
+            target_memory=target_memory,
+            scratch=None if scratch is None else scratch.unwrap(),
+            valid_shape=valid_shape,
+        )
+    )
 
 
 @overload

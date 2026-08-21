@@ -53,6 +53,12 @@ inline const PassProperties kMaterializeDistTensorCtxProperties{
     .required = {IRProperty::CommDomainScopesMaterialized},
     .produced = {IRProperty::CommDomainScopesMaterialized}};
 
+// -- MaterializeValidShapeSymbols pass (runs last) ---------------------------
+//    Prepends a Scalar[INDEX] parameter per device-kernel valid_shape symbol that
+//    the kernel cannot bind, and passes the actual extent at every call site.
+//    Signature-and-call rewrite only; touches no structural property.
+inline const PassProperties kMaterializeValidShapeSymbolsProperties{};
+
 // -- MaterializeRuntimeScopes pass (runs last, after the final Simplify) ------
 //    Inserts explicit AUTO RuntimeScopeStmt nodes for the orchestration function
 //    body and for/if bodies so codegen emits PTO2_SCOPE 1:1 from the IR.
@@ -113,7 +119,7 @@ inline const PassProperties kLowerCompositeOpsProperties{};
 // OutlineIncoreScopes opens the AivSplitValid verification window: it preserves
 // the first-class SplitAivScopeStmt regions inside each outlined InCore function,
 // so the structural region verifier can run from here until LowerAutoVectorSplit
-// erases the node (pass 21).
+// erases the node (pass 20).
 inline const PassProperties kOutlineIncoreScopesProperties{
     .required = {IRProperty::SSAForm},
     .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::AivSplitValid}};
@@ -203,8 +209,20 @@ inline const PassProperties kInferTileMemorySpaceProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure,
-                 IRProperty::AivSplitValid},
+                 IRProperty::AivSplitValid, IRProperty::AccToGmStoreValid},
     .invalidated = {IRProperty::AivSplitValid}};
+
+// -- Insert MX scale-address binding pass ------------------------------------
+//
+// Runs immediately after InferTileMemorySpace. Requires concrete Left/LeftScale
+// and Right/RightScale spaces so tile.tget_scale_addr can be inserted before
+// each MX matmul consumer. Property-preserving (no new IRProperty).
+
+inline const PassProperties kInsertMxScaleAddrProperties{
+    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::NormalizedStmtStructure, IRProperty::TileMemoryInferred},
+    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
+                 IRProperty::NormalizedStmtStructure, IRProperty::TileMemoryInferred}};
 
 // -- Materialize tensor strides pass (RFC #1300 §2.4) ------------------------
 
@@ -310,6 +328,14 @@ inline const PassProperties kNormalizeReturnOrderProperties{
 // Sequential demotion; same tile-level property set as the unroll pass
 // (structural rewrite, no property added or removed).
 inline const PassProperties kSkewCrossCorePipelineProperties{
+    .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
+                 IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure}};
+
+// Rebinds tiles onto slots of a declared allocation and demotes the loop; no
+// property is added or removed (same set as the replication pass it precedes).
+inline const PassProperties kLowerPipelineToSlotsProperties{
     .required = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps,

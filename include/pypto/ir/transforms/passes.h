@@ -153,8 +153,8 @@ Pass InitMemRef();
  * chain so accumulator producers (and other loop-carry chains) write directly
  * into the carried buffer. This is a semantics-required aliasing (the loop
  * accumulator must live in one buffer), split out of MemoryReuse so it can run
- * without the opportunistic lifetime-reuse phase (e.g. when ptoas owns reuse via
- * memory_planner=PTOAS). Runs after InitMemRef, before MemoryReuse.
+ * without the opportunistic lifetime-reuse phase (when DSA-RP or ptoas owns
+ * reuse). Runs after InitMemRef, before MemoryReuse/DSA placement.
  */
 Pass MaterializeSemanticAliases();
 
@@ -252,6 +252,21 @@ Pass LowerHostTensorCollectives();
 Pass MaterializeDistTensorCtx();
 
 /**
+ * @brief Materialize a scalar parameter per unbindable device-kernel valid_shape symbol.
+ *
+ * A ``pl.dynamic()`` symbol named only in a parameter's
+ * ``pl.TensorView(valid_shape=...)`` is neither a physical tensor dimension (which
+ * the kernel wrapper recovers from the runtime tensor's ``shapes[]``) nor a scalar
+ * parameter, so a precompiled kernel has no value for it. This pass adds the
+ * symbol itself as a *leading* ``Scalar[INDEX]`` parameter and passes the caller's
+ * actual extent at every call/submit site, lowering the annotation form into the
+ * scalar-parameter form the backend already supports. The parameter leads because
+ * the text form declares parameters left to right, and the annotation that names
+ * the symbol has to resolve to it.
+ */
+Pass MaterializeValidShapeSymbols();
+
+/**
  * @brief Create a loop unrolling pass
  *
  * Expands ForStmt nodes with ForKind::Unroll into inlined copies of the loop
@@ -282,6 +297,43 @@ Pass UnrollLoops();
  * ``LowerPipelineLoops`` to replicate.
  */
 Pass SkewCrossCorePipeline();
+
+/**
+ * @brief Rotate a ``pl.pipeline`` loop through the slots of one declared
+ *        allocation; runs immediately before ``LowerPipelineLoops``.
+ *
+ * Where ``LowerPipelineLoops`` buys ping-pong by replicating the body ``F`` times
+ * so each copy owns a distinct buffer, this pass keeps ONE body and gives the
+ * buffer ``F`` slots: every top-level ``tile.load`` / ``tile.read`` in the body
+ * whose arguments read the induction variable is rebound onto
+ * ``pl.MemRef(name, slots=F)[iv % F]``, and the loop is demoted to
+ * ``ForKind::Sequential`` with ``pipeline_stages`` stripped. Bounds, step and
+ * ``iter_args`` are untouched, so no remainder dispatch is needed and a dynamic
+ * trip count needs no special case.
+ *
+ * The synthesized MemRef is shaped exactly like an author's declaration, so
+ * ``InitMemRef`` resolves it and PTO codegen lowers it to one
+ * ``pto.alloc_multi_tile`` plus a ``pto.multi_tile_get`` per use — no new IR op
+ * and no new user-facing switch.
+ *
+ * **Self-gated on ``memory_planner=PTOAS``.** Only that planner emits a ptoas
+ * region today — PTO codegen's ``PlanMultiBufferRegions`` bails under the PyPTO
+ * planner — so this pass returns the function untouched there and the default
+ * pipeline is byte-identical. The gate tracks that codegen limitation, not a
+ * limitation of ptoas: an addressed region synchronizes identically at
+ * ``--pto-level=level3``. Widening it is follow-up work in the address
+ * allocator.
+ *
+ * Loops it declines — a slot count outside ptoas' ``[2, 16]``, a step other than 1,
+ * a start not a multiple of ``F``, a body with no eligible load, a tile in a space
+ * other than Vec / Mat / Acc, a runtime valid shape, a tile carried out as a phi or
+ * consumed by a view / in-place op, or any loop nested under a pipeline loop this
+ * pass already declined — are left intact for ``LowerPipelineLoops`` to replicate.
+ * Every rejection is a fallback to the existing behaviour, never an error: codegen
+ * refuses a region it cannot describe, so synthesizing a doubtful one would turn a
+ * kernel that compiles today into a compile failure.
+ */
+Pass LowerPipelineToSlots();
 
 /**
  * @brief Lower ``pl.pipeline(N, stage=F)`` loops at the tile level
@@ -449,7 +501,7 @@ Pass FlattenTileNdTo2D();
 Pass LegalizeTileCast();
 
 /**
- * @brief Auto-tile static 2D matmul / matmul_acc calls for the backend's L0
+ * @brief Auto-tile static 2D matmul-family calls for the backend's L0
  *
  * Queries ``utils::ChooseL0Tile`` for an ``(m, n, k, stationarity, dbC)``
  * design point and rewrites Mat-resident operands into aligned Left/Right
@@ -457,16 +509,32 @@ Pass LegalizeTileCast();
  * loop; a non-divisor aligned K tail is peeled into a final
  * ``tile.matmul_acc``.
  *
- * When the ``[M, N]`` accumulator exceeds L0c, plain ``tile.matmul`` is
- * M/N-tiled.  A result consumed by one output store uses direct-to-GM
+ * L0C legality uses the backend's physical accumulator-row alignment, which
+ * may be stricter than the logical cube shape (for example, an INT32 M=16
+ * result occupies 32 rows on Ascend910B).  When that physical ``[M, N]``
+ * footprint exceeds L0c, fresh ``tile.matmul`` and ``tile.matmul_bias`` calls
+ * are M/N-tiled.  A result consumed by one output store uses direct-to-GM
  * placement; a result consumed entirely as a later matmul operand is assembled
  * into an on-chip Mat scratch.  The Mat-scratch route also folds a compatible
- * f32-to-bf16/f16 ``tile.cast(mode="rint")`` into the FIXPIPE writeback.
+ * f32-to-bf16/f16
+ * ``tile.cast(mode="rint")`` into the FIXPIPE writeback.
+ *
+ * The canonical frontend split-K form -- a full-output accumulator placeholder,
+ * a pipeline carrying it through ``tile.matmul`` / ``tile.matmul_acc``, then
+ * one store -- is M/N-tiled at the enclosing-loop level.  Each output sub-tile
+ * completes the whole source K reduction before the next sub-tile starts, so
+ * an oversized full Acc is never materialized.  Arbitrary standalone
+ * ``tile.matmul_acc`` calls with caller-owned accumulators remain deferred with
+ * ``PH-AT-006``.
  *
  * Full-K M/N grids may use output-, A-, or B-stationary loop orders.  L0C
- * double-buffering is enabled under PTOAS and is available as a PyPTO planner
- * opt-in.  Chained Mat-scratch producers remain output-stationary to avoid the
- * allocator offset-packing limitation tracked by issue #1908.
+ * double-buffering is enabled automatically under DSA_RP and PTOAS and is an
+ * opt-in under the legacy PYPTO planner.  Under PYPTO, chained Mat-scratch
+ * producers remain output-stationary to avoid the allocator offset-packing
+ * limitation tracked by issue #1908; some dbC-enabled layouts can still exceed
+ * operand capacity there.
+ * DSA_RP and PTOAS retain operand-stationary choices because their lifetime-aware
+ * placement can subdivide the released operand range.
  *
  * The pass also recognizes a user-authored, static pipeline (stage >= 2, trip
  * count divisible by the stage count) containing exactly one already-L0
@@ -486,12 +554,36 @@ Pass LegalizeTileCast();
  * stores, and insufficient L0C capacity stay unchanged.
  *
  * Eligible calls require static 2D operands with B in Mat and A in Mat or Vec.
+ * ``tile.matmul_bias`` is supported when both matrix operands are Mat and its
+ * static ``[1, N]`` bias is Mat- or Bias-resident and has the accumulator dtype
+ * (FP32 for floating-point matrix operands, INT32 for integer operands). The
+ * bias is applied once on the first K block. M/N tiling requires a full
+ * rectangular ``[1, N]`` defining load (physical shape equals valid shape),
+ * reconstructs each N window from that single-use ``tile.load`` when it is
+ * separated from the call only by other sibling loads, then moves that
+ * independent Mat tile to Bias;
+ * candidate N is bounded by the
+ * backend's bias-table capacity and its emitted pipeline replication depth.
+ * An already-Bias-resident source stays outside the emitted grid and consumes
+ * one slot rather than inheriting those replication factors.
+ * The backend must support the exact Mat-to-Bias dtype pair, and matrix tile
+ * dimensions must satisfy their layout-derived boxed alignment.
+ * A manually materialized Left/Right operand is otherwise left untouched, but
+ * if its static physical footprint alone exceeds L0A/L0B the pass raises an
+ * operation-specific error with the operand name, required/available bytes,
+ * source location, and both automatic- and manual-tiling fixes.
  * When the chooser returns the full ``(M, N, K)`` shape, no tiling rewrite is
  * needed, although a chained result may still be remapped to Mat by the
  * compatible cast-fold placement above.  Other unsupported regimes are left
  * untouched; useful deferred cases emit ``PerfHint`` diagnostics.
- * ``tile.matmul_bias`` remains unsupported because its bias must be applied
- * only after the final K block.
+ * An already-Bias-resident source that itself needs N tiling is deferred
+ * because Bias-to-Bias sub-window extraction is unsupported. A Mat source that
+ * needs N tiling is also deferred unless it is a single-use 2D load in the same
+ * statement scope with only sibling loads between it and the matmul, since
+ * reloading across an intervening effect changes snapshot semantics and boxed
+ * one-row Mat subviews are not PTOAS-legal. Direct-store placement additionally
+ * requires that its consumer store be the first non-load statement after the
+ * matmul, so deferred emission cannot move computation across an effect.
  *
  * Requirements:
  * - Input IR must have static 2D tile ops (run FlattenTileNdTo2D first)
@@ -545,6 +637,25 @@ Pass CanonicalizeTileSlice();
  * - Input IR must have tile ops (run ConvertTensorToTileOps first)
  */
 Pass InferTileMemorySpace();
+
+/**
+ * @brief Insert tile.tget_scale_addr bindings before MX matmul consumers
+ *
+ * After InferTileMemorySpace has resolved Left/LeftScale and Right/RightScale
+ * operand spaces, inserts compiler-generated ``tile.tget_scale_addr(scale, data)``
+ * immediately before each ``tile.matmul_mx`` / ``_acc`` / ``_bias`` and rewrites
+ * the matmul to consume the bound scale SSA values.
+ *
+ * Bindings are not reused across consumers because tget mutates a shared
+ * physical scale buffer whose aliases cannot be represented by SSA identity.
+ * The pass therefore inserts a fresh binding at every consumer even when its
+ * scale operand is already the result of an earlier binding.
+ *
+ * Requirements:
+ * - Tile memory spaces must already be inferred (``TileMemoryInferred``)
+ * - Statement structure must be normalized (``NormalizedStmtStructure``)
+ */
+Pass InsertMxScaleAddr();
 
 /**
  * @brief Materialize implicit ND/DN strides on every TensorType (RFC #1300 §2.4)
@@ -769,16 +880,18 @@ Pass AutoDeriveTaskDependencies(bool analyze_auto_scopes = false);
 /**
  * @brief Fold no-op tile.reshape assignments into Var-to-Var assignments
  *
- * After MemoryReuse, two TileType variables can share the same
- * MemRef and the same TileBufSignature — in that case the `tile.reshape`
- * connecting them is a no-op at the PTO level. This pass rewrites such
+ * After InitMemRef and MaterializeSemanticAliases have finalized allocation
+ * identities, two TileType variables can share the same MemRef and the same TileBufSignature — in that
+ * case the `tile.reshape` connecting them is a no-op at the PTO level. This pass rewrites such
  * `lhs = tile.reshape(rhs, shape)` AssignStmts into plain `lhs = rhs`,
  * removing the reshape Call. PTO codegen previously dropped the emission
  * via a peephole; folding into the IR makes codegen 1:1.
  *
  * Requirements:
  * - InCore-type functions only (Opaque/Orchestration are unaffected)
- * - Must run after MemoryReuse so MemRef merging is finalized
+ * - Must run after semantic alias materialization; PyPTO-owned planners also
+ *   run AllocateMemoryAddr first, while PTOAS keeps the finalized root identity
+ *   and assigns physical addresses later
  */
 Pass FoldNoOpReshape();
 
@@ -811,8 +924,8 @@ Pass MaterializeRuntimeScopes();
  * An Orchestration ``ForStmt`` iter_arg lowers one of two ways:
  *  - **trivial**: the yield value aliases the iter_arg (same backing buffer), so
  *    iter_arg and return_var share the init value's emit name. Materialising a
- *    fresh ``Tensor`` would break the runtime dependency tracker, which keys off
- *    ``Tensor*`` identity.
+ *    fresh ``ChipTensor`` would break the runtime dependency tracker, which keys off
+ *    ``ChipTensor*`` identity.
  *  - **rebind**: the yield value is a different buffer, so a mutable carry
  *    variable is declared and the yield assigns back to it (issue #1286).
  *

@@ -18,9 +18,8 @@ Coverage per op: multiple shapes (square/tall/wide), aligned + narrow valid_shap
 the slope arg.
 
 Scope is a2a3 only (``@pytest.mark.platforms("a2a3")``); a5 coverage is a
-separate PR.
-
-(prelu is omitted: its 3-arg DSL form mismatches codegen pto.tprelu — KNOWN_ISSUES.)
+separate PR. PReLU has its own same-name test module because it also exercises
+the slope-tile and scratch-buffer contracts.
 """
 
 from typing import Any

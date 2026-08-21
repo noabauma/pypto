@@ -32,6 +32,7 @@
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/scope_outline_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
+#include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/verifier/verifier.h"
 
 namespace pypto {
@@ -167,8 +168,9 @@ class LaunchSpecStamper : public IRMutator {
   }
 
   /// Rewrite the callee-scoped ``core_num`` into the caller's Var space via the
-  /// dispatch's positional args. ``Submit::args_`` may be a prefix of
-  /// ``params_`` (pass-submit-awareness rule 5), so bound by the arg count.
+  /// dispatch's positional args. ``Submit::args_`` need not cover every entry
+  /// of ``params_`` (see Submit::args_ in include/pypto/ir/expr.h), so bound
+  /// the zip by the arg count.
   [[nodiscard]] static ExprPtr ToCallerScope(const SpmdLaunchSpec& spec, const std::vector<ExprPtr>& args) {
     // Every entry in specs_ is built with its Group attached. Falling back to
     // the un-translated expression here would silently re-introduce the very
@@ -198,7 +200,7 @@ class LaunchSpecStamper : public IRMutator {
   /// actionable message instead of emitting an unbound name.
   static void RejectCalleeBoundCoreNum(const SpmdLaunchSpec& spec, const ExprPtr& translated) {
     if (spec.callee_bound.empty() || !translated) return;
-    outline_utils::VarDefUseCollector uses;
+    var_collectors::VarDefUseCollector uses;
     uses.VisitExpr(translated);
     for (const auto* used : uses.var_uses) {
       CHECK_SPAN(spec.callee_bound.count(used) == 0, spec.group->span_)
@@ -252,8 +254,10 @@ Pass OutlineClusterScopes() {
     }
 
     for (const auto& [gvar, func] : program->functions_) {
-      // Only process Opaque and Orchestration functions (Group functions are already outlined)
-      if (func->func_type_ != FunctionType::Opaque && func->func_type_ != FunctionType::Orchestration) {
+      // Only process Opaque and orchestration-like (Orchestration / Graph)
+      // bodies; Group functions are already outlined. A Cluster or Spmd scope
+      // left un-outlined inside a Graph body makes the verifier below fail.
+      if (func->func_type_ != FunctionType::Opaque && !IsOrchestrationLike(func->func_type_)) {
         new_functions.push_back(func);
         continue;
       }
@@ -289,7 +293,7 @@ Pass OutlineClusterScopes() {
         for (const auto& param : outlined->params_) {
           if (param) spec.callee_bound.insert(param.get());
         }
-        outline_utils::VarDefUseCollector group_defs;
+        var_collectors::VarDefUseCollector group_defs;
         if (outlined->body_) group_defs.VisitStmt(outlined->body_);
         spec.callee_bound.insert(group_defs.var_defs.begin(), group_defs.var_defs.end());
         group_launch_specs.emplace(outlined->name_, std::move(spec));

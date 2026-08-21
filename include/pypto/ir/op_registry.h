@@ -23,6 +23,7 @@
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -74,6 +75,21 @@ struct OpMemorySpaceSpec {
   /// InferTileMemorySpace uses this for forward inheritance and backward-demand
   /// propagation through view-like ops; memory reuse uses it to skip retargeting.
   bool output_inherits_input = false;
+};
+
+/**
+ * @brief Evidence available to analyses of an operation's physical accesses.
+ *
+ * Unknown is deliberately the default. Functional means every tile operand is
+ * read and every tile-typed SSA result is written, with no hidden tile
+ * workspace or mutation; range-sensitive analyses must still prove that an
+ * access covers the whole allocation. NoAccess marks declarations and
+ * zero-copy metadata operations that execute no memory access.
+ */
+enum class ExecutionMemoryAccessEvidence : uint8_t {
+  Unknown,
+  Functional,
+  NoAccess,
 };
 
 /**
@@ -425,7 +441,8 @@ class OpRegistryEntry {
   }
 
   /// Mark this operation as NOT safe for in-place execution (src buffer == dst buffer).
-  /// MemoryReuse will skip producer-consumer reuse for such operations.
+  /// The shared allocation-constraint analysis prevents producer-consumer reuse
+  /// for such operations in both MemoryReuse and DSA-RP.
   inline OpRegistryEntry& not_inplace_safe() {
     is_inplace_safe_ = false;
     return *this;
@@ -435,6 +452,27 @@ class OpRegistryEntry {
   /// Defaults to true (backward compatible). Ops that do not support src == dst must
   /// explicitly call not_inplace_safe() during registration.
   [[nodiscard]] bool IsInplaceSafe() const { return is_inplace_safe_; }
+
+  /// Mark an IR-only declaration or zero-copy view that emits no execution-time
+  /// memory access. This is distinct from output-memory inheritance: mutating
+  /// operations such as tile.assemble also inherit an input memory space.
+  inline OpRegistryEntry& no_execution_memory_access() {
+    execution_memory_access_evidence_ = ExecutionMemoryAccessEvidence::NoAccess;
+    return *this;
+  }
+
+  /// Mark an operation whose complete tile access contract is functional:
+  /// every tile operand is read and every tile-typed SSA result is written.
+  /// This annotation does not by itself prove a whole-allocation access.
+  inline OpRegistryEntry& functional_execution_memory_access() {
+    execution_memory_access_evidence_ = ExecutionMemoryAccessEvidence::Functional;
+    return *this;
+  }
+
+  /// Access evidence used by conservative physical-hazard analyses.
+  [[nodiscard]] ExecutionMemoryAccessEvidence GetExecutionMemoryAccessEvidence() const {
+    return execution_memory_access_evidence_;
+  }
 
   /// Mark input argument `arg_index` as one whose buffer must NOT be reused as
   /// this op's output buffer. Unlike not_inplace_safe() (which forbids the
@@ -468,6 +506,42 @@ class OpRegistryEntry {
   /// Returns the explicitly declared core affinity, or nullopt if the op
   /// should be classified from its memory spec.
   [[nodiscard]] std::optional<core_affinity::CoreAffinity> GetCoreAffinity() const { return core_affinity_; }
+
+  /// Mark an operation that MUST NOT RUN ON A SECOND CORE: replicating the call
+  /// onto another lane changes what the program means. The canonical case is
+  /// `pld.system.notify`, which publishes a cross-rank signal — a copy on the
+  /// cube lane can release the peer before the vector lane's TPUT has landed
+  /// the data that signal covers, so the peer reads stale bytes. (The
+  /// atomic-add form additionally double-counts, but non-idempotence is not
+  /// what the flag encodes: a `NotifyOp::kSet` fires the same race.)
+  ///
+  /// This axis says nothing about WHICH core the op runs on — placement stays
+  /// entirely with set_core_affinity(). The two are orthogonal: an op may be
+  /// core-agnostic (no declared affinity, hence SHARED) and still be
+  /// no-duplicate, which is exactly the combination that makes the flag
+  /// necessary — ExpandMixedKernel replicates SHARED statements onto both the
+  /// AIC and the AIV lane, and an affinity declaration cannot express "runs on
+  /// either core, but only one of them" without making a false claim about the
+  /// ISA. Ops that are pinned to one lane by set_core_affinity() need no flag:
+  /// they are never duplicated in the first place.
+  ///
+  /// The consumer is LowerAutoVectorSplit's `pl.split_aiv` region placement
+  /// stamp: it pins exactly the no-duplicate calls inside a region to the AIV
+  /// lane, so they are not copied onto the cube lane by ExpandMixedKernel. No
+  /// verifier rejects anything on this axis — see the "NOT CHECKED,
+  /// DELIBERATELY" note in verify_aiv_split.cpp.
+  ///
+  /// Do NOT use it for an op whose presence on the cube lane is load-bearing:
+  /// pinning `pld.system.wait` to AIV would let the matmul race past the peer
+  /// data it blocks on.
+  inline OpRegistryEntry& set_no_duplicate() {
+    no_duplicate_ = true;
+    return *this;
+  }
+
+  /// True when duplicating this op onto a second core would change program
+  /// meaning (see set_no_duplicate()). False for the vast majority of ops.
+  [[nodiscard]] bool IsNoDuplicate() const { return no_duplicate_; }
 
   /// Declare the cross-core role of this op. Used for registry-driven predicates
   /// (IsTPop, IsInitializePipe, ...) so passes do not have to string-compare
@@ -530,11 +604,13 @@ class OpRegistryEntry {
       deduce_type_;                               ///< Type deduction function
   std::optional<OpMemorySpaceSpec> memory_spec_;  ///< Memory space specification
   bool is_inplace_safe_{true};  ///< Whether the op supports in-place execution (src == dst buffer)
+  ExecutionMemoryAccessEvidence execution_memory_access_evidence_{ExecutionMemoryAccessEvidence::Unknown};
   std::set<size_t> forbid_output_alias_args_;  ///< Input args whose buffer the output must not reuse
   std::optional<core_affinity::CoreAffinity> core_affinity_;     ///< Explicit core-affinity override
   std::optional<core_affinity::CrossCoreRole> cross_core_role_;  ///< Cross-core role (for predicates)
-  bool internal_only_{false};                                    ///< True for compiler-created ops only.
-  std::optional<std::string> template_dir_;                      ///< Package resource for builtin templates.
+  bool no_duplicate_{false};   ///< True when the op must not run on a second core (set_no_duplicate)
+  bool internal_only_{false};  ///< True for compiler-created ops only.
+  std::optional<std::string> template_dir_;  ///< Package resource for builtin templates.
 };
 
 /**

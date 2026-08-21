@@ -99,6 +99,10 @@ std::string IRPropertyToString(IRProperty prop) {
       return "HardSyncallOccupancyValid";
     case IRProperty::IterArgCarryClassified:
       return "IterArgCarryClassified";
+    case IRProperty::AccToGmStoreValid:
+      return "AccToGmStoreValid";
+    case IRProperty::AtomicAddDtypeValid:
+      return "AtomicAddDtypeValid";
     default:
       return "Unknown";
   }
@@ -147,7 +151,9 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::AivSplitValid,
                                    IRProperty::HardSyncallOccupancyValid,
                                    IRProperty::IterArgCarryClassified,
-                                   IRProperty::RuntimeScopesMaterialized};
+                                   IRProperty::RuntimeScopesMaterialized,
+                                   IRProperty::AccToGmStoreValid,
+                                   IRProperty::AtomicAddDtypeValid};
   return props;
 }
 
@@ -175,7 +181,8 @@ const IRPropertySet& GetStructuralProperties() {
                                    IRProperty::NoRedundantBlocks,   IRProperty::UseAfterDef,
                                    IRProperty::OutParamNotShadowed, IRProperty::NoNestedInCore,
                                    IRProperty::InOutUseValid,       IRProperty::PipelineLoopValid,
-                                   IRProperty::ArrayNotEscaped,     IRProperty::ManualDepsOnSubmitOnly};
+                                   IRProperty::ArrayNotEscaped,     IRProperty::ManualDepsOnSubmitOnly,
+                                   IRProperty::AtomicAddDtypeValid};
   return props;
 }
 

@@ -40,6 +40,19 @@ class LogLevel(IntEnum):
 def set_log_level(level: LogLevel) -> None:
     """Set the global log level threshold. Only messages at or above this level will be logged."""
 
+def get_log_level() -> LogLevel:
+    """Get the global log level threshold.
+
+    Ignores any thread-local override installed by `_set_thread_log_level`, so
+    `get_log_level()` / `set_log_level()` form a save-restore pair.
+    """
+
+def _set_thread_log_level(level: LogLevel) -> None:
+    """Override the log level threshold for the calling thread."""
+
+def _clear_thread_log_level() -> None:
+    """Remove the calling thread's log level override."""
+
 def log_debug(message: str) -> None:
     """Log a message at the DEBUG level"""
 

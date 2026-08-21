@@ -25,11 +25,14 @@ After the MemRef-mirror redesign:
 from importlib import resources
 from typing import Any, cast
 
+import pypto
 import pytest
 from pypto import DataType, ir
+from pypto.ir.op.distributed import system_ops as dist_system_ops
 from pypto.ir.op.distributed import tensor_ops as dist_tensor_ops
 from pypto.ir.op.distributed import tile_ops as dist_tile_ops
 from pypto.language.distributed.op import tensor_ops as dsl_tensor_ops
+from pypto.language.distributed.op import unified_ops as dsl_unified
 from pypto.language.distributed.op.tensor_ops import _validate_chunk, _validate_pipeline
 from pypto.language.distributed.typing.distributed_tensor import DistributedTensor
 
@@ -230,6 +233,7 @@ def test_tensor_allreduce_returns_src_type():
     call = dist_tensor_ops.allreduce(src, signal, op=ir.ReduceOp.Sum, span=span)
     assert call.type is src.type
     assert call.kwargs["op"] == int(ir.ReduceOp.Sum)
+    assert call.kwargs["core_num"] == 1
 
 
 @pytest.mark.parametrize(
@@ -274,6 +278,31 @@ def test_tensor_allreduce_accepts_missing_signal_for_later_host_synthesis():
     assert call.type is src.type
     assert len(call.args) == 1
     assert call.kwargs["op"] == int(ir.ReduceOp.Sum)
+
+
+def test_tensor_allreduce_accepts_static_core_num():
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    signal = _make_distributed_tensor_var("signal", [4, 8], DataType.INT32, span)
+    call = dist_tensor_ops.allreduce(src, signal, core_num=4, span=span)
+    assert call.kwargs["core_num"] == 4
+
+
+@pytest.mark.parametrize(
+    ("core_num", "error_type", "match"),
+    [
+        (True, TypeError, "compile-time int"),
+        (0, ValueError, "must be positive"),
+        (-1, ValueError, "must be positive"),
+        (1.5, TypeError, "compile-time int"),
+    ],
+)
+def test_tensor_allreduce_rejects_invalid_core_num(core_num, error_type, match):
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    with pytest.raises(error_type, match=match):
+        dist_tensor_ops.allreduce(src, signal, core_num=core_num, span=span)
 
 
 def test_tensor_allreduce_rejects_explicit_none_signal():
@@ -354,6 +383,29 @@ def test_builtin_tensor_allreduce_is_internal_only():
 
 def test_builtin_tensor_allreduce_template_resource_exists():
     template_root = resources.files("pypto.runtime.builtins.collectives.allreduce")
+    assert (template_root / "templates" / "entry.cpp.in").is_file()
+    assert (template_root / "templates" / "kernel.cpp.in").is_file()
+    assert (template_root / "templates" / "kernel_config.py.in").is_file()
+
+
+def test_builtin_tensor_all_to_all_v_is_internal_only():
+    span = ir.Span.unknown()
+    inp = _make_distributed_tensor_var("inp", [8, 64], DataType.FP32, span)
+    target = _make_distributed_tensor_var("target", [8, 64], DataType.FP32, span)
+    signal = _make_distributed_tensor_var("signal", [4, 1], DataType.INT32, span)
+    counts = _make_distributed_tensor_var("counts", [4, 1], DataType.INT32, span)
+    recv = _make_distributed_tensor_var("recv", [4, 1], DataType.INT32, span)
+    with pytest.raises(ValueError, match="internal-only"):
+        ir.create_op_call(
+            "builtin.tensor.all_to_all_v",
+            [inp, target, signal, counts, recv],
+            {"dtype": DataType.FP32},
+            span,
+        )
+
+
+def test_builtin_tensor_all_to_all_v_template_resource_exists():
+    template_root = resources.files("pypto.runtime.builtins.collectives.all_to_all_v")
     assert (template_root / "templates" / "entry.cpp.in").is_file()
     assert (template_root / "templates" / "kernel.cpp.in").is_file()
     assert (template_root / "templates" / "kernel_config.py.in").is_file()
@@ -832,6 +884,339 @@ def test_remote_store_rejects_extra_positional():
         )
 
 
+def test_remote_store_rejects_leading_dim_over_one():
+    """Negative: only the inner two dims are pushed, so a leading extent > 1 has
+    no lowering — FlattenTileNdTo2D would fold it into the row count and overrun
+    the target's inner dims.
+
+    Previously this reached codegen and emitted an out-of-bounds partition view.
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([2, 32, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [2, 64, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0, 0], span)
+
+    with pytest.raises(ValueError, match="src leading dimension 0 must be 1"):
+        ir.create_op_call("pld.tile.remote_store", [tile_var, target, peer, offsets], {}, span)
+
+
+def test_remote_store_accepts_nd_tile_with_unit_leading_dims():
+    """Positive: an N-D tile whose leading dims are all 1 is still 2-D worth of data.
+
+    The deducer runs *before* FlattenTileNdTo2D (pass 13) collapses N-D tiles, so
+    rejecting rank > 2 outright would break the `[1, H, W]` tile → `[1, H, W]`
+    window push, which lowers correctly (codegen pads the peer partition view with
+    the same size-1 leading dims).
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([1, 16, 32], DataType.FP16), span)
+    target = _make_distributed_tensor_var("data", [1, 16, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0, 0], span)
+
+    call = ir.create_op_call("pld.tile.remote_store", [tile_var, target, peer, offsets], {}, span)
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_remote_store_bounds_check_uses_inner_dims_of_nd_source():
+    """The bounds check reads the *inner two* dims of an N-D source, not its rank-0 dim."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([1, 16, 32], DataType.FP16), span)
+    target = _make_distributed_tensor_var("data", [1, 16, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    with pytest.raises(ValueError, match="push exceeds the peer's target region in dimension 2"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, target, peer, _make_shape_tuple([0, 0, 8], span)],
+            {},
+            span,
+        )
+
+
+def test_remote_store_rejects_rank1_source():
+    """Negative: a source below 2-D has no 2-D region to push."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(ValueError, match="src must be at least 2-D"):
+        ir.create_op_call("pld.tile.remote_store", [tile_var, target, peer, offsets], {}, span)
+
+
+def test_remote_store_rejects_rank1_target():
+    """Negative: a 2-D push needs at least 2 target dims to land in."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([1, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0], span)
+
+    with pytest.raises(ValueError, match="target rank must be >= 2"):
+        ir.create_op_call("pld.tile.remote_store", [tile_var, target, peer, offsets], {}, span)
+
+
+def test_remote_store_rejects_out_of_bounds_push():
+    """Negative: the tile must fit inside the target at ``offsets``.
+
+    remote_store carries no transfer shape of its own, so without this check an
+    oversized push silently overwrites the peer's neighbouring region. Mirrors
+    the bounds check remote_load already performs.
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([40, 0], span)  # 40 + 32 > 64
+
+    with pytest.raises(ValueError, match="push exceeds the peer's target region in dimension 0"):
+        ir.create_op_call("pld.tile.remote_store", [tile_var, target, peer, offsets], {}, span)
+
+
+def test_remote_store_bounds_check_uses_leading_unit_dims_for_nd_target():
+    """An N-D (N > 2) target carries one element per leading dim, matching the
+    size-1 partition dims codegen pads with — so a leading offset at the edge
+    is in bounds while one past it is not."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([16, 32], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [4, 16, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    ok = ir.create_op_call(
+        "pld.tile.remote_store",
+        [tile_var, target, peer, _make_shape_tuple([3, 0, 0], span)],
+        {},
+        span,
+    )
+    assert isinstance(ok.type, ir.UnknownType)
+
+    with pytest.raises(ValueError, match="dimension 0"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, target, peer, _make_shape_tuple([4, 0, 0], span)],
+            {},
+            span,
+        )
+
+
+def test_remote_store_skips_bounds_check_for_dynamic_offset():
+    """A runtime offset cannot be compared statically — it is bounded at runtime."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    dyn = ir.Var("row", ir.ScalarType(DataType.INT32), span)
+    offsets = ir.MakeTuple([dyn, ir.ConstInt(0, DataType.INT64, span)], span)
+
+    call = ir.create_op_call("pld.tile.remote_store", [tile_var, target, peer, offsets], {}, span)
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_remote_store_accepts_atomic_add():
+    """The cross-rank push exposes tile.store's atomic-add combine mode."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    call = ir.create_op_call(
+        "pld.tile.remote_store",
+        [tile_var, target, peer, offsets],
+        {"atomic": int(ir.AtomicType.Add)},
+        span,
+    )
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_remote_store_rejects_atomic_add_on_unsupported_dtype():
+    """Negative: atomic-add is limited to the dtypes the hardware can combine.
+
+    Same allow-list ``tile.store`` enforces -- both lower to ``pto.tstore``'s
+    ``atomicType``, so a dtype the local store path rejects is equally
+    unsupported cross-rank. Without this the enum check passed and codegen
+    emitted atomic_add for a dtype the hardware cannot combine.
+    """
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.UINT8), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.UINT8, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(ValueError, match="requires an fp32/bf16/fp16/int32/int16/int8 dtype"):
+        ir.create_op_call(
+            "pld.tile.remote_store",
+            [tile_var, target, peer, offsets],
+            {"atomic": int(ir.AtomicType.Add)},
+            span,
+        )
+
+    # The same dtype is fine for a plain (non-atomic) push.
+    plain = ir.create_op_call("pld.tile.remote_store", [tile_var, target, peer, offsets], {}, span)
+    assert isinstance(plain.type, ir.UnknownType)
+
+
+def test_tensor_remote_store_rejects_atomic_add_on_unsupported_dtype():
+    """The tensor-level form shares the same atomic-add dtype contract."""
+    span = ir.Span.unknown()
+    src = _make_tensor_var("x", [32, 16], DataType.UINT8, span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.UINT8, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(ValueError, match="requires an fp32/bf16/fp16/int32/int16/int8 dtype"):
+        ir.create_op_call(
+            "pld.tensor.remote_store",
+            [src, target, peer, offsets],
+            {"atomic": int(ir.AtomicType.Add)},
+            span,
+        )
+
+
+def test_remote_store_rejects_unknown_atomic_value():
+    """Negative: only AtomicType.None_ / AtomicType.Add are legal."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP32), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(ValueError, match="atomic must be"):
+        ir.create_op_call("pld.tile.remote_store", [tile_var, target, peer, offsets], {"atomic": 7}, span)
+
+
+# ---------------------------------------------------------------------------
+# pld.tensor.remote_store op — tensor-level twin (issue #2349)
+# ---------------------------------------------------------------------------
+
+
+def _make_tensor_var(name: str, shape: list[int], dtype: DataType, span: ir.Span) -> ir.Var:
+    shape_exprs: list[ir.Expr] = [ir.ConstInt(v, DataType.INT64, span) for v in shape]
+    return ir.Var(name, ir.TensorType(shape_exprs, dtype), span)
+
+
+def test_tensor_remote_store_returns_unknown_type():
+    """Positive: the tensor-level form is side-effect-only, like the tile form."""
+    span = ir.Span.unknown()
+    src = _make_tensor_var("x", [32, 16], DataType.FP16, span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    call = ir.create_op_call("pld.tensor.remote_store", [src, target, peer, offsets], {}, span)
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_tensor_remote_store_rejects_tile_src_and_names_the_tile_form():
+    """Negative: a tile operand belongs to pld.tile.remote_store — say so."""
+    span = ir.Span.unknown()
+    tile_var = ir.Var("t", ir.TileType([32, 16], DataType.FP16), span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(ValueError, match="pld.tile.remote_store"):
+        ir.create_op_call("pld.tensor.remote_store", [tile_var, target, peer, offsets], {}, span)
+
+
+def test_tensor_remote_store_rejects_distributed_src_and_names_put():
+    """Negative: a window-to-window transfer is pld.tensor.put's GM->GM job."""
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src_win", [32, 16], DataType.FP16, span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(ValueError, match="pld.tensor.put"):
+        ir.create_op_call("pld.tensor.remote_store", [src, target, peer, offsets], {}, span)
+
+
+def test_tensor_remote_store_rejects_plain_tensor_target():
+    """Negative: the destination must be window-bound."""
+    span = ir.Span.unknown()
+    src = _make_tensor_var("x", [32, 16], DataType.FP16, span)
+    plain = _make_tensor_var("y", [64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(ValueError, match="DistributedTensor"):
+        ir.create_op_call("pld.tensor.remote_store", [src, plain, peer, offsets], {}, span)
+
+
+def test_tensor_remote_store_rejects_leading_dim_over_one():
+    """Negative: same push contract as the tile form it lowers to."""
+    span = ir.Span.unknown()
+    src = _make_tensor_var("x", [2, 32, 16], DataType.FP16, span)
+    target = _make_distributed_tensor_var("data", [2, 64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0, 0], span)
+
+    with pytest.raises(ValueError, match="src leading dimension 0 must be 1"):
+        ir.create_op_call("pld.tensor.remote_store", [src, target, peer, offsets], {}, span)
+
+
+def test_tensor_remote_store_accepts_nd_src_with_unit_leading_dims():
+    """Positive: an N-D value whose leading dims are all 1 lowers fine (see the
+    tile-form twin — the deducer runs before FlattenTileNdTo2D)."""
+    span = ir.Span.unknown()
+    src = _make_tensor_var("x", [1, 16, 32], DataType.FP16, span)
+    target = _make_distributed_tensor_var("data", [1, 16, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0, 0], span)
+
+    call = ir.create_op_call("pld.tensor.remote_store", [src, target, peer, offsets], {}, span)
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_tensor_remote_store_rejects_dtype_mismatch():
+    """Negative: src dtype must match target dtype."""
+    span = ir.Span.unknown()
+    src = _make_tensor_var("x", [32, 16], DataType.FP32, span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 0], span)
+
+    with pytest.raises(ValueError, match="dtype"):
+        ir.create_op_call("pld.tensor.remote_store", [src, target, peer, offsets], {}, span)
+
+
+def test_tensor_remote_store_rejects_out_of_bounds_push():
+    """Negative: the pushed region must fit inside the target at ``offsets``."""
+    span = ir.Span.unknown()
+    src = _make_tensor_var("x", [32, 16], DataType.FP16, span)
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    offsets = _make_shape_tuple([0, 20], span)  # 20 + 16 > 32
+
+    with pytest.raises(ValueError, match="push exceeds the peer's target region in dimension 1"):
+        ir.create_op_call("pld.tensor.remote_store", [src, target, peer, offsets], {}, span)
+
+
+def test_dsl_short_form_remote_store_dispatches_on_operand_level():
+    """``pld.remote_store`` picks the tile / tensor form from its src operand.
+
+    This is the whole point of the short form: one name that works in both a
+    tile-level (@pl.jit.incore / @pl.program) and a tensor-level (@pl.jit)
+    kernel, with the same four arguments and the same semantics.
+    """
+    span = ir.Span.unknown()
+    target = _make_distributed_tensor_var("data", [64, 32], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    tile_call = dsl_unified.remote_store(
+        ir.Var("t", ir.TileType([32, 16], DataType.FP16), span), cast(Any, target), peer, [0, 0]
+    )
+    tensor_call = dsl_unified.remote_store(
+        _make_tensor_var("x", [32, 16], DataType.FP16, span), cast(Any, target), peer, [0, 0]
+    )
+
+    assert tile_call.op.name == ir.get_op("pld.tile.remote_store").name
+    assert tensor_call.op.name == ir.get_op("pld.tensor.remote_store").name
+
+
 # ---------------------------------------------------------------------------
 # pld.system.get_comm_ctx / pld.system.rank / pld.system.nranks ops (N5)
 # ---------------------------------------------------------------------------
@@ -996,6 +1381,110 @@ def test_wait_rejects_plain_tensor_signal():
         )
 
 
+def test_defer_wait_builder_returns_unknown_type():
+    """Deferred wait uses the public IR builder and remains side-effect-only."""
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+
+    call = dist_system_ops.defer_wait(signal, [0], 1, ir.WaitCmp.Ge, span=span)
+
+    assert call.op.name == ir.get_op("pld.system.defer_wait").name
+    assert isinstance(call.type, ir.UnknownType)
+    assert isinstance(call.args[1], ir.MakeTuple)
+    assert call.kwargs["cmp"] == int(ir.WaitCmp.Ge)
+
+
+def test_defer_wait_accepts_index_offsets_and_expected():
+    """INDEX values from loop induction variables are valid counter coordinates and thresholds."""
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    offset = ir.Var("offset", ir.ScalarType(DataType.INDEX), span)
+    expected = ir.Var("expected", ir.ScalarType(DataType.INDEX), span)
+
+    call = dist_system_ops.defer_wait(signal, [offset], expected, ir.WaitCmp.Ge, span=span)
+
+    assert isinstance(call.type, ir.UnknownType)
+    offsets = call.args[1]
+    assert isinstance(offsets, ir.MakeTuple)
+    assert offsets.elements[0] is offset
+    assert call.args[2] is expected
+
+
+def test_defer_wait_rejects_eq_comparison():
+    """Deferred completion v1 supports only monotonic greater-or-equal counters."""
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+
+    with pytest.raises(ValueError, match=r"only supports WaitCmp\.Ge"):
+        dist_system_ops.defer_wait(signal, [0], 1, ir.WaitCmp.Eq, span=span)
+
+
+def test_defer_wait_rejects_rank_zero_signal():
+    """The backend needs at least one signal dimension to derive an element address."""
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [], DataType.INT32, span)
+
+    with pytest.raises(ValueError, match="signal rank must be at least 1"):
+        dist_system_ops.defer_wait(signal, [], 1, ir.WaitCmp.Ge, span=span)
+
+
+def test_defer_wait_rejects_float_offset():
+    """Every signal coordinate must be integer/index typed, not merely scalar typed."""
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    offset = ir.ConstFloat(0.0, DataType.FP32, span)
+
+    with pytest.raises(ValueError, match="offset 0 must be an integer or index scalar"):
+        dist_system_ops.defer_wait(signal, [offset], 1, ir.WaitCmp.Ge, span=span)
+
+
+def test_defer_wait_rejects_float_expected():
+    """The runtime counter threshold accepts integer and INDEX scalars only."""
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    expected = ir.ConstFloat(1.0, DataType.FP32, span)
+
+    with pytest.raises(ValueError, match="expected must be an integer or index scalar"):
+        dist_system_ops.defer_wait(signal, [0], expected, ir.WaitCmp.Ge, span=span)
+
+
+@pytest.mark.parametrize(
+    ("expected", "dtype"),
+    [
+        (-1, DataType.INT64),
+        (2**31, DataType.INT64),
+        (-1, DataType.INDEX),
+        (2**31, DataType.INDEX),
+    ],
+)
+def test_defer_wait_rejects_out_of_range_constant_expected(expected: int, dtype: DataType):
+    """Statically known thresholds must fit the runtime's safe counter range."""
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    expected_expr = ir.ConstInt(expected, dtype, span)
+
+    with pytest.raises(ValueError, match=r"expected must be in \[0, INT32_MAX\]"):
+        dist_system_ops.defer_wait(signal, [0], expected_expr, ir.WaitCmp.Ge, span=span)
+
+
+def test_defer_wait_rejects_non_int32_signal():
+    """Runtime deferred counters are backed by INT32 signal slots."""
+    span = ir.Span.unknown()
+    signal = _make_distributed_tensor_var("signal", [4], DataType.FP32, span)
+
+    with pytest.raises(ValueError, match="signal dtype must be INT32"):
+        dist_system_ops.defer_wait(signal, [0], 1, ir.WaitCmp.Ge, span=span)
+
+
+def test_defer_wait_rejects_plain_tensor_signal():
+    """Deferred completion requires a window-bound DistributedTensor signal."""
+    span = ir.Span.unknown()
+    plain = ir.Var("x", ir.TensorType([ir.ConstInt(4, DataType.INT64, span)], DataType.INT32), span)
+
+    with pytest.raises(ValueError, match="DistributedTensor"):
+        dist_system_ops.defer_wait(plain, [0], 1, ir.WaitCmp.Ge, span=span)
+
+
 # ---------------------------------------------------------------------------
 # pld.tensor.put op (synchronous cross-rank bulk write — TPUT)
 # ---------------------------------------------------------------------------
@@ -1094,6 +1583,60 @@ def test_put_full_slice_dynamic_window_requires_chunk():
     src_mismatch = _make_dynamic_window_var("src2", ir.Var("m", ir.ScalarType(DataType.INT32), span), span)
     with pytest.raises(ValueError, match="must have the same shape"):
         ir.create_op_call("pld.tensor.put", [dst, peer, src_mismatch], {"atomic": 0, "chunk_rows": 4}, span)
+
+
+def test_put_rejects_atomic_add_on_non_hardware_dtype():
+    """atomic-add is limited to the hardware atomic-add dtypes.
+
+    TPUT's combine runs on the ordinary store pipe (pto-isa comm TPut lands each
+    chunk with ``TSTORE_IMPL<..., AtomicAdd>``), so the dtype set is the one
+    ``tile.store`` / ``tensor.assemble`` already gate on. The gate is
+    backend-neutral; the bf16-on-A5 split is the AtomicAddDtypeValid verifier's.
+    """
+    span = ir.Span.unknown()
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.INT64, span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.INT64, span)
+
+    with pytest.raises(ValueError, match="hardware atomic-add dtypes"):
+        ir.create_op_call("pld.tensor.put", [dst, peer, src], {"atomic": int(ir.AtomicType.Add)}, span)
+
+    # A plain (non-atomic) put of the same dtype stays legal — the gate is keyed
+    # on the atomic kwarg, not on the transfer dtype.
+    call = ir.create_op_call("pld.tensor.put", [dst, peer, src], {"atomic": 0}, span)
+    assert isinstance(call.type, ir.UnknownType)
+
+
+def test_tile_put_rejects_atomic_add_on_non_hardware_dtype():
+    """The tile-level form shares ValidatePutContract, so it is gated too."""
+    span = ir.Span.unknown()
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.INT64, span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.INT64, span)
+    stage = ir.Var(
+        "stage",
+        ir.TileType(
+            [ir.ConstInt(16, DataType.INT64, span), ir.ConstInt(64, DataType.INT64, span)],
+            DataType.INT64,
+        ),
+        span,
+    )
+
+    with pytest.raises(ValueError, match="hardware atomic-add dtypes"):
+        ir.create_op_call("pld.tile.put", [dst, peer, src, stage], {"atomic": int(ir.AtomicType.Add)}, span)
+
+
+def test_put_accepts_atomic_add_on_bf16():
+    """bf16 passes the backend-neutral gate: it is a hardware atomic-add dtype on
+    A2/A3. Rejecting it on A5 is the AtomicAddDtypeValid verifier's job, so the
+    deducer must stay neutral (a program may target either profile)."""
+    span = ir.Span.unknown()
+    dst = _make_distributed_tensor_var("dst", [16, 64], DataType.BF16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+    src = _make_distributed_tensor_var("src", [16, 64], DataType.BF16, span)
+
+    call = dist_tensor_ops.put(dst, peer, src, ir.AtomicType.Add, span=span)
+    assert call.kwargs["atomic"] == int(ir.AtomicType.Add)
 
 
 def test_put_ir_builder_accepts_positional_atomic_compat():
@@ -1272,7 +1815,9 @@ def test_tile_put_rejects_stage_larger_than_transfer():
     # 128 cols > 64 transfer cols.
     stage = _make_tile_var("stage", [16, 128], DataType.FP16, span)
 
-    with pytest.raises(ValueError, match="must fit within"):
+    # InternalError, not ValueError: pld.tile.put is materialised by ConvertTensorToTileOps
+    # and its staging tile is compiler-created, so an oversized stage is a pass bug.
+    with pytest.raises(pypto.InternalError, match="must fit within"):
         dist_tile_ops.put(dst, peer, src, stage, atomic=ir.AtomicType.None_, span=span)
 
 
@@ -1627,7 +2172,8 @@ def test_tile_get_rejects_stage_larger_than_transfer():
     # 32 rows > 16 transfer rows.
     stage = _make_tile_var("stage", [32, 64], DataType.FP16, span)
 
-    with pytest.raises(ValueError, match="must fit within"):
+    # InternalError, not ValueError: see the put sibling above.
+    with pytest.raises(pypto.InternalError, match="must fit within"):
         dist_tile_ops.get(dst, peer, src, stage, span=span)
 
 

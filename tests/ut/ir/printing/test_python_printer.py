@@ -620,6 +620,36 @@ def test_python_print_distributed_tensor_explicit_layout_surfaces_window_buffer(
     assert explicit_plain != explicit_wb
 
 
+def test_python_print_var_subclasses_reach_the_expression_printer():
+    """Every Var subclass must print as an Expr, not as the unsupported sentinel.
+
+    ``IRPythonPrinter::Print`` gates its expression arm on ``As<Expr>(node)``,
+    which consults the ``KindTrait<Expr>::kinds`` array. A Var subclass carrying
+    its own ``ObjectKind`` but missing from that array falls straight through to
+    ``"<unsupported IRNode type>"`` even though the printer has a working
+    ``VisitExpr_`` overload for it. That is exactly what happened to
+    ``WindowBuffer``: the overload at ``python_printer.cpp`` printed the
+    inherited name hint, but ``Print`` never reached it.
+    """
+    span = ir.Span.unknown()
+    index_ty = ir.ScalarType(DataType.INDEX)
+    unsupported = "<unsupported IRNode type>"
+
+    nodes = {
+        "Var": ir.Var("v", index_ty, span),
+        "IterArg": ir.IterArg("acc", index_ty, ir.ConstInt(0, DataType.INDEX, span), span),
+        "MemRef": ir.MemRef(ir.MemorySpace.Vec, ir.ConstInt(0, DataType.INDEX, span), 256, 0),
+        "WindowBuffer": ir.WindowBuffer(
+            ir.Var("wbuf", ir.PtrType(), span), ir.ConstInt(4096, DataType.INT32, span), span=span
+        ),
+    }
+    for name, node in nodes.items():
+        assert python_print(node, format=False) != unsupported, f"{name} did not reach the Expr printer"
+
+    # WindowBuffer prints through the name hint inherited from its base Ptr Var.
+    assert python_print(nodes["WindowBuffer"], format=False) == "wbuf"
+
+
 def test_python_print_all_scalar_types():
     """Test all scalar type annotations."""
     span = ir.Span.unknown()
@@ -1840,6 +1870,11 @@ def test_builtin_op_call_generic_attrs_roundtrip():
                         "my_bool_attr": True,
                         "my_str_attr": "hello",
                         "my_dtype_attr": pl.FP16,
+                        "my_memory_attr": pl.Mem.Vec,
+                        "my_tensor_layout_attr": pl.TensorLayout.ND,
+                        "my_tile_layout_attr": pl.TileLayout.row_major,
+                        "my_pad_attr": pl.PadValue.zero,
+                        "my_direction_attr": pl.adir.input,
                         "pipeline_membership": "0:3",
                         "dump_vars": [a],
                     },
@@ -1854,6 +1889,11 @@ def test_builtin_op_call_generic_attrs_roundtrip():
         assert key in printed, printed
     # DataType attrs print in the ``pl.<DTYPE>`` form the dtype resolver reads back.
     assert '"my_dtype_attr": pl.FP16' in printed, printed
+    assert '"my_memory_attr": pl.Mem.Vec' in printed, printed
+    assert '"my_tensor_layout_attr": pl.TensorLayout.ND' in printed, printed
+    assert '"my_tile_layout_attr": pl.TileLayout.row_major' in printed, printed
+    assert '"my_pad_attr": pl.PadValue.zero' in printed, printed
+    assert '"my_direction_attr": pl.adir.input' in printed, printed
 
     reparsed = pl.parse_program(printed)
     ir.assert_structural_equal(program, reparsed)
@@ -1875,6 +1915,11 @@ def test_builtin_op_call_generic_attrs_roundtrip():
     assert attrs["my_bool_attr"] is True
     assert attrs["my_str_attr"] == "hello"
     assert attrs["my_dtype_attr"] == DataType.FP16
+    assert attrs["my_memory_attr"] == ir.MemorySpace.Vec
+    assert attrs["my_tensor_layout_attr"] == ir.TensorLayout.ND
+    assert attrs["my_tile_layout_attr"] == ir.TileLayout.row_major
+    assert attrs["my_pad_attr"] == ir.PadValue.zero
+    assert attrs["my_direction_attr"] == ir.ArgDirection.Input
     assert attrs["pipeline_membership"] == "0:3"
     # The Var-list attr resolves back to the very same operand, by identity.
     assert list(attrs["dump_vars"]) == [loads[0].args[0]]

@@ -28,16 +28,19 @@ import pytest
 from pypto import ir, passes
 from pypto.language.parser.diagnostics.exceptions import ParserError
 
+_OP_PLD_TILE_REMOTE_LOAD = ir.get_op("pld.tile.remote_load").name
+_OP_TILE_LOAD = ir.get_op("tile.load").name
+
 # Primitive tile ops the decomposition is allowed to emit (besides framework
 # infrastructure ops like tile.load / tile.store / tile.move that wrap the
 # decomposed body).
 _DECOMP_PRIMITIVES = {
-    "tile.muls",
-    "tile.adds",
-    "tile.add",
-    "tile.sub",
-    "tile.mul",
-    "tile.cast",
+    ir.get_op("tile.muls").name,
+    ir.get_op("tile.adds").name,
+    ir.get_op("tile.add").name,
+    ir.get_op("tile.sub").name,
+    ir.get_op("tile.mul").name,
+    ir.get_op("tile.cast").name,
 }
 
 
@@ -481,17 +484,17 @@ _ALLREDUCE_REDUCE_CASES = [
 
 # Ops the chunked mesh decomposition must emit.
 _ALLREDUCE_REQUIRED_OPS = {
-    "pld.system.get_comm_ctx",
-    "pld.system.nranks",
-    "pld.system.rank",
-    "pld.system.notify",  # Ready and per-chunk read-complete barriers
-    "pld.system.wait",  # Ready and per-chunk read-complete barriers
-    "pld.tile.remote_load",  # Peer chunk load
-    "tile.fillpad_inplace",  # Zero ragged padding before accumulation
-    "tile.add",  # Accumulate peer chunks
-    "tile.load",  # Self chunk load + user-side load
-    "tile.set_validshape",  # Narrow the final ragged chunk
-    "tile.store",  # Per-chunk result + user-side store
+    ir.get_op("pld.system.get_comm_ctx").name,
+    ir.get_op("pld.system.nranks").name,
+    ir.get_op("pld.system.rank").name,
+    ir.get_op("pld.system.notify").name,  # Ready and per-chunk read-complete barriers
+    ir.get_op("pld.system.wait").name,  # Ready and per-chunk read-complete barriers
+    ir.get_op("pld.tile.remote_load").name,  # Peer chunk load
+    ir.get_op("tile.fillpad_inplace").name,  # Zero ragged padding before accumulation
+    ir.get_op("tile.add").name,  # Accumulate peer chunks
+    ir.get_op("tile.load").name,  # Self chunk load + user-side load
+    ir.get_op("tile.set_validshape").name,  # Narrow the final ragged chunk
+    ir.get_op("tile.store").name,  # Per-chunk result + user-side store
 }
 
 
@@ -735,10 +738,10 @@ def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
     )
 
 
-def test_all_to_all_v_is_rejected_in_host_orchestrator():
-    """all_to_all_v is InCore-only: LowerHostTensorCollectives has no rule for
-    it, so deferring it from a HOST orchestrator would leave the composite op
-    unlowered all the way into codegen. It must be rejected up front."""
+def test_all_to_all_v_in_host_orchestrator_is_left_for_host_collective_lowering():
+    """Host-level all_to_all_v is lowered by LowerHostTensorCollectives (via its
+    builtin.tensor.all_to_all_v rule), not here — LowerCompositeOps must defer
+    it unchanged rather than reject it."""
     SIZE = _AAV_SIZE
     nr = _AAV_NRANKS
     total = _AAV_TOTAL
@@ -757,8 +760,12 @@ def test_all_to_all_v_is_rejected_in_host_orchestrator():
             data = pld.tensor.all_to_all_v(inp, data, signal, counts, recv_counts)  # type: ignore[arg-type]
             return 0
 
-    with pytest.raises(ValueError, match="not supported in a HOST orchestration function"):
-        passes.lower_composite_ops()(HostAllToAllV)
+    After = passes.lower_composite_ops()(HostAllToAllV)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.all_to_all_v" in op_names
+    assert "pld.system.notify" not in op_names
+    assert "pld.tile.put" not in op_names
 
 
 def test_allreduce_without_signal_is_rejected_outside_host_orchestrator():
@@ -823,7 +830,31 @@ def test_allreduce_eval_stmt_with_signal_is_decomposed():
     assert not missing, f"lowered IR missing expected ops: {missing}"
 
 
-def test_allreduce_in_for_loop_is_rejected():
+def test_incore_allreduce_rejects_local_multicore_request():
+    SIZE = _ALLREDUCE_SIZE
+    nr = _ALLREDUCE_NRANKS
+
+    @pl.program
+    class MultiCoreAllreduce:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 4], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            data = pld.tensor.allreduce(data, signal, core_num=4)
+            return data
+
+    with pytest.raises(ValueError, match="supported only in a HOST orchestrator"):
+        passes.lower_composite_ops()(MultiCoreAllreduce)
+
+
+def test_allreduce_in_for_loop_now_succeeds():
+    """A dynamic trip count used to have no compile-time generation to wait for,
+    so this was rejected. The self-clearing epilogue (each call restarts at
+    all-zero) removes that restriction — see ``lower_composite_ops_pass.cpp``'s
+    deleted ``CheckCollectiveLoopUse``.
+    """
     SIZE = _ALLREDUCE_SIZE
     nr = _ALLREDUCE_NRANKS
 
@@ -839,11 +870,11 @@ def test_allreduce_in_for_loop_is_rejected():
                 data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
             return data
 
-    with pytest.raises(ValueError, match="allreduce is not supported inside a for/while loop"):
-        passes.lower_composite_ops()(LoopAllreduce)
+    After = passes.lower_composite_ops()(LoopAllreduce)
+    assert _static_wait_expectations(After) == [1]
 
 
-def test_allreduce_in_while_loop_is_rejected():
+def test_allreduce_in_while_loop_now_succeeds():
     SIZE = _ALLREDUCE_SIZE
     nr = _ALLREDUCE_NRANKS
 
@@ -859,12 +890,16 @@ def test_allreduce_in_while_loop_is_rejected():
                 data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
             return data
 
-    with pytest.raises(ValueError, match="allreduce is not supported inside a for/while loop"):
-        passes.lower_composite_ops()(LoopAllreduce)
+    After = passes.lower_composite_ops()(LoopAllreduce)
+    assert _static_wait_expectations(After) == [1]
 
 
-def test_all_to_all_v_in_for_loop_is_rejected():
-    """Same single-use Set(1)/wait≥1 signal protocol as allreduce — looped reuse races."""
+def test_all_to_all_v_in_for_loop_now_succeeds():
+    """The self-clearing epilogue (each call restarts at all-zero) removes the
+    old loop restriction for all collectives.  all_to_all_v lowers through
+    the same barrier path as the other six — see the deleted
+    ``CheckCollectiveLoopUse`` in ``lower_composite_ops_pass.cpp``.
+    """
     SIZE = _AAV_SIZE
     nr = _AAV_NRANKS
     total = _AAV_TOTAL
@@ -884,11 +919,11 @@ def test_all_to_all_v_in_for_loop_is_rejected():
                 data = pld.tensor.all_to_all_v(inp, data, signal, counts, recv_counts)
             return data
 
-    with pytest.raises(ValueError, match="all_to_all_v is not supported inside a for/while loop"):
-        passes.lower_composite_ops()(LoopAllToAllV)
+    passes.lower_composite_ops()(LoopAllToAllV)
 
 
-def test_all_to_all_v_in_while_loop_is_rejected():
+def test_all_to_all_v_in_while_loop_now_succeeds():
+    """Same as above — while loops are legal under the self-clearing protocol."""
     SIZE = _AAV_SIZE
     nr = _AAV_NRANKS
     total = _AAV_TOTAL
@@ -908,8 +943,7 @@ def test_all_to_all_v_in_while_loop_is_rejected():
                 data = pld.tensor.all_to_all_v(inp, data, signal, counts, recv_counts)
             return data
 
-    with pytest.raises(ValueError, match="all_to_all_v is not supported inside a for/while loop"):
-        passes.lower_composite_ops()(LoopAllToAllV)
+    passes.lower_composite_ops()(LoopAllToAllV)
 
 
 def test_allreduce_emits_for_and_if_control_flow():
@@ -936,10 +970,10 @@ def test_allreduce_emits_for_and_if_control_flow():
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    assert collector.for_count == 6, (
-        f"expected 6 ForStmts (notify, wait, chunk, reduce, re-notify, re-wait), got {collector.for_count}"
+    assert collector.for_count == 7, (
+        f"expected 7 ForStmts (notify,wait,chunk,reduce,renotify,rewait,epilogue), got {collector.for_count}"
     )
-    assert collector.if_count == 5, f"expected 5 peer-filter IfStmts, got {collector.if_count}"
+    assert collector.if_count == 6, f"expected 6 peer-filter IfStmts, got {collector.if_count}"
 
 
 def test_allreduce_flattens_target_to_2d_view_for_mesh_lowering():
@@ -1032,8 +1066,8 @@ def test_allreduce_mesh_lowering_preserves_partial_valid_shape():
 
     collector = CallCollector()
     collector.visit_program(After)
-    load = next(call for call in collector.calls if call.op.name == "tile.load")
-    remote_load = next(call for call in collector.calls if call.op.name == "pld.tile.remote_load")
+    load = next(call for call in collector.calls if call.op.name == _OP_TILE_LOAD)
+    remote_load = next(call for call in collector.calls if call.op.name == _OP_PLD_TILE_REMOTE_LOAD)
     load_shape = load.args[2]
     load_valid_shape = load.args[3]
     remote_shape = remote_load.args[3]
@@ -1583,11 +1617,11 @@ def test_allreduce_lowers_every_reduce_op(reduce_op, expected_tile_op):
 
 _BARRIER_NRANKS = 2
 _BARRIER_REQUIRED_OPS = {
-    "pld.system.get_comm_ctx",
-    "pld.system.nranks",
-    "pld.system.rank",
-    "pld.system.notify",
-    "pld.system.wait",
+    ir.get_op("pld.system.get_comm_ctx").name,
+    ir.get_op("pld.system.nranks").name,
+    ir.get_op("pld.system.rank").name,
+    ir.get_op("pld.system.notify").name,
+    ir.get_op("pld.system.wait").name,
 }
 
 
@@ -1629,8 +1663,10 @@ def test_barrier_emits_for_and_if_control_flow():
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    assert collector.for_count == 2, f"expected 2 ForStmts (notify, wait), got {collector.for_count}"
-    assert collector.if_count == 2, f"expected 2 IfStmts (one per ForStmt body), got {collector.if_count}"
+    assert collector.for_count == 3, (
+        f"expected 3 ForStmts (notify, wait, epilogue), got {collector.for_count}"
+    )
+    assert collector.if_count == 3, f"expected 3 IfStmts (one per ForStmt body), got {collector.if_count}"
 
 
 def test_barrier_lowering_is_idempotent():
@@ -1648,13 +1684,13 @@ def test_barrier_lowering_is_idempotent():
 _BROADCAST_SIZE = 16
 _BROADCAST_NRANKS = 2
 _BROADCAST_REQUIRED_OPS = {
-    "pld.system.get_comm_ctx",
-    "pld.system.nranks",
-    "pld.system.rank",
-    "pld.system.notify",
-    "pld.system.wait",
-    "tile.create",
-    "pld.tile.get",
+    ir.get_op("pld.system.get_comm_ctx").name,
+    ir.get_op("pld.system.nranks").name,
+    ir.get_op("pld.system.rank").name,
+    ir.get_op("pld.system.notify").name,
+    ir.get_op("pld.system.wait").name,
+    ir.get_op("tile.create").name,
+    ir.get_op("pld.tile.get").name,
 }
 
 
@@ -1699,8 +1735,10 @@ def test_broadcast_emits_for_and_if_control_flow():
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    assert collector.for_count == 2, f"expected 2 ForStmts (notify, wait), got {collector.for_count}"
-    assert collector.if_count == 2, f"expected 2 IfStmts (one per ForStmt body), got {collector.if_count}"
+    assert collector.for_count == 3, (
+        f"expected 3 ForStmts (notify, wait, epilogue), got {collector.for_count}"
+    )
+    assert collector.if_count == 3, f"expected 3 IfStmts (one per ForStmt body), got {collector.if_count}"
 
 
 def test_broadcast_lowering_is_idempotent():
@@ -1718,13 +1756,13 @@ def test_broadcast_lowering_is_idempotent():
 _ALLGATHER_SIZE = 16
 _ALLGATHER_NRANKS = 2
 _ALLGATHER_REQUIRED_OPS = {
-    "pld.system.get_comm_ctx",
-    "pld.system.nranks",
-    "pld.system.rank",
-    "pld.system.notify",
-    "pld.system.wait",
-    "pld.tile.put",
-    "tile.create",
+    ir.get_op("pld.system.get_comm_ctx").name,
+    ir.get_op("pld.system.nranks").name,
+    ir.get_op("pld.system.rank").name,
+    ir.get_op("pld.system.notify").name,
+    ir.get_op("pld.system.wait").name,
+    ir.get_op("pld.tile.put").name,
+    ir.get_op("tile.create").name,
 }
 
 
@@ -1773,8 +1811,12 @@ def test_allgather_emits_for_and_if_control_flow():
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    assert collector.for_count == 3, f"expected 3 ForStmts (push, notify, wait), got {collector.for_count}"
-    assert collector.if_count == 2, f"expected 2 IfStmts (notify-all + wait-all), got {collector.if_count}"
+    assert collector.for_count == 4, (
+        f"expected 4 ForStmts (push, notify, wait, epilogue), got {collector.for_count}"
+    )
+    assert collector.if_count == 3, (
+        f"expected 3 IfStmts (notify-all + wait-all + epilogue), got {collector.if_count}"
+    )
 
 
 def test_allgather_lowering_is_idempotent():
@@ -1792,15 +1834,15 @@ def test_allgather_lowering_is_idempotent():
 _REDUCE_SCATTER_SIZE = 16
 _REDUCE_SCATTER_NRANKS = 2
 _REDUCE_SCATTER_REQUIRED_OPS = {
-    "pld.system.get_comm_ctx",
-    "pld.system.nranks",
-    "pld.system.rank",
-    "pld.system.notify",
-    "pld.system.wait",
-    "pld.tile.remote_load",
-    "tile.add",
-    "tile.load",
-    "tile.store",
+    ir.get_op("pld.system.get_comm_ctx").name,
+    ir.get_op("pld.system.nranks").name,
+    ir.get_op("pld.system.rank").name,
+    ir.get_op("pld.system.notify").name,
+    ir.get_op("pld.system.wait").name,
+    ir.get_op("pld.tile.remote_load").name,
+    ir.get_op("tile.add").name,
+    ir.get_op("tile.load").name,
+    ir.get_op("tile.store").name,
 }
 
 
@@ -1845,10 +1887,10 @@ def test_reduce_scatter_emits_for_and_if_control_flow():
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    assert collector.for_count == 5, (
-        f"expected 5 ForStmts (notify, wait, reduce, re-notify, re-wait), got {collector.for_count}"
+    assert collector.for_count == 6, (
+        f"expected 6 ForStmts (notify, wait, reduce, re-notify, re-wait, epilogue), got {collector.for_count}"
     )
-    assert collector.if_count == 5, f"expected 5 IfStmts (one per ForStmt body), got {collector.if_count}"
+    assert collector.if_count == 6, f"expected 6 IfStmts (one per ForStmt body), got {collector.if_count}"
 
 
 def test_reduce_scatter_lowering_is_idempotent():
@@ -1971,8 +2013,8 @@ def test_ring_allreduce_emits_ring_control_flow():
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    assert collector.for_count == 12, f"expected 12 ForStmts for P=2 ring, got {collector.for_count}"
-    assert collector.if_count == 12, f"expected 12 IfStmts for P=2 ring, got {collector.if_count}"
+    assert collector.for_count == 14, f"expected 14 ForStmts for P=2 ring, got {collector.for_count}"
+    assert collector.if_count == 13, f"expected 13 IfStmts for P=2 ring, got {collector.if_count}"
 
 
 @pytest.mark.parametrize("size", [1, 3, 17, 8193, 65537])
@@ -2085,7 +2127,7 @@ def test_ring_allreduce_fp16_uses_aligned_ring_schedule(size, n_ranks):
 
     stmt_collector = _StmtKindCollector()
     stmt_collector.visit_program(After)
-    assert stmt_collector.for_count == 12, (
+    assert stmt_collector.for_count == 14, (
         f"FP16 mode=ring must use the ring schedule, got {stmt_collector.for_count} loops"
     )
 
@@ -2390,7 +2432,7 @@ def test_ring_allreduce_mesh_default_unchanged():
     # per-chunk read-complete barrier.
     collector = _StmtKindCollector()
     collector.visit_program(After)
-    assert collector.for_count == 6, f"mesh allreduce must produce 6 ForStmts, got {collector.for_count}"
+    assert collector.for_count == 7, f"mesh allreduce must produce 7 ForStmts, got {collector.for_count}"
 
 
 @pytest.mark.parametrize(("reduce_op", "expected_tile_op"), _ALLREDUCE_REDUCE_CASES)
@@ -2404,6 +2446,612 @@ def test_ring_allreduce_lowers_every_reduce_op(reduce_op, expected_tile_op):
     for _, other_tile_op in _ALLREDUCE_REDUCE_CASES:
         if other_tile_op != expected_tile_op:
             assert other_tile_op not in op_names
+
+
+# ============================================================================
+# Self-clearing credit-barrier protocol (issue #2156)
+#
+# Every ``pld.tensor.*`` collective barriers through one shared protocol:
+# ``AtomicAdd(1)`` into each peer's cell for every barrier this call issues,
+# then ``Wait(>= g)`` where ``g`` counts up *within this call only* — every
+# fresh call restarts at 1. A per-call epilogue then subtracts the total
+# credit count back out of every cell it touched (``AtomicAdd(-N)``), so the
+# signal is provably all-zero again once every rank has finished its
+# epilogue. The next call on the same signal therefore starts over at
+# generation 1 too, with no cross-call bookkeeping required.
+#
+# These tests pin the protocol itself, which is the deterministic regression
+# guard: functional back-to-back coverage lives in the distributed STs, where a
+# stale-signal barrier only *races* rather than reliably failing.
+# ============================================================================
+
+_PROTOCOL_SIZE = 16
+_PROTOCOL_NRANKS = 2
+
+
+# Route the operator literals through the registry getter so a typo raises at
+# import instead of silently never matching.
+_NOTIFY_OP_NAME = ir.get_op("pld.system.notify").name
+_WAIT_OP_NAME = ir.get_op("pld.system.wait").name
+
+
+class _CollectiveCallCollector(ir.IRVisitor):
+    """Collect every ``pld.system.notify`` / ``pld.system.wait`` Call in order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.notifies: list[ir.Call] = []
+        self.waits: list[ir.Call] = []
+
+    def visit_call(self, op: ir.Call) -> None:
+        if op.op.name == _NOTIFY_OP_NAME:
+            self.notifies.append(op)
+        elif op.op.name == _WAIT_OP_NAME:
+            self.waits.append(op)
+        super().visit_call(op)
+
+
+def _collect_barrier_calls(prog) -> _CollectiveCallCollector:
+    collector = _CollectiveCallCollector()
+    collector.visit_program(prog)
+    return collector
+
+
+def _static_wait_expectations(prog) -> list[int]:
+    """Expected values of every ``pld.system.wait`` with a constant expectation.
+
+    The mesh allreduce's per-chunk barrier derives its expectation from the
+    chunk loop variable, so it is skipped here — only compile-time constants
+    (one per straight-line barrier) are returned, in emission order.
+    """
+    values = []
+    for wait in _collect_barrier_calls(prog).waits:
+        expected = wait.args[2]
+        if isinstance(expected, ir.ConstInt):
+            values.append(expected.value)
+    return values
+
+
+def _build_two_barriers_program():
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def barrier_twice(
+            self,
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+            signal = pld.tensor.barrier(signal)
+            signal = pld.tensor.barrier(signal)
+            return signal
+
+    return Before
+
+
+def _build_two_all_to_all_program():
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def exchange_twice(
+            self,
+            first: pl.Tensor[[nr, SIZE], pl.FP32],
+            second: pl.Tensor[[nr, SIZE], pl.FP32],
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            data = pld.tensor.all_to_all(first, data, signal)
+            data = pld.tensor.all_to_all(second, data, signal)
+            return data
+
+    return Before
+
+
+def _build_two_allgather_program():
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gather_twice(
+            self,
+            first: pl.Tensor[[1, SIZE], pl.FP32],
+            second: pl.Tensor[[1, SIZE], pl.FP32],
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            data = pld.tensor.allgather(first, data, signal)
+            data = pld.tensor.allgather(second, data, signal)
+            return data
+
+    return Before
+
+
+def _build_two_reduce_scatter_program():
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def scatter_twice(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
+            data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    return Before
+
+
+def _build_two_broadcast_program():
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def broadcast_twice(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            data = pld.tensor.broadcast(data, signal, root=0)
+            data = pld.tensor.broadcast(data, signal, root=0)
+            return data
+
+    return Before
+
+
+def _build_two_ring_allreduce_program():
+    SIZE = _RING_ALLREDUCE_SIZE
+    nr = _RING_ALLREDUCE_NRANKS
+    total_rounds = 2 * (nr - 1)
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_twice(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[total_rounds, nr], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            return data
+
+    return Before
+
+
+# One builder per collective, with the wait expectations each back-to-back pair
+# must produce. Every call restarts at generation 1 — the epilogue resets the
+# signal to all-zero at the end of each call — so two calls repeat the same
+# sequence rather than accumulating. reduce_scatter barriers twice per call
+# (ready + post-reduce): [1, 2, 1, 2]. The ring allreduce's arbitrary-length
+# schedule (#2161) barriers twice per subchunk (ready + read-complete); at
+# NR=2 there is one reduce-scatter round and one allgather round, each with
+# one subchunk, so one call already produces [1, 2, 1, 2] and two calls repeat
+# it.
+_BACK_TO_BACK_CASES = {
+    "barrier": (_build_two_barriers_program, [1, 1]),
+    "all_to_all": (_build_two_all_to_all_program, [1, 1]),
+    "allgather": (_build_two_allgather_program, [1, 1]),
+    "broadcast": (_build_two_broadcast_program, [1, 1]),
+    "reduce_scatter": (_build_two_reduce_scatter_program, [1, 2, 1, 2]),
+    "ring_allreduce": (_build_two_ring_allreduce_program, []),
+}
+
+
+@pytest.mark.parametrize("collective", sorted(_BACK_TO_BACK_CASES))
+def test_back_to_back_collective_restarts_at_generation_one(collective):
+    """A signal reused by two consecutive collectives always restarts at 1.
+
+    Regression guard for issue #2156: the self-clearing epilogue
+    (``AtomicAdd(-N)``) restores every cell to zero at the end of each call,
+    so the *next* call's first barrier safely waits for ``>= 1`` again —
+    unlike the old ``Set(1)`` / ``Wait(>= 1)`` protocol, which left every cell
+    at 1 and let the second call's waits pass on stale state.
+    """
+    build, expected_generations = _BACK_TO_BACK_CASES[collective]
+    After = passes.lower_composite_ops()(build())
+
+    assert _static_wait_expectations(After) == expected_generations, (
+        f"{collective} back-to-back must restart at generation 1 each call, expecting "
+        f"{expected_generations}, got {_static_wait_expectations(After)}"
+    )
+
+
+@pytest.mark.parametrize("collective", sorted(_BACK_TO_BACK_CASES))
+def test_collective_barriers_use_atomic_add_and_ge(collective):
+    """Every barrier notifies with ``AtomicAdd`` and waits with ``Ge``.
+
+    ``Set`` must never appear: mixing it with ``AtomicAdd`` on the same cells
+    can clobber an already-advanced counter. ``Ge`` (not ``Eq``) is required
+    because a fast peer can advance a cell past the value the waiter is
+    looking for. The credit epilogue's reset notify is itself an ``AtomicAdd``
+    (of a negative value) — never a ``Set`` — so this invariant covers it too.
+    """
+    build, _ = _BACK_TO_BACK_CASES[collective]
+    After = passes.lower_composite_ops()(build())
+    calls = _collect_barrier_calls(After)
+
+    assert calls.notifies, f"{collective} lowering emitted no notify"
+    assert calls.waits, f"{collective} lowering emitted no wait"
+    for notify in calls.notifies:
+        assert notify.kwargs["op"] == int(pld.NotifyOp.AtomicAdd), (
+            f"{collective} must notify with AtomicAdd, got op={notify.kwargs['op']}"
+        )
+    for wait in calls.waits:
+        assert wait.kwargs["cmp"] == int(pld.WaitCmp.Ge), (
+            f"{collective} must wait with Ge, got cmp={wait.kwargs['cmp']}"
+        )
+
+
+def test_barrier_chain_restarts_generation_through_the_rebind_idiom():
+    """``sig = pld.tensor.barrier(sig)`` renames the signal on every call.
+
+    Generations are call-local under the self-clearing protocol, so a chain
+    of rebound barriers restarts at 1 on every call instead of continuing to
+    count up — the rebind idiom no longer needs cross-call alias tracking.
+    """
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def barrier_thrice(
+            self,
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+            signal = pld.tensor.barrier(signal)
+            signal = pld.tensor.barrier(signal)
+            signal = pld.tensor.barrier(signal)
+            return signal
+
+    After = passes.lower_composite_ops()(Before)
+    assert _static_wait_expectations(After) == [1, 1, 1]
+
+
+def test_mesh_allreduce_epilogue_resets_signal_for_the_next_collective():
+    """A later collective is unaffected by an earlier allreduce's barriers.
+
+    The [1, 16] FP32 target is one chunk, so the mesh recipe issues one ready
+    barrier (generation 1) plus one chunk-complete barrier (a runtime-derived
+    expected value, not a compile-time constant) and then subtracts both
+    credits back out via the epilogue. The following barrier therefore waits
+    for 1 again, not for a value that accounts for the allreduce's barriers.
+    """
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_then_barrier(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            signal = pld.tensor.barrier(signal)
+            return signal
+
+    After = passes.lower_composite_ops()(Before)
+    # The ready barrier waits for 1; the chunk barrier's expectation is derived
+    # from the chunk loop variable (not a constant, so _static_wait_expectations
+    # skips it); the epilogue resets the signal, so the trailing barrier waits
+    # for 1 again rather than accounting for the allreduce's barriers.
+    assert _static_wait_expectations(After) == [1, 1]
+
+
+def test_dynamic_mesh_allreduce_signal_is_reusable():
+    """A symbolic reduction extent no longer poisons the signal for reuse.
+
+    The self-clearing epilogue's credit total may itself be a runtime-computed
+    scalar expression (``pld.system.notify``'s value only requires
+    ``ScalarType``), so a mesh allreduce over a symbolic extent can still reset
+    its signal correctly even though the chunk count is unknown at compile
+    time.
+    """
+    n = pl.dynamic("REUSE_DYNAMIC_N")
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_then_barrier(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, n], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            signal = pld.tensor.barrier(signal)
+            return signal
+
+    After = passes.lower_composite_ops()(Before)
+    assert _static_wait_expectations(After) == [1, 1]
+
+    # The allreduce's epilogue reset must carry a symbolic (non-ConstInt)
+    # credit total, since the chunk count depends on the runtime extent n.
+    notifies = _collect_barrier_calls(After).notifies
+    symbolic_value_notifies = [call for call in notifies if not isinstance(call.args[3], ir.ConstInt)]
+    assert symbolic_value_notifies, (
+        "expected at least one symbolic-value notify (the allreduce epilogue reset)"
+    )
+
+
+def test_mixing_ring_and_mesh_barrier_protocols_on_one_signal_is_rejected():
+    """Ring's signal is [2*(NR-1), NR] (one row per round); mesh's is [NR, 1]
+    (one cell per rank). Sharing one buffer between the two is now a plain
+    shape mismatch rather than a generation-table protocol conflict."""
+    SIZE = _RING_ALLREDUCE_SIZE
+    nr = _RING_ALLREDUCE_NRANKS
+    total_rounds = 2 * (nr - 1)
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def ring_then_barrier(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[total_rounds, nr], pl.INT32]],
+        ) -> pld.DistributedTensor[[total_rounds, nr], pl.INT32]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            signal = pld.tensor.barrier(signal)
+            return signal
+
+    with pytest.raises(ValueError, match=r"signal shape\[1\] must be 1"):
+        passes.lower_composite_ops()(Before)
+
+
+def _build_barrier_in_loop_program():
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def loop_step(
+            self,
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+            for _ in pl.range(2):
+                signal = pld.tensor.barrier(signal)
+            return signal
+
+    return Before
+
+
+def _build_broadcast_in_loop_program():
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def loop_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            for _ in pl.range(2):
+                data = pld.tensor.broadcast(data, signal, root=0)
+            return data
+
+    return Before
+
+
+def _build_allgather_in_loop_program():
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def loop_step(
+            self,
+            inp: pl.Tensor[[1, SIZE], pl.FP32],
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            for _ in pl.range(2):
+                data = pld.tensor.allgather(inp, data, signal)
+            return data
+
+    return Before
+
+
+def _build_all_to_all_in_loop_program():
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def loop_step(
+            self,
+            inp: pl.Tensor[[nr, SIZE], pl.FP32],
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            for _ in pl.range(2):
+                data = pld.tensor.all_to_all(inp, data, signal)
+            return data
+
+    return Before
+
+
+def _build_reduce_scatter_in_loop_program():
+    SIZE = _PROTOCOL_SIZE
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def loop_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            for _ in pl.range(2):
+                data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Sum)
+            return data
+
+    return Before
+
+
+_IN_LOOP_BUILDERS = {
+    "barrier": _build_barrier_in_loop_program,
+    "broadcast": _build_broadcast_in_loop_program,
+    "allgather": _build_allgather_in_loop_program,
+    "all_to_all": _build_all_to_all_in_loop_program,
+    "reduce_scatter": _build_reduce_scatter_in_loop_program,
+}
+
+
+_IN_LOOP_EXPECTED = {
+    "barrier": [1],
+    "broadcast": [1],
+    "allgather": [1],
+    "all_to_all": [1],
+    "reduce_scatter": [1, 2],
+}
+
+
+@pytest.mark.parametrize("collective", sorted(_IN_LOOP_BUILDERS))
+def test_collective_in_for_loop_now_succeeds(collective):
+    """Collectives are legal inside for/while/if now.
+
+    Each call is a self-contained, stateless cycle starting from all-zero, so
+    the compiler lowers the loop body's collective call once and the same
+    compile-time expected values are safely reused on every runtime iteration
+    — unlike the old compile-time generation scheme, which had no fixed
+    generation for a dynamic trip count to wait for.
+    """
+    Before = _IN_LOOP_BUILDERS[collective]()
+    After = passes.lower_composite_ops()(Before)
+    assert _static_wait_expectations(After) == _IN_LOOP_EXPECTED[collective]
+
+
+def test_unrolled_loop_collective_restarts_each_call():
+    """``pl.unroll`` still produces straight-line back-to-back calls.
+
+    ``UnrollLoops`` runs before ``LowerCompositeOps`` in the default pipeline,
+    so a compile-time trip count becomes 3 independent calls on one signal —
+    each restarting at generation 1, since the self-clearing epilogue resets
+    the signal between them.
+    """
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def barrier_unrolled(
+            self,
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+            for _ in pl.unroll(3):
+                signal = pld.tensor.barrier(signal)
+            return signal
+
+    After = passes.lower_composite_ops()(passes.unroll_loops()(Before))
+    assert _static_wait_expectations(After) == [1, 1, 1]
+
+
+def test_stateless_signal_round_trip_across_many_calls():
+    """A dynamic (non-unrolled) loop issuing many barrier calls on one signal
+    compiles to exactly one barrier + epilogue reset, reused at runtime for
+    every iteration — proof that the protocol needs no per-iteration or
+    per-call compile-time state.
+    """
+    nr = _PROTOCOL_NRANKS
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def loop_step(
+            self,
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, 1], pl.INT32]:
+            for _ in pl.range(5):
+                signal = pld.tensor.barrier(signal)
+            return signal
+
+    After = passes.lower_composite_ops()(Before)
+    calls = _collect_barrier_calls(After)
+    assert len(calls.waits) == 1, (
+        "the loop body's barrier must be lowered exactly once, regardless of trip count"
+    )
+    expected = calls.waits[0].args[2]
+    assert isinstance(expected, ir.ConstInt)
+    assert expected.value == 1
+
+
+def test_epilogue_emits_negative_atomic_add():
+    """Every collective's final notify is its self-clearing epilogue reset:
+
+    an ``AtomicAdd`` of a negated credit total — either ``Neg(wrapped)`` for
+    runtime expressions, or ``ConstInt(negative)`` for compile-time constants
+    (the lowering helper folds ``Neg(ConstInt(N))`` to ``ConstInt(-N)`` so
+    the PyPTO printer→parser roundtrip stays stable).
+    """
+    for collective, (build, _) in sorted(_BACK_TO_BACK_CASES.items()):
+        After = passes.lower_composite_ops()(build())
+        notifies = _collect_barrier_calls(After).notifies
+        assert notifies, f"{collective} emitted no notify"
+        last_notify = notifies[-1]
+        assert last_notify.kwargs["op"] == int(pld.NotifyOp.AtomicAdd), (
+            f"{collective} epilogue must notify with AtomicAdd"
+        )
+        value = last_notify.args[3]
+        is_negative = isinstance(value, ir.Neg) or (isinstance(value, ir.ConstInt) and value.value < 0)
+        assert is_negative, f"{collective} epilogue must carry a negative value, got {type(value)}"
+
+
+def test_ring_allreduce_epilogue_resets_every_row():
+    """Ring's epilogue must reset every one of the signal's rows, not just a
+    single cell — each round credited a distinct row.
+    """
+    SIZE = _RING_ALLREDUCE_SIZE
+    nr = _RING_ALLREDUCE_NRANKS
+    total_rounds = 2 * (nr - 1)
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_once(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[total_rounds, nr], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+            return data
+
+    After = passes.lower_composite_ops()(Before)
+    notifies = _collect_barrier_calls(After).notifies
+    # The epilogue resets are the AtomicAdd notifies whose value is negative
+    # (either Neg(wrapped) for runtime expressions, or ConstInt(negative) when
+    # the lowering helper folds Neg(ConstInt(N)) to ConstInt(-N) for roundtrip
+    # stability). Every earlier round-barrier notify uses a plain +1 ConstInt.
+    epilogue_notifies = [
+        call
+        for call in notifies
+        if isinstance(call.args[3], ir.Neg)
+        or (isinstance(call.args[3], ir.ConstInt) and call.args[3].value < 0)
+    ]
+    assert epilogue_notifies, "expected at least one epilogue reset notify"
+    # Every epilogue notify targets a 2-element [row, rank] offset tuple (the
+    # 2D signal overload), confirming the reset is row-indexed rather than a
+    # single [rank, 0] cell.
+    for notify in epilogue_notifies:
+        offsets = notify.args[2]
+        assert isinstance(offsets, ir.MakeTuple)
+        assert len(offsets.elements) == 2
 
 
 if __name__ == "__main__":

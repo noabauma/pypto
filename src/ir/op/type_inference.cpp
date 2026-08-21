@@ -456,6 +456,18 @@ void CheckGatherRowOperands(const std::vector<ExprPtr>& args,
   throw ValueError(msg.str());
 }
 
+void CheckMatmulInitCond(const std::vector<ExprPtr>& args, size_t index, const std::string& op_name) {
+  if (args.size() <= index) return;
+  const auto& cond = args[index];
+  auto scalar_type = As<ScalarType>(cond->GetType());
+  CHECK(scalar_type) << "The operator " << op_name << " requires init_cond to be a boolean scalar, but got "
+                     << cond->GetType()->TypeName();
+  CHECK(scalar_type->dtype_ == DataType::BOOL)
+      << "The operator " << op_name << " requires init_cond to have dtype BOOL, but got "
+      << scalar_type->dtype_.ToString()
+      << ". Write a comparison such as `k == 0` rather than passing the index itself.";
+}
+
 void CheckReductionInputNonEmpty(const std::vector<ExprPtr>& valid, const std::string& op_name,
                                  const Span& span) {
   for (size_t i = 0; i < valid.size(); ++i) {
@@ -521,19 +533,6 @@ ExprPtr MinExtent(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span) {
     return rhs;
   }
   return FoldExtent(MakeMin(lhs, rhs, span));
-}
-
-/// `max(extent, 0)`, elided whenever the sign of the extent is already settled: a
-/// non-negative extent is its own clamp, and a non-positive one clamps to a literal
-/// zero rather than a `max` node that only ever evaluates to zero.
-ExprPtr ClampNonNegative(const ExprPtr& extent, const Span& span) {
-  if (ProveValidExtentLessEqual(IndexZero(), extent) == ProofResult::kTrue) {
-    return extent;
-  }
-  if (ProveValidExtentLessEqual(extent, IndexZero()) == ProofResult::kTrue) {
-    return IndexZero();
-  }
-  return FoldExtent(MakeMax(extent, IndexZero(), span));
 }
 
 /// The extent of dimension `i` that a read must keep inside its source.
@@ -657,10 +656,14 @@ std::vector<ExprPtr> InferWindowReadValidShape(const WindowReadValidShapeParams&
       CHECK_SPAN(IsIntegerScalarExpr(offset), params.span)
           << params.op_name << " offset " << i << " must be an integer scalar to narrow dimension " << i
           << " against a partial source, but got " << offset->GetType()->TypeName();
-      const ExprPtr remaining = ProveValidExtentEqual(offset, IndexZero()) == ProofResult::kTrue
-                                    ? src_valid
-                                    : FoldExtent(MakeSub(src_valid, offset, params.span));
-      available = MinExtent(ClampNonNegative(remaining, params.span), window, params.span);
+      // max(src_valid, offset) - offset is equivalent to
+      // max(src_valid - offset, 0), but cannot underflow when src_valid is a
+      // UINT64 symbolic extent smaller than the offset.
+      const ExprPtr remaining =
+          ProveValidExtentEqual(offset, IndexZero()) == ProofResult::kTrue
+              ? src_valid
+              : FoldExtent(MakeSub(MakeMax(src_valid, offset, params.span), offset, params.span));
+      available = MinExtent(remaining, window, params.span);
     }
 
     // result = min(requested, available).
@@ -692,6 +695,34 @@ std::vector<ExprPtr> InferWindowReadValidShape(const WindowReadValidShapeParams&
   }
 
   return result;
+}
+
+std::vector<ExprPtr> InferTensorSliceFullValidShape(const TensorType& source_type,
+                                                    const std::vector<ExprPtr>& full_shape,
+                                                    const std::vector<ExprPtr>& offsets,
+                                                    const std::vector<ExprPtr>& requested_valid, bool clamp,
+                                                    const Span& span) {
+  if (full_shape.size() == source_type.shape_.size() && offsets.size() == full_shape.size()) {
+    return InferWindowReadValidShape({
+        /*source_physical=*/source_type.shape_,
+        /*source_valid=*/GetEffectiveTensorValidShape(source_type),
+        /*offsets=*/offsets,
+        /*window=*/full_shape,
+        /*requested_valid=*/requested_valid,
+        /*kind=*/WindowReadKind::kClampedWindow,
+        /*clamp=*/clamp,
+        /*op_name=*/"tensor.slice",
+        /*bounds_remedy=*/
+        "Pass clamp=True -- pl.slice(x, shape, offset, clamp=True) -- to narrow the valid region to "
+        "the source edge instead",
+        /*span=*/span,
+    });
+  }
+
+  CHECK_SPAN(requested_valid.empty() || requested_valid.size() == full_shape.size(), span)
+      << "tensor.slice requires valid_shape to have the same rank as shape, but got valid_shape rank "
+      << requested_valid.size() << " and shape rank " << full_shape.size();
+  return requested_valid.empty() ? full_shape : requested_valid;
 }
 
 void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,

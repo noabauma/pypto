@@ -19,6 +19,7 @@ from .logging import (
     InternalError,
     LogLevel,
     check,
+    get_log_level,
     internal_check,
     internal_check_span,
     log_debug,
@@ -28,6 +29,12 @@ from .logging import (
     log_info,
     log_warn,
     set_log_level,
+)
+from .logging import (
+    _clear_thread_log_level as _clear_thread_log_level,
+)
+from .logging import (
+    _set_thread_log_level as _set_thread_log_level,
 )
 
 class DataType:
@@ -166,6 +173,7 @@ __all__ = [
     # Logging framework
     "LogLevel",
     "set_log_level",
+    "get_log_level",
     "log_debug",
     "log_info",
     "log_warn",

@@ -22,10 +22,10 @@ Timing source (simpler PR #1177)
 ``Worker.run`` no longer returns a ``RunTiming``. The host runtime instead
 emits one ``[STRACE]`` marker line per stage to **stderr** on every launch
 (``fprintf(stderr, ...)`` from the C++ host logger, gated by the compile-time
-``SIMPLER_HOST_STRACE`` macro and emitted at the ``LOG_INFO_V9`` tier). This
+``SIMPLER_HOST_STRACE`` macro and emitted at the ``LOG_TIMING`` tier). This
 module therefore:
 
-1. raises the simpler runtime log level to ``v9`` so the markers print (the
+1. sets the simpler runtime log level to ``timing`` so the markers print (the
    C++ host logger is seeded from the Python logger snapshot at
    ``ChipWorker.init``), then restores the prior level afterward;
 2. redirects ``stderr`` at the file-descriptor level (``os.dup2`` — Python's
@@ -315,8 +315,8 @@ def _span_names() -> dict[str, str]:
         return dict(_LEGACY_SPAN_NAMES)
 
 
-# Runtime log level that makes the ``LOG_INFO_V9`` ``[STRACE]`` markers visible.
-_STRACE_LOG_LEVEL = "v9"
+# Runtime log level that makes the ``LOG_TIMING`` ``[STRACE]`` markers visible.
+_STRACE_LOG_LEVEL = "timing"
 
 # Metric name → the per-dispatch :class:`TraceInvocation` attribute it reads
 # (used by ``BenchmarkStats.per_dispatch`` / ``per_rank`` / ``per_round``).
@@ -1154,10 +1154,8 @@ def _parse_stats_from_strace(
     # where the runtime is installed, absent on the lint / unit-test host. The
     # import is resolved lazily at call time; pyright cannot see it in the lint
     # env, and unit tests skip the parse path when it is not installed.
-    from simpler_setup.tools.strace_timing import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-        bucket_by_hid,
-        group_invocations,
-        parse_spans,
+    from simpler_setup.tools import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        strace_timing as _strace_timing,
     )
 
     timing_blocks: int | None = None
@@ -1169,17 +1167,20 @@ def _parse_stats_from_strace(
     if timing_blocks is not None and timing_blocks != warmup + rounds:
         stats.fallback_flattened = True
         return stats
-    # L3 forks one chip worker per rank, all sharing the capture fd; their
-    # concurrent writes can interleave two complete ``[STRACE]`` records onto one
-    # physical line. simpler's ``parse_spans`` reads at most one record per line
-    # (``search`` + greedy ``attrs=.*``), silently dropping the 2nd — which loses
-    # that dispatch's orch/sched spans and makes the (round, rank) read as 0.
-    # Each record's payload is intact on the wire; only the line boundary was lost,
-    # so re-split on the ``[STRACE]`` marker to give every record its own line
-    # before handing the (unmodified) simpler parser the text. Prefix text left on a
-    # line with no marker simply fails the regex and is skipped, as before.
+    # L3 forks one chip worker per rank, all sharing the capture fd, so two
+    # complete records can land on one physical line. Normalize those records
+    # before parsing: this is harmless with the current ``finditer`` parser and
+    # preserves compatibility with older parsers that consumed one per line.
     lines = log_text.replace("[STRACE]", "\n[STRACE]").splitlines()
-    invocations = group_invocations(parse_spans(lines))
+    spans = _strace_timing.parse_spans(lines)
+    if hasattr(_strace_timing, "legacy_spans"):
+        spans = _strace_timing.legacy_spans(spans)
+    else:
+        # Simpler versions before L3/L4 tracing do not expose the canonical
+        # filter. They do not normally emit l3.* markers either, but filtering
+        # the namespace locally makes mixed-version log ingestion safe.
+        spans = [span for span in spans if not span.name.startswith("l3.")]
+    invocations = _strace_timing.group_invocations(spans)
     if not invocations:
         return stats
 
@@ -1188,7 +1189,7 @@ def _parse_stats_from_strace(
 
     # Busiest hid bucket = our register-once callable (one invocation per launch);
     # bucket_by_hid orders each bucket by inv, so warmup drops in dispatch order.
-    busiest = max(bucket_by_hid(invocations).values(), key=len)
+    busiest = max(_strace_timing.bucket_by_hid(invocations).values(), key=len)
     for inv in busiest[warmup:]:
         stats.host_wall_us.append(_inv_span_us(inv, names["host"]))
         stats.device_wall_us.append(_inv_span_us(inv, names["device"]))
@@ -1243,7 +1244,7 @@ def benchmark(
     arg building.
 
     Timing is read from the runtime's ``[STRACE]`` stderr markers (simpler PR
-    #1177): this raises the runtime log level to ``v9`` for the worker's
+    #1177): this sets the runtime log level to ``timing`` for the worker's
     lifetime (restored afterward) and captures ``stderr`` at the file-descriptor
     level, so the emitted stderr is diverted into a temp file rather than shown
     live. For L2 the capture wraps only the measured loop; for L3 it must wrap
@@ -1260,9 +1261,10 @@ def benchmark(
             programs must pass ``compiled[<name>]``.
         args: Positional dispatch args, same as ``compiled(*args)``. **L3
             requires shared-memory host** ``torch.Tensor`` **args** (allocated
-            with ``.share_memory_()`` and reused in place) or worker-resident
-            :class:`~pypto.runtime.DeviceTensor` buffers — a buffer allocated
-            after ``prepare()`` is invisible to the forked chip workers.
+            with ``.share_memory_()`` and reused in place). This helper creates
+            its own prepared Worker, so it cannot accept a DeviceTensor owned by
+            another Worker; benchmark resident tensors with an explicit
+            ``compiled.prepare()`` dispatch loop.
         rounds: Number of measured launches. Must be positive.
         warmup: Number of leading launches discarded before measurement
             (page-in / cache warm). Total launches = ``warmup + rounds``.
@@ -1363,7 +1365,7 @@ def benchmark(
 
     # The C++ host logger that prints the ``[STRACE]`` markers is seeded from the
     # simpler Python logger snapshot at worker ``init`` (and inherited by the L3
-    # fork), so raise the level before constructing the worker. Restore afterward.
+    # fork), so set the level to ``timing`` before constructing the worker. Restore afterward.
     prior_level = current_level()
     configure_log(_STRACE_LOG_LEVEL)
     try:
@@ -1423,7 +1425,7 @@ def benchmark(
         raise RuntimeError(
             f"benchmark(): no [STRACE] markers captured across {warmup + rounds} launches. "
             "The runtime emits per-launch timing markers only when built with the "
-            "SIMPLER_HOST_STRACE macro (LOG_INFO_V9 tier); this runtime emitted none. "
+            "SIMPLER_HOST_STRACE macro (LOG_TIMING tier); this runtime emitted none. "
             "Rebuild the runtime with SIMPLER_HOST_STRACE enabled to read benchmark timing."
         )
     return stats

@@ -68,6 +68,12 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::IterArgCarryClassified, CreateIterArgCarryClassifiedPropertyVerifier);
   Register(IRProperty::CallDirectionsResolved, CreateCallDirectionsResolvedPropertyVerifier);
   Register(IRProperty::TileTypeCoherence, CreateTileTypeCoherencePropertyVerifier);
+  Register(IRProperty::AccToGmStoreValid, CreateAccToGmStoreValidPropertyVerifier);
+  // AtomicAddDtypeValid: an atomic-add into a bf16 GM destination is A2/A3-only
+  // (BackendHandler::SupportsBf16AtomicAdd). Decidable on the user's own IR, so
+  // it sits in GetStructuralProperties() and fires at pipeline input rather than
+  // after a particular pass.
+  Register(IRProperty::AtomicAddDtypeValid, CreateAtomicAddDtypeValidPropertyVerifier);
   Register(IRProperty::InlineFunctionsEliminated, CreateInlineFunctionsEliminatedPropertyVerifier);
   Register(IRProperty::OrchestrationReferencesResolved,
            CreateOrchestrationReferencesResolvedPropertyVerifier);

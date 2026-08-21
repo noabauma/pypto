@@ -34,9 +34,20 @@ import torch
 
 ## Quickstart: element-wise add
 
+<!-- doctest: setup -->
 ```python
 import pypto.language as pl
+import torch
+from pypto.runtime import RunConfig
 
+CFG = RunConfig(platform="__PLATFORM__")
+torch.manual_seed(0)
+A = torch.randn(128, 128, dtype=torch.float32)
+B = torch.randn(128, 128, dtype=torch.float32)
+```
+
+<!-- doctest: run -->
+```python
 @pl.jit
 def add(
     a: pl.Tensor[[128, 128], pl.FP32],
@@ -44,11 +55,16 @@ def add(
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
 ):
     with pl.at(level=pl.Level.CORE_GROUP):
-        out = pl.add(a, b)
+        out[:] = pl.add(a, b)
     return out
+
 
 compiled = add.compile()
 print(f"Generated code in: {compiled.output_dir}")
+
+out = torch.zeros(128, 128, dtype=torch.float32)
+add(A, B, out, config=CFG)
+torch.testing.assert_close(out, A + B, rtol=1e-4, atol=1e-4)
 ```
 
 | Line | What it does |
@@ -82,6 +98,7 @@ after. Every tensor parameter has a direction — `In` by default, or an explici
 Intermediate values are ordinary Python names. They need no annotation, and no buffer is
 declared for them — the compiler allocates whatever the chain requires:
 
+<!-- doctest: run -->
 ```python
 @pl.jit
 def add_then_square(
@@ -91,8 +108,13 @@ def add_then_square(
 ):
     with pl.at(level=pl.Level.CORE_GROUP):
         s = pl.add(a, b)
-        out = pl.mul(s, s)
+        out[:] = pl.mul(s, s)
     return out
+
+
+out = torch.zeros(128, 128, dtype=torch.float32)
+add_then_square(A, B, out, config=CFG)
+torch.testing.assert_close(out, (A + B) * (A + B), rtol=1e-4, atol=1e-4)
 ```
 
 Write shapes and dtypes inline in the annotations. A module-level alias
@@ -115,7 +137,7 @@ def accumulate(
         t = pl.add(a, a)
         for i in pl.range(3):
             t = pl.add(t, a)      # carried across iterations
-        out = pl.mul(t, t)
+        out[:] = pl.mul(t, t)
     return out
 ```
 
@@ -143,7 +165,7 @@ def add_kernel(
     b: pl.Tensor[[128, 128], pl.FP32],
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
 ):
-    out = pl.add(a, b)
+    out[:] = pl.add(a, b)
     return out
 
 @pl.jit
@@ -262,7 +284,7 @@ assert torch.allclose(out, a + b, rtol=1e-5, atol=1e-5)
 
 Calling a `@pl.jit` function directly does the whole thing: specialize on the argument
 shapes and dtypes, compile, cache, dispatch. Later calls with the same shapes reuse the
-cached compilation. `examples/hello_world.py` is this pattern, at tile level.
+cached compilation. `examples/beginner/01_hello_world.py` is this pattern, at tile level.
 
 ## Edge Cases
 
@@ -291,7 +313,7 @@ effect.
 
 - [Installation](01-installation.md) — getting to the point where these examples import.
 - [Programming Model](03-programming-model.md) — tensor vs. tile vs. block level, the two planes, the memory hierarchy, and the execution model.
-- [Language Guide](01-language_guide.md) — the full surface: tile-level authoring, `pl.load` / `pl.store`, memory spaces, and the `@pl.function` / `@pl.program` form `@pl.jit` specializes into.
-- [Operation Reference](02-operation_reference.md) — the operator surface across `pl.*`, `pl.tensor.*`, and `pl.tile.*`.
+- [Language Guide](language/index.md) — the full surface: tile-level authoring, `pl.load` / `pl.store`, memory spaces, and the `@pl.function` / `@pl.program` form `@pl.jit` specializes into.
+- [Operations](ops/index.md) — the operator surface across `pl.*`, `pl.tensor.*`, and `pl.tile.*`.
 - [Running on Device](00-getting_started.md) — resident device tensors, explicit dispatch, benchmarking, distributed execution.
-- `examples/kernels/` — tile-level kernels in the same `@pl.jit` idiom.
+- `examples/beginner/` and `examples/intermediate/` — tile-level kernels in the same `@pl.jit` idiom.

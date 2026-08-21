@@ -19,6 +19,37 @@ knowing about before you follow a command that needs them:
 | Compile a kernel to generated C++ | Nothing beyond the install. **ptoas** (distributed separately, versions pinned in `toolchain/versions.env`) adds the assembly step; `@pl.jit` detects whether it is present and skips that step when it is not |
 | Run a compiled kernel | The runtime plus an NPU or a simulator platform |
 
+### Optional AI agent skills
+
+The [pypto-skills](https://github.com/hw-native-sys/pypto-skills) marketplace provides
+plugins that teach supported AI coding agents the project's common workflows. These
+plugins are installed into the agent, independently of the PyPTO Python package:
+
+| Plugin | Intended for | Included workflows |
+| ------ | ------------ | ------------------ |
+| `pypto-user` | PyPTO users | Generate IR traces and profile in-core kernels |
+| `pypto-developer` | PyPTO contributors | Git, pull request, issue, and branch workflows |
+
+For Codex:
+
+```bash
+codex plugin marketplace add hw-native-sys/pypto-skills
+codex plugin add pypto-user@pypto-skills
+
+# Optional: add contributor workflows too
+codex plugin add pypto-developer@pypto-skills
+```
+
+For Claude Code:
+
+```bash
+claude plugin marketplace add hw-native-sys/pypto-skills
+claude plugin install pypto-user@pypto-skills
+
+# Optional: add contributor workflows too
+claude plugin install pypto-developer@pypto-skills
+```
+
 The verification below deliberately stays in the first row.
 
 ## Quickstart
@@ -53,7 +84,7 @@ Run the checked-in lowering example rather than piping a function to `python -`:
 `@pl.jit` reads the decorated function's source, which is unavailable on stdin.
 
 ```bash
-python examples/kernels/08_assemble.py
+python examples/intermediate/05_assemble.py
 ```
 
 The final line is:
@@ -127,23 +158,81 @@ PYPTO_PROG_BUILD_DIR=/scratch/pypto-out python my_kernel.py
 
 `examples/` is ordered by difficulty, and is the fastest way to see idiomatic PyPTO.
 
-| Path | What is in it |
-| ---- | ------------- |
-| `examples/hello_world.py` | The simplest complete program — start here |
-| `examples/kernels/` | Single-kernel operators, numbered by difficulty: elementwise, fused ops, matmul, softmax, assemble |
-| `examples/models/` | Multi-kernel models, numbered by difficulty: FFN, paged attention, LLaMA |
-| `examples/utils/` | Parsing, cross-function calls, error handling |
-| `examples/runtime/` | Dispatch, explicit workers, distributed callbacks, multi-program KV cache |
+**`examples/beginner/`** — one concept per file.
 
-**Most of these dispatch to hardware, not just compile.** `hello_world.py`,
-`kernels/06_softmax.py`, and `models/01_ffn.py` all end by calling their kernel with
+| File | Shows |
+| ---- | ----- |
+| `01_hello_world.py` | The smallest complete program |
+| `02_elementwise.py` | Tile add / mul, and a loop over chunks |
+| `03_scalar_ops.py` | A scalar operand |
+| `04_activation.py` | `relu`, SiLU |
+| `05_matmul.py` | One 64x64 matmul on the cube |
+| `06_concat.py` | Two tiles into disjoint column ranges |
+
+**`examples/intermediate/`** — real-kernel patterns.
+
+| File | Shows |
+| ---- | ----- |
+| `01_fused_linear.py` | Cube matmul + vector bias-add + relu |
+| `02_softmax.py` | Row-wise softmax |
+| `03_normalization.py` | RMSNorm, LayerNorm |
+| `04_matmul_acc.py` | K-dimension tiling with an accumulator |
+| `05_assemble.py` | Writing a tile into a target at an offset |
+| `06_dyn_valid_shape.py` | A runtime-narrowed valid extent |
+| `07_task_graph.py` | An inferred edge and a declared edge |
+
+**`examples/advanced/`** — performance techniques.
+
+| File | Shows |
+| ---- | ----- |
+| `01_split_k.py` | Splitting the reduction dimension |
+| `02_auto_tile_matmul.py` | Compiler-driven L0 tiling |
+| `03_mixed_kernel.py` | Cube and vector in one scope, three split modes |
+
+**`examples/models/`** — multi-kernel models.
+
+| File | Shows |
+| ---- | ----- |
+| `01_ffn.py` | An FFN module |
+| `02_vector_dag.py` | Three InCore kernels wired into a DAG |
+| `03_flash_attention.py` | Loop-carried state, nested `if` / `pl.yield_` |
+| `04_paged_attention.py` | Paged attention, online softmax, 4-kernel pipeline |
+| `05_paged_attention_batch.py` | The batch loop moved inside the kernels |
+| `06_paged_attention_dynamic.py` | `pl.dynamic()` shapes |
+| `07_paged_attention_multi_config.py` | Unroll grouping + shapes from `pl.tensor.dim()` |
+| `08_llama_mini.py` | A complete small LLaMA-style model |
+| `09_paged_attention_spmd.py` | The batch dimension across SPMD blocks |
+| `qwen3_jit/` | A `@pl.jit` decode path split into per-module kernel files |
+
+**`examples/utils/`** — the front end on its own.
+
+| File | Shows |
+| ---- | ----- |
+| `cross_function_calls.py` | `@pl.jit.inline` helpers spliced at the call site |
+| `error_handling.py` | What a bare rebinding costs, and how it surfaces |
+| `parse_from_text.py` | `pl.parse()` / `pl.loads()` from a string or a file |
+| `phase_fence_dep_compression.py` | Whole-array TaskId fences between fan-out stages |
+
+**`examples/runtime/`** — host-side patterns.
+
+| File | Shows |
+| ---- | ----- |
+| `explicit_dispatch.py` | Register once, dispatch many |
+| `multi_program_kv_cache.py` | A resident buffer shared across programs |
+| `distributed_callback.py` | A HOST `SubWorker` as a Python callback |
+
+**`examples/distributed/`** — one file per collective / primitive, covered page by page in
+[Distributed](distributed/index.md).
+
+**Most of these dispatch to hardware, not just compile.** `beginner/01_hello_world.py`,
+`intermediate/02_softmax.py`, and `models/01_ffn.py` all end by calling their kernel with
 `config=RunConfig()`, which assembles through ptoas and runs it — so they need the
 runtime and a device or simulator platform, not only the `pip install` above:
 
 ```bash
-python examples/hello_world.py          # needs runtime + device/simulator
-python examples/kernels/06_softmax.py   # needs runtime + device/simulator
-python examples/models/01_ffn.py        # needs runtime + device/simulator
+python examples/beginner/01_hello_world.py     # needs runtime + device/simulator
+python examples/intermediate/02_softmax.py     # needs runtime + device/simulator
+python examples/models/01_ffn.py               # needs runtime + device/simulator
 ```
 
 If you only have the compiler front end, read them rather than running them —

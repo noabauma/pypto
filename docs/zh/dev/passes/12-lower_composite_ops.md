@@ -188,7 +188,30 @@ sin 与 cos 共用同一组多项式系数：cos 路径只在区间归约阶段�
 
 ## `pld.tensor.*` 分布式集合通信算子
 
-本 Pass 同时降级 `pld.tensor.*` 系列的窗口绑定 (window-bound) 分布式集合通信算子。每个集合通信算子都是一个组合 `Call`，展开为 notify / wait + 数据搬运序列。数据搬运原语因算子而异：`allgather` 使用 `pld.tile.put`（基于 TPUT 的推送，经 VEC staging tile 自动分块），`broadcast` 用 `pld.tile.get` 搬运窗口数据（GM→GM 拷贝），`allreduce` 与 `reduce_scatter` 用 `pld.tile.remote_load` 把 peer chunk 拉进 UB tile。allreduce 根据规约类型选择 `tile.add`、`tile.maximum`、`tile.minimum` 或 `tile.mul`；reduce-scatter 当前仍用 `tile.add`。这些规则共享同一套 signal buffer 约定：使用窗口绑定的 INT32 `signal` 矩阵作为跨卡屏障，且**每次调用都需要新分配的 buffer**。
+本 Pass 同时降级 `pld.tensor.*` 系列的窗口绑定 (window-bound) 分布式集合通信算子。每个集合通信算子都是一个组合 `Call`，展开为 notify / wait + 数据搬运序列，外加自清理尾声。数据搬运原语因算子而异：`allgather` 使用 `pld.tile.put`（基于 TPUT 的推送，经 VEC staging tile 自动分块），`broadcast` 用 `pld.tile.get` 搬运窗口数据（GM→GM 拷贝），`allreduce` 与 `reduce_scatter` 用 `pld.tile.remote_load` 把 peer chunk 拉进 UB tile。allreduce 根据规约类型选择 `tile.add`、`tile.maximum`、`tile.minimum` 或 `tile.mul`；reduce-scatter 当前仍用 `tile.add`。七条规则共享同一套**自清理信用屏障协议**（`LoweringBuilder::EmitBarrier` + `EmitEpilogueReset`）—— 参见下方[屏障-信号协议](#屏障-信号协议) —— 因此 `signal` buffer 可以在连续调用之间复用，甚至在 `for` / `while` / `if` 内部也可以。
+
+### 屏障-信号协议
+
+每次调用发出 `N` 个屏障 —— 对每个 peer cell 做 `AtomicAdd(1)`，然后等待
+`Wait(>= g)`，其中 `g` 在**仅本次调用内部**向上计数（每次新调用都从 1 重新开始，
+由 `LoweringBuilder::EmitBarrier` 的调用局部 `barrier_count_` 实现）。主体之后，
+尾声（`LoweringBuilder::EmitEpilogueReset`）把本次调用的总信用 `N` 通过一次
+`AtomicAdd(-N)` 从每一个非 self cell 中减回去。由于原子加法与减法可交换，
+一旦所有 rank 都完成本次调用的尾声，signal 可证明地恢复为全零 —— 不存在
+跨调用状态需要管理，因此*下次*调用的同一个 signal 也从 generation 1 重新开始。
+
+`N` 可以是**运行时常量**（`pld.system.notify` 的 `value` 只需要 `ScalarType`），
+因此 mesh allreduce 的每块信用计数不需要是编译期常量 —— 与屏障计数本身不同，
+后者始终是小型编译期序列（`1`、`2`……），因为每个 `Wait` 的 `expected`
+必须在不知道外围（可能动态的）循环执行多少次的情况下就能解析。
+
+所有 wait 谓词都用 `kGe` 而非 `kEq`：快 peer 可能在慢 rank 轮询前就把
+cell 推过本次 wait 的期望值，因此相等判断会死锁。同理，`kSet` 绝对不能与
+`kAtomicAdd` 混用在同一个 cell 上 —— set 可能会覆盖已经被推高的计数器。
+
+mesh（`[NR, 1]`，每 rank 一个 cell）和 ring（`[2*(NR-1), NR]`，每轮一行）
+signal 使用互不兼容的 cell 寻址方式，因此共享同一个 buffer 会因形状不匹配
+被拒绝（`ValidateMeshSignalShape`） —— 这是协议仍然施加的唯一限制。
 
 ### `pld.tensor.allreduce`
 
@@ -213,24 +236,25 @@ ring 降级在 reduce-scatter 和 allgather 阶段使用同一个 packed 2D 视�
 subchunk 都从 32 字节对齐地址开始。FP16 的 ragged remote load 可以读取通信域
 预留的对齐物理尾部，然后通过 `tile.set_validshape` 在归约和写回前恢复逻辑范围。
 该方案无需在公开 tensor 布局中插入空洞，也能支持非整除输入和 `SIZE < NR`。
+每一轮的每个 subchunk 都使用本调用局部的 ready + read-complete generation 对
+做屏障；尾声随后把 `2 * chunk_count`（跨轮统一，因为每轮的 subchunk 循环
+共享相同边界）从 signal 的每一行中减去。
 
 任何在降级后仍为符号表达式的目标范围或 partial-valid 范围，都必须在 kernel 中
 通过标量参数、循环变量或物理 Tensor shape 参数获得运行时绑定；仅出现在类型元数据
 中的符号会在 PTO codegen 阶段被拒绝。完全动态的物理目标维度由该 Tensor 参数绑定。
 
-allreduce 规则先在共享 `signal` cell 上执行 ready 屏障：Phase 2a `AtomicAdd 1` +
-Phase 2b `wait ≥1`。之后对完全有效的目标按 UB 大小逐块处理；每个 chunk 完成 peer 归约后执行
-`AtomicAdd 1`，等待 `linear_chunk_id + 2`，再写回结果。这个逐块屏障可以阻止
-快 rank 覆盖慢 rank 尚未 remote-load 的数据。调用返回时，每个非 self 行停在
-`1 + chunk_count`；partial-valid 单矩形路径则停在 `2`。被跳过的 self 行始终保持为 `0`。
+allreduce 规则先在共享 `signal` cell 上执行 ready 屏障（generation 1）。之后对完全
+有效的目标按 UB 大小逐块处理；每个 chunk 完成 peer 归约后对本调用局部的
+generation（`2`、`3`……）做屏障，再写回结果 —— 阻止快 rank 覆盖慢 rank
+尚未 remote-load 的数据。尾声随后把本次调用的总信用
+（`1 + chunk_count`，构建为 IR 表达式，因为 `chunk_count` 可能依赖运行时
+范围）从每个非 self 行中减去。partial-valid 单矩形路径恰好发出两个屏障
+（ready + post-reduce），其尾声减去 `2`。
 
-**signal buffer 不能跨多次 allreduce 复用**。任意被 wait 的非 self 行上残留的正计数都会让
-下次调用的 Phase 2b `wait ≥1` 立刻在旧值上放行，屏障作废，下次读取与上一次
-写回直接竞态。需要连续多次 allreduce 的调用者必须为每次调用各自分配新的
-signal buffer（`alloc_window_buffer` + `window`）。用户侧的 DSL docstring
-（`python/pypto/language/distributed/op/tensor_ops.py::allreduce`）同步标注了这一契约。
-
-所有 wait 谓词都用 `kGe` 而非 `kEq`。单次调用内，每个被 wait 的 cell 都单调递增，因此慢 rank 首次轮询时，快 peer 可能已经把 cell 推过本次 wait 的期望值。此时相等判断会死锁，大于等于判断则不会。
+signal buffer 可以在连续 allreduce 调用之间安全管理复用 —— 包括对一个符号
+range 进行 mesh allreduce，其信用总数只是运行时计算表达式，而非编译器必须知道
+的值。参见上方[屏障-信号协议](#屏障-信号协议)。
 
 mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 `ReduceOp::kSum`、`kMax`、`kMin` 和 `kProd`。
@@ -241,8 +265,9 @@ mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 
 - ``tile.create([1, SIZE], dtype=..., target_memory=Vec)`` — 分配一个 VEC staging tile 供 ``pld.tile.put`` 自动分块使用。``pld.tile.put`` 直接从 ``local_data`` Tensor（或 Tile）源读取 — 不发射显式的 ``tile.load``。
 - Phase 1：对 `peer` 从 `0` 到 `NR-1`，`pld.tile.put(target, peer, local_data, put_stage, [my_rank, 0], [0, 0], [1, SIZE])` — 将本 rank 的 chunk 推送到每个 peer 窗口的第 `my_rank` 行。自推送 (`peer == my_rank`) 通过 HCCL 恒等映射实现。`pld.tile.put` 在 SIZE 超过 staging tile 容量时自动分块
-- Phase 2a：notify-all（`Set 1`）
+- Phase 2a：notify-all（`AtomicAdd 1`）
 - Phase 2b：wait-all（`Ge 1`）
+- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
 - 返回 `target` — 窗口本身就是汇聚后的 `[NR, SIZE]` 结果（窗口即结果，`DistributedTensor`）
 
 与原始基于拉取 (pull-based) 的 allgather（4 参数带独立 `out` 张量）相比，该推送版本去掉了 `out` 参数和每 peer 的 `pld.tile.get` 汇聚循环。总 HBM 从 `(NR+1)×SIZE` 降至 `NR×SIZE`，代价是窗口在调用方消费结果之前一直处于占用状态。
@@ -251,8 +276,9 @@ mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 
 展开为与 `allreduce` 相同的 5 阶段序列：
 
-- Phase 2a：notify-all（`Set 1`）
+- Phase 2a：notify-all（`AtomicAdd 1`）
 - Phase 2b：wait-all（`Ge 1`）
+- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
 - Phase 3：对每个 peer `p`，`remote_load` 该 peer 的 chunk `r` 并用 `tile.add` 累加到本地 scratch
 - Phase 3.5a：re-notify（`AtomicAdd 1`）
 - Phase 3.5b：re-wait（`Ge 2`）
@@ -266,8 +292,9 @@ mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 
 展开为 3 阶段序列：
 
-- Phase 2a：notify-all（`Set 1`）
+- Phase 2a：notify-all（`AtomicAdd 1`）
 - Phase 2b：wait-all（`Ge 1`）
+- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
 - Phase 3：每个 rank 都发射 `tile.create`（VEC staging tile）+ `pld.tile.get(target, peer=root, target, stage)`，把 root 的切片读进自己的 `target`。`peer == root` 时 HCCL 恒等映射让该 get 成为本地空操作，因此 root 保留自己的数据，非 root rank 收到 root 的数据
 
 `root` 是编译时已知的静态 `int` kwarg。
@@ -276,8 +303,9 @@ mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 
 纯同步，无数据搬运。展开为 2 阶段序列：
 
-- Phase 2a：notify-all（`Set 1`）
+- Phase 2a：notify-all（`AtomicAdd 1`）
 - Phase 2b：wait-all（`Ge 1`）
+- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
 
 返回表达式就是同一个 `signal` 张量，支持 `signal = pld.tensor.barrier(signal)` 的 rebind 写法。
 

@@ -427,12 +427,18 @@ def matmul(
 ) -> Call:
     """Matrix multiplication with optional transpose.
 
+    A transpose flag swaps its own operand's two trailing axes, so that operand
+    must be at least 2D: ``a_trans`` with a 1D ``lhs`` (or ``b_trans`` with a 1D
+    ``rhs``) raises rather than being ignored. On the mixed mat-vec / vec-mat
+    forms the flag applies to the matrix side, so a ``lhs`` stored ``[K, M]``
+    with ``a_trans=True`` against a ``[K]`` ``rhs`` deduces ``[M]``.
+
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor
         out_dtype: Output data type (optional, inferred if not provided)
-        a_trans: Whether to transpose lhs
-        b_trans: Whether to transpose rhs
+        a_trans: Whether to transpose lhs (requires a 2D+ lhs)
+        b_trans: Whether to transpose rhs (requires a 2D+ rhs)
         c_matrix_nz: C matrix non-zero flag
         span: Optional source span for debugging (auto-captured if not provided)
 
@@ -460,8 +466,15 @@ def matmul_acc(
     a_trans: bool = False,
     b_trans: bool = False,
     span: Span | None = None,
+    *,
+    init_cond: Expr | None = None,
 ) -> Call:
     """Matrix multiplication with accumulation: acc = acc + lhs @ rhs.
+
+    With ``init_cond``, the accumulator's initial value is conditional: on the
+    steps where the predicate holds, ``acc`` is overwritten with ``lhs @ rhs``
+    instead of accumulated into (the split-K ``k == 0`` idiom). Only 2D operands
+    support the predicate.
 
     Args:
         acc: Accumulator tensor
@@ -470,13 +483,15 @@ def matmul_acc(
         a_trans: Whether to transpose lhs
         b_trans: Whether to transpose rhs
         span: Optional source span for debugging (auto-captured if not provided)
+        init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
     Returns:
         Call expression for matrix multiplication with accumulation
     """
     actual_span = _get_span_or_capture(span)
     kwargs: dict[str, Any] = {"a_trans": a_trans, "b_trans": b_trans}
-    return _ir_core.create_op_call("tensor.matmul_acc", [acc, lhs, rhs], kwargs, actual_span)
+    args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
+    return _ir_core.create_op_call("tensor.matmul_acc", args, kwargs, actual_span)
 
 
 def mul(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
@@ -627,7 +642,9 @@ def div(
     rhs_type = rhs_expr.type
     if isinstance(rhs_type, ScalarType):
         if high_precision:
-            raise ValueError("tensor.div(high_precision=True) requires a Tensor rhs")
+            # TypeError, matching the unified pl.* guards: a kwarg this operand
+            # combination cannot honour is a wrong-arguments error, not a bad value.
+            raise TypeError("tensor.div(high_precision=True) requires a Tensor rhs")
         return _ir_core.create_op_call("tensor.divs", [lhs, rhs_expr], {}, actual_span)
     kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
     return _ir_core.create_op_call("tensor.div", [lhs, rhs_expr], kwargs, actual_span)
@@ -1615,18 +1632,20 @@ def abs(input: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tensor.abs", [input], {}, actual_span)
 
 
-def recip(input: Expr, span: Span | None = None) -> Call:
+def recip(input: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
     """Element-wise reciprocal (1/x) operation.
 
     Args:
         input: Input tensor
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision reciprocal mode (FP16/FP32 only)
 
     Returns:
         Call expression for element-wise reciprocal
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tensor.recip", [input], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tensor.recip", [input], kwargs, actual_span)
 
 
 def sqrt(input: Expr, span: Span | None = None) -> Call:
@@ -1708,7 +1727,11 @@ def assemble(
         span: Optional source span for debugging (auto-captured if not provided)
         atomic: ``AtomicType`` underlying int — 0 (``kNone``, plain overwrite) or
             1 (``kAdd``, atomic-add into the global-memory target). The kwarg is
-            omitted entirely when 0 so non-atomic assembles are unchanged.
+            omitted entirely when 0 so non-atomic assembles are unchanged. ``kAdd``
+            requires a tile source stored into a global-memory target, i.e. an
+            assemble inside an InCore (``pl.at(level=pl.Level.CORE_GROUP, ...)``)
+            function; it has no lowering at the orchestration level and is rejected
+            there.
 
     Returns:
         Call expression for tensor assembly
@@ -1861,7 +1884,7 @@ def view(
        both require an explicit target ``valid_shape``.
     Combining ``shape`` with a layout change is valid for type deduction and
     PTO in-core lowering. Orchestration lowering only supports shape
-    reinterpret for ND-layout tensors because the runtime ``Tensor::reshape``
+    reinterpret for ND-layout tensors because the runtime ``ChipTensor::reshape``
     cannot express an arbitrary-layout view.
 
     Args:
@@ -1915,8 +1938,9 @@ def set_validshape(
     """Update valid-shape metadata of a tensor without data movement.
 
     .. note::
-        Internal API — this op is intended for compiler-generated code only
-        and should not be exposed to end users in future releases.
+        Prefer expressing the extent at its source where possible —
+        ``pl.load(..., valid_shape=...)`` or a slice's ``valid_shape=`` — and use
+        this to pin an extent the type deducer cannot infer.
 
     Args:
         tensor: Input tensor expression (must be 2D TensorType)

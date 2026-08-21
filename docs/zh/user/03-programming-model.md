@@ -32,7 +32,7 @@ def square_tensor(
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
 ):
     # 张量级：命名整个数组。放置与搬运是编译器的事。
-    out = pl.mul(x, x)
+    out[:] = pl.mul(x, x)
     return out
 
 @pl.jit.incore
@@ -245,7 +245,7 @@ def mm(
 混合 kernel 与跨核流水这些概念正是由这个形态而来，参见
 [集群架构](../reference/pto-isa/00-cluster_architecture.md)。
 
-## Edge Cases
+## 边界情况
 
 > **致命陷阱：** Orchestration 函数里的语句顺序不约束执行顺序。如果两次派发必须按序执行，
 > 这个次序必须被表达出来 —— 通过依赖，或通过编译器能看见的缓冲区关系。只依赖源码顺序，
@@ -262,7 +262,7 @@ def mm(
 ## See Also
 
 - [快速上手](02-quickstart.md) —— 本页所解释的那些例子。
-- [语言指南](01-language_guide.md) —— 完整表面：类型、控制流、作用域、编译。
+- [语言指南](language/index.md) —— 完整表面：类型、函数、控制流、内存、作用域与任务、编译期指令。
 - [Passes](../dev/passes/index.md) —— 流水线中的每个 pass，按执行顺序编号。
 - [IR 概览](../dev/ir/00-overview.md) —— IR 的结构与设计原则。
 - [集群架构](../reference/pto-isa/00-cluster_architecture.md) —— 执行模型所面向的 Cube + Vector 集群。

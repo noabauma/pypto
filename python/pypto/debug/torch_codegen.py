@@ -20,6 +20,7 @@ import torch
 import pypto.language as pl
 from pypto import DataType
 from pypto import ir as _ir
+from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR
 
 # ---------------------------------------------------------------------------
 # DataType -> torch dtype string
@@ -726,11 +727,14 @@ def _handle_tpop_from_aiv(_a: list[str], kw: dict[str, Any]) -> str:
     return f"_cross_core_rt.pop_from_aiv({_split_kwarg(kw)})"
 
 
+# Built through the registry getter, which raises on an unregistered name, so a renamed operator
+# fails at import. A bare literal here would instead drop silently out of the membership test in
+# _collect_cross_core_split_from_expr and route the call down the wrong codegen path.
 _CROSS_CORE_SPLIT_OPS = {
-    "tile.tpush_to_aiv",
-    "tile.tpush_to_aic",
-    "tile.tpop_from_aic",
-    "tile.tpop_from_aiv",
+    _ir.get_op("tile.tpush_to_aiv").name,
+    _ir.get_op("tile.tpush_to_aic").name,
+    _ir.get_op("tile.tpop_from_aic").name,
+    _ir.get_op("tile.tpop_from_aiv").name,
 }
 
 
@@ -851,7 +855,7 @@ def _build_group_meta(program: _ir.Program) -> dict[str, dict[str, Any]]:
             split = _split_mode_to_int(func.split)
             if split == 0:
                 split = _split_mode_to_int(aiv_func.split)
-        dual_aiv_dispatch = bool(getattr(aiv_func, "attrs", {}).get("dual_aiv_dispatch", False))
+        dual_aiv_dispatch = bool(getattr(aiv_func, "attrs", {}).get(DUAL_AIV_DISPATCH_ATTR, False))
         group_meta[func.name] = {
             "aic": aic_name,
             "aiv": aiv_name,
@@ -1027,7 +1031,7 @@ def _register_ops() -> None:  # noqa: PLR0915
 
     # tile selection
     m["tile.sel"] = lambda a, _kw: f"torch.where({a[0]}, {a[1]}, {a[2]})"
-    m["tile.sels"] = lambda a, _kw: f"torch.where({a[0]}, {a[1]}, {a[2]})"
+    m["tile.sels"] = lambda a, _kw: f"torch.where({a[0]}, {a[1]}, {a[3]})"
     m["tile.lrelu"] = lambda a, _kw: f"torch.where({a[0]} > 0, {a[0]}, {a[0]} * {a[1]})"
 
     # tile ternary add/sub with carry
@@ -1170,25 +1174,27 @@ class TorchCodegen(_ir.IRVisitor):
         """Build a stable key for nanobind-backed IR vars.
 
         IR callbacks may wrap the same underlying C++ Var with different Python
-        objects, so ``id(var)`` alone is not stable across visits. We key by
-        semantic fields that remain stable across wrappers.
-        """
-        span = getattr(var, "span", None)
-        span_key: tuple[Any, ...] | None = None
-        if span is not None and getattr(span, "is_valid", False):
-            span_key = (
-                getattr(span, "filename", ""),
-                int(getattr(span, "begin_line", 0)),
-                int(getattr(span, "begin_column", 0)),
-                int(getattr(span, "end_line", 0)),
-                int(getattr(span, "end_column", 0)),
-            )
+        objects, so ``id(var)`` alone is not stable across visits. ``Var`` carries
+        a ``unique_id`` for exactly this purpose -- a process-unique counter
+        assigned at construction, documented as the key to use when deduplicating
+        wrappers of the same underlying object. ``IterArg`` shares the counter.
 
+        Keying on it is both stricter and looser than the surrounding fields in
+        the ways we need: two wrappers of one Var always agree, and two distinct
+        Vars never collide, including when both carry ``Span.unknown()`` and the
+        same name and type -- a case name/type/span fields cannot separate.
+        """
+        unique_id = getattr(var, "unique_id", None)
+        if unique_id is not None:
+            return (type(var).__name__, int(unique_id))
+
+        # No identity available (a non-Var duck type): fall back to the
+        # descriptive fields rather than merging everything onto one key.
         var_type = getattr(var, "type", None)
         return (
             type(var).__name__,
             getattr(var, "name_hint", ""),
-            span_key,
+            id(var),
             str(var_type) if var_type is not None else "",
         )
 

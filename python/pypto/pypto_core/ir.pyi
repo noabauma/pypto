@@ -377,6 +377,15 @@ class PadValue(enum.Enum):
     min = ...
     """Min value padding."""
 
+class CompactMode(enum.Enum):
+    """Partial-tile compact mode enumeration."""
+
+    null = ...
+    """Ordinary non-compact layout."""
+
+    normal = ...
+    """Compact valid-region layout."""
+
 class TensorView:
     """Tensor view representation with stride, layout, valid shape, and pad mode."""
 
@@ -601,7 +610,7 @@ class DistributedTensorType(TensorType):
 
 class TileView:
     """Tile view: read-only representation of valid shape, stride, start offset,
-    layouts, fractal, and pad. Construct with all values; fields cannot be mutated
+    layouts, fractal, pad, and compact mode. Construct with all values; fields cannot be mutated
     after construction (so hash/equality stay stable for use as set/dict keys)."""
 
     valid_shape: Final[Sequence[Expr]]
@@ -633,6 +642,9 @@ class TileView:
     pad: Final[PadValue]
     """Pad mode."""
 
+    compact: Final[CompactMode]
+    """Partial-tile compact mode."""
+
     def __init__(
         self,
         valid_shape: Sequence[Expr | int | Scalar] | None = None,
@@ -642,8 +654,9 @@ class TileView:
         slayout: TileLayout = ...,
         fractal: int = ...,
         pad: PadValue = ...,
+        compact: CompactMode = ...,
     ) -> None:
-        """Create a tile view; all fields default to empty/None/row_major/none_box/512/null.
+        """Create a tile view; all fields default to empty/None/row_major/none_box/512/null/null.
 
         Args:
             valid_shape: Valid shape dimensions (Expr/int/Scalar, ints auto-converted to ConstInt)
@@ -653,6 +666,7 @@ class TileView:
             slayout: Scatter layout (default: none_box)
             fractal: Fractal size in bytes, not elements (default: 512)
             pad: Pad mode (default: null)
+            compact: Partial-tile compact mode (default: null)
         """
 
     def __eq__(self, other: object) -> bool:
@@ -822,6 +836,9 @@ class FunctionType(enum.Enum):
     - Spmd: SPMD data-parallel dispatch
     - Inline: Whole-body substitution at every call site by the
       InlineFunctions pass (eliminated before any other pass runs)
+    - Graph: A callable orchestration fragment. Its body is orchestration
+      code, but each call site is a single task launch that the
+      host_build_graph runtime records once and replays thereafter.
     """
 
     Opaque = ...
@@ -847,6 +864,9 @@ class FunctionType(enum.Enum):
 
     Inline = ...
     """Whole-body substitution at every call site."""
+
+    Graph = ...
+    """Recordable/replayable orchestration fragment."""
 
 class Level(enum.Enum):
     """Hierarchy level in the Linqu machine model.
@@ -1165,7 +1185,15 @@ class MemRef(Var):
         slot: Expr | None = ...,
     ) -> None: ...
     @overload
-    def __init__(self, base: Var, byte_offset: Expr, size: int, span: Span = ...) -> None: ...
+    def __init__(
+        self,
+        base: Var,
+        byte_offset: Expr,
+        size: int,
+        span: Span = ...,
+        slots: int = ...,
+        slot: Expr | None = ...,
+    ) -> None: ...
     @overload
     def __init__(self, base: str, byte_offset: int, size: int, span: Span = ...) -> None: ...
     @overload
@@ -3204,6 +3232,21 @@ class IRBuilder:
 
         Args:
             type: Return type
+        """
+
+    def add_function_attrs(self, attrs: dict[str, Any]) -> None:
+        """Merge attributes into the current function.
+
+        Attributes normally arrive at ``begin_function``. A ``pl.func_attr({...})``
+        body prologue is evaluated only after the parameters bind — which is what
+        lets an attribute reference a parameter — so it merges here instead.
+
+        Args:
+            attrs: Attribute dict to merge
+
+        Raises:
+            RuntimeError: If not inside a function context
+            ValueError: If a key is already present (attrs are unique-keyed)
         """
 
     def end_function(self, end_span: Span) -> Function:

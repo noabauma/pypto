@@ -163,6 +163,7 @@ pass 之后是否存在。
 | 语义 | 同步函数调用 | 异步任务启动 |
 | 出现位置 | 任意位置 | `manual_scope` 体内（由 parser 产生），以及作为 `pl.at(..., deps=[...])` 作用域外提后的派发点（缺失 `as tid` 绑定时会得到一个合成的未使用 TaskId Var）；在整个流水线中保持不变 |
 | 返回类型 | 被调方声明的返回 | `Tuple[<callee return>..., Scalar[TASK_ID]]` |
+| `args_` 与被调方 `params_` 的对应 | 恒等映射，完全覆盖：`args_.size() == params_.size()` | **有界（bounded）**覆盖：`args_.size() <= params_.size()`。恒等映射只在开头这段调用方提供的实参上成立（方向不限——In、InOut，**以及**调用方分配的 Out）；中间未被覆盖的被调方形参必须声明为 `Out`，由运行时分配（orchestration codegen 会为每个这样的形参合成一个 `add_output`）；由 `MaterializeDistTensorCtx` 追加在尾部的 `CommCtxType` 形参虽然也带在 `args_` 中，但位置是 `args_[i - gap]`（其中 `gap = params_.size() - args_.size()`）——因此当“空缺”与 CommCtx 后缀同时存在时，`args_[i] ↔ params_[i]` **不成立**。权威表述见 `include/pypto/ir/expr.h` 中的 `Submit::args_` |
 | 是否有 `deps` | 无 —— 普通 `Call` 从不携带依赖边（`attrs["manual_dep_edges"]` 仅出现在由 `pl.at` 产生的 `ScopeStmt` 上，在作用域外提时被消费；由 ManualDepsOnSubmitOnly 校验） | 一等的 `deps_` 字段 —— `Scalar[TASK_ID]` Var / `Array[N, TASK_ID]` Var |
 | SPMD 启动规格 | 无 | `core_num_`（`optional<ExprPtr>` 块数）+ `sync_start_`（bool），仅由 `pl.spmd_submit` 设置；`sync_start_` 仅在 `core_num_` 存在时才有意义（构造函数强制 `sync_start ⇒ core_num`）；`nullopt` ⇒ 普通单块 submit |
 | Use-def 链 | 仅 `args_` | `args_`、`deps_`，**以及** `core_num_` |
@@ -201,7 +202,7 @@ for_stmt = ir.ForStmt(i, start, stop, step, [sum_iter], body, [sum_final], span)
 | **ClusterScopeStmt** | `name_hint_`, `body_` | Cluster 区域；由 `OutlineClusterScopes` 提取为 `Function(Group)` |
 | **HierarchyScopeStmt** | `name_hint_`, `body_`, `level_`, `role_`（可选） | 给定 Level/Role 的流水线阶段区域 |
 | **SpmdScopeStmt** | `name_hint_`, `body_`, `core_num_`（整型 `Expr`）, `sync_start_` | SPMD 启动区域；提取为 `Function(Spmd)` |
-| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_`（`SplitMode`，永不为 `None`）, `count_`（= 2） | 显式 AIV 切分区域（`pl.split_aiv`）；可嵌套；由 `LowerAutoVectorSplit`（pass 19）消费并擦除 |
+| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_`（`SplitMode`，永不为 `None`）, `count_`（= 2） | 显式 AIV 切分区域（`pl.split_aiv`）；可嵌套；由 `LowerAutoVectorSplit`（pass 20）消费并擦除 |
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator 运行时区域（`PTO2_SCOPE`）；`manual_=true` 选择手工依赖模式 |
 | **YieldStmt** | `values_` | 在循环迭代中产出值 |
 | **EvalStmt** | `expr_` | 为副作用求值表达式 |
@@ -329,14 +330,17 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
   - `OutlineHierarchyScopes` 提取 `HierarchyScopeStmt`
   - `SplitAivScopeStmt` **不被提取**：它对 SSA 与各 outliner 透明（保留在被
     提取出的 `Function(InCore)` 体内），随后由 `LowerAutoVectorSplit`
-    （pass 21）消费并**擦除**。它永不到达 `ExpandMixedKernel`（pass 20）或
+    （pass 20）消费并**擦除**。它永不到达 `ExpandMixedKernel`（pass 21）或
     codegen——下游只看到逐算子的 `aiv_shard` / `aic_gather` / `tpush` /
     `tpop` 标记；若有 `SplitAivScopeStmt` 残留到此，PTO codegen 守卫会显式
     报错。
   - `SplitAivScopeStmt` **可嵌套**：经由通用的 `BeginScope`/`EndScope` 构建，
     可置于任意父上下文（`pl.range` / `pl.pipeline` 循环或 `if`）。同级区域可
-    携带**不同**的 `split_` 模式（多模式）；pass 21 的减半是按区域局部进行
-    的，因此每个区域独立减半，区域外的向量计算保持全宽。顶层
+    携带**不同**的 `split_` 模式（多模式）；pass 20 的减半是按区域局部进行
+    的，因此每个区域独立减半。持有至少一个区域的函数进入**手动模式**：区域对
+    向量计算的放置具有决定权，`AivSplitValid` 验证器会拒绝所有区域之外的向量
+    计算（每个全宽阶段请写一个 `mode=None` 区域，参见
+    [LowerAutoVectorSplit](../passes/20-lower_auto_vector_split.md)）。顶层
     `for aiv_id in pl.split_aiv(...)` 会被 parser 包裹在外层
     `InCoreScopeStmt` 中（以便 `OutlineIncoreScopes` 提取），即
     `InCoreScopeStmt{ body: SplitAivScopeStmt{...} }`。
@@ -394,18 +398,23 @@ for_stmt = ir.ForStmt(i, start, stop, step, [], body, [], span, ir.ForKind.Paral
 描述张量/Tile 共享的内存分配元数据。对于 Tile，内存空间保存在
 `TileType.memory_space_`；`TensorType` 的规范内存空间固定为 DDR。
 
+`MemRef` 是 `Var` 的子类，因而是一等表达式。一个 MemRef 标识一块分配
+(`base_`) 以及其中的一段字节区间 (`byte_offset_`、`size_`)；别名关系由
+`MemRef.same_allocation(a, b)` 和 `MemRef.may_alias(a, b)` 判定。
+
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
-| `addr_` | ExprPtr | 基地址 |
-| `size_` | size_t | 大小（字节） |
-| `id_` | uint64_t | 稳定的 MemRef 标识符 |
+| `base_` | VarPtr | 分配身份标识 —— 来自 `tile.alloc` / `tensor.alloc` 的 Ptr `Var`。只有共享该字段的两个 MemRef 才可能别名。 |
+| `byte_offset_` | ExprPtr | 相对 `base_` 的字节偏移（整块分配为 0，视图则为其偏移） |
+| `size_` | uint64_t | 该区间的大小（字节） |
+| `is_pinned_` | bool | 用户显式声明的分配 (`pl.MemRef("name")`)，在 `InitMemRef` 解析之前为真 |
+| `slot_count_` | uint64_t | 该声明包含的等长 slot 数 (`pl.MemRef("name", slots=N)`)；省略 `slots` 时为 1 |
+| `slot_index_` | ExprPtr \| None | 该 MemRef 指向哪个 slot (`l0c[k]`)；未选定 slot 前为 None，且可以是运行期值 |
 
 ```python
-memref = ir.MemRef(
-    ir.ConstInt(0x1000, DataType.INT64, span),
-    1024,  # bytes
-    0     # id
-)
+# base allocation name, byte offset within it, size in bytes
+memref = ir.MemRef("mem_left_0", 0, 1024)
+assert ir.MemRef.same_allocation(memref, memref)
 ```
 
 > **注意：** `ir.Mem` 是 `ir.MemorySpace` 的简写别名。
@@ -416,15 +425,23 @@ memref = ir.MemRef(
 
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
-| `valid_shape` | list[ExprPtr] | 有效维度 |
+| `valid_shape` | list[ExprPtr] | 有效维度（为空表示等同完整 shape） |
 | `stride` | list[ExprPtr] | 每维步长 |
 | `start_offset` | ExprPtr | 起始偏移量 |
+| `blayout` | TileLayout | 块布局 (block layout)，默认 `row_major` |
+| `slayout` | TileLayout | 散布布局 (scatter layout)，默认 `none_box` |
+| `fractal` | uint64_t | 分形 (fractal) 大小，单位是**字节**而非元素（默认 512） |
+| `pad` | PadValue | 访问越出 `valid_shape` 时的填充模式（默认 `null`） |
+| `compact` | CompactMode | 部分有效 Tile 的紧凑模式（默认 `null`） |
 
 ```python
-tile_view = ir.TileView()
-tile_view.valid_shape = [ir.ConstInt(16, DataType.INT64, span)] * 2
-tile_view.stride = [ir.ConstInt(1, DataType.INT64, span), ir.ConstInt(16, DataType.INT64, span)]
-tile_view.start_offset = ir.ConstInt(0, DataType.INT64, span)
+# TileView is immutable: pass every field to the constructor.
+# valid_shape / stride / start_offset accept int or Expr.
+tile_view = ir.TileView(valid_shape=[8, 16], stride=[1, 16], start_offset=0)
+
+# Expr form, for symbolic dimensions
+rows = ir.Var("rows", ir.ScalarType(DataType.INT64), span)
+symbolic_view = ir.TileView(valid_shape=[rows, ir.ConstInt(16, DataType.INT64, span)])
 ```
 
 ## Function 节点
@@ -447,7 +464,7 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
 | `name_` | string | 函数名称 |
-| `func_type_` | FunctionType | 函数类型（Opaque、Orchestration、InCore、AIC、AIV、Group 或 Spmd） |
+| `func_type_` | FunctionType | 函数类型（见下方 FunctionType 表格） |
 | `params_` | list[VarPtr] | 参数变量 (DefField) |
 | `param_directions_` | list[ParamDirection] | 参数方向，与 params_ 长度相同 |
 | `return_types_` | list[TypePtr] | 返回类型 |
@@ -455,6 +472,26 @@ func_orch = ir.Function("orchestrator", params, return_types, body, span, ir.Fun
 | `level_` | optional[Level] | 层次级别（对 InCore/AIC/AIV/Group/Orchestration 自动派生，详见下文） |
 | `role_` | optional[Role] | 层次角色（对 InCore/AIC/AIV/Group/Orchestration 自动派生，详见下文） |
 | `attrs_` | list[(str, Any)] | 有序的自由形式元数据，以 `UsualField` 暴露（参与结构遍历） |
+
+### 保留的 `attrs_` 键
+
+一个 pass 写入、另一个 pass 读取的键是一份契约；若在每个站点都写成裸字符串字面量，
+这份契约就没有唯一的重命名入口。因此保留的 `Function` attr 键在每一层只声明一次：
+
+| 层 | 声明位置 |
+| -- | -------- |
+| C++ | `include/pypto/ir/function.h` — `inline constexpr const char* kAttr...`，每个键都带生命周期注释，说明写入 pass、读取方，以及该键是否会被剥离 |
+| Python | `python/pypto/_function_attrs.py` — `..._ATTR = "..."`，仅覆盖 DSL、后端与 JIT 层实际使用的子集 |
+
+`tests/lint/check_function_attr_key_parity.py`（pre-commit 钩子）强制三件事：
+两个声明位置对 Python 声明的每个键取值一致；标识符互相对应
+（`kAttrDualAivDispatch` ↔ `DUAL_AIV_DISPATCH_ATTR`）；其他源文件不得在读写
+`attrs` 的站点上把这些键写成裸字面量。
+
+其他节点类型的键各有归属，不在本检查范围内：`Call` / `Submit` 的 attr 声明在
+`include/pypto/ir/expr.h`（`kAttrCoreNum`、`kAttrDevice`、`kAttrPredicate`、
+`kAttrManualDepEdges` 等），`ForStmt` / pass 内部 attr 声明在
+`include/pypto/ir/transforms/utils/attrs.h`。
 
 ### `level_` / `role_` 自动派生
 
@@ -520,8 +557,19 @@ def sample(logits: pl.Tensor[[B, V], pl.FP32]) -> pl.Tensor[[B], pl.INT32]:
 | `AIV` | Vector 核心内核（特化的 InCore） |
 | `Group` | AIC + AIV 内核的协调调度组 |
 | `Spmd` | SPMD 数据并行调度封装 |
+| `Inline` | 在每个调用点整体替换函数体；由 `InlineFunctions` 在其它 pass 之前消除 |
+| `Graph` | 可调用的编排片段，由 `host_build_graph` runtime 录制一次、之后回放 |
 
 `IsInCoreType(type)` / `ir.is_incore_type(type)` 对 `InCore`、`AIC` 和 `AIV` 返回 `True`。
+
+`IsOrchestrationLike(type)` 对 `Orchestration` 和 `Graph` 返回 `True`。两者的函数体
+都是编排代码，所以「因为它编排任务而处理该函数」的 pass 必须用这个谓词，而不是
+`== FunctionType::Orchestration` —— 后者会静默跳过 Graph 函数体。例外是那些含义为
+「唯一的编译入口」的代码，它们保持严格比较：Graph 是被入口调用的，它本身永远不是
+入口。
+
+Graph 函数和其它编排体一样派生出 `{Level::CHIP, Role::Orchestrator}`，因此仅凭
+level 和 role 也无法再区分出入口。
 
 ## Program 节点
 

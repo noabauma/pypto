@@ -600,6 +600,50 @@ def static_assert(condition: Any, msg: str = "") -> None:
     """
 
 
+def func_attr(attrs: dict[str, Any]) -> None:
+    """Attach function-level attributes from inside the function body.
+
+    Written as the **first statement** of a function body, ``pl.func_attr``
+    declares metadata about the function as a whole::
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, x: pl.Tensor[[64, 64], pl.FP32],
+                   w: pl.Tensor[[64, 64], pl.FP32],
+                   out: pl.Out[pl.Tensor[[64, 64], pl.FP32]]):
+            pl.func_attr({"stationary": w})
+            ...
+
+    Why the body and not the decorator: a decorator is evaluated *before* the
+    signature binds any name, so ``@pl.function(attrs={"stationary": w})``
+    cannot be written — ``w`` does not exist yet. Body position places the
+    declaration after the parameters are bound, which is what makes an
+    attribute that references a parameter expressible at all.
+
+    Semantics:
+
+    * **Prologue only.** Every ``pl.func_attr`` call must precede every other
+      statement in the body. An attribute describes the whole function, so it
+      must not appear to start applying partway down a body; pinning it to the
+      prologue also keeps the printed form deterministic. Consequently only
+      parameters — not body-locals — are referenceable.
+    * **A bare name is always a parameter reference.** ``pl.func_attr({"n": k})``
+      records the parameter ``k``, never the value of an enclosing Python
+      variable named ``k``. Write Python-level constants as literals.
+    * **Multiple calls merge.** A key repeated across two calls — or between
+      ``pl.func_attr`` and a decorator ``attrs=`` — is a ``ParserSyntaxError``
+      naming the key.
+    * **Consumed at parse time.** The dict lands in ``Function.attrs`` and emits
+      no IR statement of its own.
+
+    Attributes the parser must read *before* it can parse the body stay on the
+    decorator as dedicated keywords: ``auto_scope=`` and ``external_source=``.
+
+    Args:
+        attrs: Attribute dict. Keys must be string literals.
+    """
+    # Runtime no-op - parser handles semantics
+
+
 class ClusterContext:
     """Context manager for Cluster scope.
 
@@ -676,7 +720,7 @@ class SpmdContext:
         # decorator parses the function source rather than executing it — but
         # returning ``self`` keeps ``as`` syntactically legal (and ``tid``
         # non-``None`` under static checking) when a script is executed directly
-        # (e.g. for linting), matching :meth:`AtContext.__enter__`.
+        # (e.g. for linting), matching ``AtContext.__enter__``.
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -876,7 +920,7 @@ class SplitAivContext:
     """Loop iterator for the explicit AIV-split region.
 
     The parser recognizes ``for aiv_id in pl.split_aiv(2, mode=...):`` and builds
-    a first-class :class:`~pypto.pypto_core.ir.SplitAivScopeStmt` region node
+    a first-class ``SplitAivScopeStmt`` region node
     carrying the requested ``SplitMode``. Unlike the legacy whole-InCore-scope
     split, this region is a structural node that may be nested anywhere in an
     InCore body — inside a ``pl.range`` / ``pl.pipeline`` loop or an ``if``. The
@@ -911,14 +955,21 @@ def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
         for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
             ...  # body runs per AIV lane; aiv_id = pl.tile.get_subblock_idx()
 
-    The loop builds a first-class :class:`~pypto.pypto_core.ir.SplitAivScopeStmt`
+    The loop builds a first-class ``SplitAivScopeStmt``
     region carrying the requested ``SplitMode``. Because it is a structural node
     (not a whole-InCore-scope flag), it is **nestable**: the region may appear
     inside a ``pl.range`` / ``pl.pipeline`` loop or an ``if``, and sibling regions
-    may carry **different** modes (multi-mode), each lowered independently. A
-    top-level ``for aiv_id in pl.split_aiv(...)`` is wrapped in an enclosing
-    ``InCore`` scope so OutlineIncoreScopes can outline it. The loop variable
-    binds the AIV lane index (equivalent to ``pl.tile.get_subblock_idx()``).
+    may carry **different** modes (multi-mode), each lowered independently. The
+    loop variable binds the AIV lane index (equivalent to
+    ``pl.tile.get_subblock_idx()``).
+
+    A top-level ``for aiv_id in pl.split_aiv(...)`` is wrapped in an enclosing
+    ``InCore`` scope so OutlineIncoreScopes can outline it — unless the region is
+    already in a core context (an open ``pl.at(level=CORE_GROUP)`` scope, or a
+    function declared ``pl.FunctionType.InCore``), where it is emitted in place.
+    A region is CORE_GROUP-level, so **authoring** one directly in an
+    ``InCore`` function is rejected by the ``AivSplitValid`` verifier; write it
+    in a plain ``@pl.function`` / ``@pl.jit`` (Opaque) body instead.
 
     Two dispatch modes:
 
@@ -928,8 +979,101 @@ def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
     * **Task-parallel** (``NONE``): **no halving** — both lanes run the *full*
       body for disjoint work the author dispatches via ``aiv_id`` (e.g. an
       ``aiv_id``-strided loop). Use this when the tiles cannot be halved
-      (unit dims) or a reduction must stay full-width. ``tile.aiv_shard`` /
-      ``tile.aic_gather`` are rejected here — there is no split axis.
+      (unit dims) or a reduction must stay full-width. ``pl.aiv_shard`` /
+      ``pl.aic_gather`` are valid here and **preserve the shape**: with no split
+      axis they carry the one meaning that still applies — this value crosses
+      the AIC/AIV boundary.
+
+    **Manual mode.** Opening even ONE region changes the contract for the whole
+    enclosing function: the regions become authoritative for where vector work
+    runs, and the ``AivSplitValid`` verifier enforces the division:
+
+    ==========================  =================  ==========================
+    op                          inside a region    outside every region
+    ==========================  =================  ==========================
+    vector compute              AIV                **rejected**
+    ``pl.load`` / ``pl.store``  AIV                allowed (compiler-inserted)
+    cube compute (``matmul``)   **rejected**       AIC
+    ``pl.aiv_shard`` /
+    ``pl.aic_gather``           the boundary       **rejected**
+    ``pld.system.notify``       pinned to AIV      duplicated onto BOTH lanes
+    ==========================  =================  ==========================
+
+    So write **one region per vector phase**, with cube ops and barriers between
+    them. A phase that must stay full width goes in its own
+    ``for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):`` — whose meaning is
+    exactly "both lanes run the full body", which is what an un-regioned vector
+    phase in such a function already did. A function with NO region is
+    unaffected and keeps its previous behaviour.
+
+    **Name every tile that crosses a region edge.** Manual mode hands the AIC/AIV
+    boundary to the author, so the compiler stops placing it: a cube-produced
+    value read on the vector lane inside a region must arrive through
+    ``pl.aiv_shard``, and a value defined in a region and read on the cube lane
+    outside it must leave through ``pl.aic_gather``. Both crossings lower fine
+    without the op — which is the point: an unnamed boundary is one nobody chose,
+    so the verifier rejects it and names the value and the reader::
+
+        mm = pl.matmul(q, k)                     # cube, outside every region
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            v = pl.exp(pl.aiv_shard(mm))         # C->V: named
+            kv = pl.aic_gather(v)                # V->C: named
+        out = pl.matmul(kv, w)                   # cube again, outside
+
+    **Gather only a lane-uniform value out of a ``NONE`` region.** The ISA requires
+    both AIV sub-lanes to take part in a no-split handshake and they share one
+    destination slot with no per-lane offset, and nothing arbitrates between
+    them: both lanes push, so if they hold different values the cube receives an
+    **unspecified** one of the two. Guarding the *production* of the value does
+    not help — lane 1 still reaches the push and still sends its own tile. So a
+    gather out of a ``NONE`` region is well-defined only for a lane-uniform
+    value; if the lanes must contribute different data, use a data-parallel
+    region instead. **Not diagnosed.**
+
+    **Put cross-rank comm ops in a region.** A region also decides placement for
+    ops that have no lane of their own. ``pld.system.notify`` is core-agnostic
+    by ISA, so in a kernel that mixes cube and vector work it is emitted on BOTH
+    the AIC and the AIV lane — and the cube copy can publish the signal before
+    the vector lane's put has landed the data it releases. Putting the op in a
+    region pins it to the vector lane::
+
+        for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            pld.tensor.put(dst=win, peer=peer, src=out, ...)
+            pld.system.notify(target=sig, peer=peer, offsets=[0, 0], value=1,
+                              op=pld.NotifyOp.AtomicAdd)
+
+    **A region is not "run once" — shard once-only side effects by aiv_id.**
+    A ``mode=NONE`` body runs on BOTH AIV sub-lanes, so the snippet above sends
+    TWO notifies to the same peer. `AtomicAdd` accumulates, so that peer's
+    counter reads 2 for one arrival, a ``pld.system.wait`` on it is released
+    early, and the rank races ahead on data that has not landed. Shard the op,
+    or guard it to one lane::
+
+        # sharded: each lane takes different peers
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            for owner in pl.range(aiv_id, NUM_PEERS, 2):
+                pld.system.notify(target=sig, peer=owner, ...)
+
+        # guarded: lane 0 only
+        for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+            if aiv_id == 0:
+                pld.system.notify(target=sig, peer=peer, ...)
+
+    **This is NOT diagnosed.** The compiler guarantees only that a region's comm
+    ops stay off the cube lane; the sharded and un-sharded forms are the same
+    single statement in the AIV body, differing only in whether ``aiv_id``
+    reaches the call's arguments.
+
+    **GM traffic is outside all of this.** The crossing rules above govern *tile*
+    values. A GM tensor belongs to no lane — ``pld.tensor.put`` takes one by
+    signature — so no boundary op can express a crossing through it, and AIC and
+    AIV run asynchronously. ``ExpandMixedKernel`` fences one narrow shape by
+    itself: a cube ``tile.store`` whose GM tensor a vector ``tile.load`` reads
+    back, when the two share an origin and the load is in or under the store's
+    body. Everything else — a comm op reading the buffer, a consumer in a
+    sibling body — needs explicit producer-side cache publication and a GM
+    fence, a cross-core ``pl.system.syncall``, and consumer-side invalidation.
+    That sequence remains the author's responsibility.
 
     The region survives parse -> SSA -> ResolveBackendOpLayouts as a structural
     node (printer emits ``for aiv_id in pl.split_aiv(...):`` so parse->print->parse
@@ -951,6 +1095,15 @@ def split_aiv(n: int, *, mode: ir.SplitMode) -> SplitAivContext:
         ...     offset = aiv_id * 128
         ...     t = pl.load(a, [offset, 0], [128, 128])
         ...     out = pl.store(t, [offset, 0], out)
+
+        A second, full-width vector phase after a cube op needs its own region
+        (manual mode) — ``mode=NONE`` keeps it un-halved:
+
+        >>> for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+        ...     ...  # phase 1, dispatched per lane via aiv_id
+        >>> mm = pl.matmul(q, k)  # cube work stays outside every region
+        >>> for _ in pl.split_aiv(2, mode=pl.SplitMode.NONE):
+        ...     out = pl.add(mm, bias)  # phase 2, full width on both lanes
     """
     if isinstance(n, bool) or not isinstance(n, int):
         raise ValueError(f"pl.split_aiv(n): n must be the integer 2, got {n!r}")

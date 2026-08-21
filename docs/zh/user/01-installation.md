@@ -17,6 +17,37 @@ CMake，所以一条普通的 `pip install` 就能完成全部工作。
 | 把 kernel 编译成生成的 C++ | 除安装外无需其他。**ptoas**（单独分发，版本固定在 `toolchain/versions.env`）负责其中的汇编步骤；`@pl.jit` 会检测它是否存在，不存在时自动跳过该步骤 |
 | 运行已编译的 kernel | 运行时，加一块 NPU 或模拟器平台 |
 
+### 可选的 AI agent skills
+
+[pypto-skills](https://github.com/hw-native-sys/pypto-skills) marketplace 提供了一组插件，
+让受支持的 AI 编程 agent 掌握项目的公共工作流。这些插件安装到 agent 中，与 PyPTO Python
+包的安装相互独立：
+
+| 插件 | 适用对象 | 包含的工作流 |
+| ---- | -------- | ------------ |
+| `pypto-user` | PyPTO 用户 | 生成 IR trace、分析 in-core kernel 性能 |
+| `pypto-developer` | PyPTO 贡献者 | Git、PR、issue 与分支管理工作流 |
+
+Codex 安装方式：
+
+```bash
+codex plugin marketplace add hw-native-sys/pypto-skills
+codex plugin add pypto-user@pypto-skills
+
+# 可选：同时安装贡献者工作流
+codex plugin add pypto-developer@pypto-skills
+```
+
+Claude Code 安装方式：
+
+```bash
+claude plugin marketplace add hw-native-sys/pypto-skills
+claude plugin install pypto-user@pypto-skills
+
+# 可选：同时安装贡献者工作流
+claude plugin install pypto-developer@pypto-skills
+```
+
 下面的验证步骤刻意只停留在第一行。
 
 ## Quickstart
@@ -48,7 +79,7 @@ Pass 流水线，并返回 Pass 后的 `ir.Program`。它不会执行代码生�
 示例，不要把函数管道给 `python -`：`@pl.jit` 需要读取被装饰函数的源码，而 stdin 上取不到。
 
 ```bash
-python examples/kernels/08_assemble.py
+python examples/intermediate/05_assemble.py
 ```
 
 最后一行是：
@@ -118,22 +149,81 @@ PYPTO_PROG_BUILD_DIR=/scratch/pypto-out python my_kernel.py
 
 `examples/` 按难度组织，是了解 PyPTO 惯用写法最快的途径。
 
-| 路径 | 内容 |
-| ---- | ---- |
-| `examples/hello_world.py` | 最简单的完整程序 —— 从这里开始 |
-| `examples/kernels/` | 单 kernel 算子，按难度编号：逐元素、融合算子、矩阵乘、softmax、assemble |
-| `examples/models/` | 多 kernel 模型，按难度编号：FFN、paged attention、LLaMA |
-| `examples/utils/` | 解析、跨函数调用、错误处理 |
-| `examples/runtime/` | 派发、显式 worker、分布式回调、多程序 KV cache |
+**`examples/beginner/`** —— 一个文件一个概念。
 
-**这些例子多数会派发到硬件，而不只是编译。** `hello_world.py`、`kernels/06_softmax.py`、
-`models/01_ffn.py` 最后都以 `config=RunConfig()` 调用各自的 kernel，也就是经 ptoas 汇编后
-真正运行 —— 因此它们需要运行时和一块设备或模拟器平台，仅有上面的 `pip install` 是不够的：
+| 文件 | 展示 |
+| ---- | ---- |
+| `01_hello_world.py` | 最小的完整程序 |
+| `02_elementwise.py` | tile 加 / 乘，以及对分块的循环 |
+| `03_scalar_ops.py` | 标量操作数 |
+| `04_activation.py` | `relu`、SiLU |
+| `05_matmul.py` | cube 上一次算完的 64x64 matmul |
+| `06_concat.py` | 两个 tile 写进互不相交的列区间 |
+
+**`examples/intermediate/`** —— 真实 kernel 模式。
+
+| 文件 | 展示 |
+| ---- | ---- |
+| `01_fused_linear.py` | cube matmul + vector bias-add + relu |
+| `02_softmax.py` | 按行 softmax |
+| `03_normalization.py` | RMSNorm、LayerNorm |
+| `04_matmul_acc.py` | K 维分块 + 累加器 |
+| `05_assemble.py` | 按偏移把 tile 写进目标 |
+| `06_dyn_valid_shape.py` | 运行时收窄的有效范围 |
+| `07_task_graph.py` | 一条推断的边与一条声明的边 |
+
+**`examples/advanced/`** —— 性能技巧。
+
+| 文件 | 展示 |
+| ---- | ---- |
+| `01_split_k.py` | 切分规约维 |
+| `02_auto_tile_matmul.py` | 编译器驱动的 L0 分块 |
+| `03_mixed_kernel.py` | cube 与 vector 同作用域，三种 split 模式 |
+
+**`examples/models/`** —— 多 kernel 模型。
+
+| 文件 | 展示 |
+| ---- | ---- |
+| `01_ffn.py` | 一个 FFN 模块 |
+| `02_vector_dag.py` | 三个 InCore kernel 连成 DAG |
+| `03_flash_attention.py` | 循环携带状态、嵌套 `if` / `pl.yield_` |
+| `04_paged_attention.py` | paged attention，在线 softmax，4 kernel 流水 |
+| `05_paged_attention_batch.py` | batch 循环挪进 kernel 内部 |
+| `06_paged_attention_dynamic.py` | `pl.dynamic()` 形状 |
+| `07_paged_attention_multi_config.py` | unroll 分组 + 由 `pl.tensor.dim()` 得到的形状 |
+| `08_llama_mini.py` | 一个完整的小型 LLaMA 风格模型 |
+| `09_paged_attention_spmd.py` | batch 维分布到 SPMD block 上 |
+| `qwen3_jit/` | 按模块拆成多个 kernel 文件的 `@pl.jit` decode 路径 |
+
+**`examples/utils/`** —— 只用前端。
+
+| 文件 | 展示 |
+| ---- | ---- |
+| `cross_function_calls.py` | `@pl.jit.inline` 辅助函数在调用点展开 |
+| `error_handling.py` | 裸重绑定的代价，以及它怎么暴露出来 |
+| `parse_from_text.py` | 从字符串或文件 `pl.parse()` / `pl.loads()` |
+| `phase_fence_dep_compression.py` | 扇出阶段之间的整数组 TaskId 栅栏 |
+
+**`examples/runtime/`** —— host 侧模式。
+
+| 文件 | 展示 |
+| ---- | ---- |
+| `explicit_dispatch.py` | 注册一次，多次派发 |
+| `multi_program_kv_cache.py` | 跨程序共享的常驻 buffer |
+| `distributed_callback.py` | 作为 Python 回调的 HOST `SubWorker` |
+
+**`examples/distributed/`** —— 每个集合通信 / 原语一个文件，在 [分布式](distributed/index.md)
+里逐页讲解。
+
+**这些例子多数会派发到硬件，而不只是编译。** `beginner/01_hello_world.py`、
+`intermediate/02_softmax.py`、`models/01_ffn.py` 最后都以 `config=RunConfig()` 调用各自的
+kernel，也就是经 ptoas 汇编后真正运行 —— 因此它们需要运行时和一块设备或模拟器平台，仅有上面的
+`pip install` 是不够的：
 
 ```bash
-python examples/hello_world.py          # 需要运行时 + 设备/模拟器
-python examples/kernels/06_softmax.py   # 需要运行时 + 设备/模拟器
-python examples/models/01_ffn.py        # 需要运行时 + 设备/模拟器
+python examples/beginner/01_hello_world.py     # 需要运行时 + 设备/模拟器
+python examples/intermediate/02_softmax.py     # 需要运行时 + 设备/模拟器
+python examples/models/01_ffn.py               # 需要运行时 + 设备/模拟器
 ```
 
 如果你只有编译器前端，读它们而不要运行 —— `examples/utils/` 是最接近“仅解析与查看”的那部分。
@@ -149,7 +239,7 @@ python -m pytest tests/ut/core/test_error.py -v            # 单个文件
 
 系统测试位于 `tests/st/`，需要设备或模拟器，参见 `tests/st/README.md`。
 
-## Edge Cases
+## 边界情况
 
 > **致命陷阱：** 在装 CPU 版 torch 之前先装 PyPTO，会静默拉取完整的 CUDA 版 torch ——
 > 约 2GB 的包，而 PyPTO 工作流一个都不会加载。没有任何报错和警告，唯一的症状是安装极慢、

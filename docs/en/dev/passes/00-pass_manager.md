@@ -74,6 +74,7 @@ struct PassProperties {
 | LegalizeTileCast | — | — | — |
 | AutoTileMatmulL0 | SSAForm, IncoreTileOps, TileOps2D | SSAForm, IncoreTileOps, TileOps2D | — |
 | CanonicalizeTileSlice | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | SSAForm, SplitIncoreOrch, IncoreTileOps, TileOps2D, NormalizedStmtStructure | — |
+| InsertMxScaleAddr | SSAForm, IncoreTileOps, SplitIncoreOrch, TileMemoryInferred, NormalizedStmtStructure | SSAForm, IncoreTileOps, SplitIncoreOrch, TileMemoryInferred, NormalizedStmtStructure | — |
 | ResolveBackendOpLayouts | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, NormalizedStmtStructure | — |
 | LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | — |
 | ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, MixedKernelExpanded | — |
@@ -404,36 +405,38 @@ The PTO-oriented tile stage of `Default` is:
 4. [`AutoTileMatmulL0`](15-auto_tile_matmul_l0.md)
 5. [`CanonicalizeTileSlice`](16-canonicalize_tile_slice.md)
 6. `InferTileMemorySpace`
-7. [`ResolveBackendOpLayouts`](18-resolve_backend_op_layouts.md) (self-normalizes statement structure internally)
-8. [`LowerAutoVectorSplit`](19-lower_auto_vector_split.md) (live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form before ExpandMixedKernel)
-9. `ExpandMixedKernel`
-10. [`InjectGMPipeBuffer`](21-inject_gm_pipe_buffer.md)
-11. [`SplitVectorKernel`](22-split_vector_kernel.md) (only stamps attrs for split_aiv functions + handles the no-split dual-AIV path)
-12. [`StampTfreeSplit`](23-stamp_tfree_split.md) (copies each cross-core tpop's split/pipe-id onto its matching tfree op)
-13. `NormalizeReturnOrder`
-14. [`SkewCrossCorePipeline`](25-skew_cross_core_pipeline.md) (cross-core cube/vector software-pipeline skew; runs immediately before LowerPipelineLoops)
-15. [`LowerPipelineLoops`](26-lower_pipeline_loops.md)
-16. [`CanonicalizeIOOrder`](27-canonicalize_io_order.md)
-17. [`MaterializeTensorStrides`](28-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
-18. `InitMemRef`
-19. [`MaterializeSemanticAliases`](30-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
-20. `MemoryReuse`
-21. `AllocateMemoryAddr`
-22. [`FoldNoOpReshape`](33-fold_no_op_reshape.md)
-23. [`FuseCreateAssembleToSlice`](34-fuse_create_assemble_to_slice.md)
-24. [`DeriveCallDirections`](35-derive_call_directions.md)
-25. [`AutoDeriveTaskDependencies`](36-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
-26. [`ExpandManualPhaseFence`](37-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
-27. [`SynthesizeAllReduceSignals`](38-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
-28. [`MaterializeCommDomainScopes`](39-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
-29. [`LowerHostTensorCollectives`](40-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
-30. [`MaterializeDistTensorCtx`](41-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
-31. `Simplify`
-32. [`MaterializeRuntimeScopes`](42-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
-33. [`ClassifyIterArgCarry`](43-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
-34. [`InsertCommFence`](44-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs dead last so the inserted ops stay adjacent to their notify through codegen)
+7. [`InsertMxScaleAddr`](18-insert_mx_scale_addr.md) (Ascend950 MX path; inserts internal scale-address bindings after memory spaces are resolved)
+8. [`ResolveBackendOpLayouts`](19-resolve_backend_op_layouts.md) (self-normalizes statement structure internally)
+9. [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) (live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form before ExpandMixedKernel)
+10. `ExpandMixedKernel`
+11. [`InjectGMPipeBuffer`](22-inject_gm_pipe_buffer.md)
+12. [`SplitVectorKernel`](23-split_vector_kernel.md) (only stamps attrs for split_aiv functions + handles the no-split dual-AIV path)
+13. [`StampTfreeSplit`](24-stamp_tfree_split.md) (copies each cross-core tpop's split/pipe-id onto its matching tfree op)
+14. `NormalizeReturnOrder`
+15. [`SkewCrossCorePipeline`](26-skew_cross_core_pipeline.md) (cross-core cube/vector software-pipeline skew; runs immediately before LowerPipelineLoops)
+16. [`LowerPipelineToSlots`](27-lower_pipeline_to_slots.md) (rotates an eligible `pl.pipeline` body through the slots of one allocation instead of replicating it; self-gated on `memory_planner=PTOAS`, and every loop it declines is left for `LowerPipelineLoops`)
+17. [`LowerPipelineLoops`](28-lower_pipeline_loops.md)
+18. [`CanonicalizeIOOrder`](29-canonicalize_io_order.md)
+19. [`MaterializeTensorStrides`](30-materialize_tensor_strides.md) — wired into the default pipeline starting from RFC #1300 P6
+20. `InitMemRef`
+21. [`MaterializeSemanticAliases`](32-materialize_semantic_aliases.md) (semantics-required must-alias: loop-carry / in-place; always runs)
+22. `MemoryReuse`
+23. `AllocateMemoryAddr`
+24. [`FoldNoOpReshape`](35-fold_no_op_reshape.md)
+25. [`FuseCreateAssembleToSlice`](36-fuse_create_assemble_to_slice.md)
+26. [`DeriveCallDirections`](37-derive_call_directions.md)
+27. [`AutoDeriveTaskDependencies`](38-auto_derive_task_dependencies.md) (compiler deps for runtime scopes; AUTO-scope analysis is opt-in)
+28. [`ExpandManualPhaseFence`](39-expand_manual_phase_fence.md) (manual-scope phase-fence TaskId dep compression)
+29. [`SynthesizeAllReduceSignals`](40-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
+30. [`MaterializeCommDomainScopes`](41-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
+31. [`LowerHostTensorCollectives`](42-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
+32. [`MaterializeDistTensorCtx`](43-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
+33. `Simplify`
+34. [`MaterializeRuntimeScopes`](44-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits PTO2_SCOPE 1:1)
+35. [`ClassifyIterArgCarry`](45-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
+36. [`InsertCommFence`](46-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs dead last so the inserted ops stay adjacent to their notify through codegen)
 
-[`ResolveBackendOpLayouts`](18-resolve_backend_op_layouts.md) repairs
+[`ResolveBackendOpLayouts`](19-resolve_backend_op_layouts.md) repairs
 backend-constrained elementwise tile ops using registered layout metadata.
 For the current PTO row-major elementwise ops, it rewrites `[N, 1]` vector
 operands into `[1, N] row_major` `tile.reshape` operations at the
@@ -441,7 +444,7 @@ constrained use site, where row-major is inferred from the target shape.
 It then reshapes the result back to the original vector shape when
 needed.
 
-[`NormalizeReturnOrder`](24-normalize_return_order.md) reorders `ReturnStmt::value_` in InCore functions so that
+[`NormalizeReturnOrder`](25-normalize_return_order.md) reorders `ReturnStmt::value_` in InCore functions so that
 `return[i]` corresponds to the i-th `Out`/`InOut` parameter in declaration order,
 and updates `TupleGetItemExpr` indices at call sites accordingly. This lets
 orchestration codegen map tuple element indices to output parameters with a

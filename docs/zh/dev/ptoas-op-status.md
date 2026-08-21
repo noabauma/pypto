@@ -4,7 +4,7 @@
 行 = **最新 PTOAS 提供的公共及兼容 op**。接口基线为 Little-oil/PTOAS `main`
 `d852dd2dba3e5bf7a69ce8324eb88afc336e8a33`：manual 公共接口 189 个，加当前
 `PTOOps.td` 仍保留的 source-only 兼容/tile 接口 15 个，共 204 个。列状态按
-**PyPTO 当前源码**核实（最后更新 2026-07-27）。后续每加或修改一个 op，只更新本表对应行。
+**PyPTO 当前源码**核实（最后更新 2026-08-11）。后续每加或修改一个 op，只更新本表对应行。
 
 本表包含公共/兼容接口中 PyPTO 级别为 `internal` 的 op；另有 `PTOOps.td` 中 32 个仅供
 lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO、VMI、SIMT 等其他 dialect。
@@ -63,12 +63,12 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tmatmul | TMATMUL | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tmatmul.acc | TMATMUL_ACC | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tmatmul.bias | TMATMUL_BIAS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tmatmul.mx | TMATMUL_MX | tile | ✅ | ❌ | ❌ | ❌ | — | 已有 backend hook，缺 IR/Python 前端与 ST |
-| pto.tmatmul.mx.acc | TMATMUL_MX (overload) | tile | ✅ | ❌ | ❌ | ❌ | — | 已有 backend hook，缺 IR/Python 前端与 ST |
-| pto.tmatmul.mx.bias | TMATMUL_MX (overload) | tile | ✅ | ❌ | ❌ | ❌ | — | 已有 backend hook，缺 IR/Python 前端与 ST |
-| pto.tgemv | TGEMV | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
-| pto.tgemv.acc | TGEMV_ACC | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
-| pto.tgemv.bias | TGEMV_BIAS | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
+| pto.tmatmul.mx | TMATMUL_MX | tile | ✅ | ✅ | ✅ | ✅ | — | A5 MXFP8 host-prequant frontend+codegen+ST；FP4 输入仅支持左侧 FP4×右侧 FP8，且必须显式做 FP4→FP8 cast；原生 FP4×FP4 暂缓；见 [operators MX 约束](ir/05-operators.md#mx--ascend950pto-isa-约束) |
+| pto.tmatmul.mx.acc | TMATMUL_MX (overload) | tile | ✅ | ✅ | ✅ | ✅ | — | A5 frontend+codegen+ST（`tile.matmul_mx_acc`） |
+| pto.tmatmul.mx.bias | TMATMUL_MX (overload) | tile | ✅ | ✅ | ✅ | ❌ | — | NEW frontend+codegen（`tile.matmul_mx_bias`）；ST 待补 |
+| pto.tgemv | TGEMV | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 task-submit ST 已通过；A5 真机验证待补 |
+| pto.tgemv.acc | TGEMV_ACC | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 task-submit ST 已通过；A5 真机验证待补 |
+| pto.tgemv.bias | TGEMV_BIAS | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 task-submit ST 已通过；A5 真机验证待补 |
 | pto.tgemv.mx | TGEMV_MX | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tgemv.mx.acc | TGEMV_MX (overload) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tgemv.mx.bias | TGEMV_MX (overload) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
@@ -86,7 +86,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tpartargmax | TPARTARGMAX | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tpartargmin | TPARTARGMIN | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tpartmul | TPARTMUL | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tprelu | TPRELU | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
+| pto.tprelu | TPRELU | tile | ✅ | ✅ | ❌ | ✅ | — | 已补齐规范 3 输入链路；A2/A3 真机已验证，A5 真机待验证 |
 | pto.tadds | TADDS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tsubs | TSUBS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 真机已验证；A5 真机待验证 |
 | pto.tmuls | TMULS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
@@ -104,7 +104,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.texp | TEXP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tlog | TLOG | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 真机已验证；A5 真机待验证 |
 | pto.tsqrt | TSQRT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.ttri | TTRI | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
+| pto.ttri | TTRI | tile | ✅ | ✅ | ❌ | ✅ | — | 前端 + 精确 codegen + 同名 ST；A2/A3 真机 10/10 通过；A5 真机待验证 |
 | pto.trsqrt | TRSQRT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trecip | TRECIP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trelu | TRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
@@ -151,7 +151,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tcmp | TCMP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcmps | TCMPS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ❌ | — | 前端/codegen 已有，缺同名 ST |
+| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | 已补齐规范 4 输入链路；A2/A3 真机已验证，A5 真机待验证 |
 | **位运算（11）** |  |  |  |  |  |  |  |  |
 | pto.tand | TAND | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.tor | TOR | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
@@ -168,9 +168,9 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tconcat | TCONCAT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tconcatidx | TCONCAT (indexed) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tgather | TGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tgatherb | TGATHERB | tile | ✅ | ❌ | ❌ | ❌ | — | 已有 backend hook，缺 IR/Python 前端与 ST |
+| pto.tgatherb | TGATHERB | tile | ✅ | ✅ | ❌ | ✅ | — | 32-byte 块偏移前端 + 精确 codegen + 同名 ST；A2/A3 真机 8/8 通过；A5 真机待验证 |
 | pto.tscatter | TSCATTER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.mgather | MGATHER | tile | ✅ | ❌ | ❌ | ❌ | — | 当前 backend 发旧名 `pto.tmgather` |
+| pto.mgather | MGATHER | tile | ✅ | ✅ | ❌ | ✅ | — | 规范 Vec/Mat overload，并显式携带 row/elem coalesce；Vec 子集已通过 A2/A3 真机，扩展后的 Vec/Mat 矩阵待验证 |
 | pto.mscatter | MSCATTER | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.treshape | TRESHAPE | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tinsert | TINSERT | tile | ✅ | ❌ | ❌ | ✅ | — | 由 `tile.assemble` / auto matmul lowering 发射 |
@@ -191,7 +191,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tgetval | .GetValue | tile | ✅ | ✅ | ❌ | ✅ | — | 由 `tile.read` 发射 |
 | pto.tsetval | .SetValue | tile | ✅ | ✅ | ❌ | ✅ | — | 由 `tile.write` 发射 |
 | **MX 量化（6）** |  |  |  |  |  |  |  |  |
-| pto.tget_scale_addr | GetScaleAddr + TASSIGN | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
+| pto.tget_scale_addr | GetScaleAddr + TASSIGN | tile | ✅ | ✅ | ✅ | ❌ | — | NEW frontend+codegen；Mat→scale `tmov` 按源序发射，PTOAS `PTOA5NormalizeTMovPass` 重排为 bind-before-fill；见 [operators MX 约束](ir/05-operators.md#mx--ascend950ptoas-约束) |
 | pto.tmov.fp | TMOV_FP | tile | ✅ | ❌ | ❌ | ❌ | — | 已有 backend hook，缺 IR/Python 前端与 ST |
 | pto.tquant | TQUANT | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tquant.mx | TQUANT (overload) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |

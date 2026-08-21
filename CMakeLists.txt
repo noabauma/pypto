@@ -99,6 +99,7 @@ set(PYPTO_SOURCES
     src/ir/op/tile_ops/broadcast.cpp
     src/ir/op/tile_ops/elementwise.cpp
     src/ir/op/tile_ops/matmul.cpp
+    src/ir/op/tile_ops/matmul_mx.cpp
     src/ir/op/tile_ops/memory.cpp
     src/ir/op/tile_ops/reduction.cpp
     src/ir/op/tile_ops/transform.cpp
@@ -151,6 +152,10 @@ set(PYPTO_SOURCES
     src/ir/arith/int_set.cpp
 
     # IR - Transforms
+    src/ir/transforms/dsa/allocation_plan.cpp
+    src/ir/transforms/dsa/dsa_reuse_penalty_solver.cpp
+    src/ir/transforms/dsa/memref_dsa_adapter.cpp
+    src/ir/transforms/dsa/reuse_penalty_recognizer.cpp
     src/ir/transforms/allocate_memory_addr_pass.cpp
     src/ir/transforms/canonicalize_tile_slice_pass.cpp
     src/ir/transforms/fold_no_op_reshape_pass.cpp
@@ -166,6 +171,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/materialize_comm_domain_scopes_pass.cpp
     src/ir/transforms/lower_host_tensor_collectives_pass.cpp
     src/ir/transforms/materialize_dist_tensor_ctx_pass.cpp
+    src/ir/transforms/materialize_valid_shape_symbols_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
     src/ir/transforms/auto_derive_task_dependencies_pass.cpp
@@ -174,6 +180,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/ctrl_flow_transform_pass.cpp
     src/ir/transforms/flatten_call_expr_pass.cpp
     src/ir/transforms/infer_tile_memory_space_pass.cpp
+    src/ir/transforms/insert_mx_scale_addr_pass.cpp
     src/ir/transforms/loop_invariant_mat_residency.cpp
     src/ir/transforms/inline_functions_pass.cpp
     src/ir/transforms/init_memref.cpp
@@ -207,6 +214,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/unroll_loops_pass.cpp
     src/ir/transforms/skew_cross_core_pipeline_pass.cpp
     src/ir/transforms/lower_pipeline_loops_pass.cpp
+    src/ir/transforms/lower_pipeline_to_slots_pass.cpp
     src/ir/transforms/canonicalize_io_order_pass.cpp
     src/ir/transforms/structural_equal.cpp
     src/ir/transforms/structural_hash.cpp
@@ -223,10 +231,12 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/op_predicates.cpp
     src/ir/transforms/utils/parent_stmt_analysis.cpp
     src/ir/transforms/utils/return_lineage_utils.cpp
+    src/ir/transforms/utils/scope_outline_utils.cpp
     src/ir/transforms/utils/split_axis_utils.cpp
     src/ir/transforms/utils/stmt_dependency_analysis.cpp
     src/ir/transforms/utils/transform_utils.cpp
     src/ir/transforms/utils/wrapper_call_utils.cpp
+    src/ir/transforms/utils/window_alias_utils.cpp
     src/ir/transforms/utils/window_externalization.cpp
     src/ir/transforms/visitor.cpp
 
@@ -236,6 +246,8 @@ set(PYPTO_SOURCES
     src/ir/verifier/mixed_kernel_expanded_verifier.cpp
     src/ir/verifier/verify_hard_syncall_occupancy.cpp
     src/ir/verifier/verify_aiv_split.cpp
+    src/ir/verifier/verify_acc_to_gm_store.cpp
+    src/ir/verifier/verify_atomic_add_dtype.cpp
     src/ir/verifier/verify_ssa_pass.cpp
     src/ir/verifier/verify_no_nested_call_pass.cpp
     src/ir/verifier/verify_no_nested_incore.cpp
@@ -261,6 +273,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_tensor_view_canonical.cpp
     src/ir/verifier/diagnostic_check_registry.cpp
     src/ir/verifier/warning_unused_var.cpp
+    src/ir/verifier/warning_out_param_write_dropped.cpp
     src/ir/verifier/perf_hint_tile_innermost_dim.cpp
 
     # IR - Serialization
@@ -310,3 +323,10 @@ set(PYPTO_SOURCES
 
 # Include Python bindings
 add_subdirectory(python/bindings)
+
+# The IR-free DSA-RP solver has a small native test that does not require the
+# Python extension or a device runtime. Skip it when building a wheel.
+include(CTest)
+if(BUILD_TESTING AND NOT SKBUILD_MODE)
+    add_subdirectory(tests/ut/cpp)
+endif()

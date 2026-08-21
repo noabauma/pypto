@@ -40,7 +40,7 @@ def square_tensor(
     out: pl.Out[pl.Tensor[[128, 128], pl.FP32]],
 ):
     # Tensor level: name the whole array. Placement and movement are the compiler's.
-    out = pl.mul(x, x)
+    out[:] = pl.mul(x, x)
     return out
 
 @pl.jit.incore
@@ -290,7 +290,7 @@ kernels and cross-core pipelines exist as concepts; see
 ## See Also
 
 - [Quickstart](02-quickstart.md) — the examples this page explains.
-- [Language Guide](01-language_guide.md) — the full surface: types, control flow, scopes, compilation.
+- [Language Guide](language/index.md) — the full surface: types, functions, control flow, memory, scopes and tasks, directives.
 - [Passes](../dev/passes/index.md) — every pass in the pipeline, in execution order.
 - [IR Overview](../dev/ir/00-overview.md) — the IR's structure and design principles.
 - [Cluster Architecture](../reference/pto-isa/00-cluster_architecture.md) — the Cube + Vector cluster the execution model targets.

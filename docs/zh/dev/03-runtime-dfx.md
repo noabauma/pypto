@@ -1,15 +1,16 @@
 # 运行时 DFX（Design For X）开关
 
 PyPTO 将 Simpler 的五项运行时诊断子功能以独立开关的形式暴露在
-[`RunConfig`](../../../python/pypto/runtime/runner.py) 上。每个开关都
-1:1 映射到 Simpler 的 `CallConfig` 字段，以及 `tests/st/conftest.py` 中
-对应的 pytest flag，保持两侧命名一致。
+[`RunConfig`](../../../python/pypto/runtime/runner.py) 上。每个开关都映射到
+Simpler 的 `CallConfig` 字段，以及 `tests/st/conftest.py` 中对应的 pytest
+flag。字段名与 Simpler 保持一致；旧拼写 `enable_l2_swimlane` /
+`--enable-l2-swimlane` 仍可用，见[已弃用别名](#已弃用别名)。
 
 ## 开关映射表
 
 | `RunConfig` 字段 | pytest flag | `CallConfig` 成员 | `dfx_outputs/` 下产物 | 后处理工具 |
 | ---------------- | ----------- | ----------------- | --------------------- | ---------- |
-| `enable_l2_swimlane: bool` | `--enable-l2-swimlane` | `enable_l2_swimlane` | `l2_swimlane_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
+| `enable_chip_swimlane: int` | `--enable-chip-swimlane`（= `4`）/ `--chip-swimlane-level N` | `enable_chip_swimlane`（`0` 关 .. `4` 全量） | `chip_swimlane_records.json` | `swimlane_converter` → `merged_swimlane_*.json` |
 | `enable_dump_args: int` | `--dump-args [LEVEL]`（裸 flag = `1`） | `enable_dump_args`（`0` 关，`1` 部分，`2` 全量） | `args_dump/{args_dump.json,bin}` | `dump_viewer`（手动） |
 | `enable_pmu: int` | `--enable-pmu [N]`（裸 flag = `2`） | `enable_pmu`（`0` 关，`>0` 事件类型） | `pmu.csv` | — |
 | `enable_dep_gen: bool` | `--enable-dep-gen` | `enable_dep_gen` | `deps.json` | `deps_viewer`（手动） |
@@ -18,6 +19,27 @@ PyPTO 将 Simpler 的五项运行时诊断子功能以独立开关的形式暴�
 五个开关**完全正交**，可任意组合。任一开启时自动将
 `RunConfig.save_kernels` 强制设为 `True`，确保 `<work_dir>/dfx_outputs/`
 目录在 run 结束后保留。
+
+### Swimlane 采集等级
+
+`enable_chip_swimlane` 是**等级**而非开关。每个等级在 runtime 采集器里都是真实的
+判断分支，低等级不会打点高等级才有的数据，事后也无法通过后处理补回：
+
+| 等级 | 新增内容 | 解锁能力 |
+| ---- | -------- | -------- |
+| `0` / `False` | — | 关闭采集 |
+| `1` | AICore 逐任务 start / end + task record buffer | 逐任务泳道 |
+| `2` | + AICPU 打点的 dispatch / finish | `[dispatch, start]` 取任务间隙 |
+| `3` | + scheduler 主循环 phase 记录 | `simpler_setup.tools.sched_overhead_analysis`、Toolkit 插件的 Scheduler View |
+| `4` / `True` | + orchestrator phase 记录 | Toolkit 插件的 AICPU Orchestrator 视图 |
+
+`True` 请求等级 `4` —— 与裸 `--enable-chip-swimlane` 请求的是同一件事，PyPTO
+与 runtime harness 皆然。超出范围的等级由 `RunConfig` 抛 `ValueError`。
+
+在 pytest 侧，裸 flag 与等级是**两个**选项（`--enable-chip-swimlane` 与
+`--chip-swimlane-level N`），而不是一个可选带值的选项。可选带值的 flag 会吞掉
+后面那个 token，`pytest --enable-chip-swimlane tests/st/runtime/` 会报
+`invalid int value: 'tests/st/runtime/'`。拆成两个选项后，裸 flag 与参数顺序无关。
 
 ## 产物契约
 
@@ -66,7 +88,7 @@ join——device 热路径不再记录 per-task fanout，因此没有 dep_gen �
 耗时。所以这两份抓取来自两次独立运行（这正是 Simpler 文档描述的“抓一次图、计多次
 时”工作流）。
 
-于是在 **onboard L2** 平台上开启 `enable_l2_swimlane` 会透明地把 kernel 跑两遍：
+于是在 **onboard L2** 平台上开启 `enable_chip_swimlane` 会透明地把 kernel 跑两遍：
 
 1. **抓图趟** —— 仅开 dep_gen，产出 `deps.json`，在**独立子进程**里运行
    （`python -m pypto.runtime._dep_gen_capture`）。这是必须的、不只是为了整洁：
@@ -75,7 +97,7 @@ join——device 热路径不再记录 per-task fanout，因此没有 dep_gen �
    退出时操作系统会彻底回收这些状态。抓图是 best-effort——子进程失败时只打印告警、
    计时趟照常运行（泳道退化成匿名 `task(rXtY)`）。
 2. **计时趟** —— 开泳道（以及 PMU / args-dump / scope-stats 等其它对时序敏感的
-   DFX），强制关闭 dep_gen，产出耗时干净的 `l2_swimlane_records.json`，这一趟的耗时
+   DFX），强制关闭 dep_gen，产出耗时干净的 `chip_swimlane_records.json`，这一趟的耗时
    才会被上报，在本进程内运行。
 
 两趟写入同一个 `dfx_outputs/`，因此 `swimlane_converter` 会自动把同目录的
@@ -109,7 +131,8 @@ run(
     MyProgram, a, b, c,
     config=RunConfig(
         platform="a2a3sim",
-        enable_l2_swimlane=True,     # 生成 l2_swimlane_records.json
+        enable_chip_swimlane=4,        # 全量 swimlane -> chip_swimlane_records.json
+                                     # （True 等价于等级 4；需要更轻量时用 1-3）
         enable_dep_gen=True,         # 生成 deps.json（按需用 deps_viewer 渲染 HTML）
         enable_pmu=4,                # PMU 事件 = MEMORY
     ),
@@ -119,11 +142,13 @@ run(
 ### 从 pytest
 
 ```bash
+# 裸 flag = 等级 4（全量）
 pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py \
-    --platform a2a3sim --enable-l2-swimlane
+    --platform a2a3sim --enable-chip-swimlane
 
+# 仅 AICore 计时——最轻量的采集
 pytest tests/st/runtime/ \
-    --platform a2a3sim --enable-l2-swimlane --enable-dep-gen
+    --platform a2a3sim --chip-swimlane-level 1 --enable-dep-gen
 ```
 
 ## 选择性张量 Dump
@@ -242,7 +267,7 @@ twopi`。`dot` 是默认值，在 ~500 节点以内 DAG 风格最清晰；更大
 默认情况下，swimlane / 依赖图工具用数字 id 标注任务（`task(rXtY)` /
 `func_<id>(...)`）。要恢复真实 kernel 名称（`matmul(rXtY)`），records
 旁边必须有一份 name map。Simpler 自带的 SceneTest harness 会写这个文件；
-pypto 不使用 SceneTest，因此当开启 `enable_l2_swimlane` 或
+pypto 不使用 SceneTest，因此当开启 `enable_chip_swimlane` 或
 `enable_dep_gen` 时，runner 会从 `kernel_config.py` 已有的 `func_id` /
 `name` 字段合成 `<work_dir>/dfx_outputs/name_map_<case>.json`。它会被自动
 消费：`swimlane_converter` 通过 `--func-names <name_map>` 调用，
@@ -280,167 +305,40 @@ python runtime/tools/scope_stats_plot.py \
 
 ## 已弃用别名
 
-`RunConfig.runtime_profiling` 与 pytest flag `--runtime-profiling` 是
-四项 DFX 独立化之前唯一启用 L2 swimlane 采集的入口，现作为
-`enable_l2_swimlane` / `--enable-l2-swimlane` 的别名暂时保留，以兼容
-仍在使用它们的外部脚本。两条路径都会发出 `DeprecationWarning`，并将
-在未来版本中移除，请尽快迁移到新名称。
+`RunConfig.enable_l2_swimlane` 与 pytest flag `--enable-l2-swimlane` 是
+`enable_chip_swimlane` / `--enable-chip-swimlane` 的旧拼写。Simpler 的
+Worker/Chip/Core 命名迁移把 L2 这一层改名为 "chip"（`L2Swimlane*` ->
+`ChipSwimlane*`，`l2_swimlane_records.json` ->
+`chip_swimlane_records.json`），PyPTO 现在遵循该契约。
+
+两个旧拼写仍可用，并会发出 `DeprecationWarning`，将在未来版本中移除。
+取值与语义完全不变，迁移就是改个名字：
+
+```python
+RunConfig(enable_l2_swimlane=True)    # 已弃用
+RunConfig(enable_chip_swimlane=4)     # 等价采集
+```
+
+几个值得知道的细节：
+
+- `enable_l2_swimlane` **不是** dataclass 字段，而是构造参数 + property。
+  这样 `dataclasses.replace(cfg, enable_chip_swimlane=N)` 才不会有歧义；
+  若把别名做成字段，`replace()` 会从旧实例把它一并传回，可能静默覆盖你刚
+  传入的值。
+- 读取 `cfg.enable_l2_swimlane` 不告警（返回规范字段的等级）。使用旧构造
+  参数、或对该属性赋值，才会告警。
+- 同时传入两种拼写会抛 `ValueError`。
 
 ## 重放已有的 build_output
 
-需要在改完 kernel cpp 之后重新跑一遍编译产物（典型场景：手调 kernel
-后用 PMU / swimlane / args-dump 验证修改是否正确），使用 debug 专用
-的 [`pypto.runtime.debug.replay`](../../../python/pypto/runtime/debug/replay.py)
-模块。它复用与 `pypto.runtime.run` 相同的 `execute_compiled` 路径,
-因此 DFX 开关的行为完全一致。
-
-```python
-from pypto.runtime.debug import replay
-from pypto.runtime import RunConfig
-
-replay(
-    "build_output/_jit_xxx/",
-    a, b, c,
-    config=RunConfig(
-        platform="a2a3sim",
-        enable_pmu=2,
-        enable_l2_swimlane=True,
-    ),
-)
-```
-
-CLI 形式（从目录里的 `golden.py` 加载输入）:
-
-```bash
-python -m pypto.runtime.debug.replay build_output/_jit_xxx/ \
-    --pmu 2 --swimlane --log-level debug
-```
-
-默认 `recompile=True` 会清掉缓存的 `.so` / `.bin`,确保手改的 cpp
-能被重新编译。如果没改 cpp、想跳过重编译,传 `recompile=False`
-（或 CLI 的 `--no-recompile`）即可。`--log-level` 接受和
-`PYPTO_RUNTIME_LOG` 相同的值（`debug`、`v0..v9`、`info`、`warn`、
-`error`、`null`）;加上 `--log-sync-pypto` 可以把同一档位推到
-PyPTO 的 C++ logger。
-
-传 `validate=True`（或 `--validate`）会在执行结束后,用
-`golden.py::compute_golden` 计算参考输出,并按 `golden.py` 里声明的
-`RTOL` / `ATOL` 公差逐 output 比对;不一致会抛 `AssertionError`。
-该开关需要目录里存在 `golden.py`（`ir.compile` 默认会产出）。
-
-### 改 `.pto` 而不是 cpp
-
-`replay`（以及自动生成的 `debug/run.py`）在清理 cpp 二进制之前会先
-按 mtime 扫描 `ptoas/*.pto`：任何比同名 `ptoas/<unit>.cpp` 新的
-`.pto` 都会触发一次 `ptoas` 重跑，新生成的 body 会 splice 到所有命中
-的 `kernels/<core>/<func>.cpp` —— 也就是在两条 sentinel
-`// --- ptoas-generated code ---` 与 `// --- Kernel entry point ---`
-之间替换。随后照常走 cpp → `.so` 重编译。
-
-| 改了哪些文件 | 实际触发的路径 |
-| ------------ | -------------- |
-| 只改 `kernels/<core>/<func>.cpp` | `cpp → .so`（保持原有行为） |
-| 只改 `ptoas/<unit>.pto` | `pto → cpp → .so`（新增 —— splice + 重编译） |
-| 两者都改 | `.pto` 决定 body 段；用户在 cpp wrapper / header 上的改动保留 |
-
-需要 `ptoas` 可被发现（`PTOAS_ROOT` 或 `PATH`）；找不到时静默跳过。
-关闭方式：`--no-rebuild-from-pto` 或 `PYPTO_REBUILD_FROM_PTO=0`。
-若 `.pto` 编辑会改变 kernel 函数签名，**不在本特性范围**：保存的
-wrapper 模板对不上,必须重新 `ir.compile()`。
-
-### 自动生成的 `debug/run.py`
-
-`ir.compile()` 会在 `<output_dir>/debug/run.py` 写一个自包含的
-重跑脚本，用户只需要记住一条命令：
-
-```bash
-python build_output/<jit_dir>/debug/run.py
-```
-
-脚本是对上面 `replay` 流程的封装：
-
-- 如果同目录有 `golden.py`，输入来自
-  `golden.generate_inputs()`，并用 `compute_golden` 做数值校验。
-- 否则（JIT 路径），输入由脚本内嵌的 shape / dtype 元数据构造，
-  用户可自由修改用于实验。脚本还预留了一个
-  `_user_compare(<参数名>)` 钩子，会在 `replay` 返回后自动调用 ——
-  在里面手写 `assert torch.allclose(...)` 即可对 kernel 输出做
-  自定义比对。
-- 上面 "改 `.pto` 而不是 cpp" 一节描述的 `.pto` 重建流程在生成的
-  脚本里同样生效：改一份 `ptoas/*.pto` 再跑一次,splice 自动发生。
-  加 `--no-rebuild-from-pto` 可跳过。
-
-生成过程是 **best-effort** —— 没有干净 orchestration 入口的程序
-会静默跳过这一步，编译流程本身不受影响。
-
-设置环境变量 `PYPTO_EMIT_DEBUG_RUNNER=0`（也接受 `false` / `no`，
-大小写不敏感）可全局关闭。适合大型测试套件或 benchmark 流水线
-（编译量大、不需要 runner）。关闭后底层的
-`pypto.runtime.debug.replay` 模块 / CLI 仍可直接对 output 目录使用。
-
-### 重放 L3 / 分布式构建
-
-分布式（L3）程序——即 `@pl.jit.host` orchestrator 编译出的
-`DistributedCompiledProgram`——支持同样的「改 `.pto` 再重跑」循环，
-但它的 build 目录形态不同：**没有顶层 `kernel_config.py`**（每个 rank
-的配置在 `next_levels/{rank}/` 下），host 驱动是
-`orchestration/host_orch.py`，并且 `ir.compile()` 会额外写一个
-`distributed_meta.json`：
-
-```text
-build_output/<jit_dir>/
-  distributed_meta.json          # 参数元数据 + platform + DistributedConfig
-  orchestration/host_orch.py     # L3 host 驱动
-  next_levels/{rank}/            # 每个 rank 一个完整的单芯片子构建
-      kernels/{aic,aiv}/*.cpp
-      ptoas/*.pto
-      kernel_config.py
-```
-
-`replay` 会自动识别这种布局（无顶层 `kernel_config.py` 但存在
-`orchestration/host_orch.py`），并改用 simpler `Worker(level=3)` 派发，
-而不是 `execute_compiled`。同样的 CLI / `debug/run.py` 流程无需改动：
-
-```bash
-python -m pypto.runtime.debug.replay build_output/<jit_dir>/
-# 或
-python build_output/<jit_dir>/debug/run.py
-```
-
-`.pto` → cpp 拼接和 `.so` 失效都会递归进每个 `next_levels/{rank}/`，
-所以改 `next_levels/rank0/ptoas/<unit>.pto`（或直接改 kernel cpp）会
-被识别，行为与单芯片完全一致。
-
-底层只凭 `distributed_meta.json` 就能把目录重建成一个可调用的程序——
-**不重新编译 pypto、不重跑 pass**。两个入口直接暴露这个能力：
-
-```python
-from pypto.runtime import execute_distributed_compiled
-# 一次性（对标单芯片的 execute_compiled）：
-execute_distributed_compiled("build_output/<jit_dir>/", [a, b, c])
-
-# 可复用对象（需要时覆盖持久化的 platform / 设备）：
-from pypto.ir.distributed_compiled_program import DistributedCompiledProgram, DistributedConfig
-prog = DistributedCompiledProgram.from_dir(
-    "build_output/<jit_dir>/",
-    platform="a2a3",
-    distributed_config=DistributedConfig(device_ids=[0, 1]),
-)
-prog(a, b, c)
-```
-
-`from_dir` 读取持久化的 HOST orchestrator 参数元数据（与 `host_orch.py`
-匹配的 post-SSA 名字、方向、形状、dtype），并通过遍历 `next_levels/`
-重建 chip callables；`platform` 与 `distributed_config` 默认取编译时
-记录的值，可覆盖以在不同目标 / 设备集上重放。
-
-L3 replay 会把 `RunConfig` 中的运行时 DFX 字段透传到每个芯片派发，产物写入
-`dfx_outputs/rank{r}/d{k}/`；onboard 泳道使用上文的抓图/计时两趟协议。
-因此「改完再跑」既支持正确性复检，也支持 L3 运行时诊断。
+重跑、修改并重新测量已有的 `build_output/<jit_dir>/`（含 `debug/run.py`、
+`.pto` 拼接、对目录重放做 `benchmark()`、以及 L3 构建）单独成页：
+[重放已有的 `build_output`](03-runtime-replay.md)。上面记录的每个 DFX 开关
+在那条路径上同样生效。
 
 ## 相关文档
 
-- Simpler runtime 侧参考：`runtime/docs/dfx/{l2-swimlane,
-  args-dump,pmu-profiling,dep_gen,scope-stats}.md`。
+- Simpler runtime 侧参考：`runtime/docs/dfx/{chip-swimlane-profiling,
+  args-dump,pmu-profiling,dep-gen,scope-stats}.md`。
 - 编译期 profiling（正交、单 PyPTO 进程）：
   [01-compile-profiling.md](01-compile-profiling.md)。

@@ -23,12 +23,15 @@ data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)  # mesh mode, in-place
 # InCore kernel — explicit signal.
 data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="mesh")
 data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
+
+# Host orchestrator — spread one call across 4 AIV cores per rank.
+data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum, core_num=4)
 ```
 
 ### Mesh Mode
 
 - O(N) remote traffic per step — every rank reads every peer
-- One global barrier per call (AtomicAdd/Ge on `[NR, 1]` signal)
+- One global barrier per call (AtomicAdd/Ge on `[NR, core_num]` signal)
 - Works with `pl.dynamic("NR")`
 - Best for small messages and low latency
 
@@ -51,14 +54,36 @@ data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum, mode="ring")
 | ------ | ---- | ---- |
 | Remote traffic per step | O(N) — every rank reads every peer | O(N/P) — each rank reads one neighbour |
 | Barrier rounds | 1 (global AtomicAdd/Ge) | 2(P-1) — reduce-scatter + allgather phases |
-| Signal shape | `[NR, 1]` | `[2 × (NR − 1), NR]` |
+| Signal shape | `[NR, core_num]` | `[2 × (NR − 1), NR]` |
 | Best for | Small messages, low latency | Large messages, high bandwidth |
 
 **Rule of thumb:** Use the default `mode="mesh"`. Switch to `mode="ring"` when
 your payload exceeds ~16 KiB and you see mesh bandwidth plateau.
 
 The host orchestrator form (`signal` omitted) is syntactic sugar — the compiler
-synthesizes a signal of `[world_size(), 1]` (mesh only).
+synthesizes a signal of `[world_size(), core_num]` (mesh only).
+
+### Multi-core (`core_num`)
+
+On a host orchestrator, `core_num` spreads one AllReduce call across several
+AIV cores **on each rank**. It does not change the task hierarchy: `device=r`
+still selects the card; that rank's builtin task now launches a synchronized
+grid of `core_num` blocks that split the payload into 256-element tiles
+block-cyclically.
+
+```python
+data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum, core_num=4)
+```
+
+- Defaults to `1` (single block — the previous behaviour).
+- Mesh only: `mode="ring"` requires `core_num == 1`.
+- Must not exceed the target's AIV core count (48 on 910B, 36 on 950) — the
+  launch requires all blocks to be admitted at once, so an over-subscribed
+  request is rejected at compile time.
+- An explicit `signal` needs one lane per block: `[world_size(), stride]` with
+  `stride >= core_num`. A rank-1 `[world_size()]` signal only works for
+  `core_num=1`.
+- InCore kernels keep `core_num=1` and use an enclosing `pl.spmd(...)` instead.
 
 ### Mutation
 
@@ -67,11 +92,12 @@ the reduced result). All ranks must pass identically shaped `target` tensors.
 
 ### Supported ReduceOp
 
-All four — `Sum`, `Max`, `Min`, `Prod` — on both the InCore composite and the
-HOST builtin path. `target`'s dtype must be `FP16` or `FP32`; this is a hard
-compile-time check, not just a storage-width constraint. Every rank must
-agree on the same `ReduceOp` and `mode`, on top of the identically-shaped
-signal tensors required of every collective.
+All four — `Sum`, `Max`, `Min`, `Prod` — on the InCore composite and the HOST
+builtin mesh path. The HOST builtin ring path (`builtin.tensor.allreduce_ring`)
+is narrower: `Sum` only, with a 4-byte `FP32` target (a compile-time check).
+`mesh` targets must be `FP16` or `FP32`; the ring path is `FP32`-only. Every
+rank must agree on the same `ReduceOp` and `mode`, on top of the
+identically-shaped signal tensors required of every collective.
 
 ## Barrier
 
@@ -82,8 +108,8 @@ Cross-rank barrier — blocks until all ranks arrive.
 signal = pld.tensor.barrier(signal)
 ```
 
-Uses `Set(1)` + `Ge(1)` on the signal. Single-shot; allocate a fresh buffer
-before the next barrier.
+Uses a self-clearing credit barrier (`AtomicAdd(+1)` / `Ge(1)` with a reset
+epilogue), so one signal buffer is reusable across back-to-back calls.
 
 ## Broadcast
 
@@ -175,27 +201,40 @@ runs and whether you need `mode="ring"`:
 | **Where** | `@pl.jit.incore` | `@pl.jit.incore` | `@pl.jit.host` |
 | **How** | Manual `notify`/`wait` + `remote_load` loops | `pld.tensor.allreduce(data, sig, ...)` called directly | `pld.tensor.allreduce(data, [sig,] ...)` called directly |
 | **Lowering** | You write the primitives | `LowerCompositeOps` | `LowerHostTensorCollectives` |
-| **Modes** | Whatever you implement | `mesh` and `ring` | `mesh` only |
-| **Signal shape** | Whatever you allocate | `[nranks, 1]` for mesh (rank count may be dynamic); `[2×(NR−1), NR]` for ring (`NR` must be a compile-time constant) | Rank-1 `[world_size]` or rank-2 `[world_size, 1]` — the compiler-synthesized signal is rank-2 |
-| **When** | Learning, custom protocols | Need `ring` mode, or already inside an InCore kernel | Day-to-day host-orchestrated collectives |
+| **Modes** | Whatever you implement | `mesh` and `ring` | `mesh` and `ring` (ring: `Sum` + `FP32` only) |
+| **Signal shape** | Whatever you allocate | `[nranks, 1]` for mesh (rank count may be dynamic); `[2×(NR−1), NR]` for ring (`NR` must be a compile-time constant) | Mesh: rank-1 `[world_size]` or rank-2 `[world_size, 1]` (the compiler-synthesized signal is rank-2). Ring: `[2*(NR−1)+1, NR]` |
+| **When** | Learning, custom protocols | Ring with non-`Sum`/non-`FP32`, or already inside an InCore kernel | Day-to-day host-orchestrated collectives |
 
 Prefer HOST builtins for day-to-day host-orchestrated code — they handle
 barrier orchestration and chunking automatically. Only `allreduce` can also
 omit the signal argument (the compiler synthesizes one outside loops); the
 other five collectives (`barrier`, `broadcast`, `allgather`,
 `reduce_scatter`, `all_to_all`) always take an explicit, caller-allocated
-signal. Reach for the InCore composite specifically when you need
-`mode="ring"`, since the HOST builtin path only lowers `mesh`.
+signal. Both the InCore composite and the HOST builtin lower `mode="ring"`;
+reach for the InCore composite when you need ring with a `ReduceOp` other than
+`Sum` or a non-`FP32` dtype, since the HOST builtin ring path is `Sum`+`FP32`
+only.
 
 ## Runnable Examples
 
 Every collective above has a runnable counterpart under
-`tests/st/distributed/` (paths below are relative to that directory):
+`tests/st/distributed/` (paths below are relative to that directory). The
+[tutorials](05-tutorials.md) are the user-facing counterparts that
+build each collective by hand before the builtin is revealed:
+
+| Collective | Tutorial step | Hand-rolled first? |
+| ---------- | ------------- | ------------------ |
+| barrier | [09-barrier](09-barrier.md) | yes (step 04, then reveal) |
+| allreduce | planned — steps 08–11 | yes (mesh, two-phase, ring, then reveal) |
+| broadcast | planned — step 12 | yes |
+| allgather | planned — step 13 | yes |
+| reduce_scatter | planned — step 14 | yes |
+| all_to_all | planned — step 15 | yes |
 
 | Collective | InCore hand-rolled | InCore composite | HOST builtin |
 | ---------- | ------------------ | ---------------- | ------------ |
 | allreduce | `collectives/test_l3_allreduce.py` | `collectives/test_l3_tensor_allreduce_intrinsic.py` | `test_l3_host_tensor_allreduce.py` |
-| allreduce (ring) | `collectives/test_l3_allreduce_ring.py` | `collectives/test_l3_tensor_allreduce_ring_intrinsic.py` | n/a (mesh only) |
+| allreduce (ring) | `collectives/test_l3_allreduce_ring.py` | `collectives/test_l3_tensor_allreduce_ring_intrinsic.py` | `test_l3_host_tensor_allreduce_ring.py` |
 | barrier | — | `collectives/test_l3_tensor_barrier_intrinsic.py` | `test_l3_host_tensor_barrier.py` |
 | broadcast | `collectives/test_l3_broadcast.py` | `collectives/test_l3_tensor_broadcast_intrinsic.py` | `test_l3_host_tensor_broadcast.py` |
 | allgather | `collectives/test_l3_allgather.py` | `collectives/test_l3_tensor_allgather_intrinsic.py` | `test_l3_host_tensor_allgather.py` |

@@ -20,7 +20,7 @@ return-style.
 
 import pytest
 import torch
-from examples.kernels.elementwise import tile_add_128, tile_mul_128
+from examples.beginner.elementwise import tile_add_128, tile_mul_128
 from pypto.ir.compiled_program import CompiledProgram
 
 
@@ -145,7 +145,6 @@ def _manual_dispatch(compiled, *args, device_id, config=None, call_config=None):
 
     cc = compiled.chip_callable
     rn = compiled.runtime_name
-    orch_args, coerced, return_style = compiled.build_orch_args(*args)
     if call_config is not None:
         cfg = call_config
     else:
@@ -153,6 +152,7 @@ def _manual_dispatch(compiled, *args, device_id, config=None, call_config=None):
     w = SimplerWorker(level=2, device_id=device_id, platform=compiled.platform, runtime=rn)
     w.init()
     try:
+        orch_args, coerced, return_style = compiled.build_orch_args(*args, worker=w)
         cid = w.register(cc)
         w.run(cid, orch_args, cfg)
         w.unregister(cid)
@@ -222,8 +222,8 @@ class TestManualWorkerExtraction:
         b = torch.full((128, 128), 3.0, dtype=torch.float32)
         tile_add_128(a, b, torch.zeros_like(a), config=test_config)
         compiled = _get_cached_compiled(tile_add_128)
-        # 3, not the 4 baked into RUNTIME_CONFIG — otherwise the assert cannot
-        # tell an applied override from the default.
+        # 3, not the auto value baked into RUNTIME_CONFIG — otherwise the
+        # assertion cannot tell an applied override from the default.
         cfg = compiled.build_call_config(test_config, aicpu_thread_num=3)
         assert cfg.aicpu_thread_num == 3
         coerced, _ = _manual_dispatch(compiled, a, b, device_id=test_config.device_id, call_config=cfg)

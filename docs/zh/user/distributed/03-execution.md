@@ -24,15 +24,18 @@ with compiled.prepare() as rt:
 
 | 方法 | 描述 |
 | ---- | ---- |
-| `compiled.prepare(config=None, *, extra_compiled=(), persistent=False, reset_persistent_windows=None, callbacks=None, sub_worker_overrides=None)` | 创建 worker、fork 芯片进程，返回 `DistributedWorker`。作为上下文管理器使用。 |
+| `compiled.prepare(config=None, *, extra_compiled=(), persistent=False, reset_persistent_windows=None, callbacks=None, sub_worker_overrides=None, startup_timeout_s=None)` | 创建 worker、fork 芯片进程，返回 `DistributedWorker`。作为上下文管理器使用。 |
 | `rt(x, y, z)` | 单次分发——转换参数，调用 host_orch。 |
 | `rt.run(compiled, x, y, z)` | 多程序分发——选择目标程序。 |
+| `rt.submit(compiled, x, y, z)` | 有界异步分发——返回 `DistributedRunHandle`。 |
 | `rt.alloc_tensor(shape, dtype, *, init=None)` | 分配 worker 常驻的 `DeviceTensor`。`init` 从 host 拷贝（一次性 H2D）。 |
 | `rt.free_tensor(tensor)` | 释放 `DeviceTensor`。 |
+| `rt.copy_to(dst_dev_ptr, src_host_ptr, nbytes, *, worker_id=0)` | 显式 staged H2D 拷贝。host `torch.Tensor` 源只需为 CPU 连续张量，可在 `prepare()` 后创建。 |
+| `rt.copy_from(dst_host_ptr, src_dev_ptr, nbytes, *, worker_id=0)` | 显式 staged D2H 拷贝。host `torch.Tensor` 目标只需为 CPU 连续张量，可在 `prepare()` 后创建。 |
 | `rt.alloc_stacked_tensor(host_w)` | 沿 dim 0 分片 `host_w`——分片 `i` 上传到卡 `i`。返回 `StackedDeviceTensor`。 |
 | `rt.free_stacked_tensor(stacked)` | 释放 `StackedDeviceTensor` 的所有分片。 |
-| `rt.copy_stacked_from(stacked, host_out)` | 把每个分片 D2H 读回 `host_out`（共享内存，须在 `prepare()` 前分配）。 |
-| `rt.release_inherited_host_tensor_refs()` | fork 后释放运行时在父进程中持有的 host 引用。 |
+| `rt.copy_stacked_from(stacked, host_out)` | staged D2H 读回 CPU 连续的 `host_out`；可在 `prepare()` 后分配。 |
+| `rt.release_inherited_host_tensor_refs()` | 释放父进程中为兼容保留的生命周期引用。 |
 | `rt.close()` | 释放 buffer，关闭芯片 worker。作为上下文管理器时自动调用。 |
 
 ### 值得了解的 `prepare()` 参数
@@ -47,6 +50,42 @@ with compiled.prepare() as rt:
   搭配使用，后者决定保留的 window 是否在两次请求之间清零（正确性与
   开销的权衡）。见 `docs/en/dev/06-persistent-l3.md`。
 - **`extra_compiled`**——见下方"在同一个 worker 上运行多个程序"。
+- **`startup_timeout_s`**——可选地覆盖 Simpler 对 fork worker 层级报告
+  启动就绪状态所设置的正有限秒数期限。保持为 `None` 时使用 Simpler
+  默认值；对于确实较慢的冷启动，应增大该期限，而不是取消期限约束。
+
+### 有界异步分发
+
+`DistributedWorker.submit(compiled, *args)` 在 Simpler 接受分发后返回
+`DistributedRunHandle`。后端支持异步执行时，调用方可以在当前请求仍在执行时准备
+下一请求的 host 工作。`run()` 和 `rt(...)` 仍是阻塞兼容接口。
+
+worker 固定拥有两个可复用的分发元数据帧。前两次提交可以同时处于执行中；第三次
+`submit()` 会先等待最老的 handle，再构造和发布新的分发。每个 handle 会快照本次
+运行配置，并把参数和生成的任务元数据保留到完成。
+
+使用 `handle.result(timeout)` 或其别名 `handle.wait(timeout)` 等待完成并抛出缓存的
+分发错误；`handle.done` 可无阻塞地报告是否已经结束。
+
+```python
+with compiled.prepare() as rt:
+    first = rt.submit(compiled, input_a, weight, output_a)
+    second = rt.submit(compiled, input_b, weight, output_b)
+    first.result()
+    second.result()
+```
+
+重叠分发必须使用不同的可变输入和输出 buffer；对应的 `result()` 返回前不得修改或
+释放这些 buffer。只读常驻权重可以共享。关闭 worker 时会按 FIFO 顺序排空所有已接受
+的 handle。诊断用双遍 swimlane 采集仍保持同步，并返回一个已经完成的 handle。
+
+### 常驻张量的所有权
+
+常驻参数只能用于 prepared worker。`DeviceTensor` 必须由执行它的同一个
+`DistributedWorker.alloc_tensor` 返回，`StackedDeviceTensor` 必须由该 worker
+的 `alloc_stacked_tensor` 返回。这些分配接口会在每个设备张量或分片上保留 Simpler
+owner `Buffer`，使无地址 wire ABI 能构造有效的 Tensor descriptor。手工包装裸指针，
+或把常驻张量交给另一个 worker，都会被拒绝。
 
 ## DeviceTensor
 
@@ -55,7 +94,6 @@ with compiled.prepare() as rt:
 
 ```python
 import torch
-from pypto.runtime import DeviceTensor
 
 with compiled.prepare() as rt:
     weight = rt.alloc_tensor((1024, 4096), torch.float16, init=host_weight)
@@ -68,16 +106,17 @@ with compiled.prepare() as rt:
 
 ```python
 # Host 张量沿 dim 0 分片——分片[i] 存在卡 i 上。
-host_weights = torch.randn(4, 1024, 4096).share_memory_()  # 4 个分片
 with compiled.prepare() as rt:
+    host_weights = torch.randn(4, 1024, 4096).contiguous()  # prepare() 后的 host 张量
     stacked = rt.alloc_stacked_tensor(host_weights)
     rt(x, stacked, out)
 ```
 
-> **致命陷阱：** `host_weights` 必须在 `prepare()` **之前**调用
-> `.share_memory_()`。上传操作在已经 fork 出的芯片 worker 内部运行，
-> 该进程只能读取它在 fork 时继承到的 host 内存——传入普通
-> `torch.Tensor` 会在 `alloc_stacked_tensor()` 处抛出 `ValueError`。
+通过 `rt.alloc_tensor(init=...)`、`rt.alloc_stacked_tensor(...)`、
+`rt.copy_to(...)`、`rt.copy_from(...)` 和 `rt.copy_stacked_from(...)` 执行的
+显式常驻上传与读回，都会经过 runtime 管理的 POSIX 共享内存 staging。host 端为
+`torch.Tensor` 时只需是 CPU 连续张量，可以是在 `prepare()` 后创建的普通张量；
+无需 `.share_memory_()`、fork 前分配或 `inherited_host_tensors`。
 
 ## One-Shot vs 持久 Worker
 
@@ -97,6 +136,9 @@ outputs = torch.zeros_like(inputs)
 compiled(inputs, outputs)   # 阻塞直到所有 rank 完成
 ```
 
+one-shot 只接受 host `torch.Tensor` 参数。它会拒绝 `DeviceTensor` 和
+`StackedDeviceTensor`；这两种常驻参数都必须使用 prepared worker。
+
 ### 持久 Worker（重复派发）
 
 在多次派发之间复用同一个 worker 对象——这是任何 `DistributedWorker` 的
@@ -115,9 +157,10 @@ with compiled.prepare() as rt:
         consume(host_out)
 ```
 
-> **致命陷阱：** 传入 `DistributedWorker` 的 IO buffer 必须在 `prepare()`
-> 前调用 `.share_memory_()`。若忘记，运行时会在分发时拒绝该
-> buffer——子进程无法访问父进程的私有内存。
+> **致命陷阱：** 直接传给 `rt(...)` 或 `rt.run(...)` 的 host `torch.Tensor`
+> 参数必须在 `prepare()` 前调用 `.share_memory_()`。若忘记，运行时会在分发时
+> 拒绝该 buffer——子进程无法访问父进程的私有内存。此规则不适用于上面列出的
+> 显式 staged 上传/读回接口。
 
 ## 在同一个 worker 上运行多个程序
 
@@ -169,6 +212,12 @@ worker 复用其芯片进程和通信设置——没有 fork 开销。`compiled_
 在本仓库中未定义也未被使用。其当前默认值见 `pypto-lib` 自身的文档。
 `pypto.runtime.benchmark()`（本仓库自己的基准测试工具）在性能指南中
 单独说明。
+
+## 配套示例
+
+`examples/runtime/distributed_callback.py` —— 函数体写成 `...` 的 HOST 级 `SubWorker`，于是它作为
+纯 Python 回调运行在 fork 出来的编排进程里。当逻辑无法在编译期写出来时就用这个形态：需要读取实时模型
+状态的采样闭包、host 侧指标收集器、结果检查器。
 
 ## 相关链接
 

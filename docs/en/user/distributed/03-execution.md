@@ -24,15 +24,18 @@ directly via `DistributedWorker(compiled)`, importable from
 
 | Method | Description |
 | ------ | ----------- |
-| `compiled.prepare(config=None, *, extra_compiled=(), persistent=False, reset_persistent_windows=None, callbacks=None, sub_worker_overrides=None)` | Create worker, fork chip processes, return `DistributedWorker`. Use as context manager. |
+| `compiled.prepare(config=None, *, extra_compiled=(), persistent=False, reset_persistent_windows=None, callbacks=None, sub_worker_overrides=None, startup_timeout_s=None)` | Create worker, fork chip processes, return `DistributedWorker`. Use as context manager. |
 | `rt(x, y, z)` | Single dispatch — coerces args, calls host_orch. |
 | `rt.run(compiled, x, y, z)` | Multi-program dispatch — selects the target program. |
+| `rt.submit(compiled, x, y, z)` | Bounded asynchronous dispatch — returns a `DistributedRunHandle`. |
 | `rt.alloc_tensor(shape, dtype, *, init=None)` | Allocate a worker-resident `DeviceTensor`. `init` copies from host (one-time H2D). |
 | `rt.free_tensor(tensor)` | Release a `DeviceTensor`. |
+| `rt.copy_to(dst_dev_ptr, src_host_ptr, nbytes, *, worker_id=0)` | Explicit staged H2D copy. A host `torch.Tensor` source only needs to be CPU-contiguous and may be created after `prepare()`. |
+| `rt.copy_from(dst_host_ptr, src_dev_ptr, nbytes, *, worker_id=0)` | Explicit staged D2H copy. A host `torch.Tensor` destination only needs to be CPU-contiguous and may be created after `prepare()`. |
 | `rt.alloc_stacked_tensor(host_w)` | Shard host_w along dim 0 — shard `i` uploaded to card `i`. Returns `StackedDeviceTensor`. |
 | `rt.free_stacked_tensor(stacked)` | Release all shards of a `StackedDeviceTensor`. |
-| `rt.copy_stacked_from(stacked, host_out)` | D2H read-back of every shard into `host_out` (shared-memory, allocated before `prepare()`). |
-| `rt.release_inherited_host_tensor_refs()` | Drop runtime-held host references in the parent process after fork. |
+| `rt.copy_stacked_from(stacked, host_out)` | Staged D2H read-back of every shard into a CPU-contiguous `host_out`; it may be allocated after `prepare()`. |
+| `rt.release_inherited_host_tensor_refs()` | Drop compatibility lifetime references retained in the parent process. |
 | `rt.close()` | Release buffers, shut down chip workers. Called automatically as context manager. |
 
 ### `prepare()` Parameters Worth Knowing
@@ -49,6 +52,52 @@ directly via `DistributedWorker(compiled)`, importable from
   retained windows are zeroed between requests (a correctness-vs-overhead
   trade-off). See `docs/en/dev/06-persistent-l3.md`.
 - **`extra_compiled`** — see "Several Programs on One Worker" below.
+- **`startup_timeout_s`** — optionally overrides Simpler's positive finite
+  startup-readiness deadline for the forked worker hierarchy. Leave it as
+  `None` to keep Simpler's default; increase it for legitimately slow cold
+  starts rather than disabling the bound.
+
+### Bounded Asynchronous Dispatch
+
+`DistributedWorker.submit(compiled, *args)` returns a
+`DistributedRunHandle` after Simpler accepts the dispatch. When the backend
+supports asynchronous execution, the caller can prepare host work for the next
+request while the current request is still running. `run()` and `rt(...)`
+remain blocking compatibility wrappers.
+
+The worker owns exactly two reusable dispatch metadata frames. The first two
+submissions may be in flight together; a third `submit()` waits for the oldest
+handle before it constructs or publishes another dispatch. Each handle
+snapshots its runtime configuration and retains its arguments and generated
+task metadata until completion.
+
+Use `handle.result(timeout)` or its alias `handle.wait(timeout)` to wait and
+raise the cached dispatch error. `handle.done` reports terminal completion
+without blocking.
+
+```python
+with compiled.prepare() as rt:
+    first = rt.submit(compiled, input_a, weight, output_a)
+    second = rt.submit(compiled, input_b, weight, output_b)
+    first.result()
+    second.result()
+```
+
+Overlapping dispatches require distinct mutable input and output buffers. Do
+not modify or release those buffers before the corresponding `result()`
+returns. Read-only resident weights may be shared. Closing the worker drains
+all accepted handles in FIFO order. Diagnostic two-pass swimlane capture stays
+synchronous and returns an already-completed handle.
+
+### Resident Tensor Ownership
+
+Resident arguments are supported only on a prepared worker. A `DeviceTensor`
+must be returned by that same `DistributedWorker`'s `alloc_tensor`, and a
+`StackedDeviceTensor` must be returned by its `alloc_stacked_tensor`. These
+allocation APIs retain the Simpler owner `Buffer` on every device tensor or
+shard so the address-free wire ABI can derive a valid Tensor descriptor.
+Manually wrapping a raw pointer, or reusing a resident tensor with another
+worker, is rejected.
 
 ## DeviceTensor
 
@@ -58,7 +107,6 @@ the runtime skips H2D/D2H copies — the device already has the data.
 
 ```python
 import torch
-from pypto.runtime import DeviceTensor
 
 with compiled.prepare() as rt:
     weight = rt.alloc_tensor((1024, 4096), torch.float16, init=host_weight)
@@ -71,16 +119,18 @@ Sharded across devices — obtained via `rt.alloc_stacked_tensor()`:
 
 ```python
 # Host tensor sharded along dim 0 — shard[i] lives on card i.
-host_weights = torch.randn(4, 1024, 4096).share_memory_()  # 4 shards
 with compiled.prepare() as rt:
+    host_weights = torch.randn(4, 1024, 4096).contiguous()  # post-prepare host tensor
     stacked = rt.alloc_stacked_tensor(host_weights)
     rt(x, stacked, out)
 ```
 
-> **Fatal pitfall:** `host_weights` must call `.share_memory_()` *before*
-> `prepare()`. The upload runs inside the already-forked chip worker, which
-> can only read host memory it inherited at fork — a plain `torch.Tensor`
-> raises `ValueError` at `alloc_stacked_tensor()`.
+Explicit resident upload and copy-back through `rt.alloc_tensor(init=...)`,
+`rt.alloc_stacked_tensor(...)`, `rt.copy_to(...)`, `rt.copy_from(...)`, and
+`rt.copy_stacked_from(...)` stage through runtime-owned POSIX shared memory.
+When a host endpoint is a `torch.Tensor`, it only needs to be CPU-contiguous;
+it may be an ordinary tensor allocated after `prepare()`. It does not need
+`.share_memory_()`, pre-fork allocation, or `inherited_host_tensors`.
 
 ## One-Shot vs Persistent Worker
 
@@ -99,6 +149,10 @@ inputs = torch.randn(4, 1, 256)
 outputs = torch.zeros_like(inputs)
 compiled(inputs, outputs)   # blocks until all ranks finish
 ```
+
+One-shot execution accepts host `torch.Tensor` parameters only. It rejects
+`DeviceTensor` and `StackedDeviceTensor`; use a prepared worker for either
+resident type.
 
 ### Persistent Worker (Repeated Dispatch)
 
@@ -119,10 +173,11 @@ with compiled.prepare() as rt:
         consume(host_out)
 ```
 
-> **Fatal pitfall:** IO buffers passed to `DistributedWorker` must call
-> `.share_memory_()` before `prepare()`. If you forget, the runtime rejects
-> the buffer at dispatch time — the child processes cannot access the
-> parent's private memory.
+> **Fatal pitfall:** host `torch.Tensor` arguments passed directly to
+> `rt(...)` or `rt.run(...)` must call `.share_memory_()` before `prepare()`.
+> If you forget, the runtime rejects the buffer at dispatch time — the child
+> processes cannot access the parent's private memory. This rule does not
+> apply to the explicit staged upload/copy-back APIs listed above.
 
 ## Several Programs on One Worker
 
@@ -176,6 +231,13 @@ The `pypto-lib` golden benchmark harness reads `PYPTO_BENCH` /
 not defined or consumed anywhere in this repository. See `pypto-lib`'s own
 documentation for current defaults. `pypto.runtime.benchmark()` (this
 repo's own harness) is documented separately in the performance guide.
+
+## Worked example
+
+`examples/runtime/distributed_callback.py` — a HOST-level `SubWorker` whose body is `...`,
+so it runs as a pure-Python callback in the forked orchestrator process. That is the shape
+to reach for when the logic cannot be written at compile time: a sampling closure over live
+model state, a host-side metric collector, a result inspector.
 
 ## See Also
 
