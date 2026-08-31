@@ -57,6 +57,195 @@ def _collect_allocated_tile_ranges(program: ir.Program) -> dict[str, tuple[int, 
     return ranges
 
 
+def _assert_if_phi_arms_write_the_phi_buffer(program: ir.Program) -> None:
+    """Assert every arm of every tile-typed if-phi yields into the phi's own buffer.
+
+    An arm whose yield value lives on a different buffer leaves the phi buffer
+    unwritten whenever that arm runs, so whatever consumes the phi -- typically
+    the loop-carry writeback -- reads whatever the buffer happened to hold.
+    """
+
+    def branch_yield(body: ir.Stmt) -> ir.YieldStmt | None:
+        if isinstance(body, ir.YieldStmt):
+            return body
+        if isinstance(body, ir.SeqStmts):
+            return next((s for s in body.stmts if isinstance(s, ir.YieldStmt)), None)
+        return None
+
+    checked = 0
+
+    class _ArmChecker(ir.IRVisitor):
+        def visit_if_stmt(self, op):  # type: ignore[override]
+            nonlocal checked
+            bodies = [op.then_body] + ([] if op.else_body is None else [op.else_body])
+            for body in bodies:
+                yield_stmt = branch_yield(body)
+                if yield_stmt is None:
+                    continue
+                for i, phi in enumerate(op.return_vars):
+                    if i >= len(yield_stmt.value):
+                        continue
+                    arm_value = yield_stmt.value[i]
+                    phi_type, arm_type = phi.type, arm_value.type
+                    if not isinstance(phi_type, ir.TileType) or phi_type.memref is None:
+                        continue
+                    assert isinstance(arm_type, ir.TileType) and arm_type.memref is not None
+                    arm_name = arm_value.name_hint if isinstance(arm_value, ir.Var) else str(arm_value)
+                    assert ir.MemRef.same_allocation(arm_type.memref, phi_type.memref), (
+                        f"if-phi '{phi.name_hint}' has an arm yielding '{arm_name}' from a different buffer"
+                    )
+                    checked += 1
+            super().visit_if_stmt(op)
+
+    for function in program.functions.values():
+        _ArmChecker().visit_stmt(function.body)
+    assert checked, "no tile-typed if-phi arm was checked -- the assertion is vacuous"
+
+
+_TILE_MOVE_OP = ir.get_op("tile.move").name
+
+
+def _carry_memref(expr):
+    t = getattr(expr, "type", None)
+    return t.memref if isinstance(t, ir.TileType) and t.memref is not None else None
+
+
+def _same_base_address(a: ir.MemRef, b: ir.MemRef) -> bool:
+    """Do two MemRefs start at the same address in the same allocation?
+
+    Mirrors the C++ `CompareBaseAddress`. Comparing only `base_` would call two
+    slots of one ``pl.MemRef(slots=N)`` the same storage; size is deliberately
+    not compared, since a padded accumulator views one buffer at two extents.
+    Offsets compare structurally, so a runtime slot subscript spelled the same
+    way at two sites still counts as one address.
+    """
+    if a.base_.unique_id != b.base_.unique_id:
+        return False
+    return ir.structural_equal(a.byte_offset_, b.byte_offset_)
+
+
+def _assert_carry_yield_lands_in_its_buffer(program: ir.Program) -> None:
+    """Assert each loop carry's yielded value occupies that carry's own byte range.
+
+    The value a `pl.range` carry yields becomes the next iteration's `iter_arg`,
+    which codegen reads out of the carry's buffer. Yielding something that lives
+    somewhere else means the next iteration reads whatever the buffer still held.
+    """
+    checked = 0
+
+    class _YieldChecker(ir.IRVisitor):
+        def visit_for_stmt(self, op):  # type: ignore[override]
+            nonlocal checked
+            body = op.body
+            stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+            yield_stmt = next((s for s in stmts if isinstance(s, ir.YieldStmt)), None)
+            if yield_stmt is not None:
+                for i, iter_arg in enumerate(op.iter_args):
+                    if i >= len(yield_stmt.value):
+                        continue
+                    carry, yielded = _carry_memref(iter_arg.initValue), _carry_memref(yield_stmt.value[i])
+                    if carry is None or yielded is None:
+                        continue
+                    assert _same_base_address(carry, yielded), (
+                        f"carry '{iter_arg.name_hint}' yields a value outside its own buffer"
+                    )
+                    checked += 1
+            super().visit_for_stmt(op)
+
+    for function in program.functions.values():
+        _YieldChecker().visit_stmt(function.body)
+    assert checked, "no tile-typed loop carry was checked -- the assertion is vacuous"
+
+
+def _count_carry_spill_buffers(program: ir.Program) -> int:
+    """How many distinct cycle-spill scratch allocations the pass created."""
+    names = set()
+
+    class _Counter(ir.IRVisitor):
+        def visit_assign_stmt(self, stmt):  # type: ignore[override]
+            t = stmt.var.type
+            if isinstance(t, ir.TileType) and t.memref is not None:
+                name = t.memref.base_.name_hint
+                if "carry_spill" in name:
+                    names.add(name)
+            super().visit_assign_stmt(stmt)
+
+    for function in program.functions.values():
+        _Counter().visit_stmt(function.body)
+    return len(names)
+
+
+def _count_tile_moves_in_loops(program: ir.Program) -> int:
+    """How many `tile.move` statements sit directly in a loop body."""
+    total = 0
+
+    class _Counter(ir.IRVisitor):
+        def visit_for_stmt(self, op):  # type: ignore[override]
+            nonlocal total
+            body = op.body
+            stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+            for stmt in stmts:
+                if (
+                    isinstance(stmt, ir.AssignStmt)
+                    and isinstance(stmt.value, ir.Call)
+                    and stmt.value.op.name == _TILE_MOVE_OP
+                ):
+                    total += 1
+            super().visit_for_stmt(op)
+
+    for function in program.functions.values():
+        _Counter().visit_stmt(function.body)
+    return total
+
+
+def _assert_carry_writebacks_do_not_clobber(program: ir.Program) -> None:
+    """Assert no loop-carry writeback reads a carry buffer an earlier one overwrote.
+
+    ``pl.yield_`` rebinds every carry at once, but the ``tile.move`` copies that
+    realize it run in sequence. A copy reading a carry buffer some earlier copy
+    already wrote observes that iteration's *new* value instead of the old one it
+    was written for, which is how a shift register collapses. Copies through a
+    cycle spill buffer are exempt by construction: a spill destination is a fresh
+    allocation, never one of the loop's carry buffers.
+    """
+
+    def memref_of(expr):
+        t = getattr(expr, "type", None)
+        return t.memref if isinstance(t, ir.TileType) and t.memref is not None else None
+
+    checked = 0
+
+    class _OrderChecker(ir.IRVisitor):
+        def visit_for_stmt(self, op):  # type: ignore[override]
+            nonlocal checked
+            carry_buffers = [m for m in (memref_of(a.initValue) for a in op.iter_args) if m is not None]
+            body = op.body
+            stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+            overwritten: list[tuple[str, ir.MemRef]] = []
+            for stmt in stmts:
+                if not isinstance(stmt, ir.AssignStmt) or not isinstance(stmt.value, ir.Call):
+                    continue
+                if stmt.value.op.name != _TILE_MOVE_OP or not stmt.value.args:
+                    continue
+                src, dst = memref_of(stmt.value.args[0]), memref_of(stmt.var)
+                if src is None or dst is None:
+                    continue
+                if any(ir.MemRef.may_alias(src, carry) for carry in carry_buffers):
+                    for earlier_name, earlier_dst in overwritten:
+                        assert not ir.MemRef.may_alias(src, earlier_dst), (
+                            f"carry writeback '{stmt.var.name_hint}' reads a buffer "
+                            f"'{earlier_name}' already overwrote"
+                        )
+                    checked += 1
+                if any(ir.MemRef.may_alias(dst, carry) for carry in carry_buffers):
+                    overwritten.append((stmt.var.name_hint, dst))
+            super().visit_for_stmt(op)
+
+    for function in program.functions.values():
+        _OrderChecker().visit_stmt(function.body)
+    assert checked, "no carry writeback read a carry buffer -- the assertion is vacuous"
+
+
 class TestBasic:
     """Core reuse logic: chain reuse, producer-consumer, size/shape, transitive conflicts."""
 
@@ -93,10 +282,10 @@ class TestBasic:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_b, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_b, [0, 0], [64, 64], [64, 64]
                 )
                 tile_c: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_b
@@ -146,7 +335,7 @@ class TestBasic:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
@@ -206,22 +395,22 @@ class TestBasic:
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 _result_a: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)] = pl.tile.store(
                     tile_a, [0, 0], output_a
                 )
                 tile_b: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_5, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_b, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_b, [0, 0], [32, 32], [32, 32]
                 )
                 _result_b: pl.Tensor[[32, 32], pl.FP32, pl.MemRef("mem_ddr_3", 0, 4096)] = pl.tile.store(
                     tile_b, [0, 0], output_b
                 )
                 tile_e: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_f: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_5, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_b, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_b, [0, 0], [32, 32], [32, 32]
                 )
                 _result_e: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)] = pl.tile.store(
                     tile_e, [0, 0], output_a
@@ -290,7 +479,7 @@ class TestBasic:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
@@ -347,7 +536,7 @@ class TestAllocCleanup:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
@@ -395,10 +584,10 @@ class TestAllocCleanup:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_c: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_b
@@ -456,7 +645,7 @@ class TestDtype:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
@@ -528,7 +717,7 @@ class TestFillpad:
                     pl.MemRef(mem_vec_2, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(valid_shape=[48, 64]),
-                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64], target_memory=pl.Mem.Vec)
+                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64])
                 padded: pl.Tile[
                     [64, 64],
                     pl.FP32,
@@ -591,7 +780,7 @@ class TestFillpad:
                     pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(valid_shape=[48, 64]),
-                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64], target_memory=pl.Mem.Vec)
+                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64])
                 padded_max: pl.Tile[
                     [64, 64],
                     pl.FP32,
@@ -608,7 +797,7 @@ class TestFillpad:
                     pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(valid_shape=[48, 64]),
-                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64], target_memory=pl.Mem.Vec)
+                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64])
                 padded_min: pl.Tile[
                     [64, 64],
                     pl.FP32,
@@ -670,7 +859,7 @@ class TestFillpad:
                     pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(valid_shape=[48, 64]),
-                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64], target_memory=pl.Mem.Vec)
+                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64])
                 padded_a: pl.Tile[
                     [64, 64],
                     pl.FP32,
@@ -687,7 +876,7 @@ class TestFillpad:
                     pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(valid_shape=[48, 64]),
-                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64], target_memory=pl.Mem.Vec)
+                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64])
                 padded_b: pl.Tile[
                     [64, 64],
                     pl.FP32,
@@ -751,7 +940,7 @@ class TestValidShapeDivergence:
                     pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(valid_shape=[48, 64]),
-                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64], target_memory=pl.Mem.Vec)
+                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64])
                 _res_a: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
                     tile_a, [0, 0], output_a
                 )
@@ -761,7 +950,7 @@ class TestValidShapeDivergence:
                     pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(valid_shape=[32, 64]),
-                ] = pl.tile.load(input_a, [0, 0], [64, 64], [32, 64], target_memory=pl.Mem.Vec)
+                ] = pl.tile.load(input_a, [0, 0], [64, 64], [32, 64])
                 result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)] = pl.tile.store(
                     tile_b, [0, 0], output_b
                 )
@@ -855,12 +1044,12 @@ class TestValidShapeDivergence:
                     pl.MemRef(mem_vec_3, 0, 16384),
                     pl.Mem.Vec,
                     pl.TileView(valid_shape=[48, 64]),
-                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64], target_memory=pl.Mem.Vec)
+                ] = pl.tile.load(input_a, [0, 0], [64, 64], [48, 64])
                 _res_a: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
                     tile_a, [0, 0], output_a
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_2", 0, 16384)] = pl.tile.store(
                     tile_b, [0, 0], output_b
@@ -1153,7 +1342,7 @@ class TestViewOps:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[4096, 1], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
                     pl.tile.reshape(tile_a, [4096, 1])
@@ -1206,13 +1395,13 @@ class TestViewOps:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_c: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 _tile_d: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_c, tile_c
                 )
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 _tile_b: pl.Tile[[4096, 1], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
                     pl.tile.reshape(tile_a, [4096, 1])
@@ -1257,7 +1446,7 @@ class TestViewOps:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 _tile_b: pl.Tile[[4096, 1], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
                     pl.tile.reshape(tile_a, [4096, 1])
@@ -1266,7 +1455,7 @@ class TestViewOps:
                     tile_a, tile_a
                 )
                 tile_d: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_e: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     tile_d, tile_d
@@ -1282,6 +1471,42 @@ class TestViewOps:
 
 class TestInplaceOps:
     """Tests verifying that ops marked not_inplace_safe block producer-consumer reuse."""
+
+    def test_remainder_outputs_do_not_alias_inputs_or_scratch(self):
+        """TREM/TREMS keep result buffers distinct from every live operand."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[16, 16], pl.FP32],
+                rhs: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                lhs_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(lhs, [0, 0], [16, 16])
+                rhs_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(rhs, [0, 0], [16, 16])
+                tmp2: pl.Tile[[2, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.create(
+                    [2, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                rem: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.rem(lhs_tile, rhs_tile, tmp2)
+                tmp1: pl.Tile[[1, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.create(
+                    [1, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                rems: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tile.rems(rem, 3.0, tmp1)
+                return pl.store(rems, [0, 0], out)
+
+        after = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(after)
+        assert bases["rem"] not in {
+            bases["lhs_tile"],
+            bases["rhs_tile"],
+            bases["tmp2"],
+        }
+        assert bases["rems"] not in {
+            bases["rem"],
+            bases["tmp1"],
+        }
 
     def test_concat_output_must_not_alias_either_source(self):
         """tile.concat's output must get a buffer distinct from both sources.
@@ -1345,7 +1570,7 @@ class TestInplaceOps:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 tile_a: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_2, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [32, 32], [32, 32]
                 )
                 tile_b: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_3, 0, 4096), pl.Mem.Vec] = pl.tile.recip(
                     tile_a
@@ -1429,19 +1654,19 @@ class TestInplaceOps:
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 mem_vec_7: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 tile_a: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_4, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [32, 32], [32, 32]
                 )
                 _s1: pl.Tensor[[32, 32], pl.FP32, pl.MemRef("mem_ddr_3", 0, 4096)] = pl.tile.store(
                     tile_a, [0, 0], output
                 )
                 tile_c: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_4, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_c, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_c, [0, 0], [32, 32], [32, 32]
                 )
                 _s2: pl.Tensor[[32, 32], pl.FP32, pl.MemRef("mem_ddr_3", 0, 4096)] = pl.tile.store(
                     tile_c, [0, 0], output
                 )
                 tile_x: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_4, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_x, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_x, [0, 0], [32, 32], [32, 32]
                 )
                 tile_b: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_7, 0, 4096), pl.Mem.Vec] = pl.tile.recip(
                     tile_x
@@ -1480,7 +1705,7 @@ class TestInplaceOps:
             ) -> pl.Tensor[[32, 32], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 tile_a: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_2, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [32, 32], [32, 32]
                 )
                 tile_b: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_2, 0, 4096), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
@@ -1520,7 +1745,7 @@ class TestInplaceOps:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 tile_a: pl.Tile[[32, 32], pl.INT32, pl.MemRef(mem_vec_2, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [32, 32], [32, 32]
                 )
                 tile_b: pl.Tile[[32, 32], pl.INT32, pl.MemRef(mem_vec_3, 0, 4096), pl.Mem.Vec] = pl.tile.ands(
                     tile_a, 255
@@ -1565,10 +1790,10 @@ class TestInplaceOps:
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 tile_a: pl.Tile[[32, 32], pl.INT32, pl.MemRef(mem_vec_3, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [32, 32], [32, 32]
                 )
                 tile_tmp: pl.Tile[[32, 32], pl.INT32, pl.MemRef(mem_vec_4, 0, 4096), pl.Mem.Vec] = (
-                    pl.tile.load(input_b, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec)
+                    pl.tile.load(input_b, [0, 0], [32, 32], [32, 32])
                 )
                 tile_b: pl.Tile[[32, 32], pl.INT32, pl.MemRef(mem_vec_5, 0, 4096), pl.Mem.Vec] = pl.tile.xors(
                     tile_a, 255, tile_tmp
@@ -1619,7 +1844,7 @@ class TestInplaceOps:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
                 tile_a: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_3, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [32, 32], [32, 32]
                 )
                 tile_b: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_3, 0, 4096), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
@@ -1628,7 +1853,7 @@ class TestInplaceOps:
                     tile_b, [0, 0], output
                 )
                 tile_u: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_3, 0, 4096), pl.Mem.Vec] = pl.tile.load(
-                    input_u, [0, 0], [32, 32], [32, 32], target_memory=pl.Mem.Vec
+                    input_u, [0, 0], [32, 32], [32, 32]
                 )
                 tile_d: pl.Tile[[32, 32], pl.FP32, pl.MemRef(mem_vec_6, 0, 4096), pl.Mem.Vec] = pl.tile.add(
                     tile_u, tile_u
@@ -1688,7 +1913,7 @@ class TestYieldFixup:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 init_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 for _i, (acc_0,) in pl.range(4, init_values=(init_0,)):
                     extra_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
@@ -1741,7 +1966,7 @@ class TestYieldFixup:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 init_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 for _i, (acc_0,) in pl.range(4, init_values=(init_0,)):
                     next_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
@@ -1802,10 +2027,10 @@ class TestYieldFixup:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 init_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 init_1: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 for _i, (acc_0, acc_1) in pl.range(4, init_values=(init_0, init_1)):
                     extra_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = (
@@ -1870,7 +2095,7 @@ class TestYieldFixup:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 _: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
                     tile_a, [0, 0], output
@@ -1882,7 +2107,6 @@ class TestYieldFixup:
                             [0, 0],
                             [64, 64],
                             [64, 64],
-                            target_memory=pl.Mem.Vec,
                         )
                     )
                     if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
@@ -1895,7 +2119,6 @@ class TestYieldFixup:
                             [0, 0],
                             [64, 64],
                             [64, 64],
-                            target_memory=pl.Mem.Vec,
                         )
                     )
                     if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
@@ -1953,10 +2176,10 @@ class TestYieldFixup:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_b, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_b, [0, 0], [64, 64], [64, 64]
                 )
                 if cond_param < 2:
                     alias_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = tile_a
@@ -1984,6 +2207,605 @@ class TestYieldFixup:
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_if_phi_arm_yielding_iter_arg_still_copies_into_the_phi_buffer(self):
+        """Every arm of an if-phi must write the phi's buffer, IterArg arms included.
+
+        ``tile.mrgsort_format1`` is ``.not_inplace_safe()`` and reads
+        ``tile_iter``, so the retargeter declines to place ``merged`` on the
+        carry buffer (see ``test_retargeter_declines_for_not_inplace_safe_op``)
+        and the phi lands on its own ``mem_vec_6``.  The ``else`` arm yields the
+        loop's ``tile_iter`` unchanged -- an ``IterArg``, which has its own
+        ObjectKind and is *not* matched by ``As<Var>``.  Skipping it left
+        ``mem_vec_6`` unwritten whenever the ``else`` arm ran, and the carry
+        writeback below then copied that stale buffer back onto the carry,
+        silently destroying the loop-carried value.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src_tensor: pl.Tensor[[1, 2048], pl.FP32],
+                idx_tensor: pl.Tensor[[1, 2048], pl.UINT32],
+                val_output: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+            ) -> pl.Tensor[[1, 2048], pl.FP32]:
+                # This pipeline stops before InferTileMemorySpace, so an unset space --
+                # which since #2475 means "the compiler places it" -- is never resolved,
+                # and an Opaque function has no on-chip memory to place it in. Name it on
+                # the loads; the tiles derived from them take their space from their inputs.
+                src_tile: pl.Tile[[1, 2048], pl.FP32] = pl.load(
+                    src_tensor, [0, 0], [1, 2048], target_memory=pl.Mem.Vec
+                )
+                idx_tile: pl.Tile[[1, 2048], pl.UINT32] = pl.load(
+                    idx_tensor, [0, 0], [1, 2048], target_memory=pl.Mem.Vec
+                )
+                sorted_tile: pl.Tile[[1, 4096], pl.FP32] = pl.tile.sort32(src_tile, idx_tile)
+                for i, (tile_iter,) in pl.range(3, init_values=(sorted_tile,)):
+                    if i >= 1:
+                        merged: pl.Tile[[1, 4096], pl.FP32] = pl.tile.mrgsort(tile_iter, block_len=64)
+                        phi = pl.yield_(merged)
+                    else:
+                        phi = pl.yield_(tile_iter)
+                    result = pl.yield_(phi)
+                vals: pl.Tile[[1, 2048], pl.FP32] = pl.tile.gather_mask(
+                    result, mask_pattern=pl.tile.MaskPattern.P0101
+                )
+                out_val: pl.Tensor[[1, 2048], pl.FP32] = pl.store(vals, [0, 0], val_output)
+                return out_val
+
+        # sorted_tile/tile_iter/result live on the carry buffer mem_vec_5; the
+        # phi lives on mem_vec_6.  Both arms write mem_vec_6 -- the then arm
+        # through mrgsort, the else arm through tile_iter_mv -- before phi_mv
+        # copies it back onto the carry.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                src_tensor: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_0", 0, 8192)],
+                idx_tensor: pl.Tensor[[1, 2048], pl.UINT32, pl.MemRef("mem_ddr_1", 0, 8192)],
+                val_output: pl.Out[pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)]],
+            ) -> pl.Tensor[[1, 2048], pl.FP32]:
+                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
+                mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
+                )
+                idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
+                    pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
+                )
+                sorted_tile: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.sort32(src_tile, idx_tile)
+                )
+                for i, (tile_iter,) in pl.range(3, init_values=(sorted_tile,)):
+                    if i >= 1:
+                        merged: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                            pl.tile.mrgsort(tile_iter, block_len=64)
+                        )
+                        phi: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                            pl.yield_(merged)
+                        )
+                    else:
+                        tile_iter_mv: pl.Tile[
+                            [1, 4096], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec
+                        ] = pl.tile.move(tile_iter, target_memory=pl.Mem.Vec)
+                        phi: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                            pl.yield_(tile_iter_mv)
+                        )
+                    phi_mv: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.move(phi, target_memory=pl.Mem.Vec)
+                    )
+                    result: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                        pl.yield_(phi_mv)
+                    )
+                vals: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.gather_mask(result, mask_pattern=pl.tile.MaskPattern.P0101)
+                )
+                out_val: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)] = pl.tile.store(
+                    vals, [0, 0], val_output
+                )
+                return out_val
+
+        After = _run_pipeline(Before)
+        ir.assert_structural_equal(After, Expected)
+        _assert_if_phi_arms_write_the_phi_buffer(After)
+
+    def test_if_phi_arm_yielding_iter_arg_makes_the_carry_buffer_canonical(self):
+        """Mirror of the test above: the *then* arm is the one yielding the IterArg.
+
+        YieldFixup only ever inserts its reconciling move into the ``else`` arm,
+        so the then arm's buffer is the canonical one.  When that arm yields the
+        carry unchanged the phi lands on the carry buffer itself, the ``else``
+        arm's producer is copied into it, and the loop-carry writeback drops out
+        because the phi already is the carry.  Skipping the IterArg arm instead
+        put the phi on the else arm's buffer and left it unwritten whenever the
+        then arm ran.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src_tensor: pl.Tensor[[1, 2048], pl.FP32],
+                idx_tensor: pl.Tensor[[1, 2048], pl.UINT32],
+                val_output: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+            ) -> pl.Tensor[[1, 2048], pl.FP32]:
+                # This pipeline stops before InferTileMemorySpace, so an unset space --
+                # which since #2475 means "the compiler places it" -- is never resolved,
+                # and an Opaque function has no on-chip memory to place it in. Name it on
+                # the loads; the tiles derived from them take their space from their inputs.
+                src_tile: pl.Tile[[1, 2048], pl.FP32] = pl.load(
+                    src_tensor, [0, 0], [1, 2048], target_memory=pl.Mem.Vec
+                )
+                idx_tile: pl.Tile[[1, 2048], pl.UINT32] = pl.load(
+                    idx_tensor, [0, 0], [1, 2048], target_memory=pl.Mem.Vec
+                )
+                sorted_tile: pl.Tile[[1, 4096], pl.FP32] = pl.tile.sort32(src_tile, idx_tile)
+                for i, (tile_iter,) in pl.range(3, init_values=(sorted_tile,)):
+                    if i < 1:
+                        phi = pl.yield_(tile_iter)
+                    else:
+                        merged: pl.Tile[[1, 4096], pl.FP32] = pl.tile.mrgsort(tile_iter, block_len=64)
+                        phi = pl.yield_(merged)
+                    result = pl.yield_(phi)
+                vals: pl.Tile[[1, 2048], pl.FP32] = pl.tile.gather_mask(
+                    result, mask_pattern=pl.tile.MaskPattern.P0101
+                )
+                out_val: pl.Tensor[[1, 2048], pl.FP32] = pl.store(vals, [0, 0], val_output)
+                return out_val
+
+        # The phi shares the carry buffer mem_vec_5, so `merged` is copied into
+        # it and no separate carry writeback is emitted before the loop yield.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                src_tensor: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_0", 0, 8192)],
+                idx_tensor: pl.Tensor[[1, 2048], pl.UINT32, pl.MemRef("mem_ddr_1", 0, 8192)],
+                val_output: pl.Out[pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)]],
+            ) -> pl.Tensor[[1, 2048], pl.FP32]:
+                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
+                mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
+                )
+                idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
+                    pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
+                )
+                sorted_tile: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.sort32(src_tile, idx_tile)
+                )
+                for i, (tile_iter,) in pl.range(3, init_values=(sorted_tile,)):
+                    if i < 1:
+                        phi: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                            pl.yield_(tile_iter)
+                        )
+                    else:
+                        merged: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                            pl.tile.mrgsort(tile_iter, block_len=64)
+                        )
+                        merged_mv: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                            pl.tile.move(merged, target_memory=pl.Mem.Vec)
+                        )
+                        phi: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                            pl.yield_(merged_mv)
+                        )
+                    result: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                        pl.yield_(phi)
+                    )
+                vals: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.gather_mask(result, mask_pattern=pl.tile.MaskPattern.P0101)
+                )
+                out_val: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)] = pl.tile.store(
+                    vals, [0, 0], val_output
+                )
+                return out_val
+
+        After = _run_pipeline(Before)
+        ir.assert_structural_equal(After, Expected)
+        _assert_if_phi_arms_write_the_phi_buffer(After)
+
+    def test_carry_writebacks_run_before_they_are_overwritten(self):
+        """A carry rename must be read before a sibling carry overwrites its buffer.
+
+        ``prev = cur`` renames the first carry, so after identity-copy
+        normalization it *is* ``cur``'s buffer. Emitting the writebacks in
+        iter_arg order would store ``grown`` into that buffer first and leave the
+        second writeback reading the value it just replaced -- the shift register
+        would carry ``prev == cur`` ([#2481]). Ordering the copies against each
+        other puts ``shifted_mv`` first; no scratch buffer is needed because the
+        conflict is one-directional.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                head_0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64]
+                )
+                tail_0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64]
+                )
+                for _i, (cur, prev) in pl.range(0, 4, init_values=(head_0, tail_0)):
+                    shifted: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = cur
+                    grown: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(cur, prev)
+                    _keep: pl.Tensor[[64, 64], pl.FP32] = pl.store(cur, [0, 0], output)
+                    r_cur, r_prev = pl.yield_(grown, shifted)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(r_prev, [0, 0], output)
+                return result
+
+        # shifted (on cur's buffer mem_vec_2) is copied into prev's buffer before
+        # grown overwrites mem_vec_2 -- the reverse of iter_arg order.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                head_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_tensor, [0, 0], [64, 64], [64, 64]
+                )
+                tail_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_tensor, [0, 0], [64, 64], [64, 64]
+                )
+                for _i, (cur, prev) in pl.range(4, init_values=(head_0, tail_0)):
+                    shifted: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = cur
+                    grown: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.add(cur, prev)
+                    )
+                    _keep: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                        cur, [0, 0], output
+                    )
+                    shifted_mv: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.move(shifted, target_memory=pl.Mem.Vec)
+                    )
+                    grown_mv: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.move(grown, target_memory=pl.Mem.Vec)
+                    )
+                    r_cur, r_prev = pl.yield_(grown_mv, shifted_mv)
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    r_prev, [0, 0], output
+                )
+                return result
+
+        After = _run_pipeline(Before)
+        ir.assert_structural_equal(After, Expected)
+        _assert_carry_writebacks_do_not_clobber(After)
+
+    def test_carry_writeback_cycle_is_broken_with_a_spill_buffer(self):
+        """A carry swap has no valid copy order, so one side is spilled first.
+
+        ``cur, prev = prev, cur`` makes each carry's value live in the other's
+        buffer, so whichever writeback runs first destroys the other's source. One
+        member is copied into a scratch buffer ahead of both writebacks and its
+        own writeback then reads the scratch -- the standard parallel-copy cycle
+        break. Without it both carries ended up holding the old ``prev``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                head_0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64]
+                )
+                tail_0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64]
+                )
+                for _i, (cur, prev) in pl.range(0, 4, init_values=(head_0, tail_0)):
+                    swap_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = prev
+                    swap_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = cur
+                    _keep: pl.Tensor[[64, 64], pl.FP32] = pl.store(cur, [0, 0], output)
+                    r_cur, r_prev = pl.yield_(swap_a, swap_b)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(r_prev, [0, 0], output)
+                return result
+
+        # swap_a (old prev) is parked in the spill buffer, prev's buffer then takes
+        # the old cur, and the spill finally lands in cur's buffer.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_0", 0, 16384)],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                mem_vec_carry_spill_0: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                head_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_tensor, [0, 0], [64, 64], [64, 64]
+                )
+                tail_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
+                    input_tensor, [0, 0], [64, 64], [64, 64]
+                )
+                for _i, (cur, prev) in pl.range(4, init_values=(head_0, tail_0)):
+                    swap_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = prev
+                    swap_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = cur
+                    _keep: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                        cur, [0, 0], output
+                    )
+                    swap_a_mv: pl.Tile[
+                        [64, 64], pl.FP32, pl.MemRef(mem_vec_carry_spill_0, 0, 16384), pl.Mem.Vec
+                    ] = pl.tile.move(swap_a, target_memory=pl.Mem.Vec)
+                    swap_b_mv: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.move(swap_b, target_memory=pl.Mem.Vec)
+                    )
+                    swap_a_mv_mv: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
+                        pl.tile.move(swap_a_mv, target_memory=pl.Mem.Vec)
+                    )
+                    r_cur, r_prev = pl.yield_(swap_a_mv_mv, swap_b_mv)
+                result: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
+                    r_prev, [0, 0], output
+                )
+                return result
+
+        After = _run_pipeline(Before)
+        ir.assert_structural_equal(After, Expected)
+        _assert_carry_writebacks_do_not_clobber(After)
+
+    def test_carry_writeback_distinguishes_slots_of_one_allocation(self):
+        """Two slots of one ``pl.MemRef(slots=2)`` are distinct carry buffers.
+
+        Comparing carries by allocation makes slot 0 and slot 1 look like the same
+        storage, so the swap's copies were dropped as unnecessary and both carries
+        kept their initial values for the whole loop. They share a base Ptr but
+        occupy disjoint byte ranges, so the swap needs the same spill-and-copy
+        treatment it gets on separate allocations.
+        """
+        slots = pl.MemRef(slots=2)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                head_0: pl.Tile[[64, 64], pl.FP32, slots[0], pl.Mem.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                tail_0: pl.Tile[[64, 64], pl.FP32, slots[1], pl.Mem.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                for _i, (cur, prev) in pl.range(0, 4, init_values=(head_0, tail_0)):
+                    swap_a: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = prev
+                    swap_b: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = cur
+                    _keep: pl.Tensor[[64, 64], pl.FP32] = pl.store(cur, [0, 0], output)
+                    r_cur, r_prev = pl.yield_(swap_a, swap_b)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(r_prev, [0, 0], output)
+                return result
+
+        After = _run_pipeline(Before)
+        _assert_carry_yield_lands_in_its_buffer(After)
+        _assert_carry_writebacks_do_not_clobber(After)
+        # The swap is a cycle, so one side parks in a scratch buffer first. Without
+        # it the two slots would just overwrite each other in whichever order ran.
+        assert _count_tile_moves_in_loops(After) == 3, "expected a spill plus both carry writebacks"
+
+    def test_nested_loop_carry_seeded_from_an_outer_iter_arg_is_written_back(self):
+        """An inner loop seeded from the enclosing loop's carry still needs its copy.
+
+        ``inner``'s initValue is the outer loop's ``IterArg``, whose own ObjectKind
+        ``As<Var>`` does not match, so the inner carry was skipped entirely and its
+        result never reached the buffer the outer loop reads. ``mrgsort`` is
+        ``.not_inplace_safe()``, so the retargeter cannot place ``grown`` on that
+        buffer either and a real ``tile.move`` is required.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src_tensor: pl.Tensor[[1, 2048], pl.FP32],
+                idx_tensor: pl.Tensor[[1, 2048], pl.UINT32],
+                val_output: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
+            ) -> pl.Tensor[[1, 2048], pl.FP32]:
+                src_tile: pl.Tile[[1, 2048], pl.FP32] = pl.load(
+                    src_tensor, [0, 0], [1, 2048], target_memory=pl.Mem.Vec
+                )
+                idx_tile: pl.Tile[[1, 2048], pl.UINT32] = pl.load(
+                    idx_tensor, [0, 0], [1, 2048], target_memory=pl.Mem.Vec
+                )
+                seed: pl.Tile[[1, 4096], pl.FP32] = pl.tile.sort32(src_tile, idx_tile)
+                for _o, (outer,) in pl.range(0, 2, init_values=(seed,)):
+                    for _i, (inner,) in pl.range(0, 3, init_values=(outer,)):
+                        grown: pl.Tile[[1, 4096], pl.FP32] = pl.tile.mrgsort(inner, block_len=64)
+                        r_inner = pl.yield_(grown)
+                    r_outer = pl.yield_(r_inner)
+                vals: pl.Tile[[1, 2048], pl.FP32] = pl.tile.gather_mask(
+                    r_outer, mask_pattern=pl.tile.MaskPattern.P0101
+                )
+                out_val: pl.Tensor[[1, 2048], pl.FP32] = pl.store(vals, [0, 0], val_output)
+                return out_val
+
+        # `grown` lands on its own mem_vec_6; grown_mv copies it into the carry
+        # buffer mem_vec_5 that both loops read.
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self,
+                src_tensor: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_0", 0, 8192)],
+                idx_tensor: pl.Tensor[[1, 2048], pl.UINT32, pl.MemRef("mem_ddr_1", 0, 8192)],
+                val_output: pl.Out[pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)]],
+            ) -> pl.Tensor[[1, 2048], pl.FP32]:
+                mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 8192)
+                mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
+                src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
+                )
+                idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
+                    pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
+                )
+                seed: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.sort32(src_tile, idx_tile)
+                )
+                for _o, (outer,) in pl.range(2, init_values=(seed,)):
+                    for _i, (inner,) in pl.range(3, init_values=(outer,)):
+                        grown: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                            pl.tile.mrgsort(inner, block_len=64)
+                        )
+                        grown_mv: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                            pl.tile.move(grown, target_memory=pl.Mem.Vec)
+                        )
+                        r_inner: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                            pl.yield_(grown_mv)
+                        )
+                    r_outer: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
+                        pl.yield_(r_inner)
+                    )
+                vals: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
+                    pl.tile.gather_mask(r_outer, mask_pattern=pl.tile.MaskPattern.P0101)
+                )
+                out_val: pl.Tensor[[1, 2048], pl.FP32, pl.MemRef("mem_ddr_2", 0, 8192)] = pl.tile.store(
+                    vals, [0, 0], val_output
+                )
+                return out_val
+
+        After = _run_pipeline(Before)
+        ir.assert_structural_equal(After, Expected)
+        _assert_carry_yield_lands_in_its_buffer(After)
+
+    def test_carry_held_in_one_dynamic_slot_needs_no_copy(self):
+        """A carry that never leaves its runtime slot must not be copied onto itself.
+
+        `buf[k % 2]` is written at two sites, so the two byte offsets are
+        structurally identical trees but distinct objects. Comparing them by
+        pointer identity called them different addresses and produced a
+        `tile.move` whose source and destination are the same bytes -- rejected
+        outright in Acc, an overlapping copy anywhere else.
+        """
+        buf = pl.MemRef(slots=2)
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+                k: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                seed: pl.Tile[[64, 64], pl.FP32, buf[k % 2], pl.Mem.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                for _i, (acc,) in pl.range(0, 4, init_values=(seed,)):
+                    nxt: pl.Tile[[64, 64], pl.FP32, buf[k % 2], pl.Mem.Vec] = pl.add(acc, acc)
+                    r = pl.yield_(nxt)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(r, [0, 0], output)
+                return result
+
+        After = _run_pipeline(Before)
+        assert _count_tile_moves_in_loops(After) == 0, "a carry that stays in its slot needs no copy"
+        _assert_carry_yield_lands_in_its_buffer(After)
+
+    def test_independent_carry_cycles_each_cost_one_spill(self):
+        """Two disjoint swaps break with one scratch buffer each, in a single pass.
+
+        Each swap is its own cycle, so exactly one member of each has to be
+        parked. Victims come from the residual graph's strongly connected
+        components, which both names real cycle members and finds every cycle in
+        one traversal -- scanning for "any node that still has an outgoing edge"
+        instead would rescan the whole set once per cycle.
+
+        This covers several single-cycle components. Several cycles sharing a node
+        inside *one* component is handled too (CycleVictims re-decomposes what is
+        left of a component after each spill), but is not exercised here: a copy
+        reads one source, so it takes a source spanning two carry slots at once to
+        give any node a second outgoing edge, and that has no spelling in the DSL
+        that survives to this pass.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                a0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                b0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                c0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                d0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    input_tensor, [0, 0], [64, 64], target_memory=pl.Mem.Vec
+                )
+                for _i, (pa, pb, pc, pd) in pl.range(0, 4, init_values=(a0, b0, c0, d0)):
+                    sa: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pb
+                    sb: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pa
+                    sc: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pd
+                    sd: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pc
+                    _keep: pl.Tensor[[64, 64], pl.FP32] = pl.store(pa, [0, 0], output)
+                    _keep2: pl.Tensor[[64, 64], pl.FP32] = pl.store(pc, [0, 0], output)
+                    ra, rb, rc, rd = pl.yield_(sa, sb, sc, sd)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(rd, [0, 0], output)
+                return result
+
+        After = _run_pipeline(Before)
+        # One scratch buffer per swap, and no more: four writebacks plus two spills.
+        assert _count_carry_spill_buffers(After) == 2, "expected exactly one spill per cycle"
+        assert _count_tile_moves_in_loops(After) == 6, "expected four writebacks plus two spills"
+        _assert_carry_yield_lands_in_its_buffer(After)
+        _assert_carry_writebacks_do_not_clobber(After)
+
+    def test_carries_sharing_one_buffer_are_rejected(self):
+        """Two carries seeded from one tile share a buffer, which no order can save.
+
+        ``prev`` and ``cur`` are both initialised from ``seed``, so both carries
+        *are* ``seed``'s buffer and one iteration cannot preserve both. Report it
+        against the loop, where the carries still have names, rather than leaving
+        codegen to reject the degenerate self-copy it eventually produces.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                input_tensor: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                seed: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(input_tensor, [0, 0], [64, 64])
+                for _i, (cur, prev) in pl.range(0, 4, init_values=(seed, seed)):
+                    shifted: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = cur
+                    grown: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(cur, prev)
+                    _keep: pl.Tensor[[64, 64], pl.FP32] = pl.store(cur, [0, 0], output)
+                    r_cur, r_prev = pl.yield_(grown, shifted)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(r_prev, [0, 0], output)
+                return result
+
+        with pytest.raises(ValueError, match="share the same on-chip buffer"):
+            _run_pipeline(Before)
+
     def test_divergent_acc_phi_rejects_acc_to_acc_move(self):
         """YieldFixup must not manufacture an unsupported Acc-to-Acc copy.
 
@@ -1994,6 +2816,60 @@ class TestYieldFixup:
         """
         with pytest.raises(InternalError, match="cannot reconcile divergent L0C accumulator buffers"):
             _run_pipeline(_divergent_acc_phi_program())
+
+
+class TestNestedCarryLifetimeCarrier:
+    """A nested loop's carry init is the *enclosing* loop's IterArg.
+
+    `RegisterReturnVars` maps each return_var onto the variable that owns the
+    carried buffer, so that a use of the return_var keeps that buffer alive.
+    An IterArg owns no buffer of its own -- like return_vars, iter-args are
+    deliberately absent from `ordered_defs_` / `var_def_order_` -- so the chain
+    has to be walked to the `AssignStmt`-defined tile underneath it.
+    """
+
+    def test_nested_carry_resolves_to_the_defining_tile(self):
+        """The whole carry nest shares the outermost init's buffer.
+
+        `r_inner` is the inner loop's return var, read after the inner loop but
+        inside the outer body. Its lifetime carrier is `init_0` -- two carry hops
+        up -- and every tile in the nest must land on that one buffer.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                output: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                init_0: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(x, [0, 0], [64, 64])
+                for _i, (outer,) in pl.range(0, 4, init_values=(init_0,)):
+                    for _j, (inner,) in pl.range(0, 4, init_values=(outer,)):
+                        n: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(inner, inner)
+                        r_inner = pl.yield_(n)
+                    # Post-inner-loop use of the inner return var.
+                    tail: pl.Tile[[64, 64], pl.FP32, pl.MemorySpace.Vec] = pl.add(r_inner, r_inner)
+                    r_outer = pl.yield_(tail)
+                result: pl.Tensor[[64, 64], pl.FP32] = pl.store(r_outer, [0, 0], output)
+                return result
+
+        printed = ir.python_print(_run_pipeline(Before))
+
+        # One Vec buffer for the whole nest -- nothing is allocated alongside it.
+        allocs = [line for line in printed.splitlines() if "pl.tile.alloc(pl.Mem.Vec" in line]
+        assert len(allocs) == 1, f"expected a single Vec allocation, got {len(allocs)}: {allocs}"
+        buffer_name = allocs[0].split(":")[0].strip()
+
+        # Every tile in the carry nest lands on it -- including the return vars,
+        # which are YieldStmt results rather than AssignStmt definitions.
+        for name in ["init_0", "n", "r_inner", "tail", "r_outer"]:
+            decl = next((line for line in printed.splitlines() if line.strip().startswith(f"{name}:")), None)
+            assert decl is not None, f"{name} missing from the transformed program"
+            assert f"pl.MemRef({buffer_name}," in decl, (
+                f"the nested carry chain must share {buffer_name}; {name} did not: {decl.strip()}"
+            )
 
 
 class TestControlFlow:
@@ -2041,7 +2917,7 @@ class TestControlFlow:
             ) -> pl.Tensor[[64, 64], pl.FP32]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 for i, (acc,) in pl.range(4, init_values=(tile_a,)):
                     if i < 2:
@@ -2109,7 +2985,6 @@ class TestControlFlow:
                             [0, 0],
                             [64, 64],
                             [64, 64],
-                            target_memory=pl.Mem.Vec,
                         )
                     )
                     if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
@@ -2122,7 +2997,6 @@ class TestControlFlow:
                             [0, 0],
                             [64, 64],
                             [64, 64],
-                            target_memory=pl.Mem.Vec,
                         )
                     )
                     if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = (
@@ -2186,7 +3060,6 @@ class TestControlFlow:
                             [0, 0],
                             [64, 64],
                             [64, 64],
-                            target_memory=pl.Mem.Vec,
                         )
                     )
                     tile_y: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
@@ -2255,7 +3128,7 @@ class TestControlFlow:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 init_outer: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
                     pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
@@ -2323,7 +3196,7 @@ class TestControlFlow:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 if cond_param < 2:
                     tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
@@ -2394,10 +3267,10 @@ class TestControlFlow:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 init_tile: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_4, 0, 16384), pl.Mem.Vec] = (
                     pl.tile.create([64, 64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
@@ -2467,7 +3340,7 @@ class TestControlFlow:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 tile_a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 if cond_param < 2:
                     tile_b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
@@ -2550,7 +3423,7 @@ class TestControlFlow:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 a: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_a, [0, 0], [64, 64], [64, 64]
                 )
                 if cond_param < 2:
                     b: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.add(
@@ -2632,7 +3505,7 @@ class TestControlFlow:
                 )
                 for _kb, (acc,) in pl.range(4, init_values=(o_acc_z,)):
                     chunk: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
-                        pl.tile.load(input_a, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec)
+                        pl.tile.load(input_a, [0, 0], [64, 64], [64, 64])
                     )
                     acc_next: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
                         pl.tile.add(acc, chunk)
@@ -2641,7 +3514,7 @@ class TestControlFlow:
                         pl.yield_(acc_next)
                     )
                 resid: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_b, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_b, [0, 0], [64, 64], [64, 64]
                 )
                 final: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.add(
                     loop_out, resid
@@ -2653,6 +3526,21 @@ class TestControlFlow:
 
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected)
+
+
+def _assert_single_acc_buffer_no_move(after: ir.Program, label: str) -> None:
+    """Assert an accumulator chain landed on ONE Acc allocation with no copy.
+
+    Two Acc bases, or a surviving ``tile.move``, both mean the same thing: one
+    logical accumulator ended up on two L0C buffers, which the hardware cannot
+    realize (nothing reads L0C except the FIXPIPE drain).
+    """
+    printed = ir.python_print(after)
+    acc_bases = {b for b in _collect_tile_memref_bases(after).values() if "acc" in b}
+    assert len(acc_bases) == 1, (
+        f"{label}: expected ONE Acc allocation, got {len(acc_bases)}: {sorted(acc_bases)}\n{printed}"
+    )
+    assert "tile.move" not in printed, f"{label}: an in-place accumulator chain needs no move:\n{printed}"
 
 
 class TestTopDownRetargeter:
@@ -3192,7 +4080,7 @@ class TestTopDownRetargeter:
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_4: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 init_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 for _i, (acc_0,) in pl.range(4, init_values=(init_0,)):
                     tmp: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = pl.tile.add(
@@ -3262,6 +4150,11 @@ class TestTopDownRetargeter:
         # retargeted onto mem_vec_2) because the liveness check detects
         # the post-IfStmt read of acc_0.  YieldFixup then inserts a
         # tile.move to unify if_result to the iter_arg buffer at the yield.
+        #
+        # The else arm yields the iter_arg, which lives on mem_vec_2 while the
+        # phi is on mem_vec_3, so it needs its own tile.move into the phi
+        # buffer -- without it mem_vec_3 is unwritten on that path and the
+        # carry writeback below copies stale data back onto acc_0.
         @pl.program
         class Expected:
             @pl.function
@@ -3273,7 +4166,7 @@ class TestTopDownRetargeter:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_3: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 init_0: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_2, 0, 16384), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [64, 64], [64, 64], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [64, 64], [64, 64]
                 )
                 for i, (acc_0,) in pl.range(4, init_values=(init_0,)):
                     if i < 2:
@@ -3284,8 +4177,11 @@ class TestTopDownRetargeter:
                             pl.yield_(tile_c)
                         )
                     else:
+                        acc_0_mv: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
+                            pl.tile.move(acc_0, target_memory=pl.Mem.Vec)
+                        )
                         if_result: pl.Tile[[64, 64], pl.FP32, pl.MemRef(mem_vec_3, 0, 16384), pl.Mem.Vec] = (
-                            pl.yield_(acc_0)
+                            pl.yield_(acc_0_mv)
                         )
                     _use: pl.Tensor[[64, 64], pl.FP32, pl.MemRef("mem_ddr_1", 0, 16384)] = pl.tile.store(
                         acc_0, [0, 0], output
@@ -3327,8 +4223,14 @@ class TestTopDownRetargeter:
                 idx_tensor: pl.Tensor[[1, 2048], pl.UINT32],
                 val_output: pl.Out[pl.Tensor[[1, 2048], pl.FP32]],
             ) -> pl.Tensor[[1, 2048], pl.FP32]:
-                src_tile: pl.Tile[[1, 2048], pl.FP32] = pl.load(src_tensor, [0, 0], [1, 2048])
-                idx_tile: pl.Tile[[1, 2048], pl.UINT32] = pl.load(idx_tensor, [0, 0], [1, 2048])
+                # Pinned via the annotation (not a kwarg): this pipeline stops before
+                # InferTileMemorySpace, so the space has to come from the source.
+                src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemorySpace.Vec] = pl.load(
+                    src_tensor, [0, 0], [1, 2048]
+                )
+                idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemorySpace.Vec] = pl.load(
+                    idx_tensor, [0, 0], [1, 2048]
+                )
                 sorted_tile: pl.Tile[[1, 4096], pl.FP32] = pl.tile.sort32(src_tile, idx_tile)
                 for i, (tile_iter,) in pl.range(3, init_values=(sorted_tile,)):
                     block_len = 1 << (6 + i * 2)
@@ -3362,10 +4264,10 @@ class TestTopDownRetargeter:
                 mem_vec_5: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 mem_vec_6: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 16384)
                 src_tile: pl.Tile[[1, 2048], pl.FP32, pl.MemRef(mem_vec_6, 0, 16384), pl.Mem.Vec] = (
-                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
+                    pl.tile.load(src_tensor, [0, 0], [1, 2048], [1, 2048])
                 )
                 idx_tile: pl.Tile[[1, 2048], pl.UINT32, pl.MemRef(mem_vec_4, 0, 8192), pl.Mem.Vec] = (
-                    pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048], target_memory=pl.Mem.Vec)
+                    pl.tile.load(idx_tensor, [0, 0], [1, 2048], [1, 2048])
                 )
                 sorted_tile: pl.Tile[[1, 4096], pl.FP32, pl.MemRef(mem_vec_5, 0, 16384), pl.Mem.Vec] = (
                     pl.tile.sort32(src_tile, idx_tile)
@@ -3392,9 +4294,152 @@ class TestTopDownRetargeter:
         After = _run_pipeline(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_predicated_pipelined_kloop_uses_one_acc_buffer(self):
+        """The migration target for the peel the sibling test rejects.
 
-class TestMetadata:
-    """Function metadata should survive MemoryReuse rewrites."""
+        Spelling the same stage-2 pipelined split-K reduction as one predicated
+        ``tile.matmul_acc(c_iter, sa, sb, init_cond=(ko == 0))`` keeps the whole
+        accumulator chain (``tile.create`` init + the per-block accumulate + the
+        loop yield) on ONE Acc allocation with no ``tile.move`` -- exactly what
+        the deleted coalescer used to reconstruct after the fact. Runs the real
+        ``lower_pipeline_loops`` under BASIC verification, so this checks legal
+        IR, not just a buffer count.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[176, 192], pl.BF16],
+                rhs: pl.Tensor[[192, 176], pl.BF16],
+                out: pl.Out[pl.Tensor[[176, 176], pl.FP32]],
+            ) -> pl.Tensor[[176, 176], pl.FP32]:
+                lhs_mat: pl.Tile[[176, 192], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [176, 192], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[192, 176], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [192, 176], target_memory=pl.Mem.Mat
+                )
+                c_init: pl.Tile[[176, 176], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [176, 176], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                )
+                for ko, (c_iter,) in pl.pipeline(0, 192, 64, init_values=(c_init,), stage=2):
+                    sa: pl.Tile[[176, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko, shape=[176, 64], target_memory=pl.Mem.Left
+                    )
+                    sb: pl.Tile[[64, 176], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko, 0, shape=[64, 176], target_memory=pl.Mem.Right
+                    )
+                    c_acc: pl.Tile[[176, 176], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(
+                        c_iter, sa, sb, init_cond=(ko == 0)
+                    )
+                    c: pl.Tile[[176, 176], pl.FP32, pl.Mem.Acc] = pl.yield_(c_acc)
+                result: pl.Tensor[[176, 176], pl.FP32] = pl.store(c, [0, 0], out)
+                return result
+
+        peeled = passes.init_mem_ref()(passes.lower_pipeline_loops()(Before))
+
+        with passes.PassContext([], passes.VerificationLevel.BASIC):
+            legacy_after = passes.memory_reuse()(passes.materialize_semantic_aliases()(peeled))
+        _assert_single_acc_buffer_no_move(legacy_after, "PYPTO")
+
+        with passes.PassContext(
+            [],
+            passes.VerificationLevel.BASIC,
+            memory_planner=passes.MemoryPlanner.DSA_RP,
+        ):
+            dsa_after = passes.materialize_semantic_aliases()(peeled)
+        _assert_single_acc_buffer_no_move(dsa_after, "DSA_RP")
+
+    def test_peel_inside_a_carrying_loop_still_compiles(self):
+        """The common source spelling of split-K -- an ``if k == 0`` peel *inside*
+        a loop that carries the accumulator -- must keep compiling.
+
+        ``MaterializeSemanticAliases`` propagates the carry's buffer down through
+        the if-phi into BOTH arms, so the two producers land on the accumulator
+        buffer and no divergence ever reaches YieldFixup. This is the shape of
+        every existing peeled kernel, so it is the regression guard that the
+        diagnostic does not fire on code that compiles today.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 192], pl.BF16],
+                rhs: pl.Tensor[[192, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[16, 192], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [16, 192], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[192, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [192, 64], target_memory=pl.Mem.Mat
+                )
+                c_init: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [16, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                )
+                for ko, (c_iter,) in pl.range(0, 192, 64, init_values=(c_init,)):
+                    sa: pl.Tile[[16, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko, shape=[16, 64], target_memory=pl.Mem.Left
+                    )
+                    sb: pl.Tile[[64, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko, 0, shape=[64, 64], target_memory=pl.Mem.Right
+                    )
+                    if ko == 0:
+                        c_first: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(sa, sb)
+                        c_phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(c_first)
+                    else:
+                        c_acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(c_iter, sa, sb)
+                        c_phi: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(c_acc)
+                    c: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(c_phi)
+                result: pl.Tensor[[16, 64], pl.FP32] = pl.store(c, [0, 0], out)
+                return result
+
+        _assert_single_acc_buffer_no_move(_run_pipeline(Before), "peel-in-carry")
+
+    def test_predicated_accumulate_inside_a_carrying_loop(self):
+        """The ``init_cond`` spelling of the peel above lowers to the same result.
+
+        Keeps the diagnostic's advice testable rather than aspirational: the form
+        the message recommends must reach one Acc allocation with no ``tile.move``.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[16, 192], pl.BF16],
+                rhs: pl.Tensor[[192, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
+            ) -> pl.Tensor[[16, 64], pl.FP32]:
+                lhs_mat: pl.Tile[[16, 192], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    lhs, [0, 0], [16, 192], target_memory=pl.Mem.Mat
+                )
+                rhs_mat: pl.Tile[[192, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    rhs, [0, 0], [192, 64], target_memory=pl.Mem.Mat
+                )
+                c_init: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.create(
+                    [16, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc
+                )
+                for ko, (c_iter,) in pl.range(0, 192, 64, init_values=(c_init,)):
+                    sa: pl.Tile[[16, 64], pl.BF16, pl.Mem.Left] = pl.tile.extract(
+                        lhs_mat, 0, ko, shape=[16, 64], target_memory=pl.Mem.Left
+                    )
+                    sb: pl.Tile[[64, 64], pl.BF16, pl.Mem.Right] = pl.tile.extract(
+                        rhs_mat, ko, 0, shape=[64, 64], target_memory=pl.Mem.Right
+                    )
+                    c_acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.tile.matmul_acc(
+                        c_iter, sa, sb, init_cond=(ko == 0)
+                    )
+                    c: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc] = pl.yield_(c_acc)
+                result: pl.Tensor[[16, 64], pl.FP32] = pl.store(c, [0, 0], out)
+                return result
+
+        _assert_single_acc_buffer_no_move(_run_pipeline(Before), "init_cond-in-carry")
 
     def test_preserves_split_metadata(self):
         @pl.program
@@ -3422,7 +4467,7 @@ class TestMetadata:
             ) -> pl.Tensor[[16, 16], pl.FP16]:
                 mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 512)
                 tile_a: pl.Tile[[16, 16], pl.FP16, pl.MemRef(mem_vec_2, 0, 512), pl.Mem.Vec] = pl.tile.load(
-                    input_tensor, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec
+                    input_tensor, [0, 0], [16, 16], [16, 16]
                 )
                 tile_b: pl.Tile[[16, 16], pl.FP16, pl.MemRef(mem_vec_2, 0, 512), pl.Mem.Vec] = pl.tile.add(
                     tile_a, tile_a
@@ -3500,13 +4545,21 @@ class TestStructuralShapeEquality:
 
         body = ir.SeqStmts(
             [
-                ir.AssignStmt(tile_a, tile.load(input_x, offsets=[0, 0], shapes=[64, 64]), span),
+                ir.AssignStmt(
+                    tile_a,
+                    tile.load(input_x, offsets=[0, 0], shapes=[64, 64], target_memory=ir.MemorySpace.Vec),
+                    span,
+                ),
                 ir.AssignStmt(
                     store_a,
                     tile.store(tile_a, offsets=[0, 0], output_tensor=output_x),
                     span,
                 ),
-                ir.AssignStmt(tile_b, tile.load(input_x, offsets=[0, 0], shapes=[64, 64]), span),
+                ir.AssignStmt(
+                    tile_b,
+                    tile.load(input_x, offsets=[0, 0], shapes=[64, 64], target_memory=ir.MemorySpace.Vec),
+                    span,
+                ),
                 ir.AssignStmt(
                     store_b,
                     tile.store(tile_b, offsets=[0, 0], output_tensor=output_x),
@@ -3931,6 +4984,131 @@ class TestAscend910BLoadTpopHazard:
             f"{ranges['down_next']} from load buffer {ranges['down_prev']}"
         )
 
+    @staticmethod
+    def _build_loop_carried_program():
+        """Same hazard, but the tpop value reaches the writer through a loop carry.
+
+        ``down_next = tile.add(down_prev=tile.load, pipe_carry)`` where
+        ``pipe_carry`` is the loop's ``IterArg``, initialised from the
+        ``tile.tpop_from_aic`` result and so must-aliased onto its buffer.  The
+        writer still reads a load result and a tpop value at one statement, so
+        the hazard is identical to ``_build_program``'s straight-line form — only
+        the spelling of the tpop operand differs.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.UP_DOWN})
+            def main(self, down: pl.InOut[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                mem_vec_0: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
+                mem_vec_1: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
+                pipe_chunk: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_0, 0, 4096), pl.Mem.Vec] = (
+                    pl.tile.tpop_from_aic(split=1)
+                )
+                for _i, (pipe_carry,) in pl.range(0, 2, init_values=(pipe_chunk,)):
+                    down_prev: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_1, 0, 4096), pl.Mem.Vec] = (
+                        pl.tile.load(down, [0, 0], [8, 128], [8, 128], target_memory=pl.Mem.Vec)
+                    )
+                    down_next: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_2, 0, 4096), pl.Mem.Vec] = (
+                        pl.tile.add(down_prev, pipe_carry)
+                    )
+                    loop_out = pl.yield_(down_next)
+                result: pl.Tensor[[16, 128], pl.FP32] = pl.tile.store(loop_out, [0, 0], down)
+                return result
+
+        return Prog
+
+    def test_iter_arg_tpop_operand_still_blocks_load_buffer_reuse(self):
+        """A loop-carried tpop operand must not escape the guard.
+
+        The operand is an ``IterArg``, which has its own ``ObjectKind`` and is
+        never itself an ``AssignStmt`` def, so neither ``As<Var>`` nor Var
+        identity can classify it.  ``HazardInputCollector`` reads operands with
+        ``AsVarLike`` and resolves a carry through the MemRef base its chain was
+        fused onto; without that, ``down_next`` is not recognised as reading a
+        tpop value and MemoryReuse forms the in-place load touch.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = passes.memory_reuse()(self._build_loop_carried_program())
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        assert "down_prev" in bases and "down_next" in bases, f"missing tile vars; got {bases}"
+        assert bases["down_next"] != bases["down_prev"], (
+            "Ascend910B split-AIV: tile.add output must NOT reuse the tile.load buffer when the "
+            "tpop_from_aic operand arrives as a loop-carried IterArg, but both bind to "
+            f"{bases['down_prev']}"
+        )
+
+    @staticmethod
+    def _build_back_edge_program():
+        """The tpop producer stands *after* the writer that consumes its value.
+
+        ``pipe_carry`` starts out as a plain ``tile.create``, so iteration 0 is
+        safe; from iteration 1 on it holds the ``tile.tpop_from_aic`` result that
+        the loop yields back into it.  The writer ``down_next`` therefore reads a
+        load result and a tpop value, but its tpop producer is only reached
+        *later* in program order — a single forward walk classifies the writer
+        before the carry's buffer is known to be tainted.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.AIV, attrs={"split": pl.SplitMode.UP_DOWN})
+            def main(self, down: pl.InOut[pl.Tensor[[16, 128], pl.FP32]]) -> pl.Tensor[[16, 128], pl.FP32]:
+                mem_vec_0: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
+                mem_vec_1: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
+                mem_vec_2: pl.Ptr = pl.tile.alloc(pl.Mem.Vec, 4096)
+                pipe_seed: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_0, 0, 4096), pl.Mem.Vec] = (
+                    pl.tile.create([8, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                )
+                for _i, (pipe_carry,) in pl.range(0, 2, init_values=(pipe_seed,)):
+                    down_prev: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_1, 0, 4096), pl.Mem.Vec] = (
+                        pl.tile.load(down, [0, 0], [8, 128], [8, 128], target_memory=pl.Mem.Vec)
+                    )
+                    # noqa: F841 — `down_next` is the writer under test; consuming it
+                    # (yielding it into a second carry) would move its lifetime and stop
+                    # MemoryReuse coalescing it onto the load buffer, defeating the test.
+                    down_next: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_2, 0, 4096), pl.Mem.Vec] = (  # noqa: F841
+                        pl.tile.add(down_prev, pipe_carry)
+                    )
+                    pipe_next: pl.Tile[[8, 128], pl.FP32, pl.MemRef(mem_vec_0, 0, 4096), pl.Mem.Vec] = (
+                        pl.tile.tpop_from_aic(split=1)
+                    )
+                    loop_out = pl.yield_(pipe_next)
+                result: pl.Tensor[[16, 128], pl.FP32] = pl.tile.store(loop_out, [0, 0], down)
+                return result
+
+        return Prog
+
+    def test_tpop_reaching_a_writer_across_the_back_edge_blocks_reuse(self):
+        """Taint arriving through the loop back edge must still block the reuse.
+
+        The carry's buffer is only known to hold a tpop value once the *yielded*
+        producer is reached, which is after the writer in program order.  A
+        single forward traversal misses it and coalesces ``down_next`` onto the
+        load buffer; ``HazardInputCollector::Run`` walks the body twice so the
+        completed buffer taint is in hand before the writer is classified.
+        """
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = passes.memory_reuse()(self._build_back_edge_program())
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        assert "down_prev" in bases and "down_next" in bases, f"missing tile vars; got {bases}"
+        assert bases["down_next"] != bases["down_prev"], (
+            "Ascend910B split-AIV: tile.add output must NOT reuse the tile.load buffer when the "
+            "tpop_from_aic value reaches it across the loop back edge, but both bind to "
+            f"{bases['down_prev']}"
+        )
+
     def test_ascend950_allows_load_buffer_reuse(self):
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend950)
@@ -3949,17 +5127,45 @@ class TestAscend910BLoadTpopHazard:
 
 
 class TestForbidOutputAlias:
-    """A tile.sel output must not alias its mask (arg 0) or tmp (arg 3) buffer.
+    """Outputs must not alias operand buffers that the hardware still reads.
 
-    The TSEL intrinsic reads the predicate mask and the tmp scratch while
-    writing dst, so an in-place write onto either would corrupt the op
-    mid-flight (wrong select results on Ascend a2a3). tile.sel declares these
-    via OpRegistryEntry::forbid_output_alias(); MemoryReuse honours the marker
-    even when shape/dtype would otherwise permit the reuse.
+    These constraints live in the op registry so MemoryReuse can distinguish
+    operands whose lifetimes end at an op from operands safe for its output to
+    overwrite.
     """
 
+    def test_ci_output_does_not_alias_compiler_scratch(self):
+        """With #2523 level3 ci scratch disabled, tile.ci stays 2-arg (no compiler tmp)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self) -> pl.Tile[[1, 32], pl.INT32, pl.Mem.Vec]:
+                seq: pl.Tile[[1, 32], pl.INT32, pl.Mem.Vec] = pl.tile.ci(
+                    31, [1, 32], dtype=pl.INT32, descending=True
+                )
+                return seq
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        ci_calls: list[ir.Call] = []
+
+        class _CiCollector(ir.IRVisitor):
+            def visit_call(self, call: ir.Call) -> None:
+                if call.op.name == ir.get_op("tile.ci").name:
+                    ci_calls.append(call)
+                super().visit_call(call)
+
+        _CiCollector().visit_program(After)
+        assert len(ci_calls) == 1 and len(ci_calls[0].args) == 2
+
     def test_sel_output_does_not_alias_mask_or_tmp(self):
-        """dst skips the mask buffer (large enough to hold it) and reuses a value operand."""
+        """dst skips the mask/tmp buffers while remaining free to reuse a value operand."""
 
         @pl.program
         class Before:
@@ -3983,7 +5189,12 @@ class TestForbidOutputAlias:
                 res: pl.Tensor[[16, 16], pl.FP32] = pl.store(dst, [0, 0], out)
                 return res
 
-        After = _run_pipeline(Before)
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
         bases = _collect_tile_memref_bases(After)
         for name in ("dst", "mask", "tmp"):
             assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
@@ -3996,6 +5207,44 @@ class TestForbidOutputAlias:
         assert bases["dst"] != bases["tmp"], (
             f"tile.sel output must not alias its tmp buffer, but both bind to {bases['dst']}"
         )
+
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    def test_sel_output_may_reuse_dead_lhs(self, backend_type):
+        """TSEL may reuse a dying lhs/rhs buffer; mask and tmp stay forbidden."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                lhs: pl.Tensor[[8, 16], pl.FP32],
+                rhs: pl.Tensor[[8, 16], pl.FP32],
+                tmp_in: pl.Tensor[[1, 16], pl.UINT32],
+                out: pl.Out[pl.Tensor[[8, 16], pl.FP32]],
+            ) -> pl.Tensor[[8, 16], pl.FP32]:
+                scattered: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(lhs, [0, 0], [8, 16])
+                base: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(rhs, [0, 0], [8, 16])
+                dead: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(scattered, scattered)
+                mask: pl.Tile[[8, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=1)
+                tmp: pl.Tile[[1, 16], pl.UINT32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [1, 16])
+                dst: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sel(mask, scattered, base, tmp)
+                keep_base_live: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(base, dst)
+                res: pl.Tensor[[8, 16], pl.FP32] = pl.store(keep_base_live, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "scattered", "base", "mask", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] == bases["scattered"]
+        assert bases["dst"] != bases["base"]
+        assert bases["dst"] != bases["mask"]
+        assert bases["dst"] != bases["tmp"]
 
     @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
     def test_sels_output_may_reuse_dead_tmp(self, backend_type):
@@ -4464,7 +5713,7 @@ class TestCapacityGatedReuse:
     afford it; when it cannot, the shed / force_legacy floor merges them (the
     fa_fused 8->1 collapse in miniature). The success metric is WAR distance /
     overlap, *never* sync-flag count (see the pipeline-stage guard in
-    docs/en/dev/passes/29-memory_reuse.md). The operands are ``tile.move``
+    docs/en/dev/passes/34-memory_reuse.md). The operands are ``tile.move``
     results (not loads), so the legacy load-only guard never protected them either.
     """
 
@@ -4939,7 +6188,7 @@ class TestCapacityGatedReuse:
 
     def test_composes_with_matmul_acc_carry(self):
         """Carry composition (#1352; see the loop-carry re-alignment in
-        docs/en/dev/passes/29-memory_reuse.md): the gate only ever *adds* separation and
+        docs/en/dev/passes/34-memory_reuse.md): the gate only ever *adds* separation and
         excludes loop carries from the packer, so capacity-gated reuse must not disturb a
         matmul_acc accumulator chain. These operands carry no pipeline_membership tags,
         so they never trip the gated residue constraint and behave like legacy. The pass

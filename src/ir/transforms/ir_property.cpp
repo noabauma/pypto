@@ -83,6 +83,8 @@ std::string IRPropertyToString(IRProperty prop) {
       return "ArrayNotEscaped";
     case IRProperty::CommDomainScopesMaterialized:
       return "CommDomainScopesMaterialized";
+    case IRProperty::DistTensorCtxMaterialized:
+      return "DistTensorCtxMaterialized";
     case IRProperty::RuntimeScopesMaterialized:
       return "RuntimeScopesMaterialized";
     case IRProperty::AssignTypeSymmetry:
@@ -103,6 +105,10 @@ std::string IRPropertyToString(IRProperty prop) {
       return "AccToGmStoreValid";
     case IRProperty::AtomicAddDtypeValid:
       return "AtomicAddDtypeValid";
+    case IRProperty::AccCompactValid:
+      return "AccCompactValid";
+    case IRProperty::GraphBoundaryLegalized:
+      return "GraphBoundaryLegalized";
     default:
       return "Unknown";
   }
@@ -149,10 +155,14 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::ManualDepsOnSubmitOnly,
                                    IRProperty::ReturnParamsExplicit,
                                    IRProperty::AivSplitValid,
+                                   IRProperty::TileMemoryInferred,
                                    IRProperty::HardSyncallOccupancyValid,
                                    IRProperty::IterArgCarryClassified,
                                    IRProperty::RuntimeScopesMaterialized,
+                                   IRProperty::DistTensorCtxMaterialized,
+                                   IRProperty::GraphBoundaryLegalized,
                                    IRProperty::AccToGmStoreValid,
+                                   IRProperty::AccCompactValid,
                                    IRProperty::AtomicAddDtypeValid};
   return props;
 }

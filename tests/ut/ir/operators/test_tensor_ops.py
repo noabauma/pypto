@@ -461,7 +461,7 @@ def test_tensor_unary_preserves_symbolic_valid_shape():
     assert valid[1] == vlen  # the symbolic extent is carried through unchanged
 
 
-@pytest.mark.parametrize("op_name", ["adds", "subs", "muls", "divs", "maximum", "minimum"])
+@pytest.mark.parametrize("op_name", ["adds", "subs", "muls", "divs", "fmods", "maximum", "minimum"])
 def test_tensor_scalar_elementwise_preserves_partial_valid_shape(op_name):
     """Fresh scalar-elementwise results keep content validity, not source alias metadata."""
     partial = _partial_tensor_var([32, 256], [28, 250])
@@ -556,7 +556,7 @@ def test_tensor_cmp_does_not_claim_partial_valid_shape_before_lowering_support(r
     assert result_type.tensor_view is None
 
 
-@pytest.mark.parametrize("op_name", ["adds", "ands", "shls"])
+@pytest.mark.parametrize("op_name", ["adds", "fmods", "ands", "shls"])
 def test_tensor_scalar_elementwise_does_not_preserve_distributed_valid_shape(op_name):
     """Direct distributed windows need a separate valid-shape lowering contract."""
     window = _partial_distributed_tensor_var([32, 256], [28, 250], dtype=DataType.INT32)
@@ -1766,6 +1766,21 @@ def test_tensor_fmod():
     call_fmods = ir.op.tensor.fmods(var_a, 3.0)
     assert isinstance(call_fmods, ir.Call)
     assert call_fmods.op.name == _OP_TENSOR_FMODS
+
+
+def test_tensor_fmod_rejects_contracts_that_tile_lowering_cannot_emit():
+    span = ir.Span.unknown()
+    fp32 = ir.Var("fp32", ir.TensorType([8, 16], DataType.FP32), span)
+    fp16 = ir.Var("fp16", ir.TensorType([8, 16], DataType.FP16), span)
+    broadcast = ir.Var("broadcast", ir.TensorType([1, 16], DataType.FP32), span)
+    scalar = ir.Var("scalar", ir.ScalarType(DataType.FP16), span)
+
+    with pytest.raises(ValueError, match="matching operand dtypes"):
+        ir.op.tensor.fmod(fp32, fp16)
+    with pytest.raises(ValueError, match="matching operand shapes"):
+        ir.op.tensor.fmod(fp32, broadcast)
+    with pytest.raises(ValueError, match="scalar dtype to match"):
+        ir.op.tensor.fmods(fp32, scalar)
 
 
 def test_const_float():
@@ -4179,12 +4194,16 @@ class TestTensorFormatShapeError:
             ir.op.tensor.add(tensor_a, tensor_b)
 
 
-def test_tensor_sort32():
-    """tensor.sort32 doubles the last dim and preserves dtype."""
+@pytest.mark.parametrize(
+    ("dtype", "expected_width"),
+    [(DataType.FP32, 64), (DataType.FP16, 128)],
+)
+def test_tensor_sort32_output_width_depends_on_dtype(dtype, expected_width):
+    """tensor.sort32 reserves one 8-byte value-index pair per input."""
     span = ir.Span.unknown()
     d8 = ir.ConstInt(8, DataType.INT32, span)
     d32 = ir.ConstInt(32, DataType.INT32, span)
-    src = ir.Var("src", ir.TensorType([d8, d32], DataType.FP32), span)
+    src = ir.Var("src", ir.TensorType([d8, d32], dtype), span)
     idx = ir.Var("idx", ir.TensorType([d8, d32], DataType.UINT32), span)
 
     call = ir.op.tensor.sort32(src, idx)
@@ -4193,10 +4212,31 @@ def test_tensor_sort32():
 
     result_type = call.type
     assert isinstance(result_type, ir.TensorType)
-    assert result_type.dtype == DataType.FP32
+    assert result_type.dtype == dtype
     assert len(result_type.shape) == 2
     assert isinstance(result_type.shape[1], ir.ConstInt)
-    assert result_type.shape[1].value == 64
+    assert result_type.shape[1].value == expected_width
+
+
+def test_tensor_sort32_scales_symbolic_valid_width():
+    """The logical output region tracks a runtime FP16 input tail at 4x width."""
+    span = ir.Span.unknown()
+    valid_cols = ir.Var("valid_cols", ir.ScalarType(DataType.INDEX), span)
+    src_view = ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[1, valid_cols])
+    idx_view = ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[1, valid_cols])
+    src = ir.Var("src", ir.TensorType([1, 64], DataType.FP16, tensor_view=src_view), span)
+    idx = ir.Var("idx", ir.TensorType([1, 64], DataType.UINT32, tensor_view=idx_view), span)
+
+    result_type = ir.op.tensor.sort32(src, idx).type
+
+    assert isinstance(result_type, ir.TensorType)
+    assert result_type.shape == [1, 256]
+    assert result_type.tensor_view is not None
+    valid_width = result_type.tensor_view.valid_shape[1]
+    assert isinstance(valid_width, ir.Mul)
+    assert valid_width.left is valid_cols
+    assert isinstance(valid_width.right, ir.ConstInt)
+    assert valid_width.right.value == 4
 
 
 def test_tensor_sort32_wrong_dtype():
@@ -4938,6 +4978,36 @@ class TestTensorAssembleValidRegionUnion:
         assert view is not None
         assert ir.python_print(view.valid_shape[0]) == "pl.min(k + m, 64)"
         assert _valid_of(result_type)[1] == 128
+
+    def test_clamped_negative_extent_is_not_treated_as_a_dimension_symbol(self):
+        """`max(-x, 0)` is a compound extent: nothing may assume `x >= 0`.
+
+        The union may take a *whole* dimension that is a bare symbol as
+        non-negative — a dimension is a count of elements. It must not descend
+        into a compound extent and assume the same of the variables inside it.
+        Here the true extent is `4` when `x == -4`; assuming `x >= 0` collapses
+        `max(-x, 0)` to `0`, which reads as an empty target and silently returns
+        the written extent alone instead of the union (issue #2500).
+
+        The union keeps `-x`: `max(max(-x, 0), 2)` is `max(-x, 2)`, which is `4`
+        for `x == -4` and `2` for `x == 5` — both correct.
+        """
+        x = self._symbol("x")
+        span = ir.Span.unknown()
+        clamped = ir.Max(
+            ir.Neg(x, DataType.INDEX, span), ir.ConstInt(0, DataType.INDEX, span), DataType.INDEX, span
+        )
+        target = _partial_tensor_var([64, 128], [clamped, 128], name="dst")
+        source = _partial_tensor_var([32, 128], [2, 128], name="src")
+
+        result_type = ir.op.tensor.assemble(target, source, [0, 0]).type
+
+        assert isinstance(result_type, ir.TensorType)
+        view = result_type.tensor_view
+        assert view is not None
+        printed = ir.python_print(view.valid_shape[0])
+        assert "-x" in printed, f"the negated scalar was folded away: {printed}"
+        assert printed == "pl.min(pl.max(-x, 2), 64)", printed
 
     def test_unprovable_symbolic_offset_rejects(self):
         """An offset unrelated to the target's extent cannot be shown to abut it."""

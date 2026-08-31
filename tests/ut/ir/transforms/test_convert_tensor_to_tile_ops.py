@@ -36,6 +36,12 @@ from pypto.pypto_core.ir import MemorySpace, PadValue
 # share one parametrized body.
 # ---------------------------------------------------------------------------
 
+# Runtime valid-row extents for the dynamic row-broadcast div tests: `lhs` and a
+# covering `rhs` share one symbol, while `_UNRELATED_ROWS` names an extent the
+# pass cannot prove covers the dividend.
+_SHARED_ROWS = pl.dynamic("shared_rows")
+_UNRELATED_ROWS = pl.dynamic("unrelated_rows")
+
 InSpec = tuple[str, list[int], DataType]  # (param name, shape, dtype)
 ExtraSpec = tuple[str, ir.Type]  # (param name, ir type) — non-tensor (e.g. Scalar) extra params
 TensorBody = Callable[..., ir.Expr]  # (ib, in_vars[, extras]) -> final tensor var
@@ -150,8 +156,22 @@ def _make_expected(
                     load_shape = list(shape if override is None else override)
                     name_override = None if load_names is None else load_names[i]
                     stem = name if name_override is None else name_override
+                    # A shape override means this load replaced a `tensor.slice`,
+                    # so the converter built it from the consumer's declared
+                    # InputSpaceReq and named the space. A plain entry load has
+                    # no such requirement: the converter leaves it unset and
+                    # InferTileMemorySpace places it.
+                    load_space = None if override is None else MemorySpace.Vec
                     tile_vars.append(
-                        ib.let(f"{stem}_tile", tile_ops.load(p, _zeros(len(load_shape)), load_shape))
+                        ib.let(
+                            f"{stem}_tile",
+                            tile_ops.load(
+                                p,
+                                _zeros(len(load_shape)),
+                                load_shape,
+                                target_memory=load_space,
+                            ),
+                        )
                     )
             else:
                 tile_vars = list(in_params)
@@ -540,53 +560,72 @@ class TestConvertTensorToTileOps:
 
     def test_tensor_view_passes_through_incore(self):
         """``tensor.view`` remains a GM metadata op in an InCore function."""
-        ib = IRBuilder()
-        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
-            x = f.param("x", ir.TensorType([2, 16], DataType.FP32))
-            viewed = ib.let("viewed", tensor_ops.view(x, [32]))
-            f.return_type(viewed.type)
-            ib.return_stmt(viewed)
-        before = ir.Program([f.get_result()], "TensorViewPassThrough", ir.Span.unknown())
 
-        after = passes.convert_tensor_to_tile_ops()(before)
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[2, 16], pl.FP32]
+            ) -> pl.Tensor[[32], pl.FP32, pl.TensorView(stride=[1], layout=pl.TensorLayout.ND)]:
+                viewed = pl.tensor.view(x, [32])
+                return viewed
 
-        ir.assert_structural_equal(after, before)
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Before)
 
     def test_tensor_slice_drop_dims_lowers_to_tile(self):
-        """Rank reduction preserves source validity and emits a separate reshape."""
-        ib = IRBuilder()
-        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
-            source_view = ir.TensorView(valid_shape=[3, 12], layout=ir.TensorLayout.ND)
-            x = f.param(
-                "x",
-                ir.TensorType([3, 64], DataType.FP32, memref=None, tensor_view=source_view),
-            )
-            sliced = ib.let("sliced", tensor_ops.slice(x, [1, 64], [1, 0], drop_dims=[0]))
-            f.return_type(sliced.type)
-            ib.return_stmt(sliced)
-        before = ir.Program([f.get_result()], "TensorSliceDropDims", ir.Span.unknown())
+        """Rank reduction preserves source validity and emits a separate reshape.
 
-        after = passes.convert_tensor_to_tile_ops()(before)
-        text = ir.python_print(after)
+        ``Expected`` pins that the dropped axis is folded into the ``tile.load``
+        extent (``[1, 64]`` read, ``[1, 12]`` valid) and that the rank drop is a
+        *separate* ``tile.reshape`` rather than a nested one.
+        """
 
-        assert "pl.tile.load(x, [1, 0], [1, 64], [1, 12]" in text
-        assert "pl.tile.reshape(" in text
-        assert ", [64])" in text
-        assert "pl.tile.reshape(pl.tile.load(" not in text
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[3, 64], pl.FP32, pl.TensorView(valid_shape=[3, 12], layout=pl.TensorLayout.ND)],
+            ) -> pl.Tensor[[64], pl.FP32, pl.TensorView(valid_shape=[12], layout=pl.TensorLayout.ND)]:
+                sliced = pl.tensor.slice(x, [1, 64], [1, 0], drop_dims=[0])
+                return sliced
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[3, 64], pl.FP32, pl.TensorView(valid_shape=[3, 12], layout=pl.TensorLayout.ND)],
+                ret0__out: pl.Out[
+                    pl.Tensor[[64], pl.FP32, pl.TensorView(valid_shape=[12], layout=pl.TensorLayout.ND)]
+                ],
+            ) -> pl.Tensor[[64], pl.FP32, pl.TensorView(valid_shape=[12], layout=pl.TensorLayout.ND)]:
+                slice_load: pl.Tile[[1, 64], pl.FP32, pl.Mem.Vec, pl.TileView(valid_shape=[1, 12])] = (
+                    pl.tile.load(x, [1, 0], [1, 64], [1, 12], target_memory=pl.Mem.Vec)
+                )
+                sliced__tile: pl.Tile[[64], pl.FP32, pl.Mem.Vec, pl.TileView(valid_shape=[12])] = (
+                    pl.tile.reshape(slice_load, [64])
+                )
+                ret0__store = pl.tile.store(sliced__tile, [0], ret0__out)
+                return ret0__store
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
 
     def test_tensor_view_rejects_input_converted_to_tile(self):
         """A GM view cannot consume a producer that pass 12 lowers to Tile."""
-        ib = IRBuilder()
-        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
-            x = f.param("x", ir.TensorType([4, 8], DataType.FP32))
-            f.return_type(ir.TensorType([32], DataType.FP32))
-            sliced = ib.let("sliced", tensor_ops.slice(x, [4, 8], [0, 0]))
-            viewed = ib.let("viewed", tensor_ops.view(sliced, [32]))
-            ib.return_stmt(viewed)
-        program = ir.Program([f.get_result()], "TensorViewConvertedInput", ir.Span.unknown())
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, x: pl.Tensor[[4, 8], pl.FP32]) -> pl.Tensor[[32], pl.FP32]:
+                sliced = pl.tensor.slice(x, [4, 8], [0, 0])
+                viewed = pl.tensor.view(sliced, [32])
+                return viewed
 
         with pytest.raises(ValueError, match="result of an op lowered to Tile"):
-            passes.convert_tensor_to_tile_ops()(program)
+            passes.convert_tensor_to_tile_ops()(Before)
 
     def test_reinterpret_view_auto_shape_lowers_to_tile(self):
         """Packed ND tensor reinterpret lowers 1:1 and keeps auto-shape semantics."""
@@ -623,23 +662,19 @@ class TestConvertTensorToTileOps:
 
     def test_reinterpret_view_rejects_dn_incore_lowering(self):
         """DN tensor reinterpret is rejected before conversion loses its contiguous axis."""
-        span = ir.Span.unknown()
-        source_type = ir.TensorType(
-            [8, 16],
-            DataType.FP32,
-            None,
-            ir.TensorView([], ir.TensorLayout.DN),
-        )
-        ib = IRBuilder()
-        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
-            x = f.param("x", source_type)
-            viewed = ib.let("viewed", tensor_ops.reinterpret_view(x, DataType.INT16))
-            f.return_type(viewed.type)
-            ib.return_stmt(viewed)
-        program = ir.Program([f.get_result()], "DnReinterpretView", span)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[8, 16], pl.FP32, pl.TensorView(stride=[], layout=pl.TensorLayout.DN)],
+            ) -> pl.Tensor[[8, 32], pl.INT16, pl.TensorView(stride=[], layout=pl.TensorLayout.DN)]:
+                viewed = pl.tensor.reinterpret_view(x, pl.INT16)
+                return viewed
 
         with pytest.raises(ValueError, match="only packed ND tensors"):
-            passes.convert_tensor_to_tile_ops()(program)
+            passes.convert_tensor_to_tile_ops()(Before)
 
     def test_2d_tensor(self):
         """2D tensor -> correct offsets and shapes for load/store."""
@@ -918,7 +953,7 @@ class TestConvertTensorToTileOps:
                 dst: pl.Out[pld.DistributedTensor[[16, 64], pl.FP16]],
                 peer: pl.Scalar[pl.INT32],
             ):
-                x_vec: pl.Tile[[16, 64], pl.FP16, pl.Mem.Vec] = pl.tile.load(x, [0, 0], [16, 64], [16, 64])
+                x_vec: pl.Tile[[16, 64], pl.FP16] = pl.tile.load(x, [0, 0], [16, 64], [16, 64])
                 scaled = pl.tile.add(x_vec, x_vec)
                 pld.tile.remote_store(scaled, dst, peer, [0, 0])
                 return  # noqa: PLR1711  (DSL return terminator, not a Python no-op)
@@ -962,7 +997,9 @@ class TestConvertTensorToTileOps:
                 dst: pl.Out[pld.DistributedTensor[[16, 64], pl.FP16]],
                 peer: pl.Scalar[pl.INT32],
             ):
-                x_vec: pl.Tile[[16, 64], pl.FP16, pl.Mem.Vec] = pl.tile.load(x, [0, 0], [16, 64], [16, 64])
+                x_vec: pl.Tile[[16, 64], pl.FP16, pl.Mem.Vec] = pl.tile.load(
+                    x, [0, 0], [16, 64], [16, 64], target_memory=pl.Mem.Vec
+                )
                 pld.tile.remote_store(x_vec, dst, peer, [0, 0])
                 return  # noqa: PLR1711  (DSL return terminator, not a Python no-op)
 
@@ -1074,7 +1111,7 @@ class TestConvertTensorToTileOps:
         in_specs: list[InSpec] = [("x", [64], DataType.FP32)]
 
         def expected_body(ib, tiles):
-            tmp = ib.let("rsqrt_tmp", tile_ops.create([64], DataType.FP32))
+            tmp = ib.let("rsqrt_tmp", tile_ops.create([64], DataType.FP32, target_memory=MemorySpace.Vec))
             return ib.let("y_tile", tile_ops.rsqrt(tiles[0], tmp))
 
         before = _make_before(
@@ -1147,7 +1184,7 @@ class TestConvertTensorToTileOps:
         in_specs: list[InSpec] = [("x", [64], DataType.INT32), *extra_in]
 
         def expected_body(ib, tiles):
-            tmp = ib.let("xor_tmp", tile_ops.create([64], DataType.INT32))
+            tmp = ib.let("xor_tmp", tile_ops.create([64], DataType.INT32, target_memory=MemorySpace.Vec))
             return ib.let("z_tile", tile_call(tiles, tmp))
 
         before = _make_before(
@@ -1275,65 +1312,56 @@ class TestConvertTensorToTileOps:
 
     def test_div_row_broadcast_requires_divisor_valid_rows_to_cover_dividend(self):
         """The row-expand template reads one divisor scalar for every valid output row."""
-        span = ir.Span.unknown()
-        lhs_type = ir.TensorType(
-            [8, 16],
-            DataType.FP32,
-            None,
-            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[7, 16]),
-        )
-        rhs_type = ir.TensorType(
-            [8, 1],
-            DataType.FP32,
-            None,
-            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[6, 1]),
-        )
-        ib = IRBuilder()
-        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
-            lhs = f.param("lhs", lhs_type)
-            rhs = f.param("rhs", rhs_type)
-            result = ib.let("result", tensor_ops.div(lhs, rhs))
-            f.return_type(result.type)
-            ib.return_stmt(result)
-        before = ir.Program([f.get_result()], "ShortDivisorValidRows", span)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[
+                    [8, 16], pl.FP32, pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[7, 16])
+                ],
+                rhs: pl.Tensor[[8, 1], pl.FP32, pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[6, 1])],
+            ) -> pl.Tensor[[8, 16], pl.FP32, pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[7, 16])]:
+                result = pl.div(lhs, rhs)
+                return result
 
         with pytest.raises(ValueError, match=r"divisor valid rows to cover the dividend"):
-            passes.convert_tensor_to_tile_ops()(before)
+            passes.convert_tensor_to_tile_ops()(Before)
 
     def test_div_row_broadcast_dynamic_valid_rows_must_be_provably_covered(self):
         """A shared runtime extent is safe, while unrelated extents need a runtime guard."""
-        span = ir.Span.unknown()
-        shared_rows = ir.Var("shared_rows", ir.ScalarType(DataType.INDEX), span)
-        unrelated_rows = ir.Var("unrelated_rows", ir.ScalarType(DataType.INDEX), span)
 
-        def make_program(rhs_rows: ir.Expr, name: str) -> ir.Program:
-            lhs_type = ir.TensorType(
-                [8, 16],
-                DataType.FP32,
-                None,
-                ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[shared_rows, 16]),
-            )
-            rhs_type = ir.TensorType(
-                [8, 1],
-                DataType.FP32,
-                None,
-                ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[rhs_rows, 1]),
-            )
-            ib = IRBuilder()
-            with ib.function("kernel", type=ir.FunctionType.InCore) as f:
-                lhs = f.param("lhs", lhs_type)
-                rhs = f.param("rhs", rhs_type)
-                result = ib.let("result", tensor_ops.div(lhs, rhs))
-                f.return_type(result.type)
-                ib.return_stmt(result)
-            return ir.Program([f.get_result()], name, span)
+        def make_program(rhs_rows):
+            @pl.program
+            class Before:
+                @pl.function(type=pl.FunctionType.InCore)
+                def kernel(
+                    self,
+                    lhs: pl.Tensor[
+                        [8, 16],
+                        pl.FP32,
+                        pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[_SHARED_ROWS, 16]),
+                    ],
+                    rhs: pl.Tensor[
+                        [8, 1], pl.FP32, pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[rhs_rows, 1])
+                    ],
+                ) -> pl.Tensor[
+                    [8, 16],
+                    pl.FP32,
+                    pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[_SHARED_ROWS, 16]),
+                ]:
+                    result = pl.div(lhs, rhs)
+                    return result
 
-        converted = passes.convert_tensor_to_tile_ops()(make_program(shared_rows, "SharedDivValidRows"))
+            return Before
+
+        converted = passes.convert_tensor_to_tile_ops()(make_program(_SHARED_ROWS))
         kernel = _require_function(converted, "kernel")
         assert _find_first_call_to(kernel, "tile.row_expand_div") is not None
 
         with pytest.raises(ValueError, match=r"divisor valid rows to cover the dividend"):
-            passes.convert_tensor_to_tile_ops()(make_program(unrelated_rows, "UnknownDivValidRows"))
+            passes.convert_tensor_to_tile_ops()(make_program(_UNRELATED_ROWS))
 
     def test_div_mixed_float_row_broadcast_inserts_explicit_cast(self):
         """Row-expand division receives one exact floating dtype after tensor promotion."""
@@ -1401,31 +1429,25 @@ class TestConvertTensorToTileOps:
             passes.convert_tensor_to_tile_ops()(before)
 
     def test_div_rejects_mismatched_valid_shapes_conversion(self):
-        """Equal physical shapes with different source valid regions cannot lower to tdiv."""
-        span = ir.Span.unknown()
-        lhs_type = ir.TensorType(
-            [8, 16],
-            DataType.FP32,
-            None,
-            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[7, 16]),
-        )
-        rhs_type = ir.TensorType(
-            [8, 16],
-            DataType.FP32,
-            None,
-            ir.TensorView(layout=ir.TensorLayout.ND, valid_shape=[8, 16]),
-        )
-        ib = IRBuilder()
-        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
-            lhs = f.param("lhs", lhs_type)
-            rhs = f.param("rhs", rhs_type)
-            result = ib.let("result", tensor_ops.div(lhs, rhs))
-            f.return_type(result.type)
-            ib.return_stmt(result)
-        before = ir.Program([f.get_result()], "MismatchedDivValidShapes", span)
+        """Exact-shape tile.div needs one shared valid_shape across src0/src1/dst."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[
+                    [8, 16], pl.FP32, pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[7, 16])
+                ],
+                rhs: pl.Tensor[
+                    [8, 16], pl.FP32, pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[8, 16])
+                ],
+            ) -> pl.Tensor[[8, 16], pl.FP32, pl.TensorView(layout=pl.TensorLayout.ND, valid_shape=[7, 16])]:
+                result = pl.div(lhs, rhs)
+                return result
 
         with pytest.raises(ValueError, match=r"requires src0, src1, and dst to have the same valid_shape"):
-            passes.convert_tensor_to_tile_ops()(before)
+            passes.convert_tensor_to_tile_ops()(Before)
 
     def test_subs_mixed_dtype_conversion_preserves_lhs_dtype(self):
         """An explicit FP32 scalar stays FP32 while the i16 tsubs result stays i16."""
@@ -1452,7 +1474,7 @@ class TestConvertTensorToTileOps:
         """tensor.row_min lowers to an ND tile.row_min with a safe padded scratch tile."""
 
         def expected_body(ib, tiles):
-            tmp = ib.let("tmp_tile", tile_ops.create([32, 128], DataType.FP32))
+            tmp = ib.let("tmp_tile", tile_ops.create([32, 128], DataType.FP32, target_memory=MemorySpace.Vec))
             return ib.let("y_tile", tile_ops.row_min(tiles[0], tmp))
 
         before = _make_before(
@@ -1488,7 +1510,7 @@ class TestConvertTensorToTileOps:
         out_shape = [32, 1] if op_name.startswith("row") else [1, 64]
 
         def expected_body(ib, tiles):
-            tmp = ib.let("tmp_tile", tile_ops.create([32, 64], DataType.FP32))
+            tmp = ib.let("tmp_tile", tile_ops.create([32, 64], DataType.FP32, target_memory=MemorySpace.Vec))
             return ib.let("y_tile", tile_op(tiles[0], tmp))
 
         before = _make_before(
@@ -1516,6 +1538,41 @@ class TestConvertTensorToTileOps:
             tile_op=lambda ts, op=tile_op: op(ts[0], ts[1]),
         )
         _assert_convert_equal(before, expected)
+
+    def test_column_vector_load_layout_does_not_depend_on_target_memory(self):
+        """An [N, 1] tile.load deduces the column-vector layout with or without target_memory.
+
+        The column-vector rule in DeduceTileLoadType used to sit inside the
+        ``target_memory.has_value()`` branch, so a load with the kwarg omitted kept an
+        explicit ``row_major`` claim that contradicts InferImplicitTileLayoutFromShape.
+        Because the two disagreed the view could not canonicalize to ``None``, and the
+        row-major branch of tile.row_expand_add then rejected the operand outright
+        ("requires row-major src1 valid last dimension to be 16").
+
+        This is a dedicated regression: the parametrized ``test_row_expand_family`` above
+        now compares against an ``_make_expected`` helper that spells ``target_memory=Vec``
+        (the converter's Phase-1 preload still stamps it), so it no longer exercises the
+        unset path at all.
+        """
+        span = ir.Span(__file__, 1, 1)
+        rv = ir.Var("rv", ir.TensorType([32, 1], DataType.FP16), span)
+        x = ir.Var("x", ir.TensorType([32, 64], DataType.FP16), span)
+
+        unset = tile_ops.load(rv, [0, 0], [32, 1])
+        vec = tile_ops.load(rv, [0, 0], [32, 1], target_memory=MemorySpace.Vec)
+
+        # Both canonicalize away: the deduced view matches the shape-implied col_major.
+        assert isinstance(unset.type, ir.TileType)
+        assert isinstance(vec.type, ir.TileType)
+        assert unset.type.tile_view is None
+        assert vec.type.tile_view is None
+        assert unset.type.memory_space is None
+        assert vec.type.memory_space == MemorySpace.Vec
+
+        # ... and the unset column vector is accepted as the row_expand_add row operand.
+        row_expanded = tile_ops.row_expand_add(tile_ops.load(x, [0, 0], [32, 64]), unset)
+        assert isinstance(row_expanded.type, ir.TileType)
+        assert row_expanded.type.shape == [32, 64]
 
     @pytest.mark.parametrize(("op_name", "tensor_op", "tile_op"), _COL_EXPAND_OPS)
     def test_col_expand_family(self, op_name, tensor_op, tile_op):
@@ -1569,6 +1626,443 @@ class TestConvertTensorToTileOps:
         )
         _assert_convert_equal(before, expected)
 
+    @pytest.mark.parametrize(
+        ("name", "rows", "boxed_rows"),
+        [
+            ("single_row", 1, 16),
+            ("just_over_one_box", 17, 32),
+            ("mid_box", 100, 112),
+        ],
+    )
+    def test_matmul_lhs_rows_are_boxed_to_the_cube_fractal(self, name, rows, boxed_rows):
+        """An unaligned matmul M loads a whole number of NZ fractal boxes.
+
+        PTO-ISA separates the two extents of a cube operand: ``pto.mad`` derives
+        ``%m`` from the operand's *valid* rows (``%m == 1`` is a documented case),
+        while the *physical* allocation must be whole 16-row boxes -- ptoas rejects
+        anything else with ``'pto.alloc_tile' op expects result boxed tile rows to
+        be a multiple of innerRows (16)``. So the bridge load allocates the boxed
+        row count and declares the tensor's true extent as ``valid_shape``; the
+        DMA still moves only the valid rows. The right operand's rows are ``K``,
+        whose granularity is dtype-dependent, and are left alone.
+        """
+        lhs_shape = [rows, 128]
+        rhs_shape = [128, 64]
+        out_shape = [rows, 64]
+        dtype = DataType.FP16
+        in_specs: list[InSpec] = [("lhs", lhs_shape, dtype), ("rhs", rhs_shape, dtype)]
+
+        def before_body(ib, ins):
+            return ib.let("y", tensor_ops.matmul(ins[0], ins[1]))
+
+        def expected_body(ib, params):
+            lhs_p, rhs_p = params
+            lhs_mat = ib.let(
+                "lhs_mat",
+                tile_ops.load(lhs_p, [0, 0], [boxed_rows, 128], lhs_shape, target_memory=MemorySpace.Mat),
+            )
+            rhs_mat = ib.let(
+                "rhs_mat",
+                tile_ops.load(rhs_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
+            )
+            return ib.let("y_tile", tile_ops.matmul(lhs_mat, rhs_mat))
+
+        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=before_body)
+        expected = _make_expected(
+            in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=expected_body, preload=False
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_sliced_matmul_lhs_is_row_boxed_by_the_consumer_driven_load(self):
+        """A sliced left operand is boxed too, not just a bare parameter.
+
+        A ``tensor.slice`` feeding a matmul answers the Mat demand at the slice
+        itself (``HandleConsumerDrivenLoad``) rather than through
+        ``BridgeInputSpaces``, so the box rule has to ride on ``ConsumerSpaceReq``
+        as well. Without that the sliced operand keeps its unaligned physical row
+        count all the way to ptoas. ``valid_shape`` still names the slice window,
+        so only the allocation grows.
+        """
+        param_shape = [32, 128]
+        slice_shape: list[int | ir.Expr] = [17, 128]
+        rhs_shape = [128, 64]
+        out_shape = [17, 64]
+        dtype = DataType.FP16
+        in_specs: list[InSpec] = [("a", param_shape, dtype), ("b", rhs_shape, dtype)]
+
+        def before_body(ib, ins):
+            sliced = ib.let("a_slice", tensor_ops.slice(ins[0], slice_shape, [0, 0]))
+            return ib.let("y", tensor_ops.matmul(sliced, ins[1]))
+
+        def expected_body(ib, params):
+            a_p, b_p = params
+            lhs_mat = ib.let(
+                "a_slice_tile",
+                tile_ops.load(a_p, [0, 0], [32, 128], slice_shape, target_memory=MemorySpace.Mat),
+            )
+            rhs_mat = ib.let(
+                "rhs_mat",
+                tile_ops.load(b_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
+            )
+            return ib.let("y_tile", tile_ops.matmul(lhs_mat, rhs_mat))
+
+        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=before_body)
+        expected = _make_expected(
+            in_specs=in_specs, out_shape=out_shape, out_dtype=dtype, body=expected_body, preload=False
+        )
+        _assert_convert_equal(before, expected)
+
+    def test_matmul_lhs_reached_through_set_validshape_is_row_boxed(self):
+        """A parameter that reaches the matmul through an inherit-input wrapper.
+
+        ``tensor.set_validshape`` propagates the Mat demand back to the parameter,
+        whose load the pass emits in its Phase-1 entry loop -- neither
+        ``BridgeInputSpaces`` nor ``HandleConsumerDrivenLoad``. That third site
+        needs the same boxing, or a 17-row operand reaches ptoas with 17 physical
+        rows and is rejected.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                av: pl.Tensor[[17, 128], pl.FP16] = pl.tensor.set_validshape(a, 17, 128)
+                y: pl.Tensor[[17, 64], pl.FP32] = pl.matmul(av, b, out_dtype=pl.FP32)
+                return y
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                y: pl.Tensor[[17, 64], pl.FP32] = self.main_incore_0(a, b)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[17, 128], pl.FP16],
+                b: pl.Tensor[[128, 64], pl.FP16],
+                ret0_out: pl.Out[pl.Tensor[[17, 64], pl.FP32]],
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                # 17 rows allocated as two whole 16-row NZ boxes; valid_shape keeps
+                # the true extent, so the store still writes exactly 17 rows.
+                a_mat: pl.Tile[[32, 128], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    a, [0, 0], [32, 128], [17, 128], target_memory=pl.MemorySpace.Mat
+                )
+                av_tile = pl.tile.set_validshape(a_mat, 17, 128)
+                b_mat: pl.Tile[[128, 64], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    b, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile = pl.tile.matmul(av_tile, b_mat)
+                out_store: pl.Tensor[[17, 64], pl.FP32] = pl.store(y_tile, [0, 0], ret0_out)
+                return out_store
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                ret0_out: pl.Tensor[[17, 64], pl.FP32] = pl.create_tensor([17, 64], dtype=pl.FP32)
+                y: pl.Tensor[[17, 64], pl.FP32] = self.main_incore_0(a, b, ret0_out)
+                return y
+
+        _assert_convert_equal(Before, Expected)
+
+    @pytest.mark.parametrize(
+        ("name", "dtype", "acc_dtype", "cols", "boxed_cols"),
+        [
+            # The column box holds 32 bytes' worth of elements: 16 for FP16, 32 for INT8.
+            ("fp16", DataType.FP16, DataType.FP32, 17, 32),
+            ("int8", DataType.INT8, DataType.INT32, 100, 128),
+        ],
+    )
+    def test_matmul_a_trans_lhs_is_boxed_on_its_column_axis(self, name, dtype, acc_dtype, cols, boxed_cols):
+        """A transposed left operand is boxed on its COLUMN axis, not its rows.
+
+        ``a_trans`` loads the operand naturally and reinterprets it with a
+        zero-copy ``tile.transpose_view``, so the loaded tile's row axis is the
+        matmul's ``K`` and its *column* axis is ``M``. The box rule follows M to
+        whichever axis carries it. The granularity there is the fractal-512
+        column box, ``32 / sizeof(dtype)`` -- which is why the INT8 case pads to
+        128 rather than to the 112 a row-axis box would give.
+        """
+        lhs_shape = [128, cols]
+        rhs_shape = [128, 64]
+        out_shape = [cols, 64]
+        in_specs: list[InSpec] = [("lhs", lhs_shape, dtype), ("rhs", rhs_shape, dtype)]
+
+        def before_body(ib, ins):
+            return ib.let("y", tensor_ops.matmul(ins[0], ins[1], a_trans=True))
+
+        def expected_body(ib, params):
+            lhs_p, rhs_p = params
+            lhs_mat = ib.let(
+                "lhs_mat",
+                tile_ops.load(lhs_p, [0, 0], [128, boxed_cols], lhs_shape, target_memory=MemorySpace.Mat),
+            )
+            lhs_operand = ib.let("lhs_mat_t", tile_ops.transpose_view(lhs_mat))
+            rhs_mat = ib.let(
+                "rhs_mat",
+                tile_ops.load(rhs_p, [0, 0], rhs_shape, rhs_shape, target_memory=MemorySpace.Mat),
+            )
+            return ib.let("y_tile", tile_ops.matmul(lhs_operand, rhs_mat))
+
+        before = _make_before(in_specs=in_specs, out_shape=out_shape, out_dtype=acc_dtype, body=before_body)
+        expected = _make_expected(
+            in_specs=in_specs, out_shape=out_shape, out_dtype=acc_dtype, body=expected_body, preload=False
+        )
+        _assert_convert_equal(before, expected)
+
+    @pytest.mark.parametrize(
+        ("name", "rows", "boxed_rows"),
+        [
+            ("single_row", 1, 16),
+            ("just_over_one_box", 17, 32),
+            ("mid_box", 100, 112),
+        ],
+    )
+    def test_matmul_acc_boxes_its_accumulator_with_its_lhs(self, name, rows, boxed_rows):
+        """``tensor.matmul_acc`` takes exactly ``tensor.matmul``'s M constraint.
+
+        The same box rule binds both cube operands the M axis runs through, and
+        it has to bind them *together*: ``tile.matmul_acc`` requires the
+        accumulator and the product to agree on physical M, so boxing the left
+        operand alone would trade one hard error for another. The accumulator is
+        never loaded -- nothing but the matrix unit writes L0C -- so its
+        allocation is where the demand is answered, and the narrowing rides on a
+        ``tile.set_validshape`` because ``tile.create`` takes no valid extent.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[rows, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[rows, 64], pl.FP32]:
+                acc: pl.Tensor[[rows, 64], pl.FP32] = pl.create_tensor([rows, 64], dtype=pl.FP32)
+                y: pl.Tensor[[rows, 64], pl.FP32] = pl.matmul_acc(acc, a, b)
+                return y
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[rows, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[rows, 64], pl.FP32]:
+                y: pl.Tensor[[rows, 64], pl.FP32] = self.main_incore_0(a, b)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[rows, 128], pl.FP16],
+                b: pl.Tensor[[128, 64], pl.FP16],
+                ret0_out: pl.Out[pl.Tensor[[rows, 64], pl.FP32]],
+            ) -> pl.Tensor[[rows, 64], pl.FP32]:
+                # compact: the box rounds the allocation past the pitch `mad`
+                # writes at (ceil(valid/16)*16), so every reader has to recompute
+                # that pitch rather than derive it from the physical rows.
+                acc_storage = pl.tile.create(
+                    [boxed_rows, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc, compact=True
+                )
+                acc_tile = pl.tile.set_validshape(acc_storage, rows, 64)
+                a_mat: pl.Tile[[boxed_rows, 128], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    a, [0, 0], [boxed_rows, 128], [rows, 128], target_memory=pl.MemorySpace.Mat
+                )
+                b_mat: pl.Tile[[128, 64], pl.FP16, pl.MemorySpace.Mat] = pl.load(
+                    b, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile = pl.tile.matmul_acc(acc_tile, a_mat, b_mat)
+                out_store: pl.Tensor[[rows, 64], pl.FP32] = pl.store(y_tile, [0, 0], ret0_out)
+                return out_store
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[rows, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[rows, 64], pl.FP32]:
+                ret0_out: pl.Tensor[[rows, 64], pl.FP32] = pl.create_tensor([rows, 64], dtype=pl.FP32)
+                y: pl.Tensor[[rows, 64], pl.FP32] = self.main_incore_0(a, b, ret0_out)
+                return y
+
+        _assert_convert_equal(Before, Expected)
+
+    @pytest.mark.parametrize(
+        ("name", "dtype", "acc_dtype", "cols", "boxed"),
+        [
+            # FP16's column box is 16, so M lands on the same 16 the accumulator
+            # wants. INT8's is 32, which is the case that proves the two share
+            # one alignment rather than each taking its own.
+            ("fp16", DataType.FP16, DataType.FP32, 17, 32),
+            ("int8", DataType.INT8, DataType.INT32, 100, 128),
+        ],
+    )
+    def test_matmul_acc_a_trans_shares_the_operand_column_alignment(
+        self, name, dtype, acc_dtype, cols, boxed
+    ):
+        """An ``a_trans`` accumulator adopts the operand's column granularity.
+
+        The op requires the accumulator and the product to agree on physical M,
+        but the two tiles' own box granularities differ: an Acc box is 16 rows
+        for every dtype, while a transposed operand's column box is
+        ``32 / sizeof(dtype)`` -- 32 for INT8. Each taking its own would give a
+        128-row product and a 112-row accumulator. ``m_align_from_arg`` makes the
+        accumulator adopt the left operand's, so both land on 128.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[128, cols], dtype], b: pl.Tensor[[128, 64], dtype]
+            ) -> pl.Tensor[[cols, 64], acc_dtype]:
+                acc: pl.Tensor[[cols, 64], acc_dtype] = pl.create_tensor([cols, 64], dtype=acc_dtype)
+                y: pl.Tensor[[cols, 64], acc_dtype] = pl.matmul_acc(acc, a, b, a_trans=True)
+                return y
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[128, cols], dtype], b: pl.Tensor[[128, 64], dtype]
+            ) -> pl.Tensor[[cols, 64], acc_dtype]:
+                y: pl.Tensor[[cols, 64], acc_dtype] = self.main_incore_0(a, b)
+                return y
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                a: pl.Tensor[[128, cols], dtype],
+                b: pl.Tensor[[128, 64], dtype],
+                ret0_out: pl.Out[pl.Tensor[[cols, 64], acc_dtype]],
+            ) -> pl.Tensor[[cols, 64], acc_dtype]:
+                acc_storage = pl.tile.create(
+                    [boxed, 64], dtype=acc_dtype, target_memory=pl.MemorySpace.Acc, compact=True
+                )
+                acc_tile = pl.tile.set_validshape(acc_storage, cols, 64)
+                # M is the operand's column axis: the natural load pads there and
+                # transpose_view swaps it onto the product's row axis.
+                a_mat: pl.Tile[[128, boxed], dtype, pl.MemorySpace.Mat] = pl.load(
+                    a, [0, 0], [128, boxed], [128, cols], target_memory=pl.MemorySpace.Mat
+                )
+                a_mat_t = pl.tile.transpose_view(a_mat)
+                b_mat: pl.Tile[[128, 64], dtype, pl.MemorySpace.Mat] = pl.load(
+                    b, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Mat
+                )
+                y_tile = pl.tile.matmul_acc(acc_tile, a_mat_t, b_mat)
+                out_store: pl.Tensor[[cols, 64], acc_dtype] = pl.store(y_tile, [0, 0], ret0_out)
+                return out_store
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[128, cols], dtype], b: pl.Tensor[[128, 64], dtype]
+            ) -> pl.Tensor[[cols, 64], acc_dtype]:
+                ret0_out: pl.Tensor[[cols, 64], acc_dtype] = pl.create_tensor([cols, 64], dtype=acc_dtype)
+                y: pl.Tensor[[cols, 64], acc_dtype] = self.main_incore_0(a, b, ret0_out)
+                return y
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_loop_carried_accumulator_seed_is_row_boxed(self):
+        """A split-K accumulator reaches its matmul_acc as an ``IterArg``.
+
+        The seed is allocated before the loop and the body accumulates into the
+        carry, so the demand has to cross two hops the collector used to drop:
+        an ``IterArg`` is not matched by ``As<Var>`` at the use site, and its
+        link back to the seed is not an inherit-input edge. Without both, the
+        seed keeps its unaligned physical rows while the boxed operand gives a
+        wider product, and the op rejects the pair on physical M.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                seed: pl.Tensor[[17, 64], pl.FP32] = pl.create_tensor([17, 64], dtype=pl.FP32)
+                for _k, (carry,) in pl.range(2, init_values=(seed,)):
+                    step: pl.Tensor[[17, 64], pl.FP32] = pl.matmul_acc(carry, a, b)
+                    acc: pl.Tensor[[17, 64], pl.FP32] = pl.yield_(step)
+                return acc
+
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[17, 128], pl.FP16], b: pl.Tensor[[128, 64], pl.FP16]
+            ) -> pl.Tensor[[17, 64], pl.FP32]:
+                y: pl.Tensor[[17, 64], pl.FP32] = self.main_incore_0(a, b)
+                return y
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        printed = ir.python_print(After)
+        assert "pl.tile.create([32, 64]" in printed, printed
+        assert "pl.tile.set_validshape(" in printed, printed
+        # The operand is boxed to the same physical M, so the op's physical-M
+        # agreement holds -- which is what the pass would otherwise break.
+        assert "[32, 128], [17, 128]" in printed, printed
+
+    @pytest.mark.parametrize("acc_trans_first", [False, True])
+    def test_conflicting_cube_m_demands_leave_the_seed_unboxed(self, acc_trans_first):
+        """Two consumers wanting different M alignments must not race.
+
+        One buffer cannot carry two physical M extents, so this program cannot
+        compile either way -- the point is *which* extent it is reported against.
+        INT8 is the only dtype where the two demands differ (a plain operand's M
+        box is 16, an ``a_trans`` operand's column box is 32) while both share the
+        INT32 accumulator dtype, and routing one use through
+        ``tensor.set_validshape`` makes that demand arrive on the seed through the
+        backward propagation sweep rather than as a direct use.
+
+        The sweep used to keep whichever demand it reached first, so the seed was
+        boxed to 112 or 128 depending on statement order and the mismatch was
+        reported against a shape the author never wrote. ``MergeConsumerReq`` now
+        applies the same reconciliation on both paths: the disputed padding is
+        dropped, and the accumulator is reported at its declared extent either way.
+        """
+        rows, k_dim, n_dim = 100, 128, 64
+
+        if acc_trans_first:
+
+            @pl.program
+            class Before:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main_incore_0(
+                    self,
+                    a: pl.Tensor[[rows, k_dim], pl.INT8],
+                    at: pl.Tensor[[k_dim, rows], pl.INT8],
+                    b: pl.Tensor[[k_dim, n_dim], pl.INT8],
+                ) -> pl.Tensor[[rows, n_dim], pl.INT32]:
+                    acc: pl.Tensor[[rows, n_dim], pl.INT32] = pl.create_tensor([rows, n_dim], dtype=pl.INT32)
+                    accv: pl.Tensor[[rows, n_dim], pl.INT32] = pl.tensor.set_validshape(acc, rows, n_dim)
+                    y: pl.Tensor[[rows, n_dim], pl.INT32] = pl.matmul_acc(acc, at, b, a_trans=True)
+                    x: pl.Tensor[[rows, n_dim], pl.INT32] = pl.matmul_acc(accv, a, b)
+                    return pl.tensor.add(x, y)
+        else:
+
+            @pl.program
+            class Before:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main_incore_0(
+                    self,
+                    a: pl.Tensor[[rows, k_dim], pl.INT8],
+                    at: pl.Tensor[[k_dim, rows], pl.INT8],
+                    b: pl.Tensor[[k_dim, n_dim], pl.INT8],
+                ) -> pl.Tensor[[rows, n_dim], pl.INT32]:
+                    acc: pl.Tensor[[rows, n_dim], pl.INT32] = pl.create_tensor([rows, n_dim], dtype=pl.INT32)
+                    accv: pl.Tensor[[rows, n_dim], pl.INT32] = pl.tensor.set_validshape(acc, rows, n_dim)
+                    x: pl.Tensor[[rows, n_dim], pl.INT32] = pl.matmul_acc(accv, a, b)
+                    y: pl.Tensor[[rows, n_dim], pl.INT32] = pl.matmul_acc(acc, at, b, a_trans=True)
+                    return pl.tensor.add(x, y)
+
+        with pytest.raises(ValueError) as excinfo:
+            passes.convert_tensor_to_tile_ops()(Before)
+        message = str(excinfo.value)
+        # The seed keeps its declared extent in both orders; only the operand it
+        # is measured against differs, and each call names its own.
+        assert f"acc M={rows}" in message, message
+
     def test_mixed_kernel_vec_btrans_moves_to_mat_then_views(self):
         """A Vec compute result (add) feeding a b_trans=True 2D matmul is bridged to Mat
         via a NATURAL tile.move, then transposed by a zero-copy tile.transpose_view — NOT
@@ -1614,12 +2108,8 @@ class TestConvertTensorToTileOps:
                 ret0_out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
             ) -> pl.Tensor[[16, 128], pl.FP32]:
                 # add operands load naturally to Vec; the add stays in Vec.
-                b0_vec: pl.Tile[[128, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    b0, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Vec
-                )
-                b1_vec: pl.Tile[[128, 64], pl.FP32, pl.MemorySpace.Vec] = pl.load(
-                    b1, [0, 0], [128, 64], [128, 64], target_memory=pl.MemorySpace.Vec
-                )
+                b0_vec: pl.Tile[[128, 64], pl.FP32] = pl.load(b0, [0, 0], [128, 64], [128, 64])
+                b1_vec: pl.Tile[[128, 64], pl.FP32] = pl.load(b1, [0, 0], [128, 64], [128, 64])
                 bt_vec: pl.Tile[[128, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tile.add(b0_vec, b1_vec)
                 # a loads natural to Mat; the Vec add result is moved to Mat in its
                 # natural shape, then reinterpreted as its transpose via a zero-copy view.
@@ -2141,7 +2631,7 @@ class TestConvertTensorToTileOps:
                 b: pl.Tensor[[1, 32], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[1, 64], pl.BF16]],
             ) -> pl.Tensor[[1, 64], pl.BF16]:
-                t__tile = pl.tile.create([1, 64], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                t__tile = pl.tile.create([1, 64], dtype=pl.FP32)
                 assemble_src = pl.load(a, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec)
                 t_1__tile = pl.tile.assemble(t__tile, assemble_src, [0, 0])
                 assemble_src_1 = pl.load(b, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec)
@@ -2328,7 +2818,7 @@ class TestConvertTensorToTileOps:
                 src: pl.Tensor[[1, 4, 8], pl.FP16],
                 target: pl.Out[pl.Tensor[[2, 4, 8], pl.FP16]],
             ) -> pl.Tensor[[2, 4, 8], pl.FP16]:
-                expand_clone_input = pl.load(src, [0, 0, 0], [1, 4, 8])
+                expand_clone_input = pl.load(src, [0, 0, 0], [1, 4, 8], target_memory=pl.Mem.Vec)
                 for i, (expand_clone_acc,) in pl.range(2, init_values=(target,)):
                     expand_clone_d0_store = pl.store(expand_clone_input, [i, 0, 0], expand_clone_acc)
                     expand_clone_d0_result = pl.yield_(expand_clone_d0_store)
@@ -2379,8 +2869,12 @@ class TestConvertTensorToTileOps:
                 target: pl.Out[pl.Tensor[[2, 4, 8], pl.FP16]],
             ) -> pl.Tensor[[2, 4, 8], pl.FP16]:
                 for i, (expand_clone_acc,) in pl.range(2, init_values=(target,)):
-                    expand_clone_d1_input = pl.load(src, [i, 0, 0], [1, 1, 8])
-                    expand_clone_d1_target = pl.tile.create([1, 4, 8], dtype=pl.FP16)
+                    expand_clone_d1_input = pl.load(src, [i, 0, 0], [1, 1, 8], target_memory=pl.Mem.Vec)
+                    expand_clone_d1_target = pl.tile.create(
+                        [1, 4, 8],
+                        dtype=pl.FP16,
+                        target_memory=pl.Mem.Vec,
+                    )
                     expand_clone_d1_col = pl.tile.col_expand(expand_clone_d1_target, expand_clone_d1_input)
                     expand_clone_d1_store = pl.store(expand_clone_d1_col, [i, 0, 0], expand_clone_acc)
                     expand_clone_d1_result = pl.yield_(expand_clone_d1_store)
@@ -2430,8 +2924,8 @@ class TestConvertTensorToTileOps:
                 src: pl.Tensor[[2, 4, 1], pl.FP16],
                 target: pl.Out[pl.Tensor[[2, 4, 8], pl.FP16]],
             ) -> pl.Tensor[[2, 4, 8], pl.FP16]:
-                expand_clone_input = pl.load(src, [0, 0, 0], [2, 4, 1])
-                expand_clone_d2_target = pl.tile.create([2, 4, 8], dtype=pl.FP16)
+                expand_clone_input = pl.load(src, [0, 0, 0], [2, 4, 1], target_memory=pl.Mem.Vec)
+                expand_clone_d2_target = pl.tile.create([2, 4, 8], dtype=pl.FP16, target_memory=pl.Mem.Vec)
                 expand_clone_d2_row = pl.tile.row_expand(expand_clone_d2_target, expand_clone_input)
                 y_tile = pl.store(expand_clone_d2_row, [0, 0, 0], target)
                 return y_tile
@@ -3213,21 +3707,22 @@ class TestGmLocalTensorConversion:
 
     def test_mixed_store_through_tensor_view_rejected(self):
         """A GM tensor.view preserves the parameter's store identity."""
-        tensor_type = ir.TensorType([32], DataType.INT32)
-        ib = IRBuilder()
-        with ib.function("view_alias", type=ir.FunctionType.InCore) as f:
-            dst = f.param("dst", tensor_type)
-            val = f.param("val", ir.ScalarType(DataType.INT32))
-            f.return_type(tensor_type)
-            viewed = ib.let("viewed", tensor_ops.view(dst, [32]))
-            src = ib.let("src", tile_ops.load(dst, [0], [32]))
-            stored = ib.let("stored", tile_ops.store(src, [0], viewed))
-            ib.let("scalar_stored", tensor_ops.write(dst, [0], val))
-            ib.return_stmt(stored)
-        program = ir.Program([f.get_result()], "ViewAliasMixedStores", ir.Span.unknown())
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def view_alias(
+                self, dst: pl.Tensor[[32], pl.INT32], val: pl.Scalar[pl.INT32]
+            ) -> pl.Tensor[[32], pl.INT32]:
+                viewed = pl.tensor.view(dst, [32])
+                src = pl.tile.load(dst, [0], [32])
+                stored = pl.tile.store(src, [0], viewed)
+                # The scalar store is what collides with the MTE3 store above.
+                scalar_stored = pl.tensor.write(dst, [0], val)  # noqa: F841
+                return stored
 
         with pytest.raises(ValueError, match="mixes MTE3 and scalar stores"):
-            passes.convert_tensor_to_tile_ops()(program)
+            passes.convert_tensor_to_tile_ops()(Before)
 
     @pytest.mark.parametrize("loop_kind", ["for", "while"])
     def test_mixed_store_through_loop_carried_alias_rejected(self, loop_kind: str):
@@ -3323,10 +3818,17 @@ class TestSliceMatmulConversion:
 
         ``slice_side`` selects which operand of matmul is sliced; ``trans_kw`` selects
         which transpose flag (a_trans/b_trans) is set on the matmul (or ``None`` for none).
+
+        A non-transposed left operand additionally loads a whole number of NZ fractal
+        boxes on its row axis, with the tensor's true extent in ``valid_shape`` — so
+        the ``btrans`` case's one-row ``a`` loads as ``[16, 128]`` valid ``[1, 128]``.
         """
         in_specs: list[InSpec] = [("a", lhs_shape, DataType.BF16), ("b", rhs_shape, DataType.BF16)]
         slice_shape = lhs_shape if slice_side == "lhs" else rhs_shape
         slice_trans = trans_kw == "a_trans" if slice_side == "lhs" else trans_kw == "b_trans"
+        # Row-boxed physical shape of the left operand's load. `a_trans` keeps its
+        # natural (unboxed) load: the transpose_view makes its COLUMN axis the M axis.
+        lhs_load_shape = lhs_shape if trans_kw == "a_trans" else [-(-lhs_shape[0] // 16) * 16, lhs_shape[1]]
 
         def before_body(ib, ins):
             a_in, b_in = ins
@@ -3369,7 +3871,7 @@ class TestSliceMatmulConversion:
             )
             other_tile = ib.let(
                 "lhs_mat",
-                tile_ops.load(a_p, [0, 0], lhs_shape, lhs_shape, target_memory=MemorySpace.Mat),
+                tile_ops.load(a_p, [0, 0], lhs_load_shape, lhs_shape, target_memory=MemorySpace.Mat),
             )
             rhs_operand = (
                 ib.let("b_slice_tile_t", tile_ops.transpose_view(sliced_tile)) if slice_trans else sliced_tile
@@ -3389,50 +3891,69 @@ class TestSliceMatmulConversion:
         _assert_convert_equal(before, expected)
 
     def test_rank_reducing_slice_then_matmul_preserves_valid_shape(self):
-        """Consumer-driven Mat loads keep 5-arg validity and lower drop_dims."""
-        ib = IRBuilder()
-        with ib.function("kernel", type=ir.FunctionType.InCore) as f:
-            a = f.param("a", ir.TensorType([16, 64], DataType.BF16))
-            b = f.param("b", ir.TensorType([2, 64, 32], DataType.BF16))
-            b_slice = ib.let(
-                "b_slice",
-                tensor_ops.slice(
+        """Consumer-driven Mat loads keep 5-arg validity and lower drop_dims.
+
+        ``Expected`` pins the whole lowering at once: the dropped axis rides in
+        the ``tile.load`` extent (``[1, 64, 32]`` read, ``[1, 64, 16]`` valid) on
+        the Mat bridge, a single ``tile.reshape`` performs the rank drop, and the
+        matmul consumes the reshape result rather than the raw load.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, a: pl.Tensor[[16, 64], pl.BF16], b: pl.Tensor[[2, 64, 32], pl.BF16]
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                b_slice = pl.tensor.slice(b, [1, 64, 32], [1, 0, 0], valid_shape=[1, 64, 16], drop_dims=[0])
+                result = pl.tensor.matmul(a, b_slice)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[16, 64], pl.BF16],
+                b: pl.Tensor[[2, 64, 32], pl.BF16],
+                ret0__out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                b_slice__tile_full_rank: pl.Tile[
+                    [1, 64, 32], pl.BF16, pl.Mem.Mat, pl.TileView(valid_shape=[1, 64, 16])
+                ] = pl.tile.load(
                     b,
-                    [1, 64, 32],
                     [1, 0, 0],
-                    valid_shape=[1, 64, 16],
-                    drop_dims=[0],
-                ),
-            )
-            result = ib.let("result", tensor_ops.matmul(a, b_slice))
-            f.return_type(result.type)
-            ib.return_stmt(result)
-        before = ir.Program([f.get_result()], "RankReducingSliceMatmul", ir.Span.unknown())
+                    [1, 64, 32],
+                    [1, 64, 16],
+                    target_memory=pl.Mem.Mat,
+                    attrs={"__compiler_tensor_to_tile_mat_bridge": True},
+                )
+                b_slice__tile: pl.Tile[
+                    [64, 32],
+                    pl.BF16,
+                    pl.Mem.Mat,
+                    pl.TileView(
+                        valid_shape=[64, 16],
+                        blayout=pl.TileLayout.row_major,
+                        slayout=pl.TileLayout.none_box,
+                    ),
+                ] = pl.tile.reshape(b_slice__tile_full_rank, [64, 32])
+                a_mat: pl.Tile[[16, 64], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    a,
+                    [0, 0],
+                    [16, 64],
+                    [16, 64],
+                    target_memory=pl.Mem.Mat,
+                    attrs={"__compiler_tensor_to_tile_mat_bridge": True},
+                )
+                result__tile: pl.Tile[[16, 32], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[16, 16])] = (
+                    pl.tile.matmul(a_mat, b_slice__tile)
+                )
+                ret0__store = pl.tile.store(result__tile, [0, 0], ret0__out)
+                return ret0__store
 
-        after = passes.convert_tensor_to_tile_ops()(before)
-        kernel = after.get_function("kernel")
-        assert kernel is not None
-
-        b_load = next(
-            load
-            for load in _find_calls_to(kernel, "tile.load")
-            if isinstance(load.args[0], ir.Var) and load.args[0].name_hint == "b"
-        )
-        assert _tuple_int_values(b_load.args[3]) == [1, 64, 16]
-        assert isinstance(b_load.type, ir.TileType)
-        assert b_load.type.memory_space == MemorySpace.Mat
-        assert dict(b_load.attrs).get(_MAT_BRIDGE_ATTR) is True
-
-        reshapes = _find_calls_to(kernel, "tile.reshape")
-        assert len(reshapes) == 1
-        reshape = reshapes[0]
-        assert isinstance(reshape.args[0], ir.Var)
-        assert _tuple_int_values(reshape.args[1]) == [64, 32]
-
-        matmul = _find_calls_to(kernel, "tile.matmul")
-        assert len(matmul) == 1
-        assert isinstance(matmul[0].args[1], ir.Var)
-        assert matmul[0].args[1].name_hint == "b_slice__tile"
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        ir.assert_structural_equal(After, Expected)
 
     def test_slice_alias_then_matmul_routes_load_to_mat(self):
         """tensor.slice → SSA alias → tensor.matmul emits tile.load(Mat).
@@ -3741,7 +4262,7 @@ class TestTensorFullConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                x__tile = pl.load(x, [0], [64], [64])
                 t__tile = pl.tile.full([64], dtype=pl.FP32, value=0.0)
                 y__tile = pl.tile.add(t__tile, x__tile)
                 ret0__store = pl.store(y__tile, [0], ret0__out)
@@ -3783,7 +4304,7 @@ class TestTensorCiConversion:
                 x: pl.Tensor[[1, 32], pl.INT32],
                 ret0__out: pl.Out[pl.Tensor[[1, 32], pl.INT32]],
             ) -> pl.Tensor[[1, 32], pl.INT32]:
-                x__tile = pl.load(x, [0, 0], [1, 32], [1, 32], target_memory=pl.Mem.Vec)
+                x__tile = pl.load(x, [0, 0], [1, 32], [1, 32])
                 idx__tile = pl.tile.ci(pl.const(0, pl.INT32), [1, 32], dtype=pl.INT32, descending=True)
                 y__tile = pl.tile.add(idx__tile, x__tile)
                 ret0__store = pl.store(y__tile, [0, 0], ret0__out)
@@ -3828,7 +4349,7 @@ class TestTensorRandomConversion:
                 x: pl.Tensor[[4, 256], pl.INT32],
                 ret0__out: pl.Out[pl.Tensor[[4, 256], pl.INT32]],
             ) -> pl.Tensor[[4, 256], pl.INT32]:
-                x__tile = pl.load(x, [0, 0], [4, 256], [4, 256], target_memory=pl.Mem.Vec)
+                x__tile = pl.load(x, [0, 0], [4, 256], [4, 256])
                 r__tile = pl.tile.random(1, 2, 3, 4, 5, 6, [4, 256], dtype=pl.INT32, rounds=7)
                 y__tile = pl.tile.add(r__tile, x__tile)
                 ret0__store = pl.store(y__tile, [0, 0], ret0__out)
@@ -3920,12 +4441,16 @@ class TestAssembleParentStride:
 class TestConvertSortOps:
     """Test conversion of tensor sort ops to tile sort ops."""
 
-    def test_sort32_conversion(self):
+    @pytest.mark.parametrize(
+        ("dtype", "out_shape"),
+        [(DataType.FP32, [8, 64]), (DataType.FP16, [8, 128])],
+    )
+    def test_sort32_conversion(self, dtype, out_shape):
         """tensor.sort32 -> tile.load (src, idx) + tile.sort32 + tile.store."""
         before, expected = _make_pair(
-            in_specs=[("src", [8, 32], DataType.FP32), ("idx", [8, 32], DataType.UINT32)],
-            out_shape=[8, 64],
-            out_dtype=DataType.FP32,
+            in_specs=[("src", [8, 32], dtype), ("idx", [8, 32], DataType.UINT32)],
+            out_shape=out_shape,
+            out_dtype=dtype,
             tensor_op=lambda ins: tensor_ops.sort32(ins[0], ins[1]),
             tile_op=lambda ts: tile_ops.sort32(ts[0], ts[1]),
         )
@@ -3980,11 +4505,11 @@ class TestConvertSortOps:
                 s3: pl.Tensor[[1, 128], pl.FP32],
                 out_0: pl.Out[pl.Tensor[[1, 512], pl.FP32]],
             ) -> pl.Tensor[[1, 512], pl.FP32]:
-                s0_tile = pl.load(s0, [0, 0], [1, 128])
-                s1_tile = pl.load(s1, [0, 0], [1, 128])
-                s2_tile = pl.load(s2, [0, 0], [1, 128])
-                s3_tile = pl.load(s3, [0, 0], [1, 128])
-                mrgsort2_tmp = pl.tile.create([1, 512], dtype=pl.FP32)
+                s0_tile = pl.load(s0, [0, 0], [1, 128], target_memory=pl.Mem.Vec)
+                s1_tile = pl.load(s1, [0, 0], [1, 128], target_memory=pl.Mem.Vec)
+                s2_tile = pl.load(s2, [0, 0], [1, 128], target_memory=pl.Mem.Vec)
+                s3_tile = pl.load(s3, [0, 0], [1, 128], target_memory=pl.Mem.Vec)
+                mrgsort2_tmp = pl.tile.create([1, 512], dtype=pl.FP32, target_memory=pl.Mem.Vec)
                 out_tile = pl.tile.mrgsort(s0_tile, s1_tile, s2_tile, s3_tile, mrgsort2_tmp)
                 out_store = pl.store(out_tile, [0, 0], out_0)
                 return out_store
@@ -4272,7 +4797,7 @@ class TestConvertGatherOp:
                 idx: pl.Tensor[[4, 3], pl.INT32],
                 ret0__out: pl.Out[pl.Tensor[[4, 3], pl.FP32]],
             ) -> pl.Tensor[[4, 3], pl.FP32]:
-                tmp__tile = pl.tile.create([4, 16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                tmp__tile = pl.tile.create([4, 16], dtype=pl.FP32)
                 assemble_src = pl.tile.load(src, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec)
                 tmp_1__tile = pl.tile.assemble(tmp__tile, assemble_src, [0, 0])
                 gather_inp = pl.tile.slice(tmp_1__tile, [4, 16], [0, 0], [4, 16])
@@ -4348,7 +4873,7 @@ class TestConvertGatherOp:
                 idx: pl.Tensor[[4, 8], pl.INT32],
                 ret0__out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
             ) -> pl.Tensor[[4, 8], pl.FP32]:
-                full__tile = pl.tile.create([4, 16], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                full__tile = pl.tile.create([4, 16], dtype=pl.FP32)
                 assemble_src = pl.tile.load(src, [0, 0], [4, 16], [4, 16], target_memory=pl.Mem.Vec)
                 full_1__tile = pl.tile.assemble(full__tile, assemble_src, [0, 0])
                 rope__tile = pl.tile.slice(full_1__tile, [4, 8], [0, 8])
@@ -4731,7 +5256,7 @@ class TestSubmitCallSiteUpdate:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                x__tile = pl.load(x, [0], [64], [64])
                 y__tile = pl.tile.add(x__tile, x__tile)
                 ret0__store = pl.store(y__tile, [0], ret0__out)
                 return ret0__store
@@ -4773,7 +5298,7 @@ class TestSpmdBlockIdentityConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                x__tile = pl.load(x, [0], [64], [64])
                 idx = pl.tile.get_block_idx()
                 y__tile = pl.tile.adds(x__tile, pl.cast(idx, pl.INT32))
                 ret0__store = pl.store(y__tile, [0], ret0__out)
@@ -4811,7 +5336,7 @@ class TestSpmdBlockIdentityConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                x__tile = pl.load(x, [0], [64], [64])
                 idx = pl.tile.get_subblock_idx()
                 y__tile = pl.tile.adds(x__tile, pl.cast(idx, pl.INT32))
                 ret0__store = pl.store(y__tile, [0], ret0__out)
@@ -4849,7 +5374,7 @@ class TestSpmdBlockIdentityConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                x__tile = pl.load(x, [0], [64], [64])
                 n = pl.tile.get_block_num()
                 y__tile = pl.tile.adds(x__tile, pl.cast(n, pl.INT32))
                 ret0__store = pl.store(y__tile, [0], ret0__out)
@@ -4892,7 +5417,7 @@ class TestSpmdBlockIdentityConversion:
                 x: pl.Tensor[[64], pl.FP32],
                 ret0__out: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x__tile = pl.load(x, [0], [64], [64], target_memory=pl.Mem.Vec)
+                x__tile = pl.load(x, [0], [64], [64])
                 i = pl.tile.get_block_idx()
                 s = pl.tile.get_subblock_idx()
                 n = pl.tile.get_block_num()
@@ -5104,14 +5629,24 @@ class TestWindowSliceIncoreConversion:
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(self, workspace: pl.Tensor[[16], pl.INT32]):
-                pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=workspace, used_cores=0)
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.AIV,
+                    gm_workspace=workspace,
+                    used_cores=0,
+                )
                 return  # noqa: PLR1711  (DSL return terminator)
 
         @pl.program
         class Expected:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(self, workspace: pl.InOut[pl.Tensor[[16], pl.INT32]]):
-                pl.system.syncall(mode="soft", core_type="aiv_only", gm_workspace=workspace, used_cores=0)
+                pl.system.syncall(
+                    mode=pl.SyncAllMode.SOFT,
+                    core_type=pl.KernelType.AIV,
+                    gm_workspace=workspace,
+                    used_cores=0,
+                )
                 return  # noqa: PLR1711  (DSL return terminator)
 
         After = passes.convert_tensor_to_tile_ops()(Before)
@@ -5253,11 +5788,18 @@ class TestWindowSliceIncoreConversion:
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
 
-    def test_allgather_upgrades_target_and_signal_to_inout(self):
+    def test_allgather_writes_target_and_reads_writes_signal(self):
         """``pld.tensor.allgather(local_data, target, signal)`` (push-based 3-arg)
-        upgrades both ``target`` and ``signal`` params to InOut. ``local_data``
-        remains In (read-only). The result is the ``target`` window
-        (window-as-result, DistributedTensor)."""
+        lifts ``target`` to Out and ``signal`` to InOut. ``local_data`` remains In
+        (read-only). The result is the ``target`` window (window-as-result,
+        DistributedTensor).
+
+        The two write differently and earn different directions. The lowering only
+        pushes into ``target`` (``pld.tile.put``) and never loads from it, so no
+        data moves into the kernel through it — that is ``Out``. ``signal`` is
+        written by the notify phase and read by the wait phase, so it is ``InOut``.
+        Declaring ``target`` ``InOut`` would stage the window host->device and
+        assert a dependency on content the collective overwrites in full."""
         SIZE = 16
         nr = 2
 
@@ -5276,7 +5818,8 @@ class TestWindowSliceIncoreConversion:
         After = passes.convert_tensor_to_tile_ops()(Before)
         # After conversion the function has additional params (MemRef for
         # local_data load).  Verify just the
-        # direction inference: target and signal must be InOut; local_data
+        # direction inference: target must be Out (pushed into, never read
+        # back) and signal InOut (notify writes it, wait reads it); local_data
         # (an original plain-Tensor In param) stays In.
         after_fn = After["kernel"]
         assert after_fn is not None
@@ -5286,7 +5829,7 @@ class TestWindowSliceIncoreConversion:
         for i, bp in enumerate(before_fn.params):
             after_dir = after_fn.param_directions[i]
             if bp.name_hint == "target":
-                assert after_dir == ir.ParamDirection.InOut, f"target must be InOut, got {after_dir}"
+                assert after_dir == ir.ParamDirection.Out, f"target must be Out, got {after_dir}"
             elif bp.name_hint == "signal":
                 assert after_dir == ir.ParamDirection.InOut, f"signal must be InOut, got {after_dir}"
             elif bp.name_hint == "local_data":
@@ -5294,10 +5837,13 @@ class TestWindowSliceIncoreConversion:
 
     def test_all_to_all_v_keeps_send_counts_read_only(self):
         """``pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts)``
-        upgrades ``target``, ``signal``, and ``recv_counts`` to InOut, while
-        ``input`` and ``send_counts`` stay In: the lowering only *reads* the
-        send counts (``tensor.read``) and *writes* recv_counts via peer notify (Set).
-        """
+        lifts ``target`` and ``recv_counts`` to Out and ``signal`` to InOut, while
+        ``input`` and ``send_counts`` stay In.
+
+        ``recv_counts`` is deposited by a peer notify with ``Set``, which
+        overwrites the slot rather than accumulating into it, so like ``target``
+        it is written without being read. Only ``signal`` is both — notify writes
+        it, wait reads it back."""
         SIZE = 16
         nr = 2
         total = nr * 2
@@ -5325,9 +5871,9 @@ class TestWindowSliceIncoreConversion:
         expected_directions = {
             "inp": ir.ParamDirection.In,
             "counts": ir.ParamDirection.In,
-            "target": ir.ParamDirection.InOut,
+            "target": ir.ParamDirection.Out,
             "signal": ir.ParamDirection.InOut,
-            "recv_counts": ir.ParamDirection.InOut,
+            "recv_counts": ir.ParamDirection.Out,
         }
         for i, bp in enumerate(before_fn.params):
             want = expected_directions.get(bp.name_hint)
@@ -5588,9 +6134,7 @@ class TestConvertCrossCoreSplitOps:
                 ret0__out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
             ) -> pl.Tensor[[256, 128], pl.FP32]:
                 pl.func_attr({"split_aiv": True, "split": pl.SplitMode.UP_DOWN})
-                x__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Vec
-                )
+                x__tile: pl.Tile[[128, 128], pl.FP32] = pl.tile.load(x, [0, 0], [128, 128], [128, 128])
                 for _ in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
                     h__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec] = pl.tile.exp(x__tile)
                     res__tile: pl.Tile[[256, 128], pl.FP32, pl.Mem.Mat] = pl.tile.aic_gather(h__tile)
@@ -5624,9 +6168,7 @@ class TestConvertCrossCoreSplitOps:
                 ret0__out: pl.Out[pl.Tensor[[128, 256], pl.FP32]],
             ) -> pl.Tensor[[128, 256], pl.FP32]:
                 pl.func_attr({"split_aiv": True, "split": pl.SplitMode.LEFT_RIGHT})
-                x__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec] = pl.tile.load(
-                    x, [0, 0], [128, 128], [128, 128], target_memory=pl.Mem.Vec
-                )
+                x__tile: pl.Tile[[128, 128], pl.FP32] = pl.tile.load(x, [0, 0], [128, 128], [128, 128])
                 for _ in pl.split_aiv(2, mode=pl.SplitMode.LEFT_RIGHT):
                     h__tile: pl.Tile[[128, 128], pl.FP32, pl.Mem.Vec] = pl.tile.exp(x__tile)
                     res__tile: pl.Tile[[128, 256], pl.FP32, pl.Mem.Mat] = pl.tile.aic_gather(h__tile)
@@ -5880,6 +6422,582 @@ class TestSynthesizedOpSpans:
         assert exp_stmt.span.begin_line <= exp_after.span.begin_line
         assert exp_after.span.end_line <= exp_stmt.span.end_line
         assert exp_after.span.begin_line > func.span.begin_line
+
+
+class TestCachePolicyConversion:
+    """``pl.set_cache_policy`` reaches this pass as the outlined-function attr
+    ``cache_policy`` — ``(param index, CachePolicy-as-int)`` pairs stamped by
+    OutlineIncoreScopes (pass 8) — and leaves it as a ``cache`` kwarg on every
+    ``tile.load`` that reads a declared param. The attr itself is erased here:
+    its indices go stale the moment a later pass grows the param list, so
+    nothing downstream may see it.
+
+    Each Before is authored in the shape pass 8 really hands over: a *bare*
+    InCore function (the scope already consumed) carrying the resolved attr via
+    ``pl.func_attr``, plus the Orchestration caller pass 8 mints beside it.
+    Writing the ``pl.at`` scope here instead would re-test pass 8's translation
+    rather than this pass's consumption of its output.
+
+    Precedence (a per-access kwarg beats the scope declaration) is covered from
+    both sides: BYPASS stated on a load under no declaration, and an explicit
+    ``cache=CachePolicy.DEFAULT`` re-caching one access inside a bypassing
+    scope. The latter is why the load builder distinguishes an unstated policy
+    (``None``, kwarg omitted) from an explicit ``DEFAULT`` (``0``, kwarg
+    recorded) — collapsing the two would leave this pass unable to tell the
+    override from an unannotated load.
+    """
+
+    _BYPASS = int(pl.CachePolicy.BYPASS)
+
+    @staticmethod
+    def _loads_by_source(func: ir.Function) -> dict[str, ir.Call]:
+        """Map every ``tile.load`` in ``func`` to the name of the tensor it reads."""
+        loads: dict[str, ir.Call] = {}
+        for call in _find_calls_to(func, ir.get_op("tile.load").name):
+            source = call.args[0]
+            assert isinstance(source, ir.Var), f"tile.load source is not a Var: {source}"
+            assert source.name_hint not in loads, f"more than one tile.load reads '{source.name_hint}'"
+            loads[source.name_hint] = call
+        return loads
+
+    @staticmethod
+    def _declared_matmul() -> ir.Program:
+        """Post-pass-8 matmul kernel declaring BYPASS for param 1 (``b``)."""
+
+        @pl.program
+        class Declared:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def mm(
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                pl.func_attr({"cache_policy": [(1, 1)]})
+                c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
+                out = pl.assemble(out, c, [0, 0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                y: pl.Tensor[[256, 256], pl.FP32] = self.mm(a, b, out)
+                return y
+
+        return Declared
+
+    @staticmethod
+    def _undeclared_matmul() -> ir.Program:
+        """The same kernel without the attr — the control the declared run is read against."""
+
+        @pl.program
+        class Undeclared:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def mm(
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
+                out = pl.assemble(out, c, [0, 0])
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                y: pl.Tensor[[256, 256], pl.FP32] = self.mm(a, b, out)
+                return y
+
+        return Undeclared
+
+    def test_declared_param_gets_the_cache_kwarg_on_its_synthesised_load(self):
+        """Only the declared param's Mat bridge load is stamped."""
+        after = passes.convert_tensor_to_tile_ops()(self._declared_matmul())
+        loads = self._loads_by_source(_require_function(after, "mm"))
+
+        assert loads["b"].kwargs["cache"] == self._BYPASS
+        # The other operand is untouched: a declaration names one tensor, not
+        # the kernel.
+        assert "cache" not in loads["a"].kwargs
+
+    def test_undeclared_kernel_gets_no_cache_kwarg(self):
+        """Control for the test above: with no attr, no load is stamped."""
+        after = passes.convert_tensor_to_tile_ops()(self._undeclared_matmul())
+        loads = self._loads_by_source(_require_function(after, "mm"))
+
+        assert set(loads) == {"a", "b"}
+        assert all("cache" not in load.kwargs for load in loads.values())
+
+    def test_function_attr_is_erased_by_the_conversion(self):
+        """Param indices stay valid only across passes 8..10 — later passes both
+        append to param lists and prepend onto them — so the attr must not
+        outlive its consumer."""
+        after = passes.convert_tensor_to_tile_ops()(self._declared_matmul())
+
+        assert "cache_policy" not in dict(_require_function(after, "mm").attrs)
+        assert "cache_policy" not in dict(_require_function(after, "main").attrs)
+
+    def test_preexisting_tile_load_of_a_declared_param_is_stamped(self):
+        """A load already in the body honours the declaration exactly as a
+        synthesised one does: the author wrote ``pl.load`` by hand, but the
+        scope-level declaration still covers that read."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def k(
+                x: pl.Tensor[[64, 64], pl.FP32],
+                y: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                pl.func_attr({"cache_policy": [(0, 1)]})
+                tx: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64])
+                ty: pl.Tile[[64, 64], pl.FP32] = pl.load(y, [0, 0], [64, 64])
+                s: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(tx, ty)
+                out = pl.store(s, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                y: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                z: pl.Tensor[[64, 64], pl.FP32] = self.k(x, y, out)
+                return z
+
+        loads = self._loads_by_source(_require_function(passes.convert_tensor_to_tile_ops()(Before), "k"))
+        assert loads["x"].kwargs["cache"] == self._BYPASS
+        assert "cache" not in loads["y"].kwargs
+
+    def test_explicit_kwarg_survives_and_is_not_duplicated(self):
+        """The per-access surface stands on its own, and coincides cleanly with
+        the scope declaration.
+
+        ``y`` is annotated at the access with no declaration behind it; ``x``
+        carries both. Either way the load ends up with exactly one ``cache``
+        kwarg holding BYPASS — the pass never appends a second one over a value
+        the load already states.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def k(
+                x: pl.Tensor[[64, 64], pl.FP32],
+                y: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                pl.func_attr({"cache_policy": [(0, 1)]})
+                tx: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64], cache=pl.CachePolicy.BYPASS)
+                ty: pl.Tile[[64, 64], pl.FP32] = pl.load(y, [0, 0], [64, 64], cache=pl.CachePolicy.BYPASS)
+                s: pl.Tile[[64, 64], pl.FP32] = pl.tile.add(tx, ty)
+                out = pl.store(s, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                y: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                z: pl.Tensor[[64, 64], pl.FP32] = self.k(x, y, out)
+                return z
+
+        loads = self._loads_by_source(_require_function(passes.convert_tensor_to_tile_ops()(Before), "k"))
+        for name in ("x", "y"):
+            keys = [key for key, _ in loads[name].kwargs.items()]
+            assert keys.count("cache") == 1, f"duplicate cache kwarg on '{name}'"
+            assert loads[name].kwargs["cache"] == self._BYPASS
+
+    def test_explicit_default_on_a_load_survives_and_beats_the_declaration(self):
+        """An explicit ``cache=CachePolicy.DEFAULT`` re-caches one access.
+
+        Regression: the load builder used to omit the kwarg on any falsy policy,
+        so an explicit DEFAULT was indistinguishable from an unstated one and
+        this pass stamped the scope's BYPASS over it — inverting the documented
+        precedence on the one operand the author had opted back into the cache.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def k(
+                x: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                pl.func_attr({"cache_policy": [(0, 1)]})
+                t: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64], cache=pl.CachePolicy.DEFAULT)
+                out = pl.store(t, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                y: pl.Tensor[[64, 64], pl.FP32] = self.k(x, out)
+                return y
+
+        loads = self._loads_by_source(_require_function(passes.convert_tensor_to_tile_ops()(Before), "k"))
+        assert loads["x"].kwargs["cache"] == int(pl.CachePolicy.DEFAULT)
+
+    def test_an_unstated_policy_still_takes_the_declaration(self):
+        """The control for the test above: no kwarg on the load means the
+        declaration applies, so the sentinel did not simply disable stamping."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def k(
+                x: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                pl.func_attr({"cache_policy": [(0, 1)]})
+                t: pl.Tile[[64, 64], pl.FP32] = pl.load(x, [0, 0], [64, 64])
+                out = pl.store(t, [0, 0], out)
+                return out
+
+            @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                y: pl.Tensor[[64, 64], pl.FP32] = self.k(x, out)
+                return y
+
+        loads = self._loads_by_source(_require_function(passes.convert_tensor_to_tile_ops()(Before), "k"))
+        assert loads["x"].kwargs["cache"] == self._BYPASS
+
+    def test_a_loop_carried_source_inherits_the_declaration(self):
+        """A load whose source is an ``IterArg`` still resolves to the param.
+
+        Regression: the lookup is keyed by parameter ``Var*``, but a loop-carried
+        tensor arrives as an ``IterArg`` — a distinct ObjectKind that
+        ``AsVarLike`` returns as itself — so the declaration was silently missed
+        and the load went out unstamped.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore, level=pl.Level.CHIP_DIE, role=pl.Role.SubWorker)
+            def k(
+                x: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                pl.func_attr({"cache_policy": [(0, 1)]})
+                # `x` is carried, so the load inside the body reads an IterArg,
+                # not the parameter the declaration named. That is the whole
+                # point of the test: the lookup has to walk back to the param.
+                for _i, (carried, acc) in pl.range(2, init_values=(x, out)):
+                    t: pl.Tile[[64, 64], pl.FP32] = pl.load(carried, [0, 0], [64, 64])
+                    acc_next: pl.Tensor[[64, 64], pl.FP32] = pl.store(t, [0, 0], acc)
+                    _carried_out, result = pl.yield_(carried, acc_next)
+                return result
+
+            @pl.function(type=pl.FunctionType.Orchestration, level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 64], pl.FP32]],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                y: pl.Tensor[[64, 64], pl.FP32] = self.k(x, out)
+                return y
+
+        after = _require_function(passes.convert_tensor_to_tile_ops()(Before), "k")
+        carried_loads = _find_calls_to(after, ir.get_op("tile.load").name)
+        assert carried_loads, "expected a tile.load in the loop body"
+        for load in carried_loads:
+            assert load.kwargs["cache"] == self._BYPASS
+
+
+class TestRegistryDrivenParamDirections:
+    """Parameter directions derived from registry-declared argument effects.
+
+    The pass used to carry its own table of write operators whose default arm
+    counted every argument of an unrecognised operator as a read. These pin the
+    operators that table missed, and pin that the operators it did know keep
+    deriving the same directions.
+    """
+
+    @staticmethod
+    def _directions(program, func_name="kernel"):
+        before = program[func_name]
+        after = passes.convert_tensor_to_tile_ops()(program)[func_name]
+        assert before is not None and after is not None
+        return {param.name_hint: after.param_directions[i] for i, param in enumerate(before.params)}
+
+    def test_mscatter_destination_is_out(self):
+        """A GM tensor written only by ``pl.mscatter`` is an output.
+
+        ``tile.mscatter`` was in none of the pass's write tables, so its
+        destination fell through to the read-only default and kept direction
+        ``In`` — no RAW edge against a later reader, and the host treated a
+        written buffer as a pure input."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                s = pl.load(src, [0, 0], [16, 16])
+                i = pl.load(idx, [0, 0], [16, 16])
+                out = pl.mscatter(s, i, out)
+                return out
+
+        directions = self._directions(Prog)
+        assert directions["out"] == ir.ParamDirection.Out
+        assert directions["src"] == ir.ParamDirection.In
+        assert directions["idx"] == ir.ParamDirection.In
+
+    def test_mscatter_matches_store(self):
+        """The two write operators derive the same direction for structurally
+        identical kernels. They disagreed before: ``pl.store`` yielded ``Out``
+        and ``pl.mscatter`` yielded ``In``."""
+
+        @pl.program
+        class WithStore:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, src: pl.Tensor[[16, 16], pl.FP32], out: pl.Tensor[[16, 16], pl.FP32]
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                s = pl.load(src, [0, 0], [16, 16])
+                out = pl.store(s, [0, 0], out)
+                return out
+
+        @pl.program
+        class WithMscatter:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                s = pl.load(src, [0, 0], [16, 16])
+                i = pl.load(idx, [0, 0], [16, 16])
+                out = pl.mscatter(s, i, out)
+                return out
+
+        assert self._directions(WithStore)["out"] == ir.ParamDirection.Out
+        assert self._directions(WithMscatter)["out"] == ir.ParamDirection.Out
+
+    def test_read_then_mscatter_is_inout(self):
+        """Scattering into a tensor the kernel also loads keeps it InOut — the
+        write effect widens the direction, it does not replace the read."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                s = pl.load(out, [0, 0], [16, 16])
+                i = pl.load(idx, [0, 0], [16, 16])
+                out = pl.mscatter(s, i, out)
+                return out
+
+        assert self._directions(Prog)["out"] == ir.ParamDirection.InOut
+
+    def test_atomic_store_destination_is_inout(self):
+        """``out += x`` reads the accumulator it adds into, so the destination
+        is InOut while a plain store leaves it Out. The pass reads that from the
+        operator's kwarg-dependent effect rather than re-deriving it."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, src: pl.Tensor[[16, 16], pl.FP32], out: pl.Tensor[[16, 16], pl.FP32]
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                s = pl.load(src, [0, 0], [16, 16])
+                out = pl.store(s, [0, 0], out, atomic=pl.AtomicType.Add)
+                return out
+
+        assert self._directions(Prog)["out"] == ir.ParamDirection.InOut
+
+
+class TestCalleeDirectionPropagationThroughCarries:
+    """Propagating a callee's write onto the caller's own signature.
+
+    The caller's argument is rarely the parameter itself. A loop-carried tensor
+    reaches the call as an ``IterArg`` whose value is the parameter's buffer, so
+    the propagation has to resolve the argument to the buffer it owns before it
+    can decide which parameter the callee's write lands on.
+    """
+
+    def test_loop_carried_arg_upgrades_the_caller_parameter(self):
+        """``for _ in ...: acc = kernel(x, acc)`` writes ``dst`` through a carry.
+
+        The argument is an ``IterArg``, which is neither matched by ``As<Var>``
+        nor present in the caller's parameter map, so the enclosing signature
+        kept declaring ``In`` for a buffer the call chain writes — and every
+        consumer of that signature (dependency analysis, distributed codegen arg
+        tags, the host ABI) was told the buffer is a pure input.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Out[pl.Tensor[[64], pl.FP32]]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                ret: pl.Tensor[[64], pl.FP32] = pl.store(t, [0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], dst: pl.Tensor[[64], pl.FP32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                acc = dst
+                for _ in pl.range(4):
+                    acc = self.kernel(x, acc)
+                return acc
+
+        before = passes.convert_to_ssa()(Prog)
+        after = passes.convert_tensor_to_tile_ops()(before)["main"]
+        assert after is not None
+
+        # The whole map, not just the parameter under test: an upgrade that also
+        # flipped `x` would otherwise pass.
+        directions = {
+            p.name_hint.split("__ssa_v")[0]: d for p, d in zip(after.params, after.param_directions)
+        }
+        assert directions == {"x": ir.ParamDirection.In, "dst": ir.ParamDirection.Out}, directions
+
+        # The direction is only meaningful if the body that produced it survived.
+        # An upgrade that dropped the carry, the call or an argument would still
+        # satisfy the map above, so pin the shape the direction was derived from.
+        text = ir.python_print(passes.convert_tensor_to_tile_ops()(before))
+        assert "pl.range(" in text, text
+        assert text.count("self.kernel(") == 1, text
+        assert "def kernel(" in text and "def main(" in text, text
+
+    def test_submitted_arg_upgrades_the_caller_parameter(self):
+        """A task launch forwards its arguments exactly as a plain call does.
+
+        The base visitor does not route ``Submit`` through the ``Call`` handler
+        (`.claude/rules/pass-submit-awareness.md`), so without a dedicated hook
+        an orchestration function that only ever submits kept declaring ``In``
+        for a buffer its tasks write — the dependency edge that buffer needs is
+        then never emitted.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Out[pl.Tensor[[64], pl.FP32]]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                ret: pl.Tensor[[64], pl.FP32] = pl.store(t, [0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], dst: pl.Tensor[[64], pl.FP32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.manual_scope():
+                    res, tid = pl.submit(self.kernel, x, dst)
+                return res
+
+        after = passes.convert_tensor_to_tile_ops()(passes.convert_to_ssa()(Prog))["main"]
+        assert after is not None
+        directions = {
+            p.name_hint.split("__ssa_v")[0]: d for p, d in zip(after.params, after.param_directions)
+        }
+        assert directions == {"x": ir.ParamDirection.In, "dst": ir.ParamDirection.Out}, directions
+
+    def test_ambiguous_arg_upgrades_every_candidate_parameter(self):
+        """Control flow can leave a value naming more than one buffer.
+
+        The callee writes whichever ``t`` turned out to be, so both ``a`` and
+        ``b`` may be written and both must be upgraded. Skipping the ambiguous
+        var dropped the dependency for every candidate at once — the direction
+        that fails silently, since an under-declared ``In`` loses the RAW edge
+        and races on device where an over-declared ``Out`` only over-orders.
+        """
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def writer(
+                self, src: pl.Tensor[[64], pl.FP32], out: pl.Out[pl.Tensor[[64], pl.FP32]]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(src, [0], [64])
+                ret: pl.Tensor[[64], pl.FP32] = pl.store(t, [0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                src: pl.Tensor[[64], pl.FP32],
+                a: pl.Tensor[[64], pl.FP32],
+                b: pl.Tensor[[64], pl.FP32],
+                cond: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                if cond > 0:
+                    t: pl.Tensor[[64], pl.FP32] = a
+                else:
+                    t: pl.Tensor[[64], pl.FP32] = b
+                r: pl.Tensor[[64], pl.FP32] = self.writer(src, t)
+                return r
+
+        after = passes.convert_tensor_to_tile_ops()(passes.convert_to_ssa()(Prog))["main"]
+        assert after is not None
+        directions = {
+            p.name_hint.split("__ssa_v")[0]: d for p, d in zip(after.params, after.param_directions)
+        }
+        assert directions["a"] == ir.ParamDirection.Out, directions
+        assert directions["b"] == ir.ParamDirection.Out, directions
+        # The read-only operand must not be swept up by the widening.
+        assert directions["src"] == ir.ParamDirection.In, directions
+
+    def test_direct_arg_still_upgrades_the_caller_parameter(self):
+        """The un-carried shape keeps working: resolving to a buffer root is a
+        generalisation of the identity lookup, not a replacement for it."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Out[pl.Tensor[[64], pl.FP32]]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                ret: pl.Tensor[[64], pl.FP32] = pl.store(t, [0], out)
+                return ret
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], dst: pl.Tensor[[64], pl.FP32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                r: pl.Tensor[[64], pl.FP32] = self.kernel(x, dst)
+                return r
+
+        after = passes.convert_tensor_to_tile_ops()(passes.convert_to_ssa()(Prog))["main"]
+        assert after is not None
+        directions = {
+            p.name_hint.split("__ssa_v")[0]: d for p, d in zip(after.params, after.param_directions)
+        }
+        assert directions["dst"] == ir.ParamDirection.Out
 
 
 if __name__ == "__main__":

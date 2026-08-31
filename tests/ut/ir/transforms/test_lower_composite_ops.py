@@ -30,6 +30,10 @@ from pypto.language.parser.diagnostics.exceptions import ParserError
 
 _OP_PLD_TILE_REMOTE_LOAD = ir.get_op("pld.tile.remote_load").name
 _OP_TILE_LOAD = ir.get_op("tile.load").name
+_OP_TILE_TQUANT_MX = ir.get_op("tile.tquant_mx").name
+_OP_TILE_TQUANT_MX_RAW = ir.get_op("tile.tquant_mx_raw").name
+_OP_TILE_TMOV_X2ZZ = ir.get_op("tile.tmov_x2zz").name
+_OP_TILE_TRANSPOSE = ir.get_op("tile.transpose").name
 
 # Primitive tile ops the decomposition is allowed to emit (besides framework
 # infrastructure ops like tile.load / tile.store / tile.move that wrap the
@@ -123,7 +127,7 @@ def test_sin_is_decomposed_to_primitives():
         def main_incore_0(
             x: pl.Tensor[[16, 16], pl.FP32], out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
         ) -> pl.Tensor[[16, 16], pl.FP32]:
-            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec)
+            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16])
             y_tile__pi_inv_x_tmp_v0 = pl.tile.muls(x_tile, 0.31830987334251404)
             y_tile__k_i_tmp_v1 = pl.tile.cast(y_tile__pi_inv_x_tmp_v0, target_type=pl.INT32, mode="round")
             y_tile__k_f_tmp_v2 = pl.tile.cast(y_tile__k_i_tmp_v1, target_type=pl.FP32, mode="none")
@@ -200,7 +204,7 @@ def test_cos_is_decomposed_to_primitives():
         def main_incore_0(
             x: pl.Tensor[[16, 16], pl.FP32], out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
         ) -> pl.Tensor[[16, 16], pl.FP32]:
-            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec)
+            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16])
             y_tile__pi_inv_x_tmp_v0 = pl.tile.muls(x_tile, 0.31830987334251404)
             y_tile__k_pre_tmp_v1 = pl.tile.adds(y_tile__pi_inv_x_tmp_v0, 0.5)
             y_tile__k_i_tmp_v2 = pl.tile.cast(y_tile__k_pre_tmp_v1, target_type=pl.INT32, mode="rint")
@@ -306,6 +310,86 @@ def test_cos_lowering_is_idempotent():
     ir.assert_structural_equal(twice, once)
 
 
+def _collect_op_names(program):
+    names = []
+
+    class Collector(ir.IRVisitor):
+        def visit_call(self, call):
+            names.append(call.op.name)
+            super().visit_call(call)
+
+    Collector().visit_program(program)
+    return names
+
+
+@pytest.mark.parametrize(
+    ("group_axis", "src_rows", "src_cols", "quant_rows", "quant_cols"),
+    [
+        (1, 16, 64, 16, 64),
+        (0, 32, 64, 64, 32),
+    ],
+)
+def test_tquant_mx_is_decomposed_to_value_returning_ops(
+    group_axis, src_rows, src_cols, quant_rows, quant_cols
+):
+    """``tile.tquant_mx`` lowers to Bind of ``tquant_mx_raw`` + ``tmov_x2zz`` (not Eval)."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def main_incore_0(
+            self,
+            src: pl.Tensor[[src_rows, src_cols], pl.FP16],
+            out: pl.Out[pl.Tensor[[quant_rows, quant_cols], pl.FP8E4M3FN]],
+        ) -> pl.Tensor[[quant_rows, quant_cols], pl.FP8E4M3FN]:
+            quant, _scale = pl.quant_mx(
+                pl.load(src, [0, 0], [src_rows, src_cols]),
+                group_axis=group_axis,
+            )
+            return pl.store(quant, [0, 0], out)
+
+        @pl.function
+        def main(
+            self, src: pl.Tensor[[src_rows, src_cols], pl.FP16]
+        ) -> pl.Tensor[[quant_rows, quant_cols], pl.FP8E4M3FN]:
+            out = pl.create_tensor([quant_rows, quant_cols], dtype=pl.FP8E4M3FN)
+            return self.main_incore_0(src, out)
+
+    After = passes.lower_composite_ops()(Before)
+    names = _collect_op_names(After)
+    assert _OP_TILE_TQUANT_MX not in names
+    assert _OP_TILE_TQUANT_MX_RAW in names
+    assert _OP_TILE_TMOV_X2ZZ in names
+    assert (_OP_TILE_TRANSPOSE in names) == (group_axis == 0)
+
+    class FormCollector(ir.IRVisitor):
+        def __init__(self):
+            super().__init__()
+            self.eval_raw = 0
+            self.assign_raw = 0
+            self.assign_x2zz = 0
+
+        def visit_eval_stmt(self, stmt):
+            if isinstance(stmt.expr, ir.Call) and stmt.expr.op.name == _OP_TILE_TQUANT_MX_RAW:
+                self.eval_raw += 1
+            super().visit_eval_stmt(stmt)
+
+        def visit_assign_stmt(self, stmt):
+            if isinstance(stmt.value, ir.Call):
+                if stmt.value.op.name == _OP_TILE_TQUANT_MX_RAW:
+                    self.assign_raw += 1
+                elif stmt.value.op.name == _OP_TILE_TMOV_X2ZZ:
+                    self.assign_x2zz += 1
+            super().visit_assign_stmt(stmt)
+
+    forms = FormCollector()
+    forms.visit_program(After)
+    assert (forms.eval_raw, forms.assign_raw, forms.assign_x2zz) == (0, 1, 1)
+
+    twice = passes.lower_composite_ops()(After)
+    ir.assert_structural_equal(twice, After)
+
+
 def test_both_sin_and_cos_in_same_function():
     """Verify sin and cos lowering don't interfere when both appear in one function."""
 
@@ -336,7 +420,7 @@ def test_both_sin_and_cos_in_same_function():
         def main_incore_0(
             x: pl.Tensor[[16, 16], pl.FP32], out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]]
         ) -> pl.Tensor[[16, 16], pl.FP32]:
-            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec)
+            x_tile = pl.tile.load(x, [0, 0], [16, 16], [16, 16])
             a__pi_inv_x_tmp_v0 = pl.tile.muls(x_tile, 0.31830987334251404)
             a__k_i_tmp_v1 = pl.tile.cast(a__pi_inv_x_tmp_v0, target_type=pl.INT32, mode="round")
             a__k_f_tmp_v2 = pl.tile.cast(a__k_i_tmp_v1, target_type=pl.FP32, mode="none")
@@ -699,6 +783,22 @@ def _build_all_to_all_v_before():
     return AllToAllV
 
 
+def _min_clamps(values: list) -> list:
+    """``ir.Min`` nodes among ``values``, looking through an enclosing ``ir.Max``.
+
+    The send-count clamp is two-sided — ``max(min(count, MAX_RECV), 0)`` — so the
+    Min bounding against capacity is nested inside the Max flooring at zero, and
+    is not the top-level value of the AssignStmt.
+    """
+    found = []
+    for value in values:
+        if isinstance(value, ir.Min):
+            found.append(value)
+        elif isinstance(value, ir.Max):
+            found.extend(o for o in (value.left, value.right) if isinstance(o, ir.Min))
+    return found
+
+
 def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
     """The push loop is bounded by ``send_counts[dest]`` read at runtime, not by
     the compile-time MAX_RECV capacity — a capacity-bounded loop would transfer
@@ -724,7 +824,7 @@ def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
 
     # The runtime count is clamped against the capacity, so a count larger than
     # MAX_RECV cannot push into the next destination's slice of the peer window.
-    clamps = [v for v in probe.assign_values if isinstance(v, ir.Min)]
+    clamps = _min_clamps(probe.assign_values)
     assert clamps, "the runtime send count must be clamped (min) against the MAX_RECV capacity"
     clamp_operands = [
         operand.value
@@ -735,6 +835,129 @@ def test_all_to_all_v_push_loop_is_bounded_by_runtime_send_counts():
     assert _AAV_MAX_RECV in clamp_operands, (
         f"the clamp must bound the count by MAX_RECV ({_AAV_MAX_RECV}); "
         f"constant clamp operands found: {clamp_operands}"
+    )
+
+
+class _GuardProbe(ir.IRVisitor):
+    """Record Call op names by whether they sit inside an ``IfStmt`` body."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.guarded: list[str] = []
+        self.unguarded: list[str] = []
+        self._if_depth = 0
+
+    def visit_for_stmt(self, op: ir.ForStmt) -> None:
+        self._walk_stmt(op.body)
+
+    def visit_if_stmt(self, op: ir.IfStmt) -> None:
+        self._if_depth += 1
+        self._walk_stmt(op.then_body)
+        if op.else_body is not None:
+            self._walk_stmt(op.else_body)
+        self._if_depth -= 1
+
+    def visit_assign_stmt(self, op: ir.AssignStmt) -> None:
+        if isinstance(op.value, ir.Call):
+            bucket = self.guarded if self._if_depth > 0 else self.unguarded
+            bucket.append(op.value.op.name)
+
+    def _walk_stmt(self, stmt: ir.Stmt) -> None:
+        # Same trampoline caveat as _StmtProbe: nested statement callbacks are
+        # not redispatched to Python overrides, so recurse explicitly.
+        if isinstance(stmt, ir.SeqStmts):
+            for child in stmt.stmts:
+                self._walk_stmt(child)
+        elif isinstance(stmt, ir.ForStmt):
+            self.visit_for_stmt(stmt)
+        elif isinstance(stmt, ir.IfStmt):
+            self.visit_if_stmt(stmt)
+        elif isinstance(stmt, ir.AssignStmt):
+            self.visit_assign_stmt(stmt)
+
+
+def _collect_tile_puts(prog) -> list:
+    """Every ``pld.tile.put`` call in the lowered program, guarded or not."""
+    put_op = ir.get_op("pld.tile.put").name
+    return [
+        value
+        for value in _probe_stmts(prog).assign_values
+        if isinstance(value, ir.Call) and value.op.name == put_op
+    ]
+
+
+def test_all_to_all_v_transfer_shape_is_the_runtime_row_count():
+    """The TPUT transfer extent is the runtime row count, not MAX_RECV.
+
+    Regression lock. The transfer shape used to be the compile-time
+    ``[MAX_RECV, SIZE]``, so every peer got the full capacity block and the
+    padding rows crossed the interconnect regardless of how few rows were
+    actually being sent.
+
+    Nothing else in the suite pins this down: the shape can silently revert to a
+    constant and every other test still passes, because correctness is
+    unaffected (the receiver uses ``recv_counts`` either way). Only the bytes on
+    the wire change, which no functional test observes.
+    """
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before())
+    puts = _collect_tile_puts(After)
+    assert puts, "expected a pld.tile.put per destination"
+
+    for put in puts:
+        transfer_shape = put.args[6]
+        assert isinstance(transfer_shape, ir.MakeTuple), "transfer shape must be a shape tuple"
+        rows, cols = transfer_shape.elements[0], transfer_shape.elements[1]
+        assert not isinstance(rows, ir.ConstInt), (
+            "transfer rows regressed to the compile-time constant "
+            f"{rows.value}; the full MAX_RECV capacity would cross the wire again"
+        )
+        assert isinstance(cols, ir.ConstInt) and cols.value == _AAV_SIZE, (
+            f"transfer cols must stay the static row width ({_AAV_SIZE})"
+        )
+
+
+def test_all_to_all_v_row_count_is_clamped_below_by_zero():
+    """``rows`` is clamped on both sides, not just against MAX_RECV.
+
+    The lower clamp only became load-bearing once ``rows`` started sizing the
+    transfer. Before that a negative ``send_counts`` merely produced a negative
+    TNOTIFY payload; now it would be a negative transfer extent.
+    """
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before())
+    probe = _probe_stmts(After)
+
+    floors = [v for v in probe.assign_values if isinstance(v, ir.Max)]
+    assert floors, "the runtime send count must be clamped below by 0 (max)"
+    floor_operands = [
+        operand.value
+        for floor in floors
+        for operand in (floor.left, floor.right)
+        if isinstance(operand, ir.ConstInt)
+    ]
+    assert 0 in floor_operands, (
+        f"the lower clamp must floor the count at 0; constant operands found: {floor_operands}"
+    )
+
+
+def test_all_to_all_v_count_notify_is_not_inside_the_push_guard():
+    """The push is guarded on ``rows > 0``; the count notify is not.
+
+    A destination receiving zero rows still needs ``recv_counts = 0`` published,
+    or it reads a stale count from a previous invocation. So the guard must wrap
+    the ``pld.tile.put`` only. This asserts the notify survives outside any
+    conditional.
+    """
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before())
+    probe = _GuardProbe()
+    probe.visit_program(After)
+
+    put_op = ir.get_op("pld.tile.put").name
+    notify_op = ir.get_op("pld.system.notify").name
+
+    assert put_op in probe.guarded, "the pld.tile.put must sit inside the rows > 0 guard"
+    assert notify_op in probe.unguarded, (
+        "the recv_counts notify must stay OUTSIDE the rows > 0 guard — a zero-row "
+        "destination would otherwise read a stale recv_counts"
     )
 
 
@@ -1943,7 +2166,7 @@ _RING_ALLREDUCE_REQUIRED_OPS = {
         "pld.system.rank",
         "pld.system.notify",  # per-round barrier (2(P−1) rounds)
         "pld.system.wait",  # per-round barrier
-        "pld.tile.remote_load",  # per-ring-step chunk receive
+        "pld.tile.put",  # TPUT push of each ring step's chunk to the right neighbour
         "tile.add",  # reduce-scatter accumulation
         "tile.load",  # reduce-scatter local accumulation
         "tile.fillpad_inplace",  # promote ragged subchunks for fixed-shape arithmetic
@@ -1995,8 +2218,8 @@ def test_ring_allreduce_is_decomposed_to_primitives():
     assert ir.get_op("pld.tensor.allreduce").name not in op_names, (
         "lower_composite_ops must remove the composite allreduce call entirely"
     )
-    assert ir.get_op("tile.create").name not in op_names, (
-        "inactive ring segments must not leave allocation-only placeholders"
+    assert ir.get_op("tile.create").name in op_names, (
+        "the TPUT push path must emit the tile.create staging tile"
     )
     missing = _RING_ALLREDUCE_REQUIRED_OPS - op_names
     assert not missing, f"ring-lowered IR missing expected ops: {missing}"
@@ -2014,7 +2237,7 @@ def test_ring_allreduce_emits_ring_control_flow():
     collector.visit_program(After)
 
     assert collector.for_count == 14, f"expected 14 ForStmts for P=2 ring, got {collector.for_count}"
-    assert collector.if_count == 13, f"expected 13 IfStmts for P=2 ring, got {collector.if_count}"
+    assert collector.if_count == 14, f"expected 14 IfStmts for P=2 ring, got {collector.if_count}"
 
 
 @pytest.mark.parametrize("size", [1, 3, 17, 8193, 65537])
@@ -2039,18 +2262,19 @@ def test_ring_allreduce_accepts_arbitrary_lengths(size, n_ranks):
 
     collector = CallCollector()
     collector.visit_program(After)
-    remote_loads = [
-        call for call in collector.calls if call.op.name == ir.get_op("pld.tile.remote_load").name
-    ]
+    puts = [call for call in collector.calls if call.op.name == ir.get_op("pld.tile.put").name]
+    stage_creates = [call for call in collector.calls if call.op.name == ir.get_op("tile.create").name]
     loads = [call for call in collector.calls if call.op.name == ir.get_op("tile.load").name]
     set_valid_shapes = [
         call for call in collector.calls if call.op.name == ir.get_op("tile.set_validshape").name
     ]
 
-    assert remote_loads
+    assert puts, "ring-lowered IR must emit pld.tile.put pushes"
+    assert stage_creates, "ring-lowered IR must emit the TPUT staging tile"
     assert loads
     assert set_valid_shapes
-    assert all(len(call.args) == 5 for call in remote_loads)
+    # pld.tile.put(dst, peer, src, stage, dst_offsets, src_offsets, shape)
+    assert all(len(call.args) == 7 for call in puts)
 
     loops: list[ir.ForStmt] = []
 
@@ -2084,7 +2308,9 @@ def test_ring_allreduce_accepts_arbitrary_lengths(size, n_ranks):
         assert isinstance(loop.start, ir.ConstInt) and loop.start.value == 0
         assert isinstance(loop.stop, ir.ConstInt) and loop.stop.value == max_segment
 
-    chunk_shapes = [call.args[3] for call in remote_loads]
+    # The static TPUT staging tile carries the UB-bounded, 32-byte-aligned
+    # chunk width (tile.create shape [1, chunk_cols]).
+    chunk_shapes = [call.args[0] for call in stage_creates]
     for shape in chunk_shapes:
         assert isinstance(shape, ir.MakeTuple)
         chunk_rows = shape.elements[0]
@@ -2099,7 +2325,7 @@ def test_ring_allreduce_accepts_arbitrary_lengths(size, n_ranks):
 @pytest.mark.parametrize("size", [1, 17, 33, 8193, 65537])
 @pytest.mark.parametrize("n_ranks", [2, 4])
 def test_ring_allreduce_fp16_uses_aligned_ring_schedule(size, n_ranks):
-    """FP16 stays on the ring path and marks every remote tail as padded."""
+    """FP16 stays on the ring path with a 16-element-aligned TPUT staging tile."""
     Before = _build_ring_allreduce_before(
         size=size,
         n_ranks=n_ranks,
@@ -2118,12 +2344,11 @@ def test_ring_allreduce_fp16_uses_aligned_ring_schedule(size, n_ranks):
 
     collector = CallCollector()
     collector.visit_program(After)
-    remote_loads = [
-        call for call in collector.calls if call.op.name == ir.get_op("pld.tile.remote_load").name
-    ]
-    assert remote_loads
-    assert all(call.kwargs.get("allow_physical_tail_padding") is True for call in remote_loads)
-    assert all(len(call.args) == 5 for call in remote_loads)
+    puts = [call for call in collector.calls if call.op.name == ir.get_op("pld.tile.put").name]
+    stage_creates = [call for call in collector.calls if call.op.name == ir.get_op("tile.create").name]
+    assert puts
+    assert stage_creates
+    assert all(len(call.args) == 7 for call in puts)
 
     stmt_collector = _StmtKindCollector()
     stmt_collector.visit_program(After)
@@ -2133,7 +2358,7 @@ def test_ring_allreduce_fp16_uses_aligned_ring_schedule(size, n_ranks):
 
     max_segment = min(size, (size + n_ranks - 1) // n_ranks + 15)
     expected_chunk = min(8192, ((max_segment + 15) // 16) * 16)
-    chunk_shapes = [call.args[3] for call in remote_loads]
+    chunk_shapes = [call.args[0] for call in stage_creates]
     for shape in chunk_shapes:
         assert isinstance(shape, ir.MakeTuple)
         chunk_cols = shape.elements[1]
@@ -2144,13 +2369,12 @@ def test_ring_allreduce_fp16_uses_aligned_ring_schedule(size, n_ranks):
 
 
 def test_ring_allreduce_fp16_lowered_ir_round_trips():
-    """The compiler-only aligned remote tail survives print and reparse."""
+    """The push-based ring schedule (pld.tile.put) survives print and reparse."""
     Before = _build_ring_allreduce_before(size=17, n_ranks=2, dtype=pl.FP16)
     After = passes.lower_composite_ops()(Before)
 
     text = ir.python_print(After)
-    assert "pld.tile._remote_load_with_physical_tail_padding(" in text
-    assert "allow_physical_tail_padding=" not in text
+    assert "pld.tile.put(" in text
     reparsed = pl.parse_program(text)
     ir.assert_structural_equal(After, reparsed)
 

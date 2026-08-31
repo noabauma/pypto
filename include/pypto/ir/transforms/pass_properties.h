@@ -40,6 +40,12 @@ inline const PassProperties kInlineFunctionsProperties{.produced = {IRProperty::
 //    and wraps the host_orch body in nested CommDomainScopeStmts (one per
 //    inferred comm domain).
 
+// SynthesizeAllReduceSignals assumes SSA-form input: ResolveLineageKey walks
+// each data Var's single defining AssignStmt RHS (var_defs is single-assignment,
+// def-dominates-use). IRProperty::SSAForm is deliberately NOT declared required
+// — kInitMemRefProperties invalidates it and nothing re-produces it before this
+// pass runs — so multi-assignment robustness is a tracked follow-up together
+// with MaterializeCommDomainScopes (same gap).
 inline const PassProperties kSynthesizeAllReduceSignalsProperties{};
 
 inline const PassProperties kMaterializeCommDomainScopesProperties{
@@ -49,9 +55,13 @@ inline const PassProperties kLowerHostTensorCollectivesProperties{
     .required = {IRProperty::CommDomainScopesMaterialized},
     .produced = {IRProperty::CommDomainScopesMaterialized}};
 
+// Resolves a returned DistributedTensor to the parameter it writes back via
+// return_lineage::ExplicitReturnedParamIndices, which is a pointer-identity read
+// of the ReturnStmt and only meaningful once NormalizeReturnOrder has
+// canonicalized it — hence the ReturnParamsExplicit requirement.
 inline const PassProperties kMaterializeDistTensorCtxProperties{
-    .required = {IRProperty::CommDomainScopesMaterialized},
-    .produced = {IRProperty::CommDomainScopesMaterialized}};
+    .required = {IRProperty::CommDomainScopesMaterialized, IRProperty::ReturnParamsExplicit},
+    .produced = {IRProperty::CommDomainScopesMaterialized, IRProperty::DistTensorCtxMaterialized}};
 
 // -- MaterializeValidShapeSymbols pass (runs last) ---------------------------
 //    Prepends a Scalar[INDEX] parameter per device-kernel valid_shape symbol that
@@ -59,9 +69,18 @@ inline const PassProperties kMaterializeDistTensorCtxProperties{
 //    Signature-and-call rewrite only; touches no structural property.
 inline const PassProperties kMaterializeValidShapeSymbolsProperties{};
 
+// -- LegalizeGraphBoundary pass (runs after the final Simplify) ---------------
+//    Hoists every boundary scalar a Graph body derives out to its call sites and
+//    rejects the graphs the host_build_graph runtime could not record. Rewrites
+//    call arguments and their directions, so it re-declares CallDirectionsResolved
+//    — MaterializeRuntimeScopes, which runs next, requires it.
+inline const PassProperties kLegalizeGraphBoundaryProperties{
+    .required = {IRProperty::SplitIncoreOrch, IRProperty::CallDirectionsResolved},
+    .produced = {IRProperty::GraphBoundaryLegalized, IRProperty::CallDirectionsResolved}};
+
 // -- MaterializeRuntimeScopes pass (runs last, after the final Simplify) ------
 //    Inserts explicit AUTO RuntimeScopeStmt nodes for the orchestration function
-//    body and for/if bodies so codegen emits PTO2_SCOPE 1:1 from the IR.
+//    body and for/if bodies so codegen emits SIMPLER_SCOPE 1:1 from the IR.
 inline const PassProperties kMaterializeRuntimeScopesProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::CallDirectionsResolved},
     .produced = {IRProperty::RuntimeScopesMaterialized}};
@@ -101,12 +120,13 @@ inline const PassProperties kNormalizeStmtStructureProperties{
 
 inline const PassProperties kSimplifyProperties{};
 
-// -- Composite op lowering pass (tile.sin / tile.cos / InCore allreduce -> primitives, etc.) -----
+// -- Composite op lowering pass (trig / packed MX quant / InCore collectives -> primitives) ------
 //
 // LowerCompositeOps decomposes composite tile/distributed ops into primitive
 // ops. Today it handles tile.sin / tile.cos (Cody-Waite range reduction +
-// degree-9 Horner polynomial) and explicit-signal InCore pld.tensor.allreduce;
-// host-level allreduce is skipped and lowered later by LowerHostTensorCollectives.
+// degree-9 Horner polynomial), packed tile.tquant_mx, and explicit-signal InCore
+// pld.tensor.allreduce; host-level allreduce is skipped and lowered later by
+// LowerHostTensorCollectives.
 // Future composite ops add a rule to the file-local dispatch table in
 // lower_composite_ops_pass.cpp. The pass operates within existing op
 // vocabularies, so it neither requires nor produces nor invalidates any
@@ -156,6 +176,26 @@ inline const PassProperties kConvertTensorToTileOpsProperties{
 inline const PassProperties kOptimizeOrchTensorsProperties{
     .required = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps},
     .produced = {IRProperty::SplitIncoreOrch, IRProperty::IncoreTileOps}};
+
+// -- Blocked NZ tensor views ---------------------------------------------------
+//
+// Rewrites a logical ``pl.NZ`` tensor into pto-isa's blocked rank-(r+2) form
+// and retargets its ``tile.load`` coordinates. It changes shapes and load
+// coordinates inside the existing tile-op vocabulary without establishing or
+// destroying an IRProperty of its own.
+//
+// It does, however, *require* TileOps2D: the destination tile must already be
+// the logical 2D operand when the load's GM window is blocked. Blocking an
+// ND-rank tile leaves a ``tile.load`` whose type annotation and argument ranks
+// cannot both be printed, which the printer round-trip rejects. Declaring the
+// requirement is what makes a hand-assembled pipeline in the wrong order fail
+// the property check instead of failing obscurely later.
+
+inline const PassProperties kBlockNzTensorViewsProperties{
+    .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::TileOps2D,
+                 IRProperty::NormalizedStmtStructure},
+    .produced = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::TileOps2D,
+                 IRProperty::NormalizedStmtStructure}};
 
 // -- Tile ND-to-2D flattening pass --------------------------------------------
 
@@ -209,14 +249,15 @@ inline const PassProperties kInferTileMemorySpaceProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure,
-                 IRProperty::AivSplitValid, IRProperty::AccToGmStoreValid},
+                 IRProperty::AivSplitValid, IRProperty::AccToGmStoreValid, IRProperty::AccCompactValid},
     .invalidated = {IRProperty::AivSplitValid}};
 
 // -- Insert MX scale-address binding pass ------------------------------------
 //
-// Runs immediately after InferTileMemorySpace. Requires concrete Left/LeftScale
-// and Right/RightScale spaces so tile.tget_scale_addr can be inserted before
-// each MX matmul consumer. Property-preserving (no new IRProperty).
+// Runs immediately after InferTileMemorySpace.
+// Requires concrete Left/LeftScale and Right/RightScale spaces so
+// tile.tget_scale_addr can be inserted before each MX matmul consumer.
+// Property-preserving (no new IRProperty).
 
 inline const PassProperties kInsertMxScaleAddrProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
@@ -275,7 +316,11 @@ inline const PassProperties kExpandMixedKernelProperties{
     .required = {IRProperty::SSAForm, IRProperty::IncoreTileOps, IRProperty::SplitIncoreOrch,
                  IRProperty::TileOps2D, IRProperty::TileMemoryInferred, IRProperty::NormalizedStmtStructure},
     .produced = {IRProperty::SSAForm, IRProperty::MixedKernelExpanded, IRProperty::NormalizedStmtStructure,
-                 IRProperty::HardSyncallOccupancyValid}};
+                 IRProperty::HardSyncallOccupancyValid, IRProperty::AccCompactValid},
+    // The Cube->Vector boundary `tile.move` is rebuilt here as a tpush/tpop
+    // pair with a freshly built consumer type, so the Acc compact contract has
+    // to be re-checked on that new IR rather than trusted from pass 17.
+    .invalidated = {IRProperty::AccCompactValid}};
 
 // -- GM pipe buffer injection pass (backend-gated; extracted from ExpandMixedKernel) --
 

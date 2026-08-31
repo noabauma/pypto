@@ -148,12 +148,16 @@ class IRNode:
         """Convert to Python-style string representation.
 
         Args:
-            prefix: Module prefix (default 'pl' for 'import pypto.language as pl')
+            prefix: Module prefix (default ``pl``). ``pld`` is reserved for
+                ``pypto.language.distributed`` when printing a Program.
             concise: If true, omit intermediate type annotations (default false)
             format: If true, apply registered format callback (default true)
 
         Returns:
             Python-style string representation
+
+        Raises:
+            ValueError: If ``prefix="pld"`` is used to print a Program
         """
 
 class Expr(IRNode):
@@ -376,6 +380,24 @@ class PadValue(enum.Enum):
 
     min = ...
     """Min value padding."""
+
+class CachePolicy(enum.IntEnum):
+    """GM cache-access policy declared for a tensor read.
+
+    A semantic contract the author states, never a hint the compiler invents.
+    Stored as ``int`` in the ``tile.load`` ``cache`` kwarg.
+    """
+
+    DEFAULT = 0
+    """Ordinary cached GM access."""
+
+    BYPASS = 1
+    """Streaming access declared to bypass the cache.
+
+    Asserts this tensor has no reuse worth caching and that nothing writes
+    those bytes while the kernel runs — mixing a cached write and a bypassing
+    read of the same bytes is a coherency bug.
+    """
 
 class CompactMode(enum.Enum):
     """Partial-tile compact mode enumeration."""
@@ -2270,7 +2292,7 @@ class ScopeKind(enum.Enum):
     """SPMD dispatch scope (core_num/sync_start on ScopeStmt)."""
 
     Runtime = 5
-    """Runtime orchestration scope (PTO2_SCOPE wrapper, manual on/off)."""
+    """Runtime orchestration scope (SIMPLER_SCOPE wrapper, manual on/off)."""
 
     CommDomain = 6
     """Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch
@@ -2464,11 +2486,11 @@ class SplitAivScopeStmt(ScopeStmt):
     ) -> None: ...
 
 class RuntimeScopeStmt(ScopeStmt):
-    """Runtime orchestration scope: a PTO2_SCOPE wrapper at codegen.
+    """Runtime orchestration scope: a SIMPLER_SCOPE wrapper at codegen.
 
     The ``manual`` flag picks between two emission modes:
-      - ``manual=False`` → ``PTO2_SCOPE() { ... }`` (auto-dep via TensorMap)
-      - ``manual=True``  → ``PTO2_SCOPE(PTO2ScopeMode::MANUAL) { ... }``
+      - ``manual=False`` → ``SIMPLER_SCOPE() { ... }`` (auto-dep via TensorMap)
+      - ``manual=True``  → ``SIMPLER_SCOPE(ScopeMode::MANUAL) { ... }``
         (no auto-dep; compiler emits explicit ``add_dep`` from SSA data flow
         plus user-supplied ``deps=[...]`` on each kernel call)
     """
@@ -3064,6 +3086,37 @@ def create_op_call(
         Exception: If operator is not registered, is internal-only, or type deduction fails
     """
 
+def _create_internal_op_call(
+    op_name: str,
+    args: Sequence[Expr],
+    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+    span: Span,
+) -> Call:
+    """Create a Call expression for a compiler-internal operator. **Private.**
+
+    Compiler-internal counterpart of :func:`create_op_call`: it reaches
+    operators marked ``internal_only`` (e.g. the ``builtin.tensor.*`` chip
+    dispatches that ``LowerHostTensorCollectives`` emits), which the
+    user-facing path rejects by design. Reserved for the round-trip parser,
+    which must rebuild the printer-emitted ``pl.builtin.<ns>.<op>(...)`` form
+    that no DSL wrapper can spell — and which re-checks the invariants the
+    printer stamps before calling in, so the guard is enforced at the
+    user-facing surface rather than dropped. Op builders and DSL wrappers keep
+    using :func:`create_op_call`.
+
+    Args:
+        op_name: Name of the registered operator
+        args: Positional Expr arguments
+        kwargs: Keyword arguments (metadata)
+        span: Source location
+
+    Returns:
+        Call expression with automatically deduced result type
+
+    Raises:
+        Exception: If operator is not registered or type deduction fails
+    """
+
 def set_call_attrs(call: Call, attrs: Mapping[str, object]) -> Call:
     """Return a copy of ``call`` with compiler-internal ``attrs_`` set.
 
@@ -3088,6 +3141,21 @@ def is_incore_type(func_type: FunctionType) -> bool:
 
     Returns:
         True if the type is InCore, AIC, or AIV
+    """
+
+def is_orchestration_like(func_type: FunctionType) -> bool:
+    """Check if a FunctionType has an orchestration body (Orchestration or Graph).
+
+    Both are host/AICPU task-orchestration code, so a caller that acts on a
+    function *because it orchestrates tasks* must accept either. Prefer this
+    over ``func_type == FunctionType.Orchestration``, which silently skips
+    Graph bodies.
+
+    Args:
+        func_type: The function type to check
+
+    Returns:
+        True if the type is Orchestration or Graph
     """
 
 def level_to_linqu_level(level: Level) -> int:
@@ -3145,6 +3213,139 @@ def get_op_memory_spec(op_name: str) -> dict[str, Any] | None:
           kwarg was absent; `InferTileMemorySpace` resolves it later from
           consumer demand (e.g. `tile.load`, `tile.create`).
         * ``None`` — no resolver registered for this op.
+    """
+
+class ArgEffect(enum.Enum):
+    """What executing an operator does to the buffer one argument names."""
+
+    Read = ...
+    """Read, never written. The default for an argument the operator does not name."""
+
+    Write = ...
+    """Overwritten without being read first (a destination operand)."""
+
+    ReadWrite = ...
+    """Read and written — accumulate, atomic update, partial in-place rewrite."""
+
+class WriteChannel(enum.Enum):
+    """The hardware path an operator's writes travel."""
+
+    Dma = ...
+    """MTE3 / DMA store path (tile.store, tensor.assemble, cross-rank put/get)."""
+
+    Scalar = ...
+    """Scalar D-cache write path (tensor.write)."""
+
+def get_op_arg_effect(op_name: str, arg_index: int, **kwargs: Any) -> ArgEffect:
+    """Effect an operator has on one positional argument.
+
+    Args:
+        op_name: Name of the operator
+        arg_index: Positional argument index
+        **kwargs: The kwargs a call would carry, for operators whose effect
+            depends on one (an atomic ``tile.store`` reads the accumulator it
+            adds into; ``pld.system.notify`` accumulates unless ``op`` selects
+            the set form)
+
+    Returns:
+        The declared effect, or ``ArgEffect.Read`` for an argument the operator
+        did not name
+
+    Raises:
+        Exception: If operator is not registered
+    """
+
+def op_has_declared_arg_effects(op_name: str) -> bool:
+    """Whether an operator declared its per-argument effects.
+
+    Args:
+        op_name: Name of the operator
+
+    Returns:
+        False when the operator was never classified — distinct from a
+        declared read-only operator, so an analysis can refuse to guess
+
+    Raises:
+        Exception: If operator is not registered
+    """
+
+def op_has_declared_arg_effect(op_name: str, arg_index: int) -> bool:
+    """Whether the registration reached a verdict about one argument.
+
+    Args:
+        op_name: Name of the operator
+        arg_index: Positional argument index
+
+    Returns:
+        True when the operator named this argument, or declared with
+        ``no_arg_writes()`` that it writes through none of them. False when it
+        classified only *other* arguments — the resulting ``Read`` for this one
+        is a default, not a decision.
+
+    Raises:
+        Exception: If operator is not registered
+    """
+
+def get_op_write_channel(op_name: str) -> WriteChannel | None:
+    """The hardware path an operator's writes travel.
+
+    Args:
+        op_name: Name of the operator
+
+    Returns:
+        The declared channel, or None when the operator declared none (it
+        writes nothing, or its writes are not GM stores)
+
+    Raises:
+        Exception: If operator is not registered
+    """
+
+def get_op_output_arity(op_name: str) -> int:
+    """Number of values an operator produces.
+
+    1 for an ordinary operator; N > 1 for a multi-output operator, whose deduced
+    result is a ``TupleType`` of exactly N elements. Codegen reads the arity from
+    here rather than restating it per emitter.
+
+    Args:
+        op_name: Name of the operator
+
+    Returns:
+        The declared output arity
+
+    Raises:
+        Exception: If operator is not registered
+    """
+
+def op_arg_is_workspace(op_name: str, arg_index: int) -> bool:
+    """Whether an argument is compiler-supplied scratch rather than a result.
+
+    A multi-output operator may write through an argument only when that
+    argument is declared a workspace; an undeclared written argument is a
+    destination tile leaked into the argument list.
+
+    Args:
+        op_name: Name of the operator
+        arg_index: Positional argument index
+
+    Returns:
+        True when the registration declared this argument a workspace
+
+    Raises:
+        Exception: If operator is not registered
+    """
+
+def get_op_argument_count(op_name: str) -> int:
+    """Number of arguments an operator's registration documents.
+
+    Args:
+        op_name: Name of the operator
+
+    Returns:
+        The documented argument count (0 for an operator taking no arguments)
+
+    Raises:
+        Exception: If operator is not registered
     """
 
 # ========== Op Conversion Registry ==========
@@ -3652,7 +3853,8 @@ def python_print(
 
     Args:
         node: IR node to print
-        prefix: Module prefix (default 'pl' for 'import pypto.language as pl')
+        prefix: Module prefix (default ``pl``). ``pld`` is reserved for
+            ``pypto.language.distributed`` when printing a Program.
         concise: If true, omit intermediate type annotations (default false)
         format: If true, apply registered format callback (default true)
         explicit_layout: If true, print every tile's fully-resolved
@@ -3661,6 +3863,9 @@ def python_print(
 
     Returns:
         String representation of the IR node
+
+    Raises:
+        ValueError: If ``prefix="pld"`` is used to print a Program
     """
 
 def python_print_type(

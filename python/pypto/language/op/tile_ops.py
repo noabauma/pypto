@@ -66,6 +66,8 @@ __all__ = [
     "abs",
     "relu",
     "cast",
+    "quant_mx",
+    "tmov_x2zz",
     "matmul",
     "batch_matmul",
     "matmul_acc",
@@ -175,15 +177,15 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
     AtomicType,
+    CachePolicy,
     Expr,
     MemorySpace,
     PadValue,
-    PtrType,
     Span,
     TileLayout,
 )
 
-from ..typing import BoolLike, IntLike, Scalar, Tensor, Tile, predicate_to_expr
+from ..typing import BoolLike, IntLike, Ptr, Scalar, Tensor, Tile, predicate_to_expr
 from .system_ops import (  # noqa: F401
     tpop_from_aic,
     tpop_from_aiv,
@@ -201,9 +203,17 @@ _TensorT = TypeVar("_TensorT", bound=Tensor)
 
 # Constrained TypeVar for the split-axis reshape wrappers (aiv_shard / aic_gather):
 # the operand is either a Tile (legacy @pl.program form) or a Tensor (@pl.jit /
-# pl.spmd form), and the result is the SAME kind as the input. A constrained
-# TypeVar keeps that correlation (Tile -> Tile, Tensor -> Tensor) instead of a
-# ``Tensor | Tile`` union, which would type every result as the union.
+# pl.spmd form), and the result is the SAME kind as the input.
+#
+# Constrained, NOT bound, and deliberately unlike the loop-carry TypeVars in
+# dsl_api: a bound ``Tensor | Tile`` would propagate a DistributedTensor operand
+# into the result type, but AIV/AIC split does not accept one. The deducer
+# matches the operand with ``As<TensorType>``, which is precise-match and returns
+# null for DistributedTensorType by design, so ``tensor.aiv_shard(dist)`` is
+# rejected ("requires argument to be a (non-distributed) TensorType", see
+# DeduceSplitReshapeTensor in src/ir/op/tile_ops/cross_core.cpp). Collapsing the
+# subclass here keeps the annotation from advertising a result the op cannot
+# produce; widening it needs both operation contracts updated first.
 _SplitOperandT = TypeVar("_SplitOperandT", Tensor, Tile)
 
 
@@ -240,7 +250,7 @@ def alloc(
     size: int,
     *,
     pinned: bool = False,
-) -> PtrType:
+) -> Ptr:
     """Stub for the internal ``tile.alloc`` IR operation.
 
     This function is never called in user-written DSL code.  It is emitted
@@ -260,9 +270,10 @@ def alloc(
             its membership isolated from other allocations.
 
     Returns:
-        Opaque ``PtrType`` sentinel (unused at runtime)
+        Opaque ``Ptr`` sentinel (unused at runtime — the parser intercepts the
+        call in the AST and never invokes this stub)
     """
-    return PtrType()
+    return Ptr()
 
 
 def _unwrap_rhs(rhs: int | float | Expr | Tile | Scalar) -> int | float | Expr:
@@ -296,17 +307,19 @@ def _scalar_operand_to_expr(value: int | Scalar | Expr) -> Expr:
 def create(
     shape: Sequence[IntLike],
     dtype: DataType,
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     transpose: bool | None = None,
     *,
     flat_layout: bool | None = None,
+    compact: bool | None = None,
 ) -> Tile:
     """Create a tile from a shape.
 
     Args:
         shape: Shape of the tile
         dtype: Data type of the tile
-        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right)
+        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right).
+            ``None`` (the default) leaves the space unset for the compiler to place.
         transpose: When True, allocate the transposed Mat (ZN) fractal layout for a
             matmul ``b_trans`` B-operand (the layout a DN-source ``gather_row`` fills).
             Default ``None`` keeps the canonical layout and is omitted from the op.
@@ -315,6 +328,13 @@ def create(
             than the boxed NZ layout Mat tiles normally carry. Requires
             ``target_memory=Mat`` and is mutually exclusive with ``transpose``.
             Default ``None`` keeps the canonical layout.
+        compact: Keyword-only. Compiler-internal. Declares that this L0C buffer
+            holds a valid-region-packed product -- N-fractal pitch
+            ``ceil(validRow/16)*16`` rather than the physical row count, which is
+            what ``mad`` writes when the matmul's left operand is row-narrowed.
+            Requires ``target_memory=Acc``. Kernels do not set this;
+            ``AutoTileMatmulL0`` declares it on the accumulator seed it
+            synthesizes for a split K.
 
     Returns:
         Tile wrapping the create operation
@@ -327,6 +347,7 @@ def create(
         target_memory,
         transpose,
         flat_layout=flat_layout,
+        compact=compact,
     )
     return Tile(expr=call_expr)
 
@@ -375,8 +396,9 @@ def load(
     offsets: Sequence[IntLike],
     shapes: Sequence[IntLike],
     valid_shape: Sequence[IntLike] | None = None,
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     clamp: bool = False,
+    cache: CachePolicy | None = None,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
 
@@ -388,19 +410,36 @@ def load(
     Args:
         tensor: Source tensor
         offsets: Offsets in each dimension. Always in the source tensor's
-            coordinate system.
+            coordinate system. Each element must be an integer scalar — a float
+            (``n / 2`` rather than ``n // 2``) or a nested sequence is rejected.
         shapes: Shape of the region to load in each dimension. Always in the
-            source tensor's coordinate system.
+            source tensor's coordinate system. Each element must be an integer
+            scalar, on the same terms as ``offsets``.
         valid_shape: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
             as valid_shape. Uses the same coordinate convention as shapes. Narrows
-            the tile; cannot widen it past what the source has.
-        target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat).
+            the tile; cannot widen it past what the source has. Each element must
+            be an integer scalar — one extent per dimension, not a nested
+            ``[start, extent]`` pair.
+        target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
+            ``None`` (the default) leaves the space unset for the compiler to place.
             MX-layout tensors require an explicit MemorySpace.Mat.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts ``offsets + valid_shape`` stays inside the source and is
             rejected when that provably fails; ``clamp=True`` cuts the request back
             to the source edge instead.
+        cache: GM cache-access policy for *this* read. ``None`` (the default)
+            states no policy, leaving any scope-level declaration to apply.
+            ``CachePolicy.BYPASS`` declares a streaming read — it asserts the
+            bytes have no reuse worth caching and that nothing writes them while
+            the kernel runs; coherency is the author's contract (see
+            [`pl.set_cache_policy`][pypto.language.tensor.set_cache_policy] for
+            the full contract). An explicit value here always wins over a
+            scope-level ``pl.set_cache_policy`` declaration for the same tensor,
+            in both directions: ``cache=CachePolicy.DEFAULT`` opts this one read
+            back into the cache inside a bypassing scope. PTOAS has no L2-bypass
+            path yet (https://github.com/hw-native-sys/PTOAS/issues/1356), so a
+            BYPASS request warns and compiles as an ordinary cached access today.
 
     Returns:
         Tile wrapping the load operation
@@ -408,6 +447,8 @@ def load(
     Example:
         >>> # 2D load
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
+        >>> # streaming read, no cache reuse expected
+        >>> tile = load(tensor, [0, 0], [32, 32], cache=pl.CachePolicy.BYPASS)
     """
     if valid_shape is None:
         valid_shape = shapes
@@ -418,6 +459,7 @@ def load(
         _normalize_intlike(valid_shape),
         target_memory,
         clamp=clamp,
+        cache=None if cache is None else int(cache),
     )
     return Tile(expr=call_expr)
 
@@ -434,9 +476,11 @@ def store(
 
     Args:
         tile: Source tile
-        offsets: Offsets in each dimension
+        offsets: Offsets in each dimension. Each element must be an integer
+            scalar — a float or a nested sequence is rejected.
         output_tensor: Output tensor
         shapes: Optional ND partition shape. Injected by FlattenTileNdTo2D for ND tensors.
+            Each element must be an integer scalar, on the same terms as ``offsets``.
         atomic: Combine mode for the global-memory write. ``AtomicType.None_``
             (default) overwrites; ``AtomicType.Add`` atomically adds the tile
             into existing GM contents — used for split-K accumulation, where
@@ -544,6 +588,9 @@ def extract(
 ) -> Tile:
     """Extract a sub-tile from ``src`` at ``(index_row, index_col)`` — ISA TEXTRACT.
 
+    Maps to ISA TEXTRACT Variant 1 (Standard Extract). The result tile has the
+    given static ``shape`` and lives in ``target_memory``.
+
     Args:
         src: Source tile (typically in Mat or Acc memory)
         index_row: Starting row offset
@@ -568,6 +615,11 @@ def extract(
 
 def scatter_update(input: Tile, *args: Any, **kwargs: Any) -> Tile:
     """Update tile rows at positions specified by 2D index tile with values from src.
+
+    Supports two rank variants:
+
+    - 2D: ``input [rows, d]``, ``src [b*s, d]``, ``index [b, s]``
+    - 4D: ``input [blockNum, blockSize, 1, d]``, ``src [b, s, 1, d]``, ``index [b, s]``
 
     Accepts the same flexible call shapes as the IR builder
     ``pypto.ir.op.tile.scatter_update``:
@@ -723,22 +775,38 @@ def ci(
     shape: Sequence[int],
     dtype: DataType = DataType.INT32,
     descending: bool = False,
+    *,
+    tmp: Tile | None = None,
 ) -> Tile:
     """Generate a contiguous integer sequence into a tile.
 
     Equivalent to ``numpy.arange``-style index generation. Maps to ``pto.tci``.
+    For a column index ``k`` in the first row of the destination, ascending gives
+    ``dst[0, k] = start + k`` and descending gives ``dst[0, k] = start - k``.
+
+    Note:
+        ``pto.tci`` uses the destination's valid-column count as the sequence
+        length and does NOT populate additional rows. Leading dimensions must
+        be 1 — prefer shapes of the form ``[1, N]``.
 
     Args:
         start: Starting integer (plain int or a Scalar). Must match ``dtype``.
         shape: Shape of the destination tile (static, innermost dim != 1).
         dtype: Destination dtype. One of {INT16, INT32}. Defaults to INT32.
         descending: If True, generate a descending sequence.
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
 
     Returns:
         Tile wrapping the ci operation.
     """
     start_expr = start.unwrap() if isinstance(start, Scalar) else start
-    call_expr = _ir_ops.ci(start_expr, list(shape), dtype=dtype, descending=descending)
+    call_expr = _ir_ops.ci(
+        start_expr,
+        list(shape),
+        dtype=dtype,
+        descending=descending,
+        tmp=None if tmp is None else tmp.unwrap(),
+    )
     return Tile(expr=call_expr)
 
 
@@ -940,6 +1008,9 @@ def get_block_num() -> Scalar:
 def add(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
     """Element-wise addition of tile and tile or scalar.
 
+    Supports broadcasting when both operands are tiles. A scalar ``rhs``
+    canonicalizes to ``tile.adds``.
+
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile or scalar
@@ -954,6 +1025,9 @@ def add(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
 def sub(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
     """Element-wise subtraction of tile and tile or scalar.
 
+    Supports broadcasting when both operands are tiles. A scalar ``rhs``
+    canonicalizes to ``tile.subs``.
+
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile or scalar
@@ -967,6 +1041,9 @@ def sub(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
 
 def mul(lhs: Tile, rhs: Tile | int | float | Scalar | Expr) -> Tile:
     """Element-wise multiplication of tile and tile or scalar.
+
+    Supports broadcasting when both operands are tiles. A scalar ``rhs``
+    canonicalizes to ``tile.muls``.
 
     Args:
         lhs: Left-hand side tile
@@ -985,6 +1062,10 @@ def div(
     high_precision: bool = False,
 ) -> Tile:
     """Element-wise division of tile and tile or scalar.
+
+    Tile-tile division requires identical physical and valid shapes. A scalar
+    ``rhs`` canonicalizes to ``tile.divs``, which does not expose the ``tdiv``
+    precision mode — hence ``high_precision`` applies only to the tile-tile form.
 
     Args:
         lhs: Left-hand side tile
@@ -1084,6 +1165,9 @@ def exp(tile: Tile) -> Tile:
 def sin(tile: Tile) -> Tile:
     """Element-wise sine of a tile (radians). FP32 only.
 
+    Non-FP32 inputs are rejected rather than promoted — cast explicitly with
+    ``pl.cast(tile, pl.FP32)`` first.
+
     Args:
         tile: Input tile (FP32)
 
@@ -1096,6 +1180,9 @@ def sin(tile: Tile) -> Tile:
 
 def cos(tile: Tile) -> Tile:
     """Element-wise cosine of a tile (radians). FP32 only.
+
+    Non-FP32 inputs are rejected rather than promoted — cast explicitly with
+    ``pl.cast(tile, pl.FP32)`` first.
 
     Args:
         tile: Input tile (FP32)
@@ -1194,6 +1281,8 @@ def cast(
     tile: Tile,
     target_type: int | DataType,
     mode: str | int = "round",
+    *,
+    tmp: Tile | None = None,
 ) -> Tile:
     """Cast tile to target data type (element-wise).
 
@@ -1202,12 +1291,102 @@ def cast(
         target_type: Target data type (DataType)
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
 
     Returns:
         Tile wrapping the cast operation
+
+    Example:
+        >>> tile_fp32 = pl.tile.cast(tile_bf16, pl.FP32)
     """
-    call_expr = _ir_ops.cast(tile.unwrap(), target_type, mode)
+    tmp_expr = None if tmp is None else tmp.unwrap()
+    call_expr = _ir_ops.cast(tile.unwrap(), target_type, mode, tmp=tmp_expr)
     return Tile(expr=call_expr)
+
+
+# ============================================================================
+# MX Quantization Operations
+# ============================================================================
+
+
+def quant_mx(
+    src: Tile,
+    *,
+    group_axis: int,
+    dtype: DataType = DataType.FP8E4M3FN,
+) -> tuple[Tile, Tile]:
+    """MXFP8 block-32 dynamic quantization with PTOAS ``grpAxis`` selection.
+
+    ``group_axis`` is required and must be ``0`` or ``1`` (same meaning as
+    PTOAS ``#pto<mx_group_axis axis*>``). Axis 1 is the A-side ``[M, K]`` path;
+    axis 0 is the B-side ``[N, K]`` path (LowerCompositeOps transposes to
+    ``[K, N]`` before quantization). GM ``TensorLayout.MX_*`` is only for
+    tensor / ``tensor.view`` annotations, not this tile op.
+
+    This release supports **MXFP8 only** (``dtype=FP8E4M3FN``). MXFP4 is out of
+    scope for this PR.
+
+    Args:
+        src: Source tile (FP16/FP32/BF16, 2D).
+            ``group_axis=1``: ``[M, K]`` with ``M%16==0``, ``K%64==0``.
+            ``group_axis=0``: ``[N, K]`` with ``N%32==0``, ``K%64==0``.
+        group_axis: PTOAS grouping axis — ``1`` (A-side) or ``0`` (B-side).
+        dtype: Must be ``FP8E4M3FN`` (default).
+
+    Returns:
+        ``group_axis=1``: ``(quant[M,K], scale[M,K/32])`` row/row ZZ scale.
+        ``group_axis=0``: ``(quant[K,N], scale[K/32,N])`` — data transposed to
+        Cube RHS layout; scale col/col NN.
+
+    Note:
+        ``quant_mx`` and ``matmul_mx`` cannot currently share one InCore mixed
+        task. Stage the quantized data and scale through GM between separate
+        AIV and AIC kernels; automatic cross-core data+scale transport is a
+        follow-up.
+    """
+    if group_axis not in (0, 1):
+        raise ValueError(f"pl.quant_mx group_axis must be 0 or 1, but got {group_axis!r}")
+    if dtype != DataType.FP8E4M3FN:
+        raise ValueError(f"pl.quant_mx supports only FP8E4M3FN (MXFP8), but got {dtype}")
+    call_expr = _ir_ops.tquant_mx(src.unwrap(), dtype=dtype, group_axis=group_axis)
+    span = call_expr.span
+    return (
+        Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
+        Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 1, span)),
+    )
+
+
+def tmov_x2zz(
+    src: Tile,
+    tmp: Tile,
+    *,
+    group_axis: int = 1,
+    dst_rows: int | None = None,
+    dst_cols: int | None = None,
+) -> Tile:
+    """Exponent X-to-ZZ layout conversion (A5-only).
+
+    ``tmp`` is a write-only workspace. Axis1 requires capacity
+    ``64 + ceil(rows/16) * cols`` bytes (typically 32-byte-aligned by the
+    caller) and ``dst_rows``/``dst_cols`` for the ZZ ``[M, G]`` shape. Axis0
+    (TMovDnTo2Zz) still requires a Vec tmp operand; use a minimal 32-byte-aligned
+    pad.
+    """
+    if group_axis not in (0, 1):
+        raise ValueError(f"pl.tmov_x2zz group_axis must be 0 or 1, but got {group_axis!r}")
+    call_expr = _ir_ops.tmov_x2zz(
+        src.unwrap(),
+        tmp.unwrap(),
+        group_axis=group_axis,
+        dst_rows=dst_rows,
+        dst_cols=dst_cols,
+    )
+    return Tile(expr=call_expr)
+
+
+# ============================================================================
+# Matrix Operations
+# ============================================================================
 
 
 def matmul(lhs: Tile, rhs: Tile) -> Tile:
@@ -1226,6 +1405,9 @@ def matmul(lhs: Tile, rhs: Tile) -> Tile:
 
 def batch_matmul(lhs: Tile, rhs: Tile) -> Tile:
     """Batch matrix multiplication of two tiles.
+
+    Broadcasts the batch dims: for inputs shaped ``[...batch_dims, M, K]`` and
+    ``[...batch_dims, K, N]``, the output is ``[...broadcast_batch_dims, M, N]``.
 
     Args:
         lhs: Left-hand side tile
@@ -1246,12 +1428,25 @@ def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = Non
     accumulated into. This is the split-K idiom, and it removes the need to zero
     the accumulator or to peel the first K step::
 
-        for k0 in pl.pipeline(0, K, K_TILE):
-            acc_t = pl.tile.slice(acc, [ROW_TILE, N], [t0, 0])
-            pl.tile.matmul_acc(acc_t, a, b, init_cond=(k0 == 0))
+        for n0 in pl.range(N // N_TILE):
+            for k0 in pl.pipeline(0, K, K_TILE, stage=2):
+                acc_n = pl.tile.slice(acc, [M, N_TILE], [0, n0 * N_TILE])
+                pl.tile.matmul_acc(acc_n, a, b, init_cond=(k0 == 0))
 
     A literal ``True`` / ``False`` selects one form at compile time; a runtime
     predicate lowers to a branch over the two, with no phi on the accumulator.
+
+    Note:
+        When ``acc`` is a window of a larger ``Mem.Acc`` (L0C) tile, slice it
+        along **columns**, as above -- the window must span every row of its
+        parent, or be at most 16 columns wide inside a single 16-column block.
+        L0C stores 16x16 blocks column-major, so a *row* window of a parent with
+        more than one block column is strided, and the MAD writes its result
+        compactly from a bare pointer with no destination stride. Slicing
+        ``[ROW_TILE, N]`` at ``[t0, 0]`` out of an ``[M, N]`` accumulator is
+        therefore rejected by ``CanonicalizeTileSlice`` rather than silently
+        miscomputed. Column windows address the same L0C memory in the order the
+        hardware writes it, so nothing is lost by preferring them.
 
     Args:
         acc: Accumulator tile
@@ -1268,22 +1463,31 @@ def matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = Non
     return Tile(expr=call_expr)
 
 
-def batch_matmul_acc(acc: Tile, lhs: Tile, rhs: Tile) -> Tile:
+def batch_matmul_acc(acc: Tile, lhs: Tile, rhs: Tile, init_cond: BoolLike | None = None) -> Tile:
     """Batch matrix multiplication with accumulation: acc += lhs @ rhs.
 
     Performs the in-place ``acc += lhs @ rhs`` with batch-dim broadcasting between
     ``lhs`` and ``rhs``. The broadcast batch shape must equal the batch shape of
     ``acc`` (acc is the in-place accumulation target and is not broadcast).
 
+    ``init_cond`` behaves exactly as on
+    [`matmul_acc`][pypto.language.op.tile_ops.matmul_acc]: where it holds, ``acc``
+    is overwritten with ``lhs @ rhs`` rather than accumulated into.
+    ``FlattenTileNdTo2D`` forwards the predicate to every 2D ``tile.matmul_acc``
+    it unrolls this op into.
+
     Args:
         acc: Accumulator tile (at least 2D)
         lhs: Left-hand side tile (at least 2D)
         rhs: Right-hand side tile (at least 2D)
+        init_cond: Optional predicate selecting overwrite over accumulate
 
     Returns:
         Tile wrapping the batch_matmul_acc operation
     """
-    call_expr = _ir_ops.batch_matmul_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap())
+    call_expr = _ir_ops.batch_matmul_acc(
+        acc.unwrap(), lhs.unwrap(), rhs.unwrap(), init_cond=predicate_to_expr(init_cond)
+    )
     return Tile(expr=call_expr)
 
 
@@ -1306,9 +1510,10 @@ def matmul_bias(lhs: Tile, rhs: Tile, bias: Tile) -> Tile:
 def matmul_mx(lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile) -> Tile:
     """MX block-scale matrix multiplication.
 
-    Both data tiles passed to this operation must be FP8E4M3FN. For the
-    supported FP4 x FP8 input form, explicitly cast the FP4 lhs to FP8E4M3FN
-    before calling this operation; native FP4 x FP4 is not supported.
+    Scales use logical ``[M, K/32]`` / ``[K/32, N]`` shapes. Both data tiles
+    passed to this operation must be FP8E4M3FN. For the supported FP4 x FP8
+    input form, explicitly cast the FP4 lhs to FP8E4M3FN before calling this
+    operation; native FP4 x FP4 is not supported.
 
     Args:
         lhs: Left-hand side data tile (FP8E4M3FN)
@@ -1386,22 +1591,53 @@ def gemv(lhs: Tile, rhs: Tile, acc_phase: str = "unspecified") -> Tile:
     return Tile(expr=call_expr)
 
 
-def gemv_acc(acc: Tile, lhs: Tile, rhs: Tile, acc_phase: str = "unspecified") -> Tile:
+def gemv_acc(
+    acc: Tile,
+    lhs: Tile,
+    rhs: Tile,
+    acc_phase: str = "unspecified",
+    *,
+    init_cond: BoolLike | None = None,
+) -> Tile:
     """GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N].
 
     ``acc`` must use the GEMV output dtype. The logical K extents and lhs/rhs
     dtype requirements are identical to [`gemv`][pypto.language.tile.gemv].
+
+    ``init_cond`` makes the accumulator's initial value conditional, exactly as in
+    [`matmul_acc`][pypto.language.tile.matmul_acc] — GEMV is a matmul whose M is
+    1, run on the same cube MAD, so it carries the same predicate bit. On the
+    steps where it holds, ``acc`` is overwritten with ``lhs @ rhs`` rather than
+    accumulated into, which removes the peeled first step from split-K::
+
+        for k0 in pl.pipeline(0, K, K_TILE):
+            a = pl.load(vec, [0, k0], [1, K_TILE], target_memory=pl.MemorySpace.Mat)
+            b = pl.load(mat, [k0, 0], [K_TILE, N], target_memory=pl.MemorySpace.Mat)
+            acc = pl.tile.gemv_acc(acc, a, b, init_cond=(k0 == 0))
+
+    A literal ``True`` / ``False`` selects one form at compile time; a runtime
+    predicate lowers to a branch over the two, with no phi on the accumulator.
+
+    ``init_cond`` is keyword-only because ``acc_phase`` already owns the fourth
+    positional slot.
 
     Args:
         acc: Accumulator tile [1, N]
         lhs: Row vector tile [1, K]
         rhs: Right-hand side tile [K, N]
         acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        init_cond: Optional predicate selecting overwrite over accumulate
 
     Returns:
         Tile wrapping the gemv_acc operation
     """
-    call_expr = _ir_ops.gemv_acc(acc.unwrap(), lhs.unwrap(), rhs.unwrap(), acc_phase=acc_phase)
+    call_expr = _ir_ops.gemv_acc(
+        acc.unwrap(),
+        lhs.unwrap(),
+        rhs.unwrap(),
+        acc_phase=acc_phase,
+        init_cond=predicate_to_expr(init_cond),
+    )
     return Tile(expr=call_expr)
 
 
@@ -1429,6 +1665,9 @@ def gemv_bias(lhs: Tile, rhs: Tile, bias: Tile, acc_phase: str = "unspecified") 
 def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise max reduction.
 
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
+
     Args:
         tile: Input tile
         tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
@@ -1443,6 +1682,9 @@ def row_max(tile: Tile, tmp_tile: Tile) -> Tile:
 
 def row_sum(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise sum reduction.
+
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
         tile: Input tile
@@ -1459,6 +1701,9 @@ def row_sum(tile: Tile, tmp_tile: Tile) -> Tile:
 def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise min reduction.
 
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
+
     Args:
         tile: Input tile
         tmp_tile: Scratch tile with the same dtype and rank as ``tile`` and
@@ -1473,6 +1718,9 @@ def row_min(tile: Tile, tmp_tile: Tile) -> Tile:
 
 def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise product reduction.
+
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
         tile: Input tile
@@ -1489,8 +1737,10 @@ def row_prod(tile: Tile, tmp_tile: Tile) -> Tile:
 def col_sum(tile: Tile, tmp_tile: Tile | None = None) -> Tile:
     """Column-wise sum reduction.
 
-    Passing ``tmp_tile`` activates the binary-tree reduction path; omitting it
-    uses the sequential path.
+    Output shape is ``[1, N]`` for an ``[M, N]`` input.
+
+    Passing ``tmp_tile`` activates the binary-tree reduction path (O(log M) depth,
+    better precision); omitting it uses the sequential path.
 
     Args:
         tile: Input tile
@@ -1508,6 +1758,8 @@ def col_sum(tile: Tile, tmp_tile: Tile | None = None) -> Tile:
 def col_max(tile: Tile) -> Tile:
     """Column-wise max reduction.
 
+    Output shape is ``[1, N]`` for an ``[M, N]`` input.
+
     Args:
         tile: Input tile
 
@@ -1520,6 +1772,8 @@ def col_max(tile: Tile) -> Tile:
 
 def col_min(tile: Tile) -> Tile:
     """Column-wise min reduction.
+
+    Output shape is ``[1, N]`` for an ``[M, N]`` input.
 
     Args:
         tile: Input tile
@@ -1534,6 +1788,8 @@ def col_min(tile: Tile) -> Tile:
 def col_prod(tile: Tile) -> Tile:
     """Column-wise product reduction.
 
+    Output shape is ``[1, N]`` for an ``[M, N]`` input.
+
     Args:
         tile: Input tile
 
@@ -1546,6 +1802,8 @@ def col_prod(tile: Tile) -> Tile:
 
 def row_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise argmax (column index of the per-row maximum, int32 output).
+
+    Output shape is ``[rows, 1]`` with INT32 index dtype.
 
     Args:
         tile: Input tile
@@ -1561,6 +1819,8 @@ def row_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
 def row_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
     """Row-wise argmin (column index of the per-row minimum, int32 output).
 
+    Output shape is ``[rows, 1]`` with INT32 index dtype.
+
     Args:
         tile: Input tile
         tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
@@ -1574,6 +1834,9 @@ def row_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
 
 def col_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
     """Column-wise argmax (row index of the per-column maximum, int32 output).
+
+    Output shape is ``[1, N]`` with INT32 index dtype. Unlike [`col_max`][pypto.language.tile.col_max], the
+    column argmax requires a ``tmp_tile`` scratch buffer.
 
     Args:
         tile: Input tile
@@ -1589,6 +1852,9 @@ def col_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
 def col_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
     """Column-wise argmin (row index of the per-column minimum, int32 output).
 
+    Output shape is ``[1, N]`` with INT32 index dtype. Unlike [`col_min`][pypto.language.tile.col_min], the
+    column argmin requires a ``tmp_tile`` scratch buffer.
+
     Args:
         tile: Input tile
         tmp_tile: Temporary tile
@@ -1602,6 +1868,8 @@ def col_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
 
 def maximum(lhs: Tile, rhs: Tile) -> Tile:
     """Element-wise maximum of two tiles.
+
+    Supports broadcasting between the two tiles.
 
     Args:
         lhs: Left-hand side tile
@@ -1631,6 +1899,9 @@ def row_expand(target: Tile, row_vec: Tile) -> Tile:
 def row_expand_sub(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast subtraction.
 
+    Subtracts a row vector from each row of the tile:
+    ``tile[i, :] - row_vec[i, 0]`` for all ``i``.
+
     Args:
         tile: Input tile [M, N]
         row_vec: Row vector [M, 1]
@@ -1644,6 +1915,9 @@ def row_expand_sub(tile: Tile, row_vec: Tile) -> Tile:
 
 def row_expand_div(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast division.
+
+    Divides each row of the tile by the corresponding row vector value:
+    ``tile[i, :] / row_vec[i, 0]`` for all ``i``.
 
     Args:
         tile: Input tile [M, N]
@@ -1659,6 +1933,9 @@ def row_expand_div(tile: Tile, row_vec: Tile) -> Tile:
 def row_expand_mul(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast multiplication.
 
+    Multiplies each row of the tile by the corresponding row vector value:
+    ``tile[i, :] * row_vec[i, 0]`` for all ``i``.
+
     Args:
         tile: Input tile [M, N]
         row_vec: Row vector [M, 1]
@@ -1672,6 +1949,11 @@ def row_expand_mul(tile: Tile, row_vec: Tile) -> Tile:
 
 def row_expand_add(tile: Tile, row_vec: Tile, tmp: Tile | None = None) -> Tile:
     """Row-wise scalar or packed-block expansion addition.
+
+    A non-row-major ``[M, 1]`` carrier broadcasts one scalar per row:
+    ``tile[i, :] + row_vec[i, 0]`` for all ``i``. A row-major carrier instead holds
+    one 32-byte lane block per row and repeats that block across the destination
+    columns.
 
     Args:
         tile: Input tile [M, N]
@@ -1703,6 +1985,9 @@ def col_expand(target: Tile, col_vec: Tile) -> Tile:
 def col_expand_mul(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and multiply with tile.
 
+    Multiplies each column of the tile by the corresponding column vector value:
+    ``tile[:, j] * col_vec[0, j]`` for all ``j``.
+
     Args:
         tile: Input tile [M, N]
         col_vec: Column vector [1, N]
@@ -1716,6 +2001,9 @@ def col_expand_mul(tile: Tile, col_vec: Tile) -> Tile:
 
 def col_expand_div(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and divide tile by it.
+
+    Divides each column of the tile by the corresponding column vector value:
+    ``tile[:, j] / col_vec[0, j]`` for all ``j``.
 
     Args:
         tile: Input tile [M, N]
@@ -1731,6 +2019,9 @@ def col_expand_div(tile: Tile, col_vec: Tile) -> Tile:
 def col_expand_sub(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and subtract from tile.
 
+    Subtracts a column vector from each column of the tile:
+    ``tile[:, j] - col_vec[0, j]`` for all ``j``.
+
     Args:
         tile: Input tile [M, N]
         col_vec: Column vector [1, N]
@@ -1744,6 +2035,9 @@ def col_expand_sub(tile: Tile, col_vec: Tile) -> Tile:
 
 def col_expand_add(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and add to tile.
+
+    Adds a column vector to each column of the tile:
+    ``tile[:, j] + col_vec[0, j]`` for all ``j``.
 
     Args:
         tile: Input tile [M, N]
@@ -1759,6 +2053,9 @@ def col_expand_add(tile: Tile, col_vec: Tile) -> Tile:
 def row_expand_max(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast maximum: max(tile, row_vec broadcasted).
 
+    Takes the element-wise maximum of each row and the row vector value:
+    ``max(tile[i, :], row_vec[i, 0])`` for all ``i``.
+
     Args:
         tile: Input tile [M, N]
         row_vec: Row vector [M, 1]
@@ -1772,6 +2069,9 @@ def row_expand_max(tile: Tile, row_vec: Tile) -> Tile:
 
 def row_expand_min(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise broadcast minimum: min(tile, row_vec broadcasted).
+
+    Takes the element-wise minimum of each row and the row vector value:
+    ``min(tile[i, :], row_vec[i, 0])`` for all ``i``.
 
     Args:
         tile: Input tile [M, N]
@@ -1787,6 +2087,8 @@ def row_expand_min(tile: Tile, row_vec: Tile) -> Tile:
 def row_expand_expdif(tile: Tile, row_vec: Tile) -> Tile:
     """Row-wise exp-diff: exp(tile - row_vec) with per-row scalar.
 
+    Computes ``exp(tile[i, :] - row_vec[i, 0])`` for all ``i``.
+
     Args:
         tile: Input tile [M, N]
         row_vec: Row vector providing per-row scalar [M, 1]
@@ -1800,6 +2102,8 @@ def row_expand_expdif(tile: Tile, row_vec: Tile) -> Tile:
 
 def col_expand_max(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and take element-wise maximum with tile.
+
+    Computes ``max(tile[:, j], col_vec[0, j])`` for all ``j``.
 
     Args:
         tile: Input tile [M, N]
@@ -1815,6 +2119,8 @@ def col_expand_max(tile: Tile, col_vec: Tile) -> Tile:
 def col_expand_min(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and take element-wise minimum with tile.
 
+    Computes ``min(tile[:, j], col_vec[0, j])`` for all ``j``.
+
     Args:
         tile: Input tile [M, N]
         col_vec: Column vector [1, N]
@@ -1828,6 +2134,8 @@ def col_expand_min(tile: Tile, col_vec: Tile) -> Tile:
 
 def col_expand_expdif(tile: Tile, col_vec: Tile) -> Tile:
     """Expand column vector and compute exp-diff with per-column scalar.
+
+    Computes ``exp(tile[:, j] - col_vec[0, j])`` for all ``j``.
 
     Args:
         tile: Input tile [M, N]
@@ -1843,6 +2151,8 @@ def col_expand_expdif(tile: Tile, col_vec: Tile) -> Tile:
 def expands(target: Tile, scalar: int | float | Expr | Scalar) -> Tile:
     """Expand scalar to target tile shape.
 
+    Broadcasts a scalar value to match the shape of the target tile.
+
     Args:
         target: Target tile defining output shape
         scalar: Scalar value to expand
@@ -1857,6 +2167,8 @@ def expands(target: Tile, scalar: int | float | Expr | Scalar) -> Tile:
 
 def minimum(lhs: Tile, rhs: Tile) -> Tile:
     """Element-wise minimum of two tiles.
+
+    Supports broadcasting between the two tiles.
 
     Args:
         lhs: Left-hand side tile
@@ -2120,20 +2432,25 @@ def set_validshape(tile: Tile, valid_rows: IntLike, valid_cols: IntLike) -> Tile
     return Tile(expr=call_expr)
 
 
-def rem(lhs: Tile, rhs: Tile, tmp: Tile) -> Tile:
+def rem(lhs: Tile, rhs: Tile, tmp: Tile, high_precision: bool = False) -> Tile:
     """Element-wise remainder (modulo) of two tiles.
 
     Computes lhs % rhs element-wise. Maps to the TREM hardware intrinsic.
+    On A2/A3, every INT32 input element must be in ``[-2**24, 2**24]``.
 
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile
-        tmp: Temporary tile (same shape/dtype) required by the hardware
+        tmp: Same-dtype scratch tile whose physical and valid capacity
+            provably provides two rows and covers the dividend columns on
+            A2/A3. It must not overlap either source there.
+        high_precision: Whether to select PTOAS's high-precision TREM mode.
+            This mode is defined only for FP32 and is ignored by A2/A3 hardware.
 
     Returns:
         Tile wrapping the rem operation
     """
-    call_expr = _ir_ops.rem(lhs.unwrap(), rhs.unwrap(), tmp.unwrap())
+    call_expr = _ir_ops.rem(lhs.unwrap(), rhs.unwrap(), tmp.unwrap(), high_precision=high_precision)
     return Tile(expr=call_expr)
 
 
@@ -2141,11 +2458,15 @@ def rems(lhs: Tile, rhs: int | float | Expr | Scalar, tmp: Tile) -> Tile:
     """Element-wise remainder (modulo) of tile and scalar.
 
     Computes lhs % rhs element-wise. Maps to the TREMS hardware intrinsic.
+    On A2/A3, source valid extents must be provably positive and every INT32
+    source element and scalar must be in ``[-2**24, 2**24]``.
 
     Args:
         lhs: Tile
         rhs: Scalar value
-        tmp: Temporary tile (same shape/dtype) required by the hardware
+        tmp: Same-dtype scratch tile whose physical and valid capacity
+            provably provides one row and covers the dividend columns on
+            A2/A3. It must not overlap the dividend there.
 
     Returns:
         Tile wrapping the rems operation
@@ -2223,28 +2544,31 @@ def part_min(src0: Tile, src1: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def fmod(lhs: Tile, rhs: Tile) -> Tile:
-    """Element-wise floating-point remainder of two tiles.
+def fmod(lhs: Tile, rhs: Tile, high_precision: bool = False) -> Tile:
+    """Element-wise truncating remainder of two tiles.
 
-    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
-    ``torch.fmod``). Maps to the TFMOD hardware intrinsic.
+    Computes the truncating remainder of lhs / rhs element-wise, matching
+    ``torch.fmod`` with the result taking the dividend sign. Maps to TFMOD.
 
     Args:
         lhs: Left-hand side tile
         rhs: Right-hand side tile
+        high_precision: Whether to select PTOAS's high-precision TFMOD mode.
+            This mode is defined only for FP32.
 
     Returns:
         Tile wrapping the fmod operation
     """
-    call_expr = _ir_ops.fmod(lhs.unwrap(), rhs.unwrap())
+    call_expr = _ir_ops.fmod(lhs.unwrap(), rhs.unwrap(), high_precision=high_precision)
     return Tile(expr=call_expr)
 
 
 def fmods(lhs: Tile, rhs: int | float | Expr | Scalar) -> Tile:
-    """Element-wise floating-point remainder of tile and scalar.
+    """Element-wise truncating remainder of tile and scalar.
 
-    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
-    ``torch.fmod``). Maps to the TFMODS hardware intrinsic.
+    Computes the truncating remainder of lhs / rhs element-wise, matching
+    ``torch.fmod`` with the result taking the dividend sign. Maps to TFMODS.
+    A2/A3 requires every source valid extent to be provably positive.
 
     Args:
         lhs: Tile
@@ -2596,7 +2920,7 @@ def sel(mask: Tile, lhs: Tile, rhs: Tile, tmp: Tile) -> Tile:
         mask: Predicate mask tile; encoding is target-defined
         lhs: Source tile 0, selected where mask is true
         rhs: Source tile 1, selected where mask is false
-        tmp: Scratch tile required by TSEL (UINT8 [1, 32] on A2/A3)
+        tmp: Scratch tile required by TSEL (UINT32 [1, 16] on A2/A3; unread ABI placeholder on A5)
 
     Returns:
         Tile wrapping the sel operation
@@ -2625,11 +2949,12 @@ def sels(mask: Tile, src: Tile, tmp: Tile, scalar: int | float | Expr | Scalar) 
     return Tile(expr=call_expr)
 
 
-def sort32(src: Tile, idx: Tile) -> Tile:
+def sort32(src: Tile, idx: Tile, *, tmp: Tile | None = None) -> Tile:
     """Sort fixed 32-element blocks with explicit index tile.
 
     Sorts 32-element blocks in src, permuting idx alongside.
-    Returns sorted value-index pairs tile with doubled last dimension.
+    Returns an 8-byte value-index-pair tile. Its last dimension is 2x the input
+    width for FP32 and 4x the input width for FP16.
 
     For FP16 src: initialize idx with [0, 1, 2, ..., 31] per block.
     For FP32 src: initialize idx with [0, 2, 4, ..., 62] per block.
@@ -2637,11 +2962,12 @@ def sort32(src: Tile, idx: Tile) -> Tile:
     Args:
         src: Input value tile (FP16 or FP32)
         idx: Input index tile with sequential offsets
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
 
     Returns:
-        Tile wrapping the sort32 operation (last dim doubled)
+        Tile wrapping the dtype-dependent expanded sort32 output
     """
-    call_expr = _ir_ops.sort32(src.unwrap(), idx.unwrap())
+    call_expr = _ir_ops.sort32(src.unwrap(), idx.unwrap(), tmp=None if tmp is None else tmp.unwrap())
     return Tile(expr=call_expr)
 
 
@@ -2911,6 +3237,10 @@ def mgather(
 ) -> Tile:
     """Gather-load rows or elements from a GM tensor into a fresh Vec or Mat tile.
 
+    Vec output uses a 2D INT32 index tile. Mat output uses a GM INT32 index tensor
+    and produces canonical NZ layout; its element mode additionally requires a
+    same-dtype GM scratch tensor.
+
     Args:
         mem: Source tensor in GM.
         idx: Two-dimensional INT32 index tile for Vec output, or GM tensor for
@@ -2920,6 +3250,9 @@ def mgather(
         gather_oob: Out-of-bounds handling: ``"undefined"``, ``"clamp"``,
             ``"wrap"``, ``"zero"``, or the corresponding integer ``0..3``.
         target_memory: ``MemorySpace.Vec`` (default) or ``MemorySpace.Mat``.
+            This selects the operator *variant*, not merely a placement: the two
+            take a different ``idx`` type and produce a different output shape
+            and view, so it cannot be left for the compiler to infer.
         scratch: Same-dtype GM workspace required by Mat element gather and
             forbidden by the other forms.
         valid_shape: Optional two-dimensional written region for Mat output.

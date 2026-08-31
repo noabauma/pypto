@@ -17,7 +17,9 @@ Tests cover:
 - Error cases
 """
 
+import re
 import sys
+from pathlib import Path
 
 import pypto
 import pytest
@@ -794,6 +796,7 @@ class TestRegistryInfrastructure:
             "tile.exp",
             "tile.recip",
             "tile.sqrt",
+            "tile.tquant_mx",
             "tile.row_sum",
             "tile.row_max",
             "tile.row_min",
@@ -985,6 +988,466 @@ class TestDeduceTypeExceptionPassthrough:
         """The common case is unchanged: a CHECK in deduction stays a ValueError."""
         with pytest.raises(ValueError):
             ir.create_op_call("tile.cast", [self._arg()], ir.Span.unknown())
+
+
+class TestArgEffects:
+    """Per-argument read/write effects declared on the operator registry.
+
+    Every direction and dependency analysis needs one answer to "does this call
+    write the buffer this argument names". These tests pin that answer at its
+    source, so a new operator cannot quietly join the set of writers nobody
+    models — which is how a written parameter keeps direction ``In``, loses its
+    RAW edge, and deadlocks or races on device.
+    """
+
+    def test_unnamed_argument_defaults_to_read(self):
+        """The tile a store copies *from* is read, not written."""
+        assert ir.get_op_arg_effect("tile.store", 0) == ir.ArgEffect.Read
+
+    def test_index_past_the_argument_list_is_read(self):
+        assert ir.get_op_arg_effect("tile.store", 99) == ir.ArgEffect.Read
+
+    def test_functional_op_is_unclassified(self):
+        """`tensor.add` writes through no argument and was never classified;
+        `False` here is what lets an analysis tell that apart from a declared
+        read-only operator."""
+        assert ir.op_has_declared_arg_effects("tensor.add") is False
+        assert ir.get_op_arg_effect("tensor.add", 0) == ir.ArgEffect.Read
+
+    def test_declared_read_only_op_is_classified(self):
+        """`pld.system.wait` polls a signal it never writes — classified, but
+        with no write. That is a decision on record, not an omission."""
+        assert ir.op_has_declared_arg_effects("pld.system.wait") is True
+        assert ir.get_op_arg_effect("pld.system.wait", 0) == ir.ArgEffect.Read
+
+    def test_unknown_op_raises(self):
+        with pytest.raises(ValueError):
+            ir.get_op_arg_effect("tile.not_an_op", 0)
+
+    @pytest.mark.parametrize(
+        ("op_name", "arg_index", "expected"),
+        [
+            # A store overwrites the region it lands on; the untouched remainder
+            # is neither loaded nor re-stored, so nothing moves into the kernel.
+            ("tile.store", 2, ir.ArgEffect.Write),
+            # Same contract, and the one that was missing: a GM tensor written
+            # only by a scatter used to read as a pure input.
+            ("tile.mscatter", 2, ir.ArgEffect.Write),
+            ("tensor.assemble", 0, ir.ArgEffect.Write),
+            ("tensor.write", 0, ir.ArgEffect.Write),
+            # Cross-rank pushes and pulls land in their destination operand.
+            ("pld.tile.remote_store", 1, ir.ArgEffect.Write),
+            ("pld.tensor.remote_store", 1, ir.ArgEffect.Write),
+            ("pld.tile.put", 0, ir.ArgEffect.Write),
+            ("pld.tile.get", 0, ir.ArgEffect.Write),
+            # Accumulators read the running sum they add to.
+            ("tile.matmul_acc", 0, ir.ArgEffect.ReadWrite),
+            ("tile.gemv_acc", 0, ir.ArgEffect.ReadWrite),
+            # Destination-passing style: the positions the op does not rewrite
+            # pass through to the result, so the prior content is read.
+            ("tile.scatter", 0, ir.ArgEffect.ReadWrite),
+            ("tile.scatter_update", 0, ir.ArgEffect.ReadWrite),
+            ("array.update_element", 0, ir.ArgEffect.ReadWrite),
+            ("tile.write", 0, ir.ArgEffect.ReadWrite),
+            ("tile.assemble", 0, ir.ArgEffect.ReadWrite),
+            # Composite collectives update their window and signal in place.
+            ("pld.tensor.allreduce", 0, ir.ArgEffect.ReadWrite),
+            ("pld.tensor.allreduce", 1, ir.ArgEffect.ReadWrite),
+            # A gather/exchange destination is overwritten, not updated: the
+            # lowering only pushes into it and never loads from it. `recv_counts`
+            # is deposited with NotifyOp::Set, so it is not an accumulate either.
+            ("pld.tensor.allgather", 0, ir.ArgEffect.Read),
+            ("pld.tensor.allgather", 1, ir.ArgEffect.Write),
+            ("pld.tensor.allgather", 2, ir.ArgEffect.ReadWrite),
+            ("pld.tensor.all_to_all", 1, ir.ArgEffect.Write),
+            ("pld.tensor.all_to_all_v", 1, ir.ArgEffect.Write),
+            ("pld.tensor.all_to_all_v", 3, ir.ArgEffect.Read),
+            ("pld.tensor.all_to_all_v", 4, ir.ArgEffect.Write),
+            # A reduce destination *is* read — its lowering loads the running
+            # value back — so the distinction is per operator, not per family.
+            ("pld.tensor.allreduce", 0, ir.ArgEffect.ReadWrite),
+            ("pld.tensor.reduce_scatter", 0, ir.ArgEffect.ReadWrite),
+        ],
+    )
+    def test_declared_effects(self, op_name, arg_index, expected):
+        assert ir.get_op_arg_effect(op_name, arg_index) == expected
+
+    def test_atomic_store_reads_its_destination(self):
+        """`out += x` is not an overwrite: the accumulate reads the slot first.
+        Declaring it `Write` would let the runtime skip staging the buffer, and
+        the sum would start from allocator garbage."""
+        plain = ir.get_op_arg_effect("tile.store", 2)
+        atomic = ir.get_op_arg_effect("tile.store", 2, atomic=int(ir.AtomicType.Add))
+        assert plain == ir.ArgEffect.Write
+        assert atomic == ir.ArgEffect.ReadWrite
+
+    def test_atomic_assemble_reads_its_destination(self):
+        assert ir.get_op_arg_effect("tensor.assemble", 0) == ir.ArgEffect.Write
+        assert (
+            ir.get_op_arg_effect("tensor.assemble", 0, atomic=int(ir.AtomicType.Add))
+            == ir.ArgEffect.ReadWrite
+        )
+
+    def test_notify_defaults_to_accumulating(self):
+        """`pld.system.notify`'s `op` kwarg defaults to atomic-add, so an
+        unannotated notify reads the slot it adds into; only the set form is a
+        pure overwrite."""
+        assert ir.get_op_arg_effect("pld.system.notify", 0) == ir.ArgEffect.ReadWrite
+        assert ir.get_op_arg_effect("pld.system.notify", 0, op=int(ir.NotifyOp.Set)) == ir.ArgEffect.Write
+
+    def test_mgather_scratch_only_in_mat_elem_mode(self):
+        """`tile.mgather`'s argument 2 is a written GM scratch tensor only when
+        the gather stages through one.
+
+        `DeduceTileMgatherType` puts `scratch` at that position for Mat *elem*
+        mode; Mat row mode holds `valid_shape` there and Vec mode has no third
+        operand at all. Declaring the write unconditionally would claim a tuple
+        operand is a written buffer, and could promote a read-only parameter to
+        an output.
+        """
+        mat = ir.MemorySpace.Mat
+        # `MgatherCoalesceMode` (include/pypto/ir/comm.h) is not bound to Python;
+        # the DSL passes the same ints, and the op deducer validates the range.
+        elem, row = 1, 0
+        assert ir.get_op_arg_effect("tile.mgather", 2, target_memory=mat, coalesce=elem) == (
+            ir.ArgEffect.Write
+        )
+        assert ir.get_op_arg_effect("tile.mgather", 2, target_memory=mat, coalesce=row) == (ir.ArgEffect.Read)
+        # Vec is the default output space and carries no third operand.
+        assert ir.get_op_arg_effect("tile.mgather", 2) == ir.ArgEffect.Read
+
+    def test_enum_valued_kwargs_reach_the_resolver(self):
+        """A resolver may key on any kwarg the operator declares, including an
+        enum-valued one. The query converts kwargs the same way every other
+        binding does, so a `MemorySpace` argument resolves instead of raising."""
+        assert (
+            ir.get_op_arg_effect("tile.mgather", 2, target_memory=ir.MemorySpace.Mat, coalesce=1)
+            == ir.ArgEffect.Write
+        )
+
+    def test_set_ffts_declares_no_write(self):
+        """`system.set_ffts` hands the workspace *pointer* to the FFTS unit
+        (`pto.set_ffts %ws : !pto.ptr<i64>`); it declares where the hardware's
+        scratch lives rather than moving any data. The FFTS unit writes that
+        region on its own schedule, which no PyPTO dependency edge models."""
+        assert ir.op_has_declared_arg_effects("system.set_ffts") is True
+        assert ir.get_op_arg_effect("system.set_ffts", 0) == ir.ArgEffect.Read
+        assert ir.get_op_write_channel("system.set_ffts") is None
+
+    def test_in_place_gate_asks_about_the_reused_argument(self):
+        """The import-time gate must ask about the argument the operator updates
+        in place, not merely whether *some* argument was classified.
+
+        `per_arg` cannot answer that on its own — it is resized to cover the
+        highest declared index, so a slot nobody named looks like a declared
+        `Read`. Without the distinction, an operator declaring
+        `set_output_reuses_input(2)` while classifying argument 1 would pass the
+        gate with argument 2 still defaulting to `Read`.
+        """
+        # tile.store declares set_output_reuses_input(2) and classifies 2.
+        assert ir.op_has_declared_arg_effect("tile.store", 2) is True
+        # Argument 0 is covered by `per_arg` (it was resized past it) but was
+        # never named, so no verdict was reached about it.
+        assert ir.op_has_declared_arg_effect("tile.store", 0) is False
+        # `no_arg_writes()` is a verdict about every argument at once.
+        assert ir.op_has_declared_arg_effect("pld.system.wait", 0) is True
+        assert ir.op_has_declared_arg_effect("pld.system.wait", 7) is True
+        # An operator nobody classified reaches no verdict about any argument.
+        assert ir.op_has_declared_arg_effect("tensor.add", 0) is False
+
+    def test_a_write_channel_alone_is_not_a_verdict(self):
+        """Declaring only a write channel must not make an operator look classified.
+
+        `set_write_channel()` creates the effect spec as a side effect, so
+        "the spec exists" cannot stand in for "a human decided". Were it allowed
+        to, an operator that declared a channel and forgot its `set_arg_effect`
+        would pass the in-place gate with the argument it updates still
+        defaulting to `Read` — the exact silent default this registry exists to
+        remove. `no_arg_writes()` records the verdict explicitly instead.
+
+        Every operator that declares a channel therefore also writes something,
+        which `ValidateArgEffects()` enforces at import; this pins the invariant
+        that check maintains.
+        """
+        for op_name, written_index in _CHANNEL_OPS.items():
+            assert ir.get_op_write_channel(op_name) is not None, op_name
+            assert ir.op_has_declared_arg_effect(op_name, written_index), (
+                f"{op_name} declares a write channel but reached no verdict about "
+                f"argument {written_index}, the one that channel describes"
+            )
+
+    def test_composite_collectives_declare_no_write_channel(self):
+        """A composite collective updates a data window and a signal through
+        different mechanisms, and one operator-level channel cannot describe
+        both. Declaring `Dma` for the pair would let the mixed-store diagnostic
+        pair a collective's signal write against a scalar `tensor.write` on the
+        same buffer and reject a program that is fine. Recording no channel
+        keeps them out of that diagnostic, exactly as before this API existed.
+        """
+        for op_name in (
+            ir.get_op("pld.tensor.allreduce").name,
+            ir.get_op("pld.tensor.barrier").name,
+            ir.get_op("pld.tensor.allgather").name,
+            ir.get_op("builtin.tensor.broadcast").name,
+        ):
+            assert ir.get_op_write_channel(op_name) is None, op_name
+
+    def test_notify_declares_no_write_channel(self):
+        """`pld.system.notify` emits `pto.comm.tnotify`, which is neither the
+        MTE3 store path nor the scalar D-cache path the mixed-store diagnostic
+        orders against each other. Claiming either would make that diagnostic
+        reject a valid program, so it declares the write without a channel."""
+        assert ir.get_op_arg_effect("pld.system.notify", 0) == ir.ArgEffect.ReadWrite
+        assert ir.get_op_write_channel("pld.system.notify") is None
+
+    def test_hard_syncall_does_not_touch_the_workspace(self):
+        """The soft form counts arrivals in the GM workspace; the hard form is
+        an FFTS barrier that never reads or writes it."""
+        assert ir.get_op_arg_effect("system.syncall", 0) == ir.ArgEffect.Read
+        assert ir.get_op_arg_effect("system.syncall", 0, mode="soft") == ir.ArgEffect.ReadWrite
+
+    @pytest.mark.parametrize(
+        ("op_name", "expected"),
+        [
+            ("tile.store", ir.WriteChannel.Dma),
+            ("tensor.assemble", ir.WriteChannel.Dma),
+            ("tile.mscatter", ir.WriteChannel.Dma),
+            # The one scalar D-cache writer. PyPTO cannot order a scalar write
+            # against an MTE3 store to the same GM tensor, and rejects a
+            # function that mixes them.
+            ("tensor.write", ir.WriteChannel.Scalar),
+            # Declared classified, writes nothing, so no channel.
+            ("pld.system.wait", None),
+        ],
+    )
+    def test_write_channel(self, op_name, expected):
+        assert ir.get_op_write_channel(op_name) == expected
+
+    def test_every_in_place_op_is_classified(self):
+        """An operator whose result reuses an input's buffer writes through that
+        argument. Leaving the effect undeclared is what let `tile.mscatter`
+        write a GM output while every direction analysis read it as an input.
+
+        `pypto` fails at import when this is violated (see
+        `OpRegistry::ValidateArgEffects`); asserting it here names the operator
+        and the fix instead of failing the whole test session on import.
+        """
+        for op_name in _IN_PLACE_OPS:
+            assert ir.op_has_declared_arg_effects(op_name), (
+                f"{op_name} updates an argument in place but never declared what it does to it. "
+                f"Add .set_arg_effect(<index>, ArgEffect::Write) to its REGISTER_OP block — "
+                f"ArgEffect::ReadWrite when it accumulates, or .no_arg_writes() when the slot "
+                f"is metadata rather than data."
+            )
+
+
+#: Operators declaring a write channel, mapped to the argument that channel
+#: describes. Each must also declare a write there — a channel says *how* an
+#: operator writes, so one without a write is either a stray declaration or a
+#: missing one. `tile.mgather` reaches its verdict through a kwarg resolver,
+#: which still counts: the registration named the argument.
+_CHANNEL_OPS = {
+    ir.get_op(name).name: index
+    for name, index in (
+        ("tile.store", 2),
+        ("tile.mscatter", 2),
+        ("tile.mgather", 2),
+        ("tensor.write", 0),
+        ("tensor.assemble", 0),
+        ("pld.tile.put", 0),
+        ("pld.tile.get", 0),
+        ("pld.tile.remote_store", 1),
+    )
+}
+
+#: Operators declaring ``set_output_reuses_input``: their SSA result IS an
+#: argument's buffer, so they write through it and must classify that argument.
+#: Routed through ``get_op`` so a renamed operator fails at import rather than
+#: silently dropping out of the coverage this list asserts.
+_IN_PLACE_OPS = [
+    ir.get_op(name).name
+    for name in (
+        "array.update_element",
+        # main declared these in-place after this series began; the import gate
+        # is what surfaced them, so pin them here too.
+        "tensor.assemble",
+        "tensor.set_validshape",
+        "tile.batch_matmul_acc",
+        "tile.fillpad_inplace",
+        "tile.gather_row",
+        "tile.gemv_acc",
+        "tile.matmul_acc",
+        "tile.matmul_mx_acc",
+        "tile.mscatter",
+        "tile.scatter",
+        "tile.scatter_mask",
+        "tile.scatter_update",
+        "tile.store",
+        "tile.tget_scale_addr",
+    )
+]
+
+
+class TestResultAliasContract:
+    """The result-alias contract may only name operators that have a result.
+
+    ``ResultAliasedArgIndex`` answers "which argument's buffer does this call's
+    result name". A side-effect-only operator deduces ``UnknownType`` — "no SSA
+    result for downstream consumers" — so there is no result to alias, and its
+    write target travels through ``ArgEffect`` / ``CallWriteTargets`` instead.
+    Listing one would invite a consumer to read a destination alias out of a
+    bare side effect.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[4]
+    _CONTRACT = _REPO_ROOT / "src/ir/transforms/utils/result_alias_utils.cpp"
+
+    def _contract_ops(self) -> set[str]:
+        text = self._CONTRACT.read_text()
+        return set(re.findall(r'IsOp\(call, "([^"]+)"\)', text))
+
+    def _side_effect_only_ops(self) -> set[str]:
+        """Operators whose registered deduction returns ``GetUnknownType()``."""
+        op_sources = sorted((self._REPO_ROOT / "src/ir/op").rglob("*.cpp"))
+        joined = "\n".join(f.read_text() for f in op_sources)
+        side_effect = set()
+        for match in re.finditer(r'REGISTER_OP\("([^"]+)"\)(.*?)(?=REGISTER_OP\(|\Z)', joined, re.S):
+            name, body = match.group(1), match.group(2)
+            deduce = re.search(r"f_deduce_type\(\s*&?([A-Za-z_][A-Za-z0-9_]*)", body)
+            if deduce is None:
+                continue
+            fn = re.search(r"TypePtr\s+" + deduce.group(1) + r"\s*\([^)]*\)[^{]*\{(.*?)\n\}", joined, re.S)
+            if fn is not None and "GetUnknownType()" in fn.group(1):
+                side_effect.add(name)
+        return side_effect
+
+    def test_contract_names_only_registered_operators(self):
+        for name in self._contract_ops():
+            # Raises if the literal is not a registered operator.
+            assert ir.get_op(name).name == name
+
+    def test_contract_excludes_side_effect_only_operators(self):
+        side_effect = self._side_effect_only_ops()
+        # Guard the detector itself: these are known side-effect-only ops.
+        for known in ("pld.tile.put", "pld.tile.get", "pld.system.notify"):
+            assert known in side_effect, f"{known} should be detected as side-effect-only"
+
+        listed = sorted(self._contract_ops() & side_effect)
+        assert listed == [], "these operators have no SSA result, so they cannot alias one: " + ", ".join(
+            listed
+        )
+
+
+class TestMultiOutputOps:
+    """A multi-output operator carries its results in the deduced ``TupleType``.
+
+    The alternative — naming the destination tiles in ``add_argument`` — is the
+    path of least resistance when wrapping a hardware DPS intrinsic, and it is
+    wrong twice over: it makes the caller pre-allocate a buffer ``InitMemRef``
+    owns, and it hides the write from direction inference, which reads an
+    undeclared argument as a pure consumer. ``ValidateMultiOutputOps()`` rejects
+    both shapes at import, so the checks below pin the contract that check
+    maintains rather than re-deriving it.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[4]
+
+    def _declared_multi_output_ops(self) -> dict[str, int]:
+        """Every operator whose registration calls ``set_output_arity(N > 1)``.
+
+        Scanning the registrations rather than listing names keeps the test
+        growing with the codebase: a new multi-output operator is covered the
+        moment it is registered, with nothing to remember to update here.
+        """
+        found: dict[str, int] = {}
+        for source in sorted((self._REPO_ROOT / "src/ir/op").rglob("*.cpp")):
+            text = source.read_text()
+            for block in re.split(r"\bREGISTER_OP\(", text)[1:]:
+                name_match = re.match(r'"([^"]+)"', block)
+                arity_match = re.search(r"\.set_output_arity\((\d+)\)", block.split(";\n")[0])
+                if name_match and arity_match and int(arity_match.group(1)) > 1:
+                    found[name_match.group(1)] = int(arity_match.group(1))
+        return found
+
+    def test_registrations_are_discoverable(self):
+        """The scan finds the multi-output ops that exist, so the rest is not vacuous."""
+        declared = self._declared_multi_output_ops()
+        assert "tile.gather_compare" in declared, declared
+        assert "tensor.gather_compare" in declared, declared
+
+    def test_declared_arity_reaches_the_registry(self):
+        """Codegen reads the arity from the registry, so the two must agree."""
+        for op_name, arity in self._declared_multi_output_ops().items():
+            assert ir.get_op_output_arity(op_name) == arity, op_name
+
+    def test_every_argument_is_classified(self):
+        """An unclassified argument defaults to ``Read``, which is exactly how a
+        destination tile hides. A multi-output op must reach a verdict on each."""
+        for op_name in self._declared_multi_output_ops():
+            for i in range(ir.get_op_argument_count(op_name)):
+                assert ir.op_has_declared_arg_effect(op_name, i), (
+                    f"{op_name} argument {i} was never classified; the Read it "
+                    f"defaults to is indistinguishable from a destination tile"
+                )
+
+    def test_workspace_declarations_name_a_written_argument(self):
+        """A workspace claims two things: the argument exists, and it is written.
+
+        Neither is implied by the check below, which only walks arguments that
+        exist. An index past the end protects nothing, and a workspace declared
+        ``Read`` — including via ``no_arg_writes()`` — still reads as a pure
+        consumer of a slot the hardware writes.
+        """
+        for op_name in self._declared_multi_output_ops():
+            arg_count = ir.get_op_argument_count(op_name)
+            for i in range(arg_count + 4):
+                if not ir.op_arg_is_workspace(op_name, i):
+                    continue
+                assert i < arg_count, (
+                    f"{op_name} declares argument {i} a workspace but takes only {arg_count}"
+                )
+                assert ir.get_op_arg_effect(op_name, i) != ir.ArgEffect.Read, (
+                    f"{op_name} argument {i} is declared a workspace yet classified Read; "
+                    f"scratch is hardware-written by definition"
+                )
+
+    def test_written_arguments_are_workspaces(self):
+        """A written argument is scratch the hardware needs — which must say so —
+        or a result the caller reads, which belongs in the TupleType instead."""
+        for op_name in self._declared_multi_output_ops():
+            for i in range(ir.get_op_argument_count(op_name)):
+                if ir.get_op_arg_effect(op_name, i) == ir.ArgEffect.Read:
+                    continue
+                assert ir.op_arg_is_workspace(op_name, i), (
+                    f"{op_name} writes argument {i} without declaring it a "
+                    f"workspace; a written argument that carries a result is a "
+                    f"destination and must be a TupleType element"
+                )
+
+    def test_single_output_ops_declare_no_arity(self):
+        """The default arity is what makes ``set_output_arity`` mean something."""
+        assert ir.get_op_output_arity(ir.get_op("tile.add").name) == 1
+        assert ir.get_op_output_arity(ir.get_op("tensor.matmul").name) == 1
+
+    def test_gather_compare_shape(self):
+        """The one multi-output op that exists today, spelled out.
+
+        ``tile.gather_compare`` maps to ``pto.tgather``, which needs three inputs
+        and writes two destinations plus a scratch buffer. Only the scratch is an
+        argument: ``ConvertTensorToTileOps`` synthesizes it, and nobody reads it.
+        """
+        assert ir.get_op_output_arity("tile.gather_compare") == 2
+        assert ir.get_op_argument_count("tile.gather_compare") == 3
+        assert ir.get_op_arg_effect("tile.gather_compare", 0) == ir.ArgEffect.Read
+        assert ir.get_op_arg_effect("tile.gather_compare", 1) == ir.ArgEffect.Read
+        assert ir.get_op_arg_effect("tile.gather_compare", 2) == ir.ArgEffect.Write
+        assert ir.op_arg_is_workspace("tile.gather_compare", 2)
+        assert not ir.op_arg_is_workspace("tile.gather_compare", 0)
+
+        # The tensor-level op has no workspace yet — it appears only after the
+        # tile conversion synthesizes it.
+        assert ir.get_op_output_arity("tensor.gather_compare") == 2
+        assert ir.get_op_argument_count("tensor.gather_compare") == 2
 
 
 if __name__ == "__main__":

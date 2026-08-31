@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -26,7 +27,6 @@
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
-#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -39,13 +39,32 @@
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/deferred_wait_contract.h"
+#include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/result_alias_utils.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
 namespace ir {
 namespace outline_utils {
+
+std::vector<CallWriteTarget> CallWriteTargets(const CallPtr& call) {
+  std::vector<CallWriteTarget> targets;
+  if (!call) return targets;
+  const auto* entry = LookupOpEntry(call->op_);
+  if (!entry || !entry->WritesAnyArg()) return targets;
+  for (size_t i = 0; i < call->args_.size(); ++i) {
+    auto effect = entry->GetArgEffect(i, call->kwargs_);
+    if (!ArgEffectWrites(effect)) continue;
+    if (auto var = AsVarLike(call->args_[i])) {
+      targets.push_back(CallWriteTarget{var, i, effect});
+    }
+  }
+  return targets;
+}
+
 namespace {
 
 /**
@@ -54,6 +73,14 @@ namespace {
  * These tensors are modified via side-effect inside scopes but are not
  * captured by VarDefUseCollector since they are defined externally.  The third
  * argument of store is the output tensor.
+ *
+ * Deliberately narrower than `CallWriteTargets`, which answers "what does this
+ * call write" for the direction analysis. This set drives the *export*
+ * machinery — a store target becomes an extra outlined-function output, and
+ * `StoreEvalToAssignMutator` binds a result Var for it — and that mechanism
+ * exists for a write whose result the body does not already thread. An SSA-pure
+ * writer such as `tensor.assemble` returns the updated tensor and the caller
+ * binds it, so exporting it too would add a redundant output.
  */
 class StoreTargetCollector : public IRVisitor {
  public:
@@ -75,10 +102,17 @@ class StoreTargetCollector : public IRVisitor {
 /// access either one witnessed: ``In < Out < InOut``.
 ///
 /// Evidence about a parameter arrives from several independent places
-/// (``ParamReadCollector``, the store-target set, the assemble scan, each inner
-/// callee), and each one is a *lower* bound — none of them can prove the
-/// absence of an access the others saw. Merging rather than assigning is what
-/// keeps a later observation from erasing an earlier one.
+/// (``ParamReadCollector``, the store-target set, the assemble scan), and each
+/// one is a *lower* bound — none of them can prove the absence of an access the
+/// others saw. Merging rather than assigning is what keeps a later observation
+/// from erasing an earlier one.
+///
+/// The inner callees' evidence does **not** arrive through this ordering.
+/// ``In`` is the seeded *no evidence yet* floor, so it cannot also stand for
+/// "somebody read this" — folding a callee's ``In`` slot against another's
+/// ``Out`` slot along the ranks above would yield ``Out`` and lose the read.
+/// ``InferParamDirections`` accumulates the callee slots as two independent
+/// flags and calls this once, with the verdict already formed.
 [[nodiscard]] inline ParamDirection MergeParamDirection(ParamDirection lhs, ParamDirection rhs) {
   auto rank = [](ParamDirection d) {
     switch (d) {
@@ -103,19 +137,23 @@ class StoreTargetCollector : public IRVisitor {
 /**
  * @brief Marks which captured variables a scope body *reads*.
  *
- * A "read" is any use of the variable other than the write-destination operand
- * of the two ops that update a caller-owned tensor in place:
+ * A "read" is any use of the variable other than an operand the callee purely
+ * overwrites. Two declarations say so, one per kind of callee: a builtin's
+ * ``ArgEffect::Write`` slot (``DestinationSlots``, read straight off the
+ * argument-effect registry rather than from a hand-kept list of op names) and a
+ * user function's ``ParamDirection::Out`` parameter (``CalleeWriteOnlySlots``). Such
+ * an operand replaces a sub-region of the destination *in place*: the untouched
+ * region is neither loaded nor re-stored, so passing the variable there moves
+ * no data into the scope and is not a read. ``tile.store(tile, offsets,
+ * target)`` and ``tensor.assemble(dst, src, offsets)`` are the familiar cases,
+ * but nothing here names them.
  *
- *   - ``tile.store(tile, offsets, target)``  — ``args_[2]`` is the destination
- *   - ``tensor.assemble(dst, src, offsets)`` — ``args_[0]`` is the destination
- *
- * Both replace a sub-region of the destination *in place*: the untouched region
- * is neither loaded nor re-stored, so passing the variable there moves no data
- * into the scope and is not a read. An *atomic* store or assemble
- * (``atomic=pl.AtomicType.Add``) is the exception — it accumulates into the
- * destination, so that operand stays on the read path. Every other use is, including a use inside
- * the same call's remaining operands (``pl.assemble(dst, pl.slice(dst, ...))``
- * really does read ``dst``).
+ * The registry already draws the distinction this analysis needs: an *atomic*
+ * store or assemble (``atomic=pl.AtomicType.Add``) declares ``ReadWrite``
+ * rather than ``Write``, because it accumulates into the destination, so that
+ * operand stays on the read path without being special-cased. Every other use
+ * is a read, including a use inside the same call's remaining operands
+ * (``pl.assemble(dst, pl.slice(dst, ...))`` really does read ``dst``).
  *
  * Definition sites are not reads either, so the stmt hooks below skip the
  * binding fields (an ``AssignStmt`` LHS, a loop's ``loop_var_`` / ``iter_args_``
@@ -139,8 +177,15 @@ class StoreTargetCollector : public IRVisitor {
  */
 class ParamReadCollector : public IRVisitor {
  public:
-  ParamReadCollector(const std::unordered_map<const Var*, size_t>& var_to_idx, std::vector<bool>& has_read)
-      : aliases_(var_to_idx), has_read_(has_read) {}
+  /// @param program Resolves a ``GlobalVar`` callee so an argument the callee
+  ///                 declares ``Out`` can be skipped, exactly as a builtin's
+  ///                 declared ``Write`` slot is. May be null, in which case
+  ///                 every call argument stays on the read path — the
+  ///                 conservative answer, since an unresolvable callee could
+  ///                 read anything.
+  ParamReadCollector(const std::unordered_map<const Var*, size_t>& var_to_idx, std::vector<bool>& has_read,
+                     ProgramPtr program)
+      : aliases_(var_to_idx), has_read_(has_read), program_(std::move(program)) {}
 
  protected:
   void VisitVarLike_(const VarPtr& op) override {
@@ -187,54 +232,132 @@ class ParamReadCollector : public IRVisitor {
   void VisitStmt_(const IfStmtPtr& op) override {
     VisitExpr(op->condition_);
     VisitStmt(op->then_body_);
-    if (op->else_body_.has_value()) VisitStmt(*op->else_body_);
+    // Bound to a local so the optional's engagement is provable at the use:
+    // through `op->`, the analysis cannot tie the guard to the access.
+    const auto& else_body = op->else_body_;
+    if (else_body.has_value()) VisitStmt(else_body.value());
   }
 
-  /// The operand index ``op`` overwrites in place, or ``args_.size()`` when it
-  /// overwrites none. Both ops replace a sub-region of that operand without
-  /// moving data into the scope, which is what makes the slot a non-read.
+  /// The operand indices ``op`` overwrites in place. Such an operand replaces a
+  /// sub-region of the destination without moving data into the scope, which is
+  /// what makes the slot a non-read.
   ///
-  /// An *atomic* store or assemble is excluded: ``out += x`` accumulates into
-  /// the destination, so it reads the value already there. Reporting no
-  /// destination leaves that operand on the normal read path, which keeps an
-  /// accumulator ``InOut`` — and therefore staged, so it starts from the
-  /// caller's zeros rather than allocator garbage.
-  [[nodiscard]] static size_t DestinationSlot(const CallPtr& op) {
-    auto opnode = std::dynamic_pointer_cast<const Op>(op->op_);
-    const bool is_assemble = opnode && IsOp(opnode, "tensor.assemble") && !op->args_.empty();
-    const bool is_store = opnode && IsOp(opnode, "tile.store") && op->args_.size() >= 3;
-    if (!is_assemble && !is_store) return op->args_.size();
-    if (op->GetKwarg<int>("atomic", static_cast<int>(AtomicType::kNone)) !=
-        static_cast<int>(AtomicType::kNone)) {
-      return op->args_.size();  // read-modify-write, not a pure overwrite
+  /// Read from the operator's registry declaration, which already draws the
+  /// distinction this analysis needs: an *atomic* store or assemble declares
+  /// ``ReadWrite`` rather than ``Write``, because ``out += x`` reads the value
+  /// already there. Such an operand stays on the normal read path, which keeps
+  /// an accumulator ``InOut`` — and therefore staged, so it starts from the
+  /// caller's zeros rather than allocator garbage. The same rule now covers
+  /// every declared writer, so an ``AtomicAdd`` notify keeps its signal
+  /// ``InOut`` while a ``Set`` notify does not, without either being named here.
+  [[nodiscard]] static std::set<size_t> DestinationSlots(const CallPtr& op) {
+    std::set<size_t> slots;
+    for (const auto& target : CallWriteTargets(op)) {
+      if (target.effect == ArgEffect::Write) slots.insert(target.slot);
     }
-    return is_assemble ? 0 : 2;
+    return slots;
   }
 
-  /// The tensor ``value`` writes in place, or null when it writes none.
+  /// The argument indices a call to a *user function* purely overwrites.
+  ///
+  /// A callee parameter declared ``Out`` is the user-function counterpart of a
+  /// builtin's ``ArgEffect::Write`` slot: the callee replaces the buffer's
+  /// contents without consulting them, so handing a capture to that slot moves
+  /// no data into this scope and is not a read. Without this, *every* argument
+  /// of *every* inner call counted as a read, and the later merge had to ignore
+  /// the resulting ``has_read`` to keep write-only captures ``Out`` — which is
+  /// how a genuine body read next to a write-only call slot got lost.
+  ///
+  /// Both call-like kinds are covered. ``Call`` maps ``args_[i]`` to
+  /// ``params_[i]`` with full coverage; ``Submit`` maps the same way over a
+  /// *prefix*, with ``args_.size() <= params_.size()`` — the omitted tail is
+  /// runtime-allocated and never appears as an argument here. The trailing
+  /// ``CommCtx`` params that would break that identity are materialised by
+  /// pass 43, long after any outliner runs, so the prefix mapping is exact at
+  /// this point (`.claude/rules/pass-submit-awareness.md`).
+  ///
+  /// Anything that fails those constraints — no program to resolve the callee,
+  /// a non-``GlobalVar`` callee, or a size that violates the coverage bound —
+  /// yields no skips, leaving every argument on the read path. That
+  /// over-approximates reads, which is the safe direction.
+  [[nodiscard]] std::set<size_t> CalleeWriteOnlySlots(const OpPtr& callee_op, size_t arg_count,
+                                                      bool is_submit) const {
+    std::set<size_t> slots;
+    if (!program_) return slots;
+    auto gv = std::dynamic_pointer_cast<const GlobalVar>(callee_op);
+    if (!gv) return slots;
+    auto callee = program_->GetFunction(gv->name_);
+    if (!callee) return slots;
+    const auto& dirs = callee->param_directions_;
+    const bool covered = is_submit ? (arg_count <= dirs.size()) : (arg_count == dirs.size());
+    if (!covered) return slots;
+    for (size_t i = 0; i < arg_count; ++i) {
+      if (dirs[i] == ParamDirection::Out) slots.insert(i);
+    }
+    return slots;
+  }
+
+  /// The tensor ``value`` names on the way out, or null when it names none.
+  ///
+  /// Only the operator's declared result-alias contract answers, which is the
+  /// same one ``ConvertTensorToTileOps`` reads. Writing an argument does not
+  /// make the result name it: ``tile.mgather`` stages Mat *elem* gathers
+  /// through a GM ``scratch`` operand and returns a **fresh** tile, so treating
+  /// its lone write slot as the alias would register the gathered tile as
+  /// another name for ``scratch``. Reading the tile would then mark a
+  /// write-only ``scratch`` read and promote it to ``InOut`` — the false read
+  /// that turns disjoint per-rank slices into a cross-rank dependency
+  /// (issue #2415). An operator whose result really does name a destination
+  /// says so in the contract.
   [[nodiscard]] static VarPtr WrittenDestination(const ExprPtr& value) {
     auto call = As<Call>(value);
     if (!call) return nullptr;
-    size_t dst_slot = DestinationSlot(call);
-    if (dst_slot >= call->args_.size()) return nullptr;
-    return AsVarLike(call->args_[dst_slot]);
+    auto index = ResultAliasedArgIndex(call);
+    if (!index) return nullptr;
+    return AsVarLike(call->args_[*index]);
   }
 
   void VisitExpr_(const CallPtr& op) override {
-    // ``dst_slot`` is the one operand index that is a pure write destination;
-    // ``args_.size()`` (the default) means "no operand is skipped".
-    size_t dst_slot = DestinationSlot(op);
+    // The operand indices this call purely overwrites; every other operand is
+    // walked as a read.
+    const auto dst_slots = DestinationSlots(op);
+    const auto callee_out_slots = CalleeWriteOnlySlots(op->op_, op->args_.size(), /*is_submit=*/false);
     for (size_t i = 0; i < op->args_.size(); ++i) {
       // Skipping the whole operand, not just a bare Var in it, is deliberate:
       // the destination slot only ever holds the tensor being written, so
       // anything nested there is address computation, not a content read.
-      if (i == dst_slot) continue;
+      if (dst_slots.count(i) > 0 || callee_out_slots.count(i) > 0) continue;
       INTERNAL_CHECK_SPAN(op->args_[i], op->span_) << "Call has null argument at index " << i;
       VisitExpr(op->args_[i]);
     }
     // Reference-typed attrs name Vars used elsewhere; mirror the base visitor so
     // a var reachable only through an attr is still counted as read — except
     // for the bookkeeping keys, which name a tensor without accessing it.
+    for (const auto& [key, value] : op->attrs_) {
+      if (!ShouldVisitScopeAttr(key)) continue;
+      ForEachAttrExpr(value, [this](const ExprPtr& e) { VisitExpr(e); });
+    }
+  }
+
+  /// A task launch reads its capture exactly as a plain call does, and the base
+  /// visitor's ``Submit`` handler does not forward to the ``Call`` one (see
+  /// `.claude/rules/pass-submit-awareness.md`). Without this override every
+  /// ``pl.submit`` argument counted as a read, so a capture handed only to a
+  /// callee's ``Out`` slot came back ``InOut`` — the false cross-rank
+  /// dependency of issue #2415, for exactly the ``manual_scope`` programs that
+  /// launch work asynchronously.
+  void VisitExpr_(const SubmitPtr& op) override {
+    const auto callee_out_slots = CalleeWriteOnlySlots(op->op_, op->args_.size(), /*is_submit=*/true);
+    for (size_t i = 0; i < op->args_.size(); ++i) {
+      if (callee_out_slots.count(i) > 0) continue;
+      INTERNAL_CHECK_SPAN(op->args_[i], op->span_) << "Submit has null argument at index " << i;
+      VisitExpr(op->args_[i]);
+    }
+    // ``deps_`` are TaskId values this launch consumes — real SSA uses, never
+    // a write destination, so they are always read.
+    for (const auto& dep : op->deps_) {
+      if (dep) VisitExpr(dep);
+    }
     for (const auto& [key, value] : op->attrs_) {
       if (!ShouldVisitScopeAttr(key)) continue;
       ForEachAttrExpr(value, [this](const ExprPtr& e) { VisitExpr(e); });
@@ -263,6 +386,7 @@ class ParamReadCollector : public IRVisitor {
   /// plus each SSA binding of a post-write state discovered along the way.
   std::unordered_map<const Var*, size_t> aliases_;
   std::vector<bool>& has_read_;
+  ProgramPtr program_;
 };
 
 /**
@@ -511,8 +635,11 @@ class UpwardExposedUseCollector : public IRVisitor {
     // masked by a write on the other, then join on *must*-definitions: a
     // variable written by only one arm may still carry its incoming value.
     const std::vector<const Var*> then_new = VisitBranchIsolated(op->then_body_);
-    if (!op->else_body_.has_value()) return;
-    const std::vector<const Var*> else_new = VisitBranchIsolated(*op->else_body_);
+    // Bound to a local so the optional's engagement is provable at the use:
+    // through `op->`, the analysis cannot tie the guard to the access.
+    const auto& else_body = op->else_body_;
+    if (!else_body.has_value()) return;
+    const std::vector<const Var*> else_new = VisitBranchIsolated(else_body.value());
     const std::unordered_set<const Var*> then_set(then_new.begin(), then_new.end());
     for (const auto* var : else_new) {
       if (then_set.count(var) > 0) Define(var);
@@ -771,6 +898,431 @@ StmtPtr ScopeOutliner::VisitStmt_(const SpmdScopeStmtPtr& op) { return VisitScop
 // the nested SplitAivScopeStmt inside the outlined InCore function body.
 StmtPtr ScopeOutliner::VisitStmt_(const SplitAivScopeStmtPtr& op) { return VisitScopeKind(op); }
 
+// ============================================================================
+// Control flow: threading store-target renames out as real carries
+// ============================================================================
+
+namespace {
+
+/// Append @p extra to @p body's trailing YieldStmt, adding one when the body has
+/// none (a loop that carried nothing yields nothing today).
+///
+/// Walks the same spine as ``GetLastYieldStmt``: the trailing yield is the last
+/// element of the outermost SeqStmts chain. A statement kind that hides a yield
+/// from this walk gets a *new* trailing yield instead, which is why the caller
+/// checks the resulting arity.
+StmtPtr AppendTrailingYieldValues(const StmtPtr& body, const std::vector<ExprPtr>& extra, const Span& span) {
+  if (extra.empty()) return body;
+  if (auto yield = As<YieldStmt>(body)) {
+    auto values = yield->value_;
+    values.insert(values.end(), extra.begin(), extra.end());
+    return std::make_shared<YieldStmt>(values, yield->span_);
+  }
+  if (auto seq = As<SeqStmts>(body)) {
+    auto stmts = seq->stmts_;
+    if (!stmts.empty() && transform_utils::GetLastYieldStmt(stmts.back())) {
+      stmts.back() = AppendTrailingYieldValues(stmts.back(), extra, span);
+    } else {
+      stmts.push_back(std::make_shared<YieldStmt>(extra, span));
+    }
+    return SeqStmts::Flatten(std::move(stmts), seq->span_);
+  }
+  return SeqStmts::Flatten({body, std::make_shared<YieldStmt>(extra, span)}, span);
+}
+
+/// Rebind loop-body references from a carry's seed onto the carry itself.
+///
+/// Not ``transform_utils::Substitute``: that one re-visits whatever it
+/// substitutes in, so a chained map (A->B, B->C) settles. That is exactly wrong
+/// here, because the replacement is an ``IterArg`` whose ``initValue_`` *is* the
+/// Var being replaced — re-visiting rewrites the seed inside the carry into a
+/// self-reference and mints a second, unbound IterArg. The map is built in one
+/// step and needs no chain resolution, so a carry is terminal in both
+/// directions: substituted in verbatim, and never descended into afterwards
+/// (the base visitor would otherwise reach its ``initValue_`` when the carry
+/// resurfaces as a nested loop's init value).
+class CarryRebindMutator : public IRMutator {
+ public:
+  explicit CarryRebindMutator(const std::unordered_map<const Var*, VarPtr>& seed_to_carry)
+      : seed_to_carry_(seed_to_carry) {
+    for (const auto& [seed, carry] : seed_to_carry_) carries_.insert(carry.get());
+  }
+
+ protected:
+  // Var and IterArg get separate overrides rather than VisitVarLike_: a seed may
+  // itself be an enclosing loop's IterArg (see .claude/rules/ir-kind-traits.md),
+  // and neither may fall through to the base visitor on a hit.
+  ExprPtr VisitExpr_(const VarPtr& op) override {
+    auto it = seed_to_carry_.find(op.get());
+    return it != seed_to_carry_.end() ? it->second : IRMutator::VisitExpr_(op);
+  }
+  ExprPtr VisitExpr_(const IterArgPtr& op) override {
+    auto it = seed_to_carry_.find(op.get());
+    if (it != seed_to_carry_.end()) return it->second;
+    if (carries_.count(op.get()) > 0) return op;
+    return IRMutator::VisitExpr_(op);
+  }
+
+ private:
+  const std::unordered_map<const Var*, VarPtr>& seed_to_carry_;
+  std::unordered_set<const Var*> carries_;
+};
+
+/// Index of @p var among @p iter_args, or ``npos``.
+size_t FindIterArgSlot(const std::vector<IterArgPtr>& iter_args, const Var* var) {
+  for (size_t i = 0; i < iter_args.size(); ++i) {
+    if (iter_args[i].get() == var) return i;
+  }
+  return std::string::npos;
+}
+
+}  // namespace
+
+StmtPtr ScopeOutliner::VisitStmt_(const AssignStmtPtr& op) {
+  if (!body_rename_stack_.empty() && op->var_) {
+    body_rename_stack_.back().local_defs.insert(op->var_.get());
+  }
+  return IRMutator::VisitStmt_(op);
+}
+
+void ScopeOutliner::NoteLocalDefinitions(const std::vector<VarPtr>& vars) {
+  if (body_rename_stack_.empty()) return;
+  auto& local_defs = body_rename_stack_.back().local_defs;
+  for (const auto& var : vars) {
+    if (var) local_defs.insert(var.get());
+  }
+}
+
+void ScopeOutliner::NoteStoreTargetRename(const VarPtr& original, const VarPtr& seed, const VarPtr& fresh) {
+  if (body_rename_stack_.empty()) return;
+  auto& frame = body_rename_stack_.back();
+  // A target defined in this body is recreated on each execution. Its fresh SSA
+  // name remains visible to later statements in the same body through
+  // store_target_renames_, but it cannot seed a carry at the body's boundary.
+  if (frame.local_defs.count(original.get()) > 0) return;
+
+  auto& renames = frame.renames;
+  auto it = std::find_if(renames.begin(), renames.end(), [&](const BodyStoreRename& rename) {
+    return rename.original.get() == original.get();
+  });
+  if (it != renames.end()) {
+    // Renamed again by a later scope in the same body: the carry still starts
+    // from the value the body was entered with, only the yielded value moves on.
+    it->body_values.push_back(fresh);
+    return;
+  }
+  renames.push_back(BodyStoreRename{original, seed, {fresh}});
+}
+
+StmtPtr ScopeOutliner::VisitControlFlowBody(const StmtPtr& body, std::vector<BodyStoreRename>* renames) {
+  body_rename_stack_.emplace_back();
+  auto visited = VisitStmt(body);
+  *renames = std::move(body_rename_stack_.back().renames);
+  body_rename_stack_.pop_back();
+  return visited;
+}
+
+std::vector<IterArgPtr> ScopeOutliner::MakeCarryIterArgs(const std::vector<BodyStoreRename>& renames,
+                                                         const Span& span) {
+  std::vector<IterArgPtr> iter_args;
+  iter_args.reserve(renames.size());
+  for (const auto& rename : renames) {
+    auto iter_arg = std::make_shared<IterArg>(GenerateFreshSSAName(rename.original->name_hint_, "iter"),
+                                              rename.original->GetType(), rename.seed, span);
+    RegisterVar(iter_arg);
+    iter_args.push_back(iter_arg);
+  }
+  return iter_args;
+}
+
+std::vector<VarPtr> ScopeOutliner::MakeCarryReturnVars(const std::vector<BodyStoreRename>& renames,
+                                                       const Span& span) {
+  std::vector<VarPtr> return_vars;
+  return_vars.reserve(renames.size());
+  for (const auto& rename : renames) {
+    auto return_var = std::make_shared<Var>(GenerateFreshSSAName(rename.original->name_hint_, "rv"),
+                                            rename.original->GetType(), span);
+    RegisterVar(return_var);
+    return_vars.push_back(return_var);
+  }
+  return return_vars;
+}
+
+StmtPtr ScopeOutliner::BuildCarriedLoopBody(const StmtPtr& body, const std::vector<BodyStoreRename>& renames,
+                                            const std::vector<IterArgPtr>& carry_iter_args,
+                                            size_t total_carries, const Span& span) const {
+  INTERNAL_CHECK_SPAN(renames.size() == carry_iter_args.size(), span)
+      << "Internal error: carry iter_arg count does not match the rename count";
+  std::unordered_map<const Var*, VarPtr> seed_to_iter_arg;
+  std::vector<ExprPtr> yields;
+  yields.reserve(renames.size());
+  for (size_t i = 0; i < renames.size(); ++i) {
+    seed_to_iter_arg[renames[i].seed.get()] = carry_iter_args[i];
+    yields.push_back(renames[i].body_values.back());
+  }
+  // Rebind before appending: the yielded values are bound *inside* the body and
+  // so are never seeds, but keeping the order explicit makes that obvious.
+  CarryRebindMutator rebinder(seed_to_iter_arg);
+  auto result = AppendTrailingYieldValues(rebinder.VisitStmt(body), yields, span);
+  auto yield = transform_utils::GetLastYieldStmt(result);
+  INTERNAL_CHECK_SPAN(yield && yield->value_.size() == total_carries, span)
+      << "Internal error: loop body yields " << (yield ? yield->value_.size() : 0)
+      << " values after threading " << renames.size() << " store-target carries, expected " << total_carries;
+  return result;
+}
+
+void ScopeOutliner::RetargetBodyValues(const std::vector<BodyStoreRename>& renames,
+                                       const std::vector<VarPtr>& visible_values) {
+  INTERNAL_CHECK(renames.size() == visible_values.size())
+      << "Internal error: carry value count does not match the rename count";
+  // Visit only the entries that actually hold one of this body's values, found
+  // through the reverse index. Sweeping the whole map instead would cost the
+  // pass O(N^2) on a function with N sequential loops writing N distinct
+  // tensors, since the map keeps growing (.claude/rules/pass-complexity.md).
+  for (size_t i = 0; i < renames.size(); ++i) {
+    for (const auto& body_value : renames[i].body_values) {
+      auto holders = renamed_by_value_.find(body_value.get());
+      if (holders == renamed_by_value_.end()) continue;
+      // Move the bucket out: every key in it is about to point at
+      // `visible_values[i]` instead, and the entry for `body_value` is dead
+      // once they have.
+      auto keys = std::move(holders->second);
+      renamed_by_value_.erase(holders);
+      auto& new_holders = renamed_by_value_[visible_values[i].get()];
+      for (const Var* key : keys) {
+        auto entry = store_target_renames_.find(key);
+        // Stale index entry: the key was retargeted since, so it no longer
+        // holds `body_value` and this bucket no longer speaks for it.
+        if (entry == store_target_renames_.end() || entry->second.get() != body_value.get()) continue;
+        entry->second = visible_values[i];
+        new_holders.push_back(key);
+      }
+    }
+  }
+}
+
+void ScopeOutliner::SetStoreTargetRename(const VarPtr& original, const VarPtr& fresh) {
+  auto [entry, inserted] = store_target_renames_.try_emplace(original.get(), fresh);
+  if (!inserted) {
+    if (entry->second.get() == fresh.get()) return;
+    entry->second = fresh;
+  }
+  renamed_by_value_[fresh.get()].push_back(original.get());
+}
+
+void ScopeOutliner::RewindRenames(const std::vector<BodyStoreRename>& renames) {
+  for (const auto& rename : renames) SetStoreTargetRename(rename.original, rename.seed);
+}
+
+void ScopeOutliner::RetargetCarries(const std::vector<BodyStoreRename>& renames,
+                                    const std::vector<VarPtr>& visible_values) {
+  INTERNAL_CHECK(renames.size() == visible_values.size())
+      << "Internal error: carry value count does not match the rename count";
+  // Post-store aliases first — the sweep consumes each body value's bucket.
+  RetargetBodyValues(renames, visible_values);
+  // Then the store target itself, authoritatively. The sweep already moved it
+  // when it still held a body value (the loop path), but not when the body was
+  // an `if` branch that RewindRenames has since rewound to the seed.
+  for (size_t i = 0; i < renames.size(); ++i) {
+    SetStoreTargetRename(renames[i].original, visible_values[i]);
+  }
+}
+
+void ScopeOutliner::PublishCarries(const std::vector<BodyStoreRename>& renames,
+                                   const std::vector<VarPtr>& return_vars) {
+  INTERNAL_CHECK(renames.size() == return_vars.size())
+      << "Internal error: carry return_var count does not match the rename count";
+  // Tell the enclosing body first: it must be handed the seed *this* body
+  // started from, before the retarget below rewrites the map entry.
+  for (size_t i = 0; i < renames.size(); ++i) {
+    NoteStoreTargetRename(renames[i].original, renames[i].seed, return_vars[i]);
+  }
+  RetargetCarries(renames, return_vars);
+}
+
+/// Split @p renames into the ones this loop must newly carry and the ones it
+/// already carries.
+///
+/// A store target that *is* one of the loop's own iter_args is already threaded
+/// through the loop; giving it a second carry seeded with itself would make the
+/// loop carry its own carry, and the seed would not even be in scope at the loop
+/// header. Its post-loop value is simply the matching return_var, so it needs
+/// republishing but no new slot.
+void ScopeOutliner::SplitAlreadyCarried(const std::vector<BodyStoreRename>& renames,
+                                        const std::vector<IterArgPtr>& iter_args,
+                                        const std::vector<IterArgPtr>& visited_iter_args,
+                                        const std::vector<VarPtr>& return_vars, const Span& span,
+                                        std::vector<BodyStoreRename>* fresh,
+                                        std::vector<BodyStoreRename>* carried,
+                                        std::vector<VarPtr>* carried_values) const {
+  for (const auto& rename : renames) {
+    // The rename's seed comes from var_objects_, which holds the *pre-visit* Var
+    // objects, so match the original iter_args first and the visited ones second
+    // (IRMutator clones an IterArg whose initValue this pass renamed).
+    size_t slot = FindIterArgSlot(iter_args, rename.seed.get());
+    if (slot == std::string::npos) slot = FindIterArgSlot(visited_iter_args, rename.seed.get());
+    if (slot == std::string::npos) {
+      fresh->push_back(rename);
+      continue;
+    }
+    INTERNAL_CHECK_SPAN(slot < return_vars.size(), span)
+        << "Internal error: loop carries " << iter_args.size() << " values but declares only "
+        << return_vars.size() << " return_vars, so the carry at slot " << slot
+        << " has no value visible after the loop";
+    carried->push_back(rename);
+    carried_values->push_back(return_vars[slot]);
+  }
+}
+
+StmtPtr ScopeOutliner::VisitStmt_(const ForStmtPtr& op) {
+  // A loop's return_vars are definitions in its parent body, not in its own.
+  NoteLocalDefinitions(op->return_vars_);
+  // Only the body can outline a scope: the bounds, the iter_arg seeds and the
+  // return_vars are all expressions. So one frame around the whole node is
+  // enough, and IRMutator's own traversal can stay in charge.
+  body_rename_stack_.emplace_back();
+  auto visited = IRMutator::VisitStmt_(op);
+  auto renames = std::move(body_rename_stack_.back().renames);
+  body_rename_stack_.pop_back();
+  if (renames.empty()) return visited;
+
+  auto loop = As<ForStmt>(visited);
+  INTERNAL_CHECK_SPAN(loop, op->span_)
+      << "Internal error: ScopeOutliner mutated a ForStmt into " << (visited ? visited->TypeName() : "null");
+
+  std::vector<BodyStoreRename> fresh;
+  std::vector<BodyStoreRename> carried;
+  std::vector<VarPtr> carried_values;
+  SplitAlreadyCarried(renames, op->iter_args_, loop->iter_args_, loop->return_vars_, loop->span_, &fresh,
+                      &carried, &carried_values);
+  RetargetCarries(carried, carried_values);
+  if (fresh.empty()) return visited;
+
+  auto carry_iter_args = MakeCarryIterArgs(fresh, loop->span_);
+  auto return_vars = MakeCarryReturnVars(fresh, loop->span_);
+  auto result = MutableCopy(loop);
+  result->body_ = BuildCarriedLoopBody(loop->body_, fresh, carry_iter_args,
+                                       loop->iter_args_.size() + fresh.size(), loop->span_);
+  result->iter_args_.insert(result->iter_args_.end(), carry_iter_args.begin(), carry_iter_args.end());
+  result->return_vars_.insert(result->return_vars_.end(), return_vars.begin(), return_vars.end());
+  PublishCarries(fresh, return_vars);
+  return result;
+}
+
+StmtPtr ScopeOutliner::VisitStmt_(const WhileStmtPtr& op) {
+  NoteLocalDefinitions(op->return_vars_);
+  body_rename_stack_.emplace_back();
+  auto visited = IRMutator::VisitStmt_(op);
+  auto renames = std::move(body_rename_stack_.back().renames);
+  body_rename_stack_.pop_back();
+  if (renames.empty()) return visited;
+
+  auto loop = As<WhileStmt>(visited);
+  INTERNAL_CHECK_SPAN(loop, op->span_) << "Internal error: ScopeOutliner mutated a WhileStmt into "
+                                       << (visited ? visited->TypeName() : "null");
+
+  std::vector<BodyStoreRename> fresh;
+  std::vector<BodyStoreRename> carried;
+  std::vector<VarPtr> carried_values;
+  SplitAlreadyCarried(renames, op->iter_args_, loop->iter_args_, loop->return_vars_, loop->span_, &fresh,
+                      &carried, &carried_values);
+  RetargetCarries(carried, carried_values);
+  if (fresh.empty()) return visited;
+
+  auto carry_iter_args = MakeCarryIterArgs(fresh, loop->span_);
+  auto return_vars = MakeCarryReturnVars(fresh, loop->span_);
+  auto result = MutableCopy(loop);
+  result->body_ = BuildCarriedLoopBody(loop->body_, fresh, carry_iter_args,
+                                       loop->iter_args_.size() + fresh.size(), loop->span_);
+  result->iter_args_.insert(result->iter_args_.end(), carry_iter_args.begin(), carry_iter_args.end());
+  result->return_vars_.insert(result->return_vars_.end(), return_vars.begin(), return_vars.end());
+  PublishCarries(fresh, return_vars);
+  return result;
+}
+
+StmtPtr ScopeOutliner::VisitStmt_(const IfStmtPtr& op) {
+  NoteLocalDefinitions(op->return_vars_);
+  INTERNAL_CHECK_SPAN(op->condition_, op->span_) << "Internal error: IfStmt has null condition";
+  auto new_condition = VisitExpr(op->condition_);
+
+  // The branches are alternatives, not a sequence: a rename the then branch made
+  // is not visible in the else branch, so the else branch has to start from the
+  // same incoming values. Rewinding the store targets the frame recorded is
+  // enough, and costs O(renames) instead of a copy of the whole map — the
+  // branch-local post-store aliases are keyed on Vars the other branch cannot
+  // name, so they are free to stay, and PublishCarries retargets them below.
+  std::vector<BodyStoreRename> then_renames;
+  auto new_then_body = VisitControlFlowBody(op->then_body_, &then_renames);
+  RewindRenames(then_renames);
+
+  std::vector<BodyStoreRename> else_renames;
+  std::optional<StmtPtr> new_else_body;
+  if (op->else_body_.has_value()) {
+    new_else_body = VisitControlFlowBody(*op->else_body_, &else_renames);
+    RewindRenames(else_renames);
+  }
+
+  // One carry per store target either branch wrote; the branch that did not
+  // write it yields the value it came in with.
+  std::vector<BodyStoreRename> renames = then_renames;
+  std::vector<VarPtr> then_values;
+  std::vector<VarPtr> else_values;
+  then_values.reserve(renames.size());
+  for (const auto& rename : renames) then_values.push_back(rename.body_values.back());
+  for (const auto& rename : else_renames) {
+    auto it = std::find_if(renames.begin(), renames.end(), [&](const BodyStoreRename& merged) {
+      return merged.original.get() == rename.original.get();
+    });
+    if (it == renames.end()) {
+      renames.push_back(rename);
+      then_values.push_back(rename.seed);
+    } else {
+      it->body_values.insert(it->body_values.end(), rename.body_values.begin(), rename.body_values.end());
+    }
+  }
+  else_values.reserve(renames.size());
+  for (const auto& rename : renames) {
+    auto it = std::find_if(else_renames.begin(), else_renames.end(), [&](const BodyStoreRename& branch) {
+      return branch.original.get() == rename.original.get();
+    });
+    else_values.push_back(it == else_renames.end() ? rename.seed : it->body_values.back());
+  }
+
+  StmtPtr result_then = new_then_body;
+  std::optional<StmtPtr> result_else = new_else_body;
+  std::vector<VarPtr> new_return_vars = op->return_vars_;
+  if (!renames.empty()) {
+    // An `if` that already returns values must have both branches yielding, so
+    // the missing-else shortcut below is only sound when it returned nothing.
+    INTERNAL_CHECK_SPAN(op->else_body_.has_value() || op->return_vars_.empty(), op->span_)
+        << "Internal error: IfStmt declares " << op->return_vars_.size()
+        << " return_vars but has no else branch to yield them";
+    auto return_vars = MakeCarryReturnVars(renames, op->span_);
+    result_then = AppendTrailingYieldValues(
+        new_then_body, std::vector<ExprPtr>(then_values.begin(), then_values.end()), op->span_);
+    // An ``if`` with no else still has to produce a value on the untaken path.
+    result_else =
+        AppendTrailingYieldValues(new_else_body.value_or(SeqStmts::Flatten({}, op->span_)),
+                                  std::vector<ExprPtr>(else_values.begin(), else_values.end()), op->span_);
+    new_return_vars.insert(new_return_vars.end(), return_vars.begin(), return_vars.end());
+    const size_t expected = op->return_vars_.size() + renames.size();
+    for (const auto& branch : {result_then, *result_else}) {
+      auto yield = transform_utils::GetLastYieldStmt(branch);
+      INTERNAL_CHECK_SPAN(yield && yield->value_.size() == expected, op->span_)
+          << "Internal error: IfStmt branch yields " << (yield ? yield->value_.size() : 0)
+          << " values after threading " << renames.size() << " store-target carries, expected " << expected;
+    }
+    PublishCarries(renames, return_vars);
+  }
+
+  auto result = MutableCopy(op);
+  result->condition_ = std::move(new_condition);
+  result->then_body_ = std::move(result_then);
+  result->else_body_ = std::move(result_else);
+  result->return_vars_ = std::move(new_return_vars);
+  return result;
+}
+
 /// True when `name` is already claimed by this function (`known_names_`) or,
 /// when the pass opts in, by any earlier function in the program
 /// (`reserved_func_names_`).
@@ -998,6 +1550,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   auto saved_known_names = known_names_;
   auto saved_required_outputs = required_outputs_;
   auto saved_renames = store_target_renames_;
+  auto saved_renamed_by_value = renamed_by_value_;
   func_name_ = outlined_func_name;
   scope_counter_ = 0;
   for (const auto& [ptr, type] : scope_var_collector.var_types) {
@@ -1008,6 +1561,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   }
   known_names_.insert(scope_var_collector.known_names.begin(), scope_var_collector.known_names.end());
   store_target_renames_.clear();
+  renamed_by_value_.clear();
   // Propagate output requirements so nested scopes know what's needed
   required_outputs_.clear();
   for (const auto& var : output_vars) {
@@ -1021,6 +1575,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   known_names_ = saved_known_names;
   required_outputs_ = saved_required_outputs;
   store_target_renames_ = saved_renames;
+  renamed_by_value_ = saved_renamed_by_value;
 
   // Create fresh parameters for the outlined function.
   // Infer param directions from the inner callee when possible (requires program_).
@@ -1200,6 +1755,18 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     outlined_body = std::make_shared<SeqStmts>(body_stmts, op->span_);
   }
 
+  // Map each captured input Var to its positional index. The index is exact for
+  // BOTH surfaces the translations below need: ``input_params`` is built
+  // index-parallel to ``input_vars`` and is what the outlined ``Function`` is
+  // constructed from, and ``call_args`` is built from ``input_vars`` in the same
+  // order. Built once here, ahead of the attr resolution that follows, and
+  // reused by the no_dep / dump translations further down.
+  std::unordered_map<const Var*, int32_t> input_var_to_idx;
+  input_var_to_idx.reserve(input_vars.size());
+  for (size_t i = 0; i < input_vars.size(); ++i) {
+    input_var_to_idx[input_vars[i].get()] = static_cast<int32_t>(i);
+  }
+
   // Register the outlined function (propagate level/role from ScopeStmt, convert split/core_num to attrs)
   std::vector<std::pair<std::string, std::any>> outlined_attrs;
   auto append_split_attr = [&](SplitMode split) {
@@ -1224,6 +1791,42 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     if (deferred_wait.has_deferred_wait) {
       outlined_attrs.emplace_back(kAttrDeferredCompletionWaiter, true);
     }
+  };
+  // Resolve pl.set_cache_policy declarations onto the outlined function's params.
+  // The scope attr is consumed here and never propagated: downstream the function
+  // attr (param indices) is the single carrier until ConvertTensorToTileOps
+  // converts it to per-load kwargs at pass 10.
+  auto append_cache_policy_attr = [&]() {
+    auto scope_cache_policies = op->GetAttr<std::vector<std::pair<VarPtr, int>>>(kAttrCachePolicyVars);
+    if (scope_cache_policies.empty()) return;
+    std::vector<std::pair<int32_t, int>> cache_policy_indices;
+    cache_policy_indices.reserve(scope_cache_policies.size());
+    for (const auto& [v, policy] : scope_cache_policies) {
+      INTERNAL_CHECK_SPAN(v, op->span_)
+          << "Internal error: null Var in cache_policy_vars on outlined scope '" << outlined_func_name << "'";
+      auto it = input_var_to_idx.find(v.get());
+      CHECK_SPAN(it != input_var_to_idx.end(), op->span_)
+          << "pl.set_cache_policy(...) references tensor '" << v->name_hint_
+          << "', which is not captured by the scope body. Only tensors actually read inside the "
+             "scope can be declared.";
+      // A bypassing read only makes sense on a tensor this kernel does not
+      // write: the policy is a promise about the bytes, and the direction
+      // inference above already knows whether the scope writes them.
+      const ParamDirection dir = input_param_directions[static_cast<size_t>(it->second)];
+      CHECK_SPAN(static_cast<CachePolicy>(policy) != CachePolicy::kBypass || dir == ParamDirection::In,
+                 op->span_)
+          << "pl.set_cache_policy(" << v->name_hint_
+          << ", CachePolicy.BYPASS) is not allowed on a tensor this scope writes ("
+          << ParamDirectionToString(dir)
+          << "). A bypassing read of bytes the same kernel writes is a coherency bug.";
+      cache_policy_indices.emplace_back(it->second, policy);
+    }
+    // Sorted by param index for the same reason ``arg_dir_override_indices`` is:
+    // the declaration set is order-independent, so two programs that differ only
+    // in the order the user wrote the declarations (or in capture order) must
+    // produce structurally equal IR, and dumps must stay deterministic.
+    std::sort(cache_policy_indices.begin(), cache_policy_indices.end());
+    outlined_attrs.emplace_back(kAttrCachePolicyParams, std::move(cache_policy_indices));
   };
   // Bridge the first-class SplitAivScopeStmt region into the function-level
   // AIV-split markers the downstream contract (passes 11-24) expects. The
@@ -1293,6 +1896,10 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     append_deferred_completion_waiter_attr();
     append_split_aiv_attr(incore->split_);
   }
+  // Scope-kind agnostic: a cache-policy declaration reads the same on an InCore
+  // task and on the Hierarchy scope that encloses one, and both outline through
+  // this helper.
+  append_cache_policy_attr();
   std::optional<Level> outlined_level;
   std::optional<Role> outlined_role;
   if (auto hier = As<HierarchyScopeStmt>(op)) {
@@ -1384,17 +1991,6 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     var_types_[scope_task_id_var.get()] = scope_task_id_var->GetType();
     var_objects_[scope_task_id_var.get()] = scope_task_id_var;
     known_names_.insert(scope_task_id_var->name_hint_);
-  }
-
-  // Map each captured input Var to its positional arg index. Shared by the
-  // no_dep override translation and the dump translation below; built once
-  // when either needs it.
-  std::unordered_map<const Var*, int32_t> input_var_to_idx;
-  if (!scope_no_dep_vars.empty() || !scope_dump_vars.empty()) {
-    input_var_to_idx.reserve(input_vars.size());
-    for (size_t i = 0; i < input_vars.size(); ++i) {
-      input_var_to_idx[input_vars[i].get()] = static_cast<int32_t>(i);
-    }
   }
 
   std::vector<int32_t> arg_dir_override_indices;
@@ -1605,7 +2201,10 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   for (const auto& [alias_ptr, target_ptr] : deferred_post_store_aliases) {
     auto rename_it = store_target_renames_.find(target_ptr);
     if (rename_it != store_target_renames_.end()) {
-      store_target_renames_[alias_ptr] = rename_it->second;
+      // var_objects_ holds the identity Var for the alias; the map itself is
+      // keyed by raw pointer, so look it up rather than minting a handle.
+      auto alias_it = var_objects_.find(alias_ptr);
+      if (alias_it != var_objects_.end()) SetStoreTargetRename(alias_it->second, rename_it->second);
     }
   }
   return result;
@@ -1616,12 +2215,32 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
  *
  * E.g. "buf_0" -> "buf_1", "x_2" -> "x_3".  Falls back to appending "_1".
  */
-std::string ScopeOutliner::GenerateFreshSSAName(const std::string& original_name) const {
+std::string ScopeOutliner::GenerateFreshSSAName(const std::string& original_name,
+                                                const std::string& role) const {
   std::unordered_set<std::string> used_names;
   for (const auto& [var, _] : var_types_) {
     used_names.insert(var->name_hint_);
   }
-  return auto_name::GenerateFreshNameLike(original_name, used_names);
+  if (role.empty()) {
+    return auto_name::GenerateFreshNameLike(original_name, used_names);
+  }
+  // Same search as GenerateFreshNameLike, but stamping the requested role rather
+  // than inheriting the source name's — a carry derived from ``t__ssa_v0`` must
+  // read ``t__iter_v1``, not ``t__ssa_v1``.
+  auto parsed = auto_name::Parse(original_name);
+  int version = parsed.version.value_or(-1) + 1;
+  std::string candidate;
+  do {
+    candidate = auto_name::BuildName(parsed.base_name, parsed.qualifier, role, version);
+    ++version;
+  } while (used_names.count(candidate) > 0);
+  return candidate;
+}
+
+void ScopeOutliner::RegisterVar(const VarPtr& var) {
+  var_types_[var.get()] = var->GetType();
+  var_objects_[var.get()] = var;
+  known_names_.insert(var->name_hint_);
 }
 
 /**
@@ -1642,10 +2261,11 @@ VarPtr ScopeOutliner::CreateFreshStoreTargetVar(const VarPtr& original_var, cons
   std::string fresh_name = GenerateFreshSSAName(original_var->name_hint_);
   auto type = original_var->GetType();
   auto fresh_var = std::make_shared<Var>(fresh_name, type, span);
-  store_target_renames_[original_var.get()] = fresh_var;
-  var_types_[fresh_var.get()] = type;
-  var_objects_[fresh_var.get()] = fresh_var;
-  known_names_.insert(fresh_name);
+  auto current = store_target_renames_.find(original_var.get());
+  NoteStoreTargetRename(original_var, current != store_target_renames_.end() ? current->second : original_var,
+                        fresh_var);
+  SetStoreTargetRename(original_var, fresh_var);
+  RegisterVar(fresh_var);
   return fresh_var;
 }
 
@@ -1700,19 +2320,22 @@ std::string ScopeOutliner::GenerateHierarchySuffix(Level level, const std::optio
 /// Infer parameter directions for the outlined function by examining the scope body.
 ///
 /// Strategy:
-///   0. Collect which captured vars the body *reads* — every use except the
-///      two write-destination operand slots (``tile.store``'s target and
-///      ``tensor.assemble``'s destination). Conservative by construction: an
-///      unrecognised use counts as a read, so the classification can only err
-///      towards ``InOut``.
-///   1. Mark tile.store targets (from ``store_output_set``) as written
-///   2. Mark tensor.assemble destinations as written (``tensor.assemble`` is
-///      SSA-pure but its first arg is a destination the result aliases in
-///      place; without this the spmd wrapper for
-///      ``for n0 in pl.spmd(...): out = pl.assemble(out, slice, [...])``
-///      keeps direction In on the shared output and the orchestration
-///      codegen drops the SSA-result alias for the call)
-///   3. Merge ``Out``/``InOut`` directions from inner GlobalVar calls
+///   0. Collect which captured vars the body *reads* — every use except an
+///      operand the operator declares it purely overwrites. Conservative by
+///      construction: an unrecognised use counts as a read, so the
+///      classification can only err towards ``InOut``.
+///   1. Mark every captured var the body writes. Which argument an operator
+///      writes comes from its registry declaration (`set_arg_effect`), so a
+///      scope writing through ``tile.mscatter``, ``tensor.write``,
+///      ``pld.tile.put`` or any other declared writer is classified the same
+///      way as one writing through ``tile.store``. Two sources feed this: the
+///      exported ``store_output_set`` (targets that also become outputs) and a
+///      scan of the body, which catches an SSA-pure writer such as
+///      ``tensor.assemble`` whose result the caller rebinds — without it the
+///      spmd wrapper for ``for n0 in pl.spmd(...): out = pl.assemble(out,
+///      slice, [...])`` keeps direction In on the shared output and the
+///      orchestration codegen drops the SSA-result alias for the call.
+///   2. Merge ``Out``/``InOut`` directions from inner GlobalVar calls
 ///
 /// A written param is ``InOut`` only when Step 0 also saw a read; a
 /// write-only param is ``Out``. Claiming ``InOut`` for a param the body never
@@ -1739,40 +2362,37 @@ std::vector<ParamDirection> ScopeOutliner::InferParamDirections(
   // Step 0: which captured vars does the body read? A written param earns
   // ``InOut`` only when it is also read; write-only earns ``Out``.
   std::vector<bool> has_read(input_vars.size(), false);
-  ParamReadCollector(var_to_idx, has_read).VisitStmt(body);
+  ParamReadCollector(var_to_idx, has_read, program_).VisitStmt(body);
   std::vector<ParamDirection> written_direction(input_vars.size());
   for (size_t i = 0; i < input_vars.size(); ++i) {
     written_direction[i] = has_read[i] ? ParamDirection::InOut : ParamDirection::Out;
   }
 
-  // Step 1: mark tile.store targets as written
+  // Step 1a: mark the exported write targets
   for (size_t i = 0; i < input_vars.size(); ++i) {
     if (store_output_set.count(input_vars[i].get())) {
       directions[i] = written_direction[i];
     }
   }
 
-  // Step 2: mark tensor.assemble destinations as written. ``tensor.assemble``
-  // is SSA-pure (returns a fresh Tensor) but the first arg is a destination
-  // that the result aliases in place — when the destination is a parameter
-  // the function writes into the caller's backing buffer.
-  class AssembleDestUpgrader : public IRVisitor {
+  // Step 1b: scan the body for writes the exported set does not carry. An
+  // SSA-pure writer such as ``tensor.assemble`` returns a fresh Tensor, so it
+  // never enters ``store_output_set``, yet its destination operand is the
+  // caller's backing buffer and the result aliases it in place.
+  class WrittenParamUpgrader : public IRVisitor {
    public:
-    AssembleDestUpgrader(const std::unordered_map<const Var*, size_t>& var_to_idx,
+    WrittenParamUpgrader(const std::unordered_map<const Var*, size_t>& var_to_idx,
                          std::vector<ParamDirection>& directions,
                          const std::vector<ParamDirection>& written_direction)
         : var_to_idx_(var_to_idx), directions_(directions), written_direction_(written_direction) {}
 
    protected:
     void VisitExpr_(const CallPtr& call) override {
-      auto opnode = std::dynamic_pointer_cast<const Op>(call->op_);
-      if (opnode && IsOp(opnode, "tensor.assemble") && !call->args_.empty()) {
-        if (auto var = As<Var>(call->args_[0])) {
-          auto it = var_to_idx_.find(var.get());
-          if (it != var_to_idx_.end() && directions_[it->second] == ParamDirection::In) {
-            directions_[it->second] = written_direction_[it->second];
-          }
-        }
+      for (const auto& target : CallWriteTargets(call)) {
+        auto it = var_to_idx_.find(target.var.get());
+        if (it == var_to_idx_.end()) continue;
+        directions_[it->second] =
+            MergeParamDirection(directions_[it->second], written_direction_[it->second]);
       }
       IRVisitor::VisitExpr_(call);
     }
@@ -1782,20 +2402,38 @@ std::vector<ParamDirection> ScopeOutliner::InferParamDirections(
     std::vector<ParamDirection>& directions_;
     const std::vector<ParamDirection>& written_direction_;
   };
-  AssembleDestUpgrader(var_to_idx, directions, written_direction).VisitStmt(body);
+  WrittenParamUpgrader(var_to_idx, directions, written_direction).VisitStmt(body);
 
   if (!program_) return directions;
 
-  // Step 3: collect all GlobalVar function calls in the body and merge
+  // Step 2: collect all GlobalVar function calls in the body and merge
   // ``Out``/``InOut`` directions from their callees onto our parameters.
   class CallFinder : public IRVisitor {
    public:
     std::vector<CallPtr> found_calls;
     void VisitExpr_(const CallPtr& call) override {
+      Record(call);
+      IRVisitor::VisitExpr_(call);
+    }
+
+    /// A task launch calls its callee just as a plain call does, and the base
+    /// visitor's Submit handler does not forward here (see
+    /// `.claude/rules/pass-submit-awareness.md`), so a `pl.submit` inside an
+    /// outlined scope would otherwise contribute no callee direction at all.
+    /// The view is transient — the merge below only reads its `op_` and
+    /// `args_`, and it is never stored in the IR. Its arguments are a
+    /// positional *prefix* of the callee's parameters; the merge is already
+    /// bounded by both sizes.
+    void VisitExpr_(const SubmitPtr& submit) override {
+      Record(SubmitToCallView(submit));
+      IRVisitor::VisitExpr_(submit);
+    }
+
+   private:
+    void Record(const CallPtr& call) {
       if (std::dynamic_pointer_cast<const GlobalVar>(call->op_)) {
         found_calls.push_back(call);
       }
-      IRVisitor::VisitExpr_(call);
     }
   };
 
@@ -1803,7 +2441,20 @@ std::vector<ParamDirection> ScopeOutliner::InferParamDirections(
   finder.VisitStmt(body);
   if (finder.found_calls.empty()) return directions;
 
-  // Merge directions from all calls, preferring Out/InOut over In
+  // Accumulate what the callees prove about each capture as two independent
+  // observations rather than folding one direction at a time.
+  //
+  // ``ParamDirection`` is not a lattice this evidence can be merged along.
+  // ``In`` is the *no evidence yet* floor — ``directions`` is seeded with it —
+  // so ``MergeParamDirection`` cannot read an ``In`` operand as "somebody read
+  // this" without also promoting every write-only capture to ``InOut``, which
+  // is the false read issue #2415 exists to prevent. Folding per call therefore
+  // dropped a real read: a capture handed to one callee's ``In`` slot and
+  // another's ``Out`` slot merged to ``In``, then to ``Out``, losing the first
+  // observation. Kept apart, the two combine into the ``InOut`` such a capture
+  // actually is, and a capture only ever written still comes out ``Out``.
+  std::vector<bool> callee_reads(input_vars.size(), false);
+  std::vector<bool> callee_writes(input_vars.size(), false);
   for (const auto& call : finder.found_calls) {
     auto gv = std::dynamic_pointer_cast<const GlobalVar>(call->op_);
     if (!gv) continue;
@@ -1812,20 +2463,41 @@ std::vector<ParamDirection> ScopeOutliner::InferParamDirections(
     const auto& call_args = call->args_;
     const auto& callee_dirs = callee->param_directions_;
     for (size_t arg_idx = 0; arg_idx < call_args.size() && arg_idx < callee_dirs.size(); ++arg_idx) {
-      auto arg_var = As<Var>(call_args[arg_idx]);
+      // ``AsVarLike``: a loop-carried capture arrives as an ``IterArg``, which
+      // has its own ``ObjectKind`` and so never matches ``As<Var>``
+      // (`.claude/rules/ir-kind-traits.md`). Missing it pinned the wrapper
+      // parameter to the seeded ``In`` no matter what the callee declared.
+      auto arg_var = AsVarLike(call_args[arg_idx]);
       if (!arg_var) continue;
       auto it = var_to_idx.find(arg_var.get());
       if (it == var_to_idx.end()) continue;
-      // Merge monotonically along ``In < Out < InOut`` rather than
-      // overwriting (same ordering ``ComputeWrapperEffectiveDirections``
-      // uses). A callee slot only ever adds evidence: it can lift ``In`` to a
-      // write direction, or lift ``Out`` to ``InOut`` when the callee reads.
-      // It must never *remove* the read Step 0 saw in this body — a plain
-      // assignment would demote a genuine ``InOut`` to ``Out`` whenever the
-      // same capture is also handed to a callee that declares its slot
-      // ``Out``, dropping a real RAW dependency.
-      directions[it->second] = MergeParamDirection(directions[it->second], callee_dirs[arg_idx]);
+      const ParamDirection callee_dir = callee_dirs[arg_idx];
+      if (callee_dir == ParamDirection::In || callee_dir == ParamDirection::InOut) {
+        callee_reads[it->second] = true;
+      }
+      if (callee_dir == ParamDirection::Out || callee_dir == ParamDirection::InOut) {
+        callee_writes[it->second] = true;
+      }
     }
+  }
+
+  // Only a write is new information here; a callee that merely reads its slot
+  // leaves the capture where the body put it. The read half of the verdict
+  // combines *both* sources: a slot some callee reads, and a read Step 0 saw in
+  // this body. Step 0's answer is now trustworthy for this — it skips the
+  // arguments a callee declares ``Out``, so ``has_read`` no longer counts the
+  // argument pass itself and means what it says. Consulting only the callees
+  // would drop the read in
+  //
+  //     value = pl.load(shared, ...)   # this body reads it
+  //     self.overwrite(shared)         # and a callee overwrites it
+  //
+  // leaving ``shared`` ``Out`` and telling the wrapper it need not stage the
+  // very contents ``pl.load`` consumes.
+  for (size_t i = 0; i < input_vars.size(); ++i) {
+    if (!callee_writes[i]) continue;
+    const bool is_read = callee_reads[i] || has_read[i];
+    directions[i] = MergeParamDirection(directions[i], is_read ? ParamDirection::InOut : ParamDirection::Out);
   }
 
   return directions;

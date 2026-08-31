@@ -27,7 +27,7 @@ TPUT/TGET 在该侧只需要一段可读/可写的*本地* GM 区域。窗口绑
 | `pld.tensor.reduce_scatter` | 跨 rank 规约并分散 | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.allgather` | 从所有 rank 收集数据到窗口 | `DistributedTensorType`（同 src） | builtin collective |
 | `pld.tensor.all_to_all` | 基于推送的对称个性化交换——每个 rank 通过 `pld.tensor.put`（TPUT）将自己的各目标 block 推送到每个对等方的窗口中，返回窗口作为结果 | `DistributedTensorType`（同 src） | composite / HOST builtin |
-| `pld.tensor.all_to_all_v` | 变长 all-to-all（MPI_Alltoallv）——按每个目标推送完整的 MAX_RECV 行容量块，写入平面 2D 暂存窗口（传输大小是每个目标完整的容量块），同时通过 `pld.system.notify`（Set）把 `min(send_counts[dest], MAX_RECV)` 发布到对端 `recv_counts[my_rank, 0]`，使接收方能跳过超出其计数的行；返回窗口作为结果（与对称 `all_to_all` 相同的窗口即结果模式） | `DistributedTensorType`（与 target 相同） | composite / HOST builtin |
+| `pld.tensor.all_to_all_v` | 变长 all-to-all（MPI_Alltoallv）——按每个目标推送 `clamp(send_counts[dest], 0, MAX_RECV)` 行，写入平面 2D 暂存窗口（传输大小是运行时行数，因此填充不会经过链路），同时通过 `pld.system.notify`（Set）把同一钳制后的计数发布到对端 `recv_counts[my_rank, 0]`，使接收方知道哪些行有效；返回窗口作为结果（与对称 `all_to_all` 相同的窗口即结果模式） | `DistributedTensorType`（与 target 相同） | composite / HOST builtin |
 | `pld.system.notify` | 给 peer 的槽位发信号 | `Unknown`（副作用） | TNOTIFY |
 | `pld.system.wait` | 在自身槽位上阻塞 | `Unknown`（副作用） | TWAIT |
 | `pld.system.defer_wait` | 让本任务的逻辑完成等待本地 counter | `Unknown`（副作用） | Simpler completion runtime（无 PTOAS wait op） |
@@ -89,7 +89,7 @@ SSA 值而存在。
 该标记与亲和性正交（它约束的是复制而非放置位置）。它唯一的消费者是
 `LowerAutoVectorSplit` 的 `pl.split_aiv` 区域放置标记：该 pass 把区域内的
 no-duplicate 调用钉在 AIV 通路上；参见 `docs/zh/dev/ir/05-operators.md` 与
-`docs/zh/dev/passes/20-lower_auto_vector_split.md`。
+`docs/zh/dev/passes/21-lower_auto_vector_split.md`。
 
 **写在所有区域之外的通信算子仍然会被复制到两条通路上，且没有任何诊断会提示这一点。**
 把通信阶段放进 `pl.split_aiv` 区域是作者的职责；参见
@@ -364,13 +364,33 @@ pld.tensor.all_to_all_v(
 - `recv_counts` — DistributedTensor INT32 `[NR, 1]`（InOut recvcounts）
 
 `MAX_RECV = target.shape[0] // NR`。降级在运行时读取 `send_counts[dest]`、钳制到
-`MAX_RECV`，并把**钳制后**的计数通过 `pld.system.notify`（Set）写入对端
-`recv_counts[my_rank, 0]`。推送本身总是传输每个目标完整的 `MAX_RECV` 行容量
-块——与运行时计数无关——因此超出发送方实际计数的行也会经过链路传输；屏障之后
-接收方用 `recv_counts[src, 0]` 跳过这些行（MPI_Alltoallv 语义适用于逻辑结果，
-而非链路传输本身）。InCore 路径的传输是编译期定长的 `pld.tile.put`（PTOAS 要求
-静态 partition-view 维度）；HOST 路径的内核在入口根据运行时 rank 数推导
-`MAX_RECV`（`target.shape[0] / nranks`），因此始终与实际运行的设备数一致。
+`[0, MAX_RECV]`，并把**钳制后**的计数通过 `pld.system.notify`（Set）写入对端
+`recv_counts[my_rank, 0]`。推送只传输这么多行——传输形状是运行时的
+`[rows, SIZE]`，而非编译期容量——因此填充行不会经过链路。屏障之后接收方用
+`recv_counts[src, 0]` 识别有效行；其容量槽的其余部分根本不会被写入。窗口内存
+不*保证*清零，且可能在同一进程内残留，因此这些未触及的字节是未定义的。
+
+> [!WARNING]
+> **先按 `recv_counts` 裁剪，再对容量块做算术运算。**
+> 未触及的尾部是*未初始化*的，因此可能解码为 **NaN 或 Inf**——而不只是一个
+> 错误但有限的数值。这是**性质**的改变，而不仅仅是数值的改变：此前的满容量
+> 推送会把发送方的多余行留在那里，那些始终是有限的 FP32。若代码先在稠密的
+> `[NR*MAX_RECV, SIZE]` 块上做归约或其他运算、*之后*才用 `recv_counts` 掩码
+> ——这正是 MoE dispatch 的自然写法——那么它此前是正确的，现在会把 NaN 传播
+> 到本来有效的行中。请先掩码，再计算。
+
+钳制是双侧的，其下界在两处都起作用：一是避免负的 `send_counts` 变成负的传输
+范围；二是由于发布的计数就是同一个钳制后的值，负的 `send_counts[dest]` 现在
+会发布 `recv_counts = 0`，而不是那个负数本身。两条路径同步改动，因此在负输入
+下仍然逐字节一致。
+
+InCore 路径是一个 `pld.tile.put`，其传输形状为运行时计数，通过静态
+`[1, SIZE]` 暂存 tile 送入 TPUT 引擎自动分块；PTOAS 接受 `pto.comm.tput` 上的
+动态 partition-view 维度（`TPutOp::verify` 传入 `AllowDynamicPartitionView`），
+且由于暂存 tile 是显式的，不需要 `chunk_rows` 属性。HOST 路径的内核在入口根据
+运行时 rank 数推导 `MAX_RECV`（`target.shape[0] / nranks`），因此始终与实际运行
+的设备数一致。两条路径应用完全相同的双侧钳制和相同的 `[rows, SIZE]` 传输范围，
+在链路上保持逐字节一致。
 
 **InCore composite**（`LowerCompositeOps`）：上述原语在芯片内核中被分解为
 `pld.tile.put` + `pld.system.notify`/`wait`。
@@ -438,7 +458,7 @@ chunk，Pass 会保留该元数据，并沿用单矩形路径只归约这个矩�
 
 host-orchestrator 用户代码可以省略 `signal`，包括在 `for` / `while`
 循环内；
-[`SynthesizeAllReduceSignals`](passes/40-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，
+[`SynthesizeAllReduceSignals`](passes/41-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，
 语义 shape 为 `[world_size, core_num]`（仅 mesh 模式 — `mode="ring"` 必须显式传入
 signal）。该阶段会先插入 standalone `world_size = pld.world_size()` binding，
 再用该变量构造 buffer size 和 window shape。自清理协议（参见
@@ -584,10 +604,10 @@ peer 算术；而*远程*操作数
 ## 流水线集成
 
 通信域与其槽位分配由
-[`MaterializeCommDomainScopes`](passes/41-materialize_comm_domain_scopes.md) pass 完成。该 pass 将每个
+[`MaterializeCommDomainScopes`](passes/42-materialize_comm_domain_scopes.md) pass 完成。该 pass 将每个
 host_orch 函数体包裹进嵌套的 `CommDomainScopeStmt` 节点（按推断出的通信域逐层嵌套），并产生运行时据以
 绑定物理缓冲的按窗口 `WindowBuffer` 记录。
-随后 [`LowerHostTensorCollectives`](passes/42-lower_host_tensor_collectives.md) 会在最终
+随后 [`LowerHostTensorCollectives`](passes/43-lower_host_tensor_collectives.md) 会在最终
 `Simplify` 之前把 host-level tensor collectives 降为内部 builtin chip dispatch。
 
 ## 测试

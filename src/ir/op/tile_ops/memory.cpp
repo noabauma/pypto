@@ -38,6 +38,7 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
@@ -60,6 +61,42 @@ T GetKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const st
   }
   throw ValueError("Missing kwarg: " + key);
 }
+
+namespace {
+
+/// Validate that every element of a window-geometry tuple is an integer scalar.
+///
+/// ``tile.load`` / ``tile.store`` declare each of offsets, shapes and valid_shape
+/// as "TupleType of integer ScalarType", and nothing downstream re-derives that:
+/// the window-read proofs in ``InferWindowReadValidShape`` are defined only over
+/// integer scalars, so a non-scalar element makes every bounds obligation
+/// *undecidable* rather than false — the negative-offset, valid-region-fits and
+/// reads-past-the-end checks then pass silently and codegen lowers whatever the
+/// element happens to reduce to (its last leaf, for a nested tuple). Reject it
+/// here, at the operator boundary, on the same terms ``tensor.slice`` uses for
+/// its own shape and offset tuples.
+///
+/// ``IsInt()`` (not ``IsIndexLike()``) is the bar because every integer width is
+/// legitimate all the way down: ``EmitCastToIndex`` exists precisely to widen a
+/// non-INDEX integer offset at the partition_view site.
+///
+/// ``role`` names the operand in the diagnostic using the spelling the DSL
+/// exposes (``offset`` / ``shapes`` / ``valid_shape``), so the message points at
+/// the argument the author actually wrote.
+void ValidateIntScalarTupleElements(const MakeTuplePtr& tuple, const std::string& op_name, const char* role) {
+  for (size_t i = 0; i < tuple->elements_.size(); ++i) {
+    const ExprPtr& elem = tuple->elements_[i];
+    CHECK(elem) << op_name << " " << role << " tuple element " << i << " must not be null";
+    auto scalar_type = As<ScalarType>(elem->GetType());
+    CHECK_SPAN(scalar_type, elem->span_) << op_name << " " << role << " tuple element " << i
+                                         << " must be ScalarType, but got " << elem->GetType()->TypeName();
+    CHECK_SPAN(scalar_type->dtype_.IsInt(), elem->span_)
+        << op_name << " " << role << " tuple element " << i << " must have integer dtype, but got "
+        << scalar_type->dtype_.ToString();
+  }
+}
+
+}  // namespace
 
 TypePtr DeduceTileGetBlockIdxType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -111,18 +148,21 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
   CHECK(offsets_tuple) << "The operator " << op_name
                        << " requires second argument to be a tuple (offsets), but got "
                        << args[1]->GetType()->TypeName();
+  ValidateIntScalarTupleElements(offsets_tuple, op_name, "offset");
 
   // Third argument must be TupleType (shapes)
   auto shapes_tuple = As<MakeTuple>(args[2]);
   CHECK(shapes_tuple) << "The operator " << op_name
                       << " requires third argument to be a tuple (shapes), but got "
                       << args[2]->GetType()->TypeName();
+  ValidateIntScalarTupleElements(shapes_tuple, op_name, "shapes");
 
   // Fourth argument must be TupleType (valid_shape)
   auto valid_shape_tuple = As<MakeTuple>(args[3]);
   CHECK(valid_shape_tuple) << "The operator " << op_name
                            << " requires fourth argument to be a tuple (valid shape), but got "
                            << args[3]->GetType()->TypeName();
+  ValidateIntScalarTupleElements(valid_shape_tuple, op_name, "valid_shape");
 
   // Verify offsets, shapes and valid_shape have same number of dimensions
   CHECK(offsets_tuple->elements_.size() == shapes_tuple->elements_.size())
@@ -170,6 +210,31 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
           tile_view_semantics::ShapeExprListsEquivalent(source_view.stride, packed_stride))
         << "The operator " << op_name
         << " of an MX-layout tensor only supports packed 2D sources; strided sources are not supported";
+    const bool is_mx_a = source_view.layout == TensorLayout::MX_A_ZZ;
+    const size_t block_axis = is_mx_a ? 0 : 1;
+    const size_t group_axis = is_mx_a ? 1 : 0;
+    const std::string layout_name = TensorLayoutToString(source_view.layout);
+    // PTOAS / pto-isa special requirement (feeds EmitMxPhysicalView):
+    //   Physical MX GlobalTensor needs SFractal axes [16, 2], so every logical
+    //   block/group extent, load size, and offset must be static and divisible
+    //   by 16 (block) / 2 (group).  Example: logical MX_A_ZZ [64, 4] load at
+    //   [0,0] size [64,4] -> physical [1,4,2,16,2]; a dynamic or misaligned
+    //   group size cannot form that box and A5 TLoad static_asserts.
+    auto check_static_aligned = [&](const ExprPtr& expr, int64_t alignment, int64_t minimum, const char* name,
+                                    const Span& span) {
+      auto value = As<ConstInt>(expr);
+      CHECK_SPAN(value, span) << "The operator " << op_name << " of an " << layout_name
+                              << " tensor requires static " << name;
+      CHECK_SPAN(value->value_ >= minimum && value->value_ % alignment == 0, span)
+          << "The operator " << op_name << " of an " << layout_name << " tensor requires " << name
+          << " >= " << minimum << " and divisible by " << alignment << ", but got " << value->value_;
+    };
+    check_static_aligned(tensor_type->shape_[block_axis], 16, 16, "tensor block dimension", args[0]->span_);
+    check_static_aligned(tensor_type->shape_[group_axis], 2, 2, "tensor group dimension", args[0]->span_);
+    check_static_aligned(valid_shape_tuple->elements_[block_axis], 16, 16, "load block size", args[3]->span_);
+    check_static_aligned(valid_shape_tuple->elements_[group_axis], 2, 2, "load group size", args[3]->span_);
+    check_static_aligned(offsets_tuple->elements_[block_axis], 16, 0, "load block offset", args[1]->span_);
+    check_static_aligned(offsets_tuple->elements_[group_axis], 2, 0, "load group offset", args[1]->span_);
     // MX cube scale loads are Mat-only (TLoadMxCube*) and require the caller to
     // spell the target explicitly. The public load interface keeps its ordinary
     // Vec default, so an omitted target fails instead of being silently changed.
@@ -198,32 +263,36 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
       tile_view.slayout = TileLayout::row_major;
     }
     tile_view.fractal = tile_view_semantics::kMXScaleFractal;
-  } else if (target_memory_opt.has_value()) {
-    if (*target_memory_opt == MemorySpace::Mat) {
-      tile_view.blayout = TileLayout::col_major;
-      tile_view.slayout = TileLayout::row_major;
-      if (source_is_dn) {
-        std::swap(tile_view.blayout, tile_view.slayout);
-      }
-      // A single-row 2-D Mat operand (cube GEMV lhs / bias) is an ND row
-      // vector, not the NZ fractal used by multi-row matmul operands. PTO-ISA
-      // declares it as Tile<Mat, 1, K, BLayout::RowMajor, ...,
-      // SLayout::NoneBox>; that pair routes the Mat->Left move through the
-      // rows==1 vector path instead of the regular extraction path, whose row
-      // alignment excludes M=1. In a rank-3+ Mat load, shape[0] is a batch
-      // dimension, so keep the canonical NZ view.
-      const auto& shape = shapes_tuple->elements_;
-      if (shape.size() == 2) {
-        const ExprPtr& row_dim = source_is_dn ? shape[1] : shape[0];
-        if (auto rows = As<ConstInt>(row_dim); rows && rows->value_ == 1) {
-          tile_view.blayout = TileLayout::row_major;
-          tile_view.slayout = TileLayout::none_box;
-        }
-      }
-    } else if (auto last_dim = As<ConstInt>(shapes_tuple->elements_.back());
-               last_dim && last_dim->value_ == 1) {
-      tile_view.blayout = TileLayout::col_major;
+  } else if (target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat) {
+    tile_view.blayout = TileLayout::col_major;
+    tile_view.slayout = TileLayout::row_major;
+    if (source_is_dn) {
+      std::swap(tile_view.blayout, tile_view.slayout);
     }
+    // A single-row 2-D Mat operand (cube GEMV lhs / bias) is an ND row
+    // vector, not the NZ fractal used by multi-row matmul operands. PTO-ISA
+    // declares it as Tile<Mat, 1, K, BLayout::RowMajor, ...,
+    // SLayout::NoneBox>; that pair routes the Mat->Left move through the
+    // rows==1 vector path instead of the regular extraction path, whose row
+    // alignment excludes M=1. In a rank-3+ Mat load, shape[0] is a batch
+    // dimension, so keep the canonical NZ view.
+    const auto& shape = shapes_tuple->elements_;
+    if (shape.size() == 2) {
+      const ExprPtr& row_dim = source_is_dn ? shape[1] : shape[0];
+      if (auto rows = As<ConstInt>(row_dim); rows && rows->value_ == 1) {
+        tile_view.blayout = TileLayout::row_major;
+        tile_view.slayout = TileLayout::none_box;
+      }
+    }
+    // Column vector: independent of the destination, and in particular still
+    // true when `target_memory` is absent. This arm used to sit inside the
+    // `has_value()` branch, so an unset load of an [N, 1] tile kept the default
+    // row_major -- an explicit claim contradicting InferImplicitTileLayoutFromShape,
+    // which makes it col_major. Because the two disagreed the view could not
+    // canonicalize away, and a downstream row_expand_add read the wrong layout.
+  } else if (auto last_dim = As<ConstInt>(shapes_tuple->elements_.back());
+             last_dim && last_dim->value_ == 1) {
+    tile_view.blayout = TileLayout::col_major;
   }
 
   // Build tile shape from shapes tuple (always in source-tensor coordinates).
@@ -259,6 +328,17 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
     tile_view.valid_shape = valid_shape_tuple->elements_;
   }
 
+  // Optional GM cache-access policy. Absent = the caller stated none; an
+  // explicit kDefault is distinct from absence and out-ranks a scope-level
+  // declaration downstream. Range-checked here, at the op boundary, for the
+  // same reason `atomic` is: the DSL types it as CachePolicy, but the text
+  // parser and hand-built or deserialized IR can hand over any int, and an
+  // unknown one would otherwise surface at codegen with no context.
+  const int cache = GetKwarg<int>(kwargs, "cache", static_cast<int>(CachePolicy::kDefault));
+  CHECK(cache == static_cast<int>(CachePolicy::kDefault) || cache == static_cast<int>(CachePolicy::kBypass))
+      << "The operator " << op_name
+      << " cache kwarg must be CachePolicy.DEFAULT or CachePolicy.BYPASS, but got int " << cache;
+
   // Return TileType with same dtype as tensor and TileView containing valid_shape.
   // When target_memory is specified, write it into memory_space_ so the constructed
   // type is internally coherent (tile_view layout and memory_space agree). This
@@ -290,6 +370,7 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
   CHECK(offsets_tuple) << "The operator " << op_name
                        << " requires second argument to be a tuple (offsets), but got "
                        << args[1]->GetType()->TypeName();
+  ValidateIntScalarTupleElements(offsets_tuple, op_name, "offset");
 
   // Third argument must be the output tensor. AsTensorTypeLike accepts both
   // plain TensorType and DistributedTensorType — the latter is needed for the
@@ -299,6 +380,9 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name
       << " requires third argument to be a TensorType or DistributedTensorType, but got "
       << args[2]->GetType()->TypeName();
+  CHECK_SPAN(!output_tensor_type->tensor_view_ || !IsMxTensorLayout(output_tensor_type->tensor_view_->layout),
+             args[2]->span_)
+      << "The operator " << op_name << " does not support MX-layout output tensors";
 
   // Optional fourth argument (when 4 args total) must be a shapes tuple
   MakeTuplePtr shapes_tuple;
@@ -308,6 +392,7 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
                         << " requires optional 4th argument to be a shapes tuple (MakeTuple)";
     CHECK(!shapes_tuple->elements_.empty())
         << "The operator " << op_name << " requires non-empty shapes tuple when provided";
+    ValidateIntScalarTupleElements(shapes_tuple, op_name, "shapes");
     CHECK(shapes_tuple->elements_.size() == offsets_tuple->elements_.size())
         << "The operator " << op_name
         << " requires shapes and offsets to have the same number of dimensions, but got "
@@ -436,8 +521,10 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
   // Where the destination's layout coincides with the space-agnostic one (Vec
   // and the other flat spaces) that double canonicalization was a no-op, so
   // those keep the source's blayout/slayout: a Mat->Vec move deliberately
-  // carries the source's layout today.  fractal is never inherited -- it is the
-  // destination buffer's boxing granularity.  See
+  // carries the source's layout today.  fractal normally comes from the
+  // destination buffer's boxing granularity; the Vec-to-Vec MX-scale reorder
+  // below is the one exception because it must keep the 32-byte scale boxes.
+  // See
   // docs/en/dev/ir/05-operators.md "Result view of tile.move".
   const auto dst_layout = tile_view_semantics::GetImplicitTileLayout(input_shape, space);
   const bool destination_dictates_layout =
@@ -471,6 +558,23 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
   }
   tile_view.blayout = requested_blayout;
   tile_view.slayout = requested_slayout;
+
+  // TQUANT produces its exponent bytes as row/row/32 and the MX_B_NN path
+  // materializes col/col/32 with a Vec-to-Vec TMOV.  Vec's ordinary implicit
+  // fractal is 512, so retaining the source's MX-scale marker here keeps the
+  // moved result type consistent with the physical 32-byte scale boxes.  Keep
+  // this exception deliberately narrow: byte-valued scale payloads, complete
+  // row/row or col/col layouts, and a Vec destination.
+  const bool source_is_complete_box =
+      source_view.blayout == source_view.slayout && source_view.blayout != TileLayout::none_box;
+  const bool destination_is_complete_box =
+      requested_blayout == requested_slayout && requested_blayout != TileLayout::none_box;
+  const bool is_mx_scale_payload =
+      tile_type->dtype_ == DataType::UINT8 || tile_type->dtype_ == DataType::FP8E8M0;
+  if (space == MemorySpace::Vec && source_view.fractal == tile_view_semantics::kMXScaleFractal &&
+      source_is_complete_box && destination_is_complete_box && is_mx_scale_payload) {
+    tile_view.fractal = tile_view_semantics::kMXScaleFractal;
+  }
 
   // Keep original shape
   std::vector<ExprPtr> output_shape = input_shape;
@@ -584,9 +688,21 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
   // tile: a contiguous byte-staging buffer rather than the boxed NZ layout Mat
   // tiles normally carry.
   bool flat_layout = false;
+  // `compact=true` DECLARES that the fresh L0C buffer holds a valid-region-packed
+  // product: `mad` lays its result out with an N-fractal stride of
+  // `ceil(validRow/16)*16` taken from the L0A operand's valid rows (pto-isa
+  // `TMatmul.hpp`), so an accumulator seeded here for a row-narrowed matmul is
+  // written at that pitch and every reader must recompute it the same way.
+  // Declaring it at creation rather than stamping it later is what makes the mode
+  // survive: a pass-applied type refinement is discarded the moment any pass
+  // re-deduces the call (InferTileMemorySpace does), whereas a kwarg is re-read.
+  // `tile.set_validshape` then inherits the mode onto the narrowed seed without
+  // re-interpreting bytes it did not write (the inherit-only contract of #2474).
+  bool compact_layout = false;
   for (const auto& [k, v] : kwargs) {
     if (k == "transpose") transpose_layout = AnyCast<bool>(v, "transpose");
     if (k == "flat_layout") flat_layout = AnyCast<bool>(v, "flat_layout");
+    if (k == "compact") compact_layout = AnyCast<bool>(v, "compact");
   }
   // The transposed Mat (ZN) layout is a 2D L1 matmul-`b_trans` operand layout; it
   // is meaningless for a non-Mat space or a non-2D shape. Fail fast rather than
@@ -599,6 +715,13 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
   CHECK(!flat_layout || (target_memory_opt == MemorySpace::Mat && !transpose_layout))
       << "The operator " << op_name
       << " supports flat_layout=true only for target_memory=Mat (L1) without transpose";
+  // Compact is a fractal-pitch property of an accumulator. Left/Right get theirs
+  // from the partial `tile.extract` that fills them, so `tile.create` only ever
+  // needs to declare it for L0C.
+  CHECK(!compact_layout || target_memory_opt == MemorySpace::Acc)
+      << "The operator " << op_name
+      << " supports compact=true only for target_memory=Acc (L0C), which is the only space whose "
+         "fractal pitch a matmul derives from the valid row count";
 
   // A flat L1 tile keeps the canonical flat view (blayout=row_major,
   // slayout=none_box, fractal default) — it is deliberately NOT boxed. We also
@@ -613,6 +736,9 @@ TypePtr DeduceTileCreateTileType(const std::vector<ExprPtr>& args,
     // space it is a view of rather than against nullopt (see 02-types.md).
     tile_view_semantics::SetTileLayout(
         tile_view, tile_view_semantics::GetImplicitTileLayout(tile_shape, MemorySpace::Acc));
+    if (compact_layout) {
+      tile_view.compact = CompactMode::normal;
+    }
     creation_space = MemorySpace::Acc;
   } else if (transpose_layout) {
     tile_view.blayout = TileLayout::row_major;
@@ -672,9 +798,12 @@ TypePtr DeduceTileFullType(const std::vector<ExprPtr>& args,
 TypePtr DeduceTileCiType(const std::vector<ExprPtr>& args,
                          const std::vector<std::pair<std::string, std::any>>& kwargs,
                          const std::string& op_name) {
-  // tile.ci signature: (start, shape) with attrs {dtype, descending}
-  CHECK(args.size() == 2) << "The operator " << op_name
-                          << " requires exactly 2 arguments (start, shape), but got " << args.size();
+  // tile.ci signature: (start, shape[, tmp]) with attrs {dtype, descending}.
+  // A2/A3 requires the optional scratch operand when PTOAS PlanMemory is
+  // skipped; InitMemRef materializes the canonical workspace when absent.
+  CHECK(args.size() == 2 || args.size() == 3)
+      << "The operator " << op_name << " requires 2 or 3 arguments (start, shape[, tmp]), but got "
+      << args.size();
 
   // Extract dtype and validate it is one of the supported integer types.
   DataType dtype = GetKwarg<DataType>(kwargs, "dtype");
@@ -730,6 +859,17 @@ TypePtr DeduceTileCiType(const std::vector<ExprPtr>& args,
 
   // descending kwarg is optional and defaults to false.
   (void)GetKwarg<bool>(kwargs, "descending", false);
+
+  if (args.size() == 3) {
+    auto tmp_type = As<TileType>(args[2]->GetType());
+    CHECK(tmp_type) << "The operator " << op_name
+                    << " requires optional third argument 'tmp' to be a TileType, but got "
+                    << args[2]->GetType()->TypeName();
+    CHECK(tmp_type->dtype_ == DataType::FP32 || tmp_type->dtype_ == DataType::INT32 ||
+          tmp_type->dtype_ == DataType::UINT32)
+        << "The operator " << op_name << " requires tmp dtype to be FP32, INT32, or UINT32, but got "
+        << tmp_type->dtype_.ToString();
+  }
 
   TileView tile_view;
   tile_view.valid_shape = tile_shape;
@@ -976,6 +1116,11 @@ REGISTER_OP("tile.write")
     .add_argument("tile", "Destination tile (TileType)")
     .add_argument("indices", "Index dimensions (TupleType of ScalarType)")
     .add_argument("value", "Scalar value to write (ScalarType)")
+    // Rewrites one element and passes every other element of the tile through
+    // to the result, so the prior content is read. No write channel: this is a
+    // tile-local write, not one of the GM store paths the mixed-store
+    // diagnostic orders against each other.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .set_input_memory(0, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
@@ -1043,6 +1188,7 @@ REGISTER_OP("tile.create")
     .set_attr<MemorySpace>("target_memory")
     .set_attr<bool>("transpose")
     .set_attr<bool>("flat_layout")
+    .set_attr<bool>("compact")
     .no_execution_memory_access()
     // No fallback: when target_memory is absent, memory_space stays unresolved and
     // InferTileMemorySpace picks the space from consumer demand.
@@ -1058,7 +1204,7 @@ REGISTER_OP("tile.load")
     .set_description("Copy data from tensor to unified buffer (tile)")
     .add_argument("tensor", "Source tensor (TensorType)")
     .add_argument("offsets",
-                  "Offsets in each dimension, in source tensor coordinates (TupleType of ScalarType)")
+                  "Offsets in each dimension, in source tensor coordinates (TupleType of integer ScalarType)")
     .add_argument(
         "shapes",
         "Shape of region to load in each dimension, in source tensor coordinates (TupleType of ScalarType)")
@@ -1067,6 +1213,9 @@ REGISTER_OP("tile.load")
         "Valid shape of tile in each dimension, in source tensor coordinates (TupleType of ScalarType). ")
     .set_attr<MemorySpace>("target_memory")
     .set_attr<bool>("clamp")
+    // Declared GM cache-access policy, carried as an int (``ir::CachePolicy``)
+    // so serialization / structural comparison need no new enum arm.
+    .set_attr<int>("cache")
     // No fallback: when target_memory is absent, memory_space stays unresolved and
     // InferTileMemorySpace picks the space from consumer demand.
     .set_output_memory_from_kwarg("target_memory")
@@ -1079,7 +1228,7 @@ REGISTER_OP("tile.store")
     .set_op_category("TileOp")
     .set_description("Copy data from unified buffer (tile) to tensor")
     .add_argument("tile", "Source tile (TileType)")
-    .add_argument("offsets", "Offsets in each dimension (TupleType of ScalarType)")
+    .add_argument("offsets", "Offsets in each dimension (TupleType of integer ScalarType)")
     .add_argument("output_tensor", "Output tensor (TensorType)")
     .add_argument("shapes",
                   "Optional ND partition shape (TupleType). "
@@ -1087,6 +1236,18 @@ REGISTER_OP("tile.store")
     .set_attr<int>("atomic")
     .set_input_memory(0, {MemorySpace::Vec, MemorySpace::Acc})
     .set_output_reuses_input(2)
+    // A plain store overwrites the region it lands on: the untouched remainder
+    // is neither loaded nor re-stored, so nothing moves *into* the kernel and
+    // the destination is a pure write. An atomic store is not an overwrite at
+    // all — `out += x` reads the accumulator it adds to.
+    .set_arg_effect(2,
+                    [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
+                      return GetIntKwarg(kwargs, "atomic", static_cast<int>(AtomicType::kNone)) ==
+                                     static_cast<int>(AtomicType::kNone)
+                                 ? ArgEffect::Write
+                                 : ArgEffect::ReadWrite;
+                    })
+    .set_write_channel(WriteChannel::Dma)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileStoreType(args, kwargs, "tile.store");
@@ -1139,6 +1300,9 @@ TypePtr DeduceTileMscatterType(const std::vector<ExprPtr>& args,
   CHECK(tensor_type) << "The operator " << op_name
                      << " requires third argument to be a TensorType or DistributedTensorType, but got "
                      << args[2]->GetType()->TypeName();
+  CHECK_SPAN(!tensor_type->tensor_view_ || !IsMxTensorLayout(tensor_type->tensor_view_->layout),
+             args[2]->span_)
+      << "The operator " << op_name << " does not support MX-layout output tensors";
   CHECK(!tensor_type->shape_.empty())
       << "The operator " << op_name
       << " requires output_tensor to have at least 1 dimension (scalar not supported)";
@@ -1163,6 +1327,10 @@ REGISTER_OP("tile.mscatter")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_reuses_input(2)
+    // Scatters `src` into the indexed cells of `output_tensor` without reading
+    // any of it — the same pure-write destination contract as tile.store.
+    .set_arg_effect(2, ArgEffect::Write)
+    .set_write_channel(WriteChannel::Dma)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileMscatterType(args, kwargs, "tile.mscatter");
@@ -1239,6 +1407,8 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
   std::vector<ExprPtr> output_valid_shape;
   TileView tile_view;
   if (target_memory == MemorySpace::Vec) {
+    CHECK_SPAN(!mem_type->tensor_view_ || !IsMxTensorLayout(mem_type->tensor_view_->layout), args[0]->span_)
+        << "The operator " << op_name << " with Vec output does not support MX-layout source tensors";
     CHECK(args.size() == 2) << "The operator " << op_name << " permits scratch only for Mat elem mode";
     auto idx_type = As<TileType>(args[1]->GetType());
     CHECK(idx_type) << "The operator " << op_name
@@ -1381,6 +1551,21 @@ REGISTER_OP("tile.mgather")
     .set_attr<MemorySpace>("target_memory")
     .set_output_memory_from_kwarg("target_memory", MemorySpace::Vec)
     .not_inplace_safe()
+    // Argument 2 is the GM `scratch` tensor only in Mat *elem* mode, where the
+    // gathered elements are staged through it. In Mat row mode that position
+    // holds `valid_shape`, and in Vec mode it is absent — declaring an
+    // unconditional write there would claim a tuple operand is a written
+    // buffer and could promote a read-only parameter to an output.
+    .set_arg_effect(2,
+                    [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
+                      const bool mat_output =
+                          GetMemorySpaceKwarg(kwargs, "target_memory", MemorySpace::Vec) == MemorySpace::Mat;
+                      const bool elem_mode =
+                          GetIntKwarg(kwargs, "coalesce", static_cast<int>(MgatherCoalesceMode::kRow)) ==
+                          static_cast<int>(MgatherCoalesceMode::kElem);
+                      return mat_output && elem_mode ? ArgEffect::Write : ArgEffect::Read;
+                    })
+    .set_write_channel(WriteChannel::Dma)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileMgatherType(args, kwargs, "tile.mgather");
@@ -1446,8 +1631,15 @@ REGISTER_OP("tile.ci")
     .set_description("Generate a contiguous integer sequence into a destination tile (pto.tci)")
     .add_argument("start", "Starting integer scalar (must match dst dtype)")
     .add_argument("shape", "Destination shape (TupleType of ConstInt)")
+    .add_argument("tmp", "Optional A2/A3 scratch tile (FP32 Vec)")
     .set_attr<DataType>("dtype")
     .set_attr<bool>("descending")
+    .set_input_memory(2, MemorySpace::Vec)
+    // The A2/A3 PTOAS level3 TCI form takes tmp as an explicit scratch input
+    // and may still read it while producing dst, so MemoryReuse cannot recycle
+    // tmp's allocation for the output. A5 normally uses the tmp-free form, and
+    // InitMemRef never synthesizes this operand for A5.
+    .forbid_output_alias(2)
     .set_output_memory(MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {

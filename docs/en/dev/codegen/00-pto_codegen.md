@@ -14,7 +14,7 @@ Codegen must be a **strict 1-to-1 translation** from IR to generated code. Each 
 
 **Why:** Codegen that embeds analysis becomes fragile — it duplicates logic that passes already handle, and it's harder to test in isolation. Keeping codegen a straightforward translation ensures it stays predictable and maintainable.
 
-**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/25-normalize_return_order.md) pass.
+**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/26-normalize_return_order.md) pass.
 
 ## Overview
 
@@ -193,7 +193,7 @@ or call `set_validshape` on the source tile before taking the view.
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | Reserve buffer (`auto = true`, `base` omitted under `memory_planner=PTOAS`) |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | Import peer buffer |
 | `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | Cross-core all-participant barrier (hard/FFTS form) |
-| `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_pview[, %used] : !pto.partition_tensor_view<...xi32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | Current PTO-ISA soft/GM-polling barrier (partial occupancy; at least 64-byte GM workspace; explicit `N=0` derives the count from device launch registers and omits `%used`) |
+| `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_ptr[, %used] : !pto.ptr<i32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | Current PTO-ISA soft/GM-polling barrier (partial occupancy; at least 64-byte GM workspace; explicit `N=0` derives the count from device launch registers and omits `%used`) |
 
 **Notes:**
 
@@ -203,20 +203,57 @@ or call `set_validshape` on the source tile before taking the view.
   `tile.set_validshape`, `tpush` emits the same tile handle after its runtime valid shape has been
   updated. For split `tpush`, codegen temporarily uses the full physical transport box, then restores
   the producer tile's logical valid shape.
-- The Cube-to-Vector FIFO is physically box-strided at **every** split: the ISA builds the GM slot
-  view from the popped tile's compile-time rows/cols and the producer's box row pitch, then strides
-  that view with the tile's *runtime* `valid_col`. A partial valid shape on TPOP therefore collapses
-  the GM row gap and makes the consumer read one contiguous run instead of one box row per burst —
-  silent corruption of the *valid* region, since the ISA's matching assertion is compiled out in
-  release builds. So a partial Acc-to-Vec transfer uses the full physical box for both TPUSH and
-  TPOP, whether the transfer is no-split or `split = 1` / `split = 2`, and restores the logical valid
-  shape immediately on each side of the transport — on the consumer side through a metadata-only
-  `pto.treshape` (a frontend tpop result is not a locally bound PTOAS tile, so `pto.set_validshape`
-  cannot restore it in place).
+- `split` is pto-isa's `TileSplitAxis`, printed verbatim. `0` = no split, `1` / `2` = up-down /
+  left-right, and `3` / `4` = the same two axes over an **odd** extent:
+
+  | Code | pto-isa | Lane 0 | Lane 1 | Lane 1's band starts at |
+  | ---- | ------- | ------ | ------ | ----------------------- |
+  | 0 | `TILE_NO_SPLIT` | whole tile | (single reader) | — |
+  | 1 / 2 | `TILE_UP_DOWN` / `TILE_LEFT_RIGHT` | `e0` | `e1` | `e1 * pitch` |
+  | 3 / 4 | `TILE_UP_DOWN_ODD` / `TILE_LEFT_RIGHT_ODD` | `e0` | `e1` | `(e1 + 1) * pitch` |
+
+  `eL` is lane `L`'s **runtime** valid extent on the split axis — the ISA reads it off the popped
+  tile (`popVecTileFromGMFiFo`), so the even codes require `e0 == e1` and the odd ones
+  `e0 == e1 + 1`. [LowerAutoVectorSplit](../passes/21-lower_auto_vector_split.md) materializes those
+  extents and [ExpandMixedKernel](../passes/22-expand_mixed_kernel.md) picks the matching code.
+- The Cube-to-Vector FIFO carries a compacted rectangle: the producer stores its `valid_row` x
+  `valid_col` block at a `valid_col` row pitch, and each consumer lane reads its band back with the
+  same pitch (`gmStrideR = valid_col`, doubled for the left-right codes). A partial valid shape on
+  one side of the transport and not the other therefore mis-strides the pop — silent corruption of
+  the *valid* region, since the ISA's matching assertion is compiled out in release builds. So a
+  partial Acc-to-Vec transfer uses the full physical box for TPOP and for the TPUSH **columns**,
+  whether the transfer is no-split or split, and restores the logical valid shape immediately on each
+  side of the transport — on the consumer side through a metadata-only `pto.treshape` (a frontend
+  tpop result is not a locally bound PTOAS tile, so `pto.set_validshape` cannot restore it in place).
+  The split-axis extent is one exception: it stays per-lane on the TPOP operands, because that is
+  what tells the ISA where lane 1's band begins — which is also why a per-lane extent the compiler
+  could not verify must never get there. A `pl.split_aiv` boundary whose split-axis extent is a
+  runtime value keeps the FULL box on the popped tile (`split_axis::WithFullSplitAxisValid`) so the
+  even code's band lands on the box half, and carries the lane's own extent on the consumers
+  instead.
+- The **row** extent of a *no-split* Acc-to-Vec TPUSH is the other exception: it stays exactly as the
+  producer wrote it. TPUSH runs `TStoreAccNz2nd` out of L0C, whose source pitch is
+  `ceil(validRow/16)*16` for a compact tile and `TileData::Rows` otherwise, while `mad` laid the
+  product out at the pitch implied by the L0A operand's *valid* rows. Widening `validRow` before the
+  push re-derives that pitch from the physical box, so the fix-pipe walks L0C at a stride `mad` never
+  wrote at — with a 64-row box valid to 16 the push picks up N-fractal `4j` for every fractal `j`
+  (issue #2510). The rows past `validRow` stay stale in the slot, which is what a narrowed
+  `valid_shape` already promises about its invalid region, and the transport moves `validRow` rows
+  instead of the whole box.
+- A **split** Acc-to-Vec transport cannot take that route: lane 1 reads the band starting at the box
+  half, which exists only if the producer wrote the full box — and writing it means reading L0C at
+  the physical pitch, which is not the pitch `mad` used. The two requirements are mutually exclusive,
+  so a row-narrowed compact accumulator crossing a `pl.split` / `pl.split_aiv` boundary is **rejected**
+  with a message naming both DSL alternatives (narrow the result instead of the operand, or stage the
+  accumulator through GM), rather than lowered into silently skewed data — measured on device at 1808
+  of 8192 elements wrong before the refusal. The refusal is gated on the pitches actually differing,
+  so a single-fractal-block accumulator (`ceil(validRow/16)*16 == Rows`) keeps crossing as before.
 - When a tpop result `TileView.valid_shape` differs from the physical tile shape, PTO codegen emits PTOAS frontend operands as `%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`. This covers dynamic expressions and static non-full shapes such as `[0, 0]`; the operands carry the logical extents used by compute and store. The full-box Cube-to-Vector transport above overrides this for a statically-shaped, non-empty partial pop, because `pto.treshape` carries no valid-row/valid-col operands and so can only restore *static* logical extents.
-- For split consumers, `SplitVectorKernel` localizes those dynamic tpop
+- For split consumers of a hand-written pop, `SplitVectorKernel` localizes those dynamic tpop
   valid-shape operands per subblock (for example global `[8, 16]` becomes
-  `[8, 16]` then `[0, 16]` under up/down split of a `[16, 16]` tile).
+  `[8, 16]` then `[0, 16]` under up/down split of a `[16, 16]` tile). An odd
+  split axis reaches the operands the same way — a `[17, 128]` tile pops
+  `[9, 128]` on lane 0 and `[8, 128]` on lane 1 under `split = 3`.
 - `system.tfree_*` derives `split` from its tile argument, so the frontend must free the exact SSA value produced by `tile.tpop_*`, even though the PTO instruction itself does not take the tile as an explicit operand
 - `ExpandMixedKernel` now auto-generates consumer-side `system.tfree_*` after split-generated `tile.tpop_*`, preserving `tpop -> direct users -> tfree -> next tpop`
 - `reserve_buffer` and `import_reserved_buffer` return `i32` SSA values; `initialize_pipe` references them as operands
@@ -493,6 +530,54 @@ then byte-identical to the location-free form; this is the escape hatch for a
 ptoas build whose parser rejects a trailing location, since ptoas ships
 independently of PyPTO.
 
+## Boxed Tile Extents
+
+Every `pto.alloc_tile` PyPTO emits is validated against the box grid PTOAS will
+check it against. PTO addresses a boxed tile one box at a time, so a tile whose
+*physical* extent is not a whole number of boxes has no address at all.
+
+The rule mirrors PTOAS' `verifyBoxedTileLayout` exactly:
+
+| Layout | Box (rows x cols) |
+| ------ | ----------------- |
+| fractal 1024 (`Acc`) | 16 x 16 |
+| fractal 512, `slayout = row_major` (`Mat` / `Left`) | 16 x (32 / sizeof(dtype)) |
+| fractal 512, `slayout = col_major` (`Right`, the transposed dual) | (32 / sizeof(dtype)) x 16 |
+| `slayout = none_box` | not boxed — no rule |
+
+with PTOAS' own exemptions kept: the *row* rule is skipped for `Vec` and for a
+single-row tile (the NZ map degenerates there), while the column rule always
+applies. The MX-scale fractal and sub-byte carriers are left to PTOAS, which
+diagnoses them itself.
+
+**Why here rather than in PTOAS.** PTOAS rejects the same shape, but its message
+names its own internals and offers no remedy:
+
+```text
+'pto.alloc_tile' op expects result boxed tile rows to be a multiple of innerRows (16), but got 100
+```
+
+Raising at the emission site instead reports the tile, the axis, the extent to
+reach, and how to reach it:
+
+```text
+a Mat tile of physical shape [100, 128] and dtype fp16 must be a whole number of
+16x16 fractal boxes, but its row extent 100 is not a multiple of 16. PTO addresses
+a boxed tile one box at a time, so a partial box has no address. The *logical*
+extent is free -- allocate 112 on that axis and declare 100 as the tile's
+valid_shape (`valid_shape=` on pl.load / pl.tile.create + pl.set_validshape),
+which moves and computes only the real data. A tensor-level pl.matmul /
+pl.matmul_acc does this for its M axis automatically.
+```
+
+`ComputeAllocTileFields` is the single choke point every allocation passes
+through — the per-variable declaration, the hoisted `extra_alloc_tiles`, and the
+control-flow paths alike — so the check sees exactly what is emitted and cannot
+drift from it. A tensor-level `pl.matmul` / `pl.matmul_acc` never trips it *on
+its M axis*, which is boxed for the user in
+[`ConvertTensorToTileOps`](../passes/10-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing).
+The axes that remain the user's responsibility are `K` and `N`.
+
 ## Complete Example
 
 ### Input: PyPTO Program
@@ -664,9 +749,41 @@ layout/fractal/pad/compact mode from the associated TileView (when available):
 | `compact` | `TileView::compact` | `null(0)`, `normal(1)` | `null(0)` |
 
 When no TileView is associated with the MemRef, the codegen falls back to the default values listed above.
-The `compact` attribute is omitted for its null default. A partial `tile.extract` into L0A/L0B sets
-`normal(1)` automatically so TEXTRACT transfers only the logical `valid_shape` instead of treating
-box-alignment padding as data.
+The `compact` attribute is omitted for its null default. Two paths set `normal(1)` automatically:
+
+- A partial `tile.extract` into L0A/L0B, so TEXTRACT transfers only the logical `valid_shape` instead
+  of treating box-alignment padding as data.
+- An **Acc (L0C) tile whose valid rows are not provably equal to its physical rows**, as produced by the
+  `tile.matmul`, `tile.matmul_bias`, and `tile.matmul_mx` deducers. `mad` always lays the product out
+  with an N-fractal stride of `ceil(validRow/16)*16` taken from the *lhs* valid rows, while every Acc
+  reader derives its stride from the compile-time physical `Rows` unless the tile is compact. Without
+  the flag a runtime-narrowed accumulator is read back at a different pitch than it was written at.
+  Only the **row** extent decides this — every Acc stride the ISA derives is a function of `validRow`
+  alone, so a narrowed column extent keeps the non-compact form.
+
+  Compact is stamped **only where the accumulator's layout is established**, never re-derived on an
+  alias of it. `tile.matmul_acc` (and `matmul_mx_acc`) *inherit* the accumulator operand's mode,
+  because the op reuses that operand's buffer in place and codegen aliases the two only when their
+  full tile config matches. `tile.set_validshape` likewise inherits: it is metadata-only and may run
+  *after* the buffer was written, so the pitch its readers must use is the one `mad` already wrote at
+  — deriving a new one from the narrowed rows would re-interpret bytes that were never repacked.
+
+  A buffer can also *declare* the mode at creation: `tile.create(..., target_memory=Acc,
+  compact=True)`. A fresh L0C buffer has no prior bytes to re-interpret, so a declaration is not an
+  alias re-derivation — and it is what `AutoTileMatmulL0` puts on the accumulator seed it synthesizes
+  when it splits K, since `tile.matmul_acc` inherits from that seed and a non-compact one drags the
+  whole chain, and the reader after the loop, back to the physical pitch. A declaration is also the
+  only form that survives: a type a pass stamps onto a call is discarded as soon as any later pass
+  re-deduces it (`InferTileMemorySpace` does), whereas a kwarg is re-read every time.
+
+  `AccCompactValid` (see [Verifier](../passes/99-verifier.md)) checks both halves of the contract:
+  every `tile.matmul_acc` accumulates into a compact buffer when `mad`'s pitch differs from the
+  accumulator's physical row count, and no tile outside Left/Right/Acc carries a compact mode at
+  all.
+
+Note that the Acc → L1 readers (`TExtractAccToMat`, `TMovCcToCb`) have no `CompactMode` branch in
+PTO-ISA on either a2a3 or a5, so a runtime-narrowed accumulator consumed by `tile.extract` /
+`tile.move` into L1 still reads at the physical `Rows` pitch. That gap needs a matching PTO-ISA change.
 
 ## Kernel Wrapper Generation (PTO Backend)
 
@@ -698,14 +815,14 @@ output_dir/
 ├── kernels/aiv/
 │   └── <func_name>.cpp              # Final wrapper
 ├── orchestration/
-│   └── <orch_func_name>.cpp         # PTO2 runtime orchestration code
+│   └── <orch_func_name>.cpp         # simpler runtime orchestration code
 └── kernel_config.py                 # Runtime/orchestration/kernel config
 ```
 
 `ptoas_passes/` is emitted only when `ir.compile(...,
 dump_ptoas_passes=True)` or `RunConfig(dump_ptoas_passes=True)` is used.
 
-The orchestration codegen generates identical orchestration C++ code using the PTO2 runtime API (`rt_submit_task`, `make_tensor_external`, etc.).
+The orchestration codegen generates identical orchestration C++ code using the simpler runtime API (`rt_submit_task`, `make_tensor_external`, etc.).
 
 ### Runtime configuration (`kernel_config.py`)
 

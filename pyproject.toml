@@ -8,7 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 
 [build-system]
-requires = ["scikit-build-core>=0.10.0", "nanobind>=2.0.0", "ninja>=1.11.0", "cmake>=3.15"]
+# These are compatibility ranges, not the versions anything is built against:
+# build-constraints.txt pins those, and CI applies it through PIP_CONSTRAINT.
+#
+# nanobind is additionally capped below 3.0 because 3.0.0 stopped accepting the
+# null holder this project uses as an argument default (e.g. TileView's
+# `start_offset`, an unset ExprPtr), so `ir.TileView()` no longer matches its
+# own all-defaulted overload. Lift the cap together with the binding changes
+# 3.x needs; that cap is not a verdict on 3.x, only on migrating under a red CI.
+requires = ["scikit-build-core>=0.10.0", "nanobind>=2.0.0,<3", "ninja>=1.11.0", "cmake>=3.15"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -86,6 +94,7 @@ fixable = ["ALL"]
 # Python binding is unused but structurally required by the pass output.
 "tests/ut/ir/transforms/test_expand_mixed_kernel.py" = ["E501"]
 "tests/ut/ir/transforms/test_flatten_tile_nd_to_2d.py" = ["F841"]
+"tests/ut/ir/transforms/test_canonicalize_tile_slice.py" = ["F841"]
 "tests/ut/ir/transforms/test_init_memref.py" = ["E501"]
 "tests/ut/ir/transforms/test_memory_reuse.py" = ["E501"]
 "tests/ut/ir/transforms/test_infer_tile_memory_space.py" = ["E501"]

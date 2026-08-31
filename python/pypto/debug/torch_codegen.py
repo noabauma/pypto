@@ -106,6 +106,16 @@ def _copy_region_attrs(src, dst):
     return dst
 
 
+# pto-isa TileSplitAxis codes carried by the cross-core ``split`` attr:
+# 0 = no split, 1 = up/down, 2 = left/right, 3 / 4 = the same two axes over an
+# ODD extent (lane 0 takes the ceil half, lane 1 the floor one).
+_SPLIT_CODES = (1, 2, 3, 4)
+
+
+def _is_odd_split(split):
+    return split in (3, 4)
+
+
 class _CrossCoreRuntime:
     def __init__(self):
         self._lock = threading.Lock()
@@ -116,10 +126,10 @@ class _CrossCoreRuntime:
         with self._cv:
             self._no_split_dual_aiv_dispatch = bool(no_split_dual_aiv_dispatch)
             self._to_aiv = deque()
-            self._to_aiv_split = {1: {0: deque(), 1: deque()}, 2: {0: deque(), 1: deque()}}
+            self._to_aiv_split = {c: {0: deque(), 1: deque()} for c in _SPLIT_CODES}
             self._to_aiv_dual_nosplit = {0: deque(), 1: deque()}
             self._to_aic = deque()
-            self._to_aic_split = {1: {0: deque(), 1: deque()}, 2: {0: deque(), 1: deque()}}
+            self._to_aic_split = {c: {0: deque(), 1: deque()} for c in _SPLIT_CODES}
             self._to_aic_dual_nosplit = {0: deque(), 1: deque()}
             self._cv.notify_all()
 
@@ -140,8 +150,8 @@ class _CrossCoreRuntime:
                 1: len(self._to_aiv_dual_nosplit[1]),
             },
             "to_aiv_split": {
-                1: {0: len(self._to_aiv_split[1][0]), 1: len(self._to_aiv_split[1][1])},
-                2: {0: len(self._to_aiv_split[2][0]), 1: len(self._to_aiv_split[2][1])},
+                c: {0: len(self._to_aiv_split[c][0]), 1: len(self._to_aiv_split[c][1])}
+                for c in _SPLIT_CODES
             },
             "to_aic": len(self._to_aic),
             "to_aic_dual_nosplit": {
@@ -149,8 +159,8 @@ class _CrossCoreRuntime:
                 1: len(self._to_aic_dual_nosplit[1]),
             },
             "to_aic_split": {
-                1: {0: len(self._to_aic_split[1][0]), 1: len(self._to_aic_split[1][1])},
-                2: {0: len(self._to_aic_split[2][0]), 1: len(self._to_aic_split[2][1])},
+                c: {0: len(self._to_aic_split[c][0]), 1: len(self._to_aic_split[c][1])}
+                for c in _SPLIT_CODES
             },
         }
 
@@ -172,25 +182,57 @@ class _CrossCoreRuntime:
             self._cv.wait(timeout=min(0.05, remaining))
 
     @staticmethod
-    def _split_tile(tile, split):
-        dim = 0 if split == 1 else 1
+    def _split_tile(tile, split, lane_stride=None):
+        # Partition a pushed tile between the two AIV lanes exactly the way the
+        # compiler did: lane L owns [L * S, L * S + S) of the split axis, where S
+        # is the partition stride (`lane_stride` when a ragged boundary was
+        # rebalanced, else the ceil half of the physical box). The split CODE
+        # states how the two lanes' VALID extents relate — equal for 1/2, one
+        # apart for the _ODD codes 3/4 — so it is validated against those
+        # extents, not against the physical box, which stays even in the common
+        # "even box, odd valid extent" case.
+        dim = 0 if split in (1, 3) else 1
         size = int(tile.shape[dim])
-        if size % 2 != 0:
-            raise ValueError(f"Split mode {split} requires even dimension size, got {size}")
-        half = size // 2
+        # Two distinct quantities: every lane's PHYSICAL box is the ceil half of
+        # the pushed tile (that is the buffer the compiler typed), while the
+        # partition STRIDE only says where lane 1's data begins — they differ
+        # exactly when a ragged boundary was rebalanced (box 16, stride 7).
+        box_half = (size + 1) // 2
+        stride = int(lane_stride) if lane_stride else box_half
+        if stride <= 0 or stride > box_half:
+            raise ValueError(
+                f"Split mode {split} got an out-of-range lane stride {stride} for a {size}-wide "
+                f"axis (per-lane box {box_half})"
+            )
+        valid_shape = getattr(tile, "_pypto_valid_shape", None)
+        valid = int(valid_shape[dim]) if valid_shape is not None else size
+        lane0 = min(valid, stride)
+        lane1 = min(max(valid - stride, 0), stride)
+        # Only the _ODD codes carry a contract worth checking here: they exist to
+        # say "lane 1 is exactly one cell shorter". The even codes stay permissive
+        # — this runtime is a semantic simulator, and it is the compiler
+        # (split_axis::ShardSplitCode) that refuses lane extents pto-isa cannot
+        # place.
+        if _is_odd_split(split) and lane0 != lane1 + 1:
+            raise ValueError(
+                f"Split mode {split} requires lanes one cell apart, but a valid extent of {valid} "
+                f"over stride {stride} gives {lane0} and {lane1}"
+            )
+        # Lane L takes a box_half-wide slice starting at L * stride, so both
+        # payloads keep the physical shape the compiler gave the popped tile.
         if dim == 0:
-            part0 = tile[:half, ...].clone()
-            part1 = tile[half:, ...].clone()
+            part0 = tile[:box_half, ...].clone()
+            part1 = tile[stride : stride + box_half, ...].clone()
         else:
-            part0 = tile[:, :half, ...].clone()
-            part1 = tile[:, half:, ...].clone()
+            part0 = tile[:, :box_half, ...].clone()
+            part1 = tile[:, stride : stride + box_half, ...].clone()
 
         full_shape = getattr(tile, "_pypto_full_shape", None)
         if full_shape is not None:
             full0 = list(int(s) for s in full_shape)
             full1 = list(int(s) for s in full_shape)
-            full0[dim] = min(full0[dim], half)
-            full1[dim] = max(full1[dim] - half, 0)
+            full0[dim] = min(full0[dim], box_half)
+            full1[dim] = min(max(full1[dim] - stride, 0), box_half)
             part0._pypto_full_shape = tuple(full0)
             part1._pypto_full_shape = tuple(full1)
 
@@ -198,8 +240,8 @@ class _CrossCoreRuntime:
         if valid_shape is not None:
             valid0 = list(int(s) for s in valid_shape)
             valid1 = list(int(s) for s in valid_shape)
-            valid0[dim] = min(valid0[dim], half)
-            valid1[dim] = max(valid1[dim] - half, 0)
+            valid0[dim] = lane0
+            valid1[dim] = lane1
             part0._pypto_valid_shape = tuple(valid0)
             part1._pypto_valid_shape = tuple(valid1)
 
@@ -207,7 +249,7 @@ class _CrossCoreRuntime:
 
     @staticmethod
     def _merge_tile(part0, part1, split):
-        dim = 0 if split == 1 else 1
+        dim = 0 if split in (1, 3) else 1
         merged = torch.cat([part0, part1], dim=dim)
 
         full0 = getattr(part0, "_pypto_full_shape", tuple(part0.shape))
@@ -229,8 +271,9 @@ class _CrossCoreRuntime:
 
         return merged
 
-    def push_to_aiv(self, tile, split):
+    def push_to_aiv(self, tile, split, lane_stride=0):
         split = int(split)
+        lane_stride = int(lane_stride)
         with self._cv:
             if split == 0:
                 if self._no_split_dual_aiv_dispatch:
@@ -238,8 +281,8 @@ class _CrossCoreRuntime:
                     self._to_aiv_dual_nosplit[1].append(_copy_region_attrs(tile, tile.clone()))
                 else:
                     self._to_aiv.append(_copy_region_attrs(tile, tile.clone()))
-            elif split in (1, 2):
-                lane0, lane1 = self._split_tile(tile, split)
+            elif split in _SPLIT_CODES:
+                lane0, lane1 = self._split_tile(tile, split, lane_stride)
                 self._to_aiv_split[split][0].append(lane0)
                 self._to_aiv_split[split][1].append(lane1)
             else:
@@ -261,7 +304,7 @@ class _CrossCoreRuntime:
                     return queue.popleft()
                 self._wait_for_locked(lambda: len(self._to_aiv) > 0, "tpop_from_aic", split, lane)
                 return self._to_aiv.popleft()
-            if split in (1, 2):
+            if split in _SPLIT_CODES:
                 if lane not in (0, 1):
                     raise ValueError(f"Split tpop_from_aic requires lane in {{0,1}}, got {lane}")
                 queue = self._to_aiv_split[split][lane]
@@ -271,6 +314,11 @@ class _CrossCoreRuntime:
 
     def push_to_aic(self, tile, split):
         split = int(split)
+        if _is_odd_split(split):
+            # pto-isa places lane 1's Vector -> Cube band at lane 1's own extent,
+            # so the two only abut when the lanes are equal: there is no odd V2C
+            # transport, and PTO codegen rejects these codes too.
+            raise ValueError(f"Unsupported odd split mode for push_to_aic: {split}")
         lane = _get_subblock_idx()
         with self._cv:
             if split == 0:
@@ -282,7 +330,7 @@ class _CrossCoreRuntime:
                     self._to_aic_dual_nosplit[lane].append(_copy_region_attrs(tile, tile.clone()))
                 else:
                     self._to_aic.append(_copy_region_attrs(tile, tile.clone()))
-            elif split in (1, 2):
+            elif split in _SPLIT_CODES:
                 if lane not in (0, 1):
                     raise ValueError(f"Split tpush_to_aic requires lane in {{0,1}}, got {lane}")
                 self._to_aic_split[split][lane].append(_copy_region_attrs(tile, tile.clone()))
@@ -292,6 +340,8 @@ class _CrossCoreRuntime:
 
     def pop_from_aiv(self, split):
         split = int(split)
+        if _is_odd_split(split):
+            raise ValueError(f"Unsupported odd split mode for pop_from_aiv: {split}")
         lane = _get_subblock_idx()
         with self._cv:
             if split == 0:
@@ -309,7 +359,7 @@ class _CrossCoreRuntime:
                     return lane0_tile
                 self._wait_for_locked(lambda: len(self._to_aic) > 0, "tpop_from_aiv", split, lane)
                 return self._to_aic.popleft()
-            if split in (1, 2):
+            if split in _SPLIT_CODES:
                 lane0_q = self._to_aic_split[split][0]
                 lane1_q = self._to_aic_split[split][1]
                 self._wait_for_locked(
@@ -332,7 +382,7 @@ def _run_mixed_kernels(group_name, meta, *args):
     aiv_name = meta["aiv"]
     split = int(meta.get("split", 0))
     dual_aiv_dispatch = bool(meta.get("dual_aiv_dispatch", False))
-    num_aiv_lanes = 2 if split in (1, 2) or dual_aiv_dispatch else 1
+    num_aiv_lanes = 2 if split in _SPLIT_CODES or dual_aiv_dispatch else 1
 
     _cross_core_rt.reset(no_split_dual_aiv_dispatch=(split == 0 and dual_aiv_dispatch))
     aic_fn = globals().get(aic_name)
@@ -558,6 +608,13 @@ def _assemble(target, source, offsets, atomic=0):
     else:
         target[slices] = source[valid_slices]
     return target
+
+def _acc_init(acc, prod, init_cond):
+    # `init_cond` is the MAD's cmatrixInit bit: where the predicate holds the op
+    # *overwrites* the accumulator with the fresh product instead of adding into
+    # it.  The predicate is a BOOL *scalar*, so this is a whole-op branch rather
+    # than an elementwise torch.where.
+    return prod if init_cond else acc + prod
 """
 
 # ---------------------------------------------------------------------------
@@ -613,17 +670,55 @@ def _handle_tensor_matmul(a: list[str], kw: dict[str, Any]) -> str:
     return expr
 
 
+def _acc_expr(acc: str, prod: str, init_cond: str | None) -> str:
+    """Combine an accumulator with a fresh matmul product.
+
+    The accumulating matmuls take an optional trailing `init_cond` operand -- a
+    BOOL scalar carrying the MAD's ``cmatrixInit`` bit.  Where it holds, the op
+    *overwrites* `acc` with `prod` instead of accumulating into it, so dropping
+    it would model an overwrite as an accumulate.
+
+    Args:
+        acc: Emitted expression for the accumulator operand
+        prod: Emitted expression for the `lhs @ rhs` product
+        init_cond: Emitted expression for the predicate, or None when the call
+            carries no `init_cond` operand (always accumulate)
+
+    Returns:
+        A Python expression string for the op's result
+    """
+    if init_cond is None:
+        return f"({acc} + {prod})"
+    # Fold a literal predicate the way the pto backend does, so the generated
+    # script keeps the shape of the branch the machine actually takes.
+    if init_cond in ("True", "1"):
+        return prod
+    if init_cond in ("False", "0"):
+        return f"({acc} + {prod})"
+    return f"_acc_init({acc}, {prod}, {init_cond})"
+
+
+def _init_cond_arg(a: list[str], index: int) -> str | None:
+    """Return the emitted `init_cond` operand at `index`, or None if absent."""
+    return a[index] if len(a) > index else None
+
+
 def _handle_tensor_matmul_acc(a: list[str], kw: dict[str, Any]) -> str:
     acc, lhs, rhs = a[0], a[1], a[2]
     if kw.get("a_trans"):
         lhs = f"{lhs}.mT"
     if kw.get("b_trans"):
         rhs = f"{rhs}.mT"
-    expr = f"({acc} + torch.matmul({lhs}, {rhs}))"
+    expr = _acc_expr(acc, f"torch.matmul({lhs}, {rhs})", _init_cond_arg(a, 3))
     out_dtype = kw.get("out_dtype")
     if isinstance(out_dtype, DataType):
         expr = f"{expr}.to({_torch_dtype(out_dtype)})"
     return expr
+
+
+def _tile_matmul_acc(a: list[str], _kw: dict[str, Any]) -> str:
+    """Accumulating tile matmul; `.float()` matches hardware FP32 accumulation."""
+    return _acc_expr(a[0], f"torch.matmul({a[1]}, {a[2]}).float()", _init_cond_arg(a, 3))
 
 
 def _handle_cast(a: list[str], kw: dict[str, Any]) -> str:
@@ -711,8 +806,17 @@ def _split_kwarg(kw: dict[str, Any]) -> int:
     return _split_mode_to_int(kw.get("split", 0))
 
 
+def _lane_stride_kwarg(kw: dict[str, Any]) -> int:
+    """The partition stride a rebalanced ragged boundary carries (0 = box partition)."""
+    return int(kw.get("lane_stride", 0) or 0)
+
+
 def _handle_tpush_to_aiv(a: list[str], kw: dict[str, Any]) -> str:
-    return f"_cross_core_rt.push_to_aiv({a[0]}, {_split_kwarg(kw)})"
+    # The stride is emitted only when a ragged boundary was rebalanced, so every
+    # other kernel keeps the two-argument form.
+    stride = _lane_stride_kwarg(kw)
+    stride_arg = f", {stride}" if stride else ""
+    return f"_cross_core_rt.push_to_aiv({a[0]}, {_split_kwarg(kw)}{stride_arg})"
 
 
 def _handle_tpush_to_aic(a: list[str], kw: dict[str, Any]) -> str:
@@ -1019,11 +1123,11 @@ def _register_ops() -> None:  # noqa: PLR0915
     # tile matmul variants — .float() to match hardware FP32 accumulation output
     m["tile.matmul"] = lambda a, _kw: f"torch.matmul({a[0]}, {a[1]}).float()"
     m["tile.batch_matmul"] = lambda a, _kw: f"torch.matmul({a[0]}, {a[1]}).float()"
-    m["tile.matmul_acc"] = lambda a, _kw: f"({a[0]} + torch.matmul({a[1]}, {a[2]}).float())"
-    m["tile.batch_matmul_acc"] = lambda a, _kw: f"({a[0]} + torch.matmul({a[1]}, {a[2]}).float())"
+    m["tile.matmul_acc"] = _tile_matmul_acc
+    m["tile.batch_matmul_acc"] = _tile_matmul_acc
     m["tile.matmul_bias"] = lambda a, _kw: f"(torch.matmul({a[0]}, {a[1]}).float() + {a[2]})"
     m["tile.gemv"] = lambda a, _kw: f"torch.matmul({a[0]}, {a[1]}).float()"
-    m["tile.gemv_acc"] = lambda a, _kw: f"({a[0]} + torch.matmul({a[1]}, {a[2]}).float())"
+    m["tile.gemv_acc"] = _tile_matmul_acc
     m["tile.gemv_bias"] = lambda a, _kw: f"(torch.matmul({a[0]}, {a[1]}).float() + {a[2]})"
 
     # tile ternary ops (third arg is workspace/tmp, ignore it)
@@ -1250,7 +1354,7 @@ class TorchCodegen(_ir.IRVisitor):
         the shape check above), so there a parameter's runtime shape is not the
         extent its type declares.
         """
-        if func.func_type != _ir.FunctionType.Orchestration:
+        if not _ir.is_orchestration_like(func.func_type):
             return
         defined: set[str] = set()
         for param in func.params:

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -56,8 +57,13 @@ using pto_ops_detail::AsPto;
 using pto_ops_detail::CheckArity;
 using pto_ops_detail::cmp_modes;
 using pto_ops_detail::EmitInsOuts;
+using pto_ops_detail::EmitInsOutsWithViewTypes;
+using pto_ops_detail::EnsureStaticViewTileSsa;
+using pto_ops_detail::EnsureTileViewSsa;
 using pto_ops_detail::GenerateInsOutsClause;
+using pto_ops_detail::GetTileViewTypeAnnotation;
 using pto_ops_detail::MaterializeSubviewOperandIfNeeded;
+using pto_ops_detail::RequireStaticValidShapeForPtoas;
 using pto_ops_detail::round_modes;
 
 static bool RequiresRowMajorLayout(std::string_view op_name) {
@@ -97,6 +103,7 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       "tile.sels",
       // Gather operands and result are linearly addressed.
       "tile.gatherb",
+      "tile.rems",
       // Ternary scalar ops (Tile x Scalar x Tile)
       "tile.addsc",
       "tile.subsc",
@@ -223,7 +230,8 @@ static std::string MakeTileTransposeCodegenPTO(const CallPtr& op, codegen::Codeg
 //   tile.col_expand -> pto.tcolexpand: emits the column vector (args_[1]); args_[0]
 //                      (target) is kept only for shape/type inference.
 //   tile.row_expand -> pto.trowexpand: emits the row vector (args_[1]); ditto.
-//   tile.fillpad_expand -> pto.tfillpad_expand: emits the source tile (args_[0]);
+//   tile.fillpad_expand -> pto.tfillpad: emits the source tile (args_[0]); PTOAS 0.58
+//                      infers expand lowering when dst tile_buf is larger than src.
 //                      args_[1] (shape tuple) is type-deduction only. The pad value
 //                      and dst extents ride on the result tile-buf type.
 struct SingleOperandOp {
@@ -282,6 +290,154 @@ static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_
   return "";
 }
 
+// The level3 explicit-tmp form verifies tcvt scratch against src capacity and
+// dst valid_shape. alloc_tile types keep v_row=?, v_col=?, so bridge to
+// static-valid views the same way tprelu / tcolsum do.
+static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
+      << "tile.cast requires 1 or 2 arguments (src[, tmp]), but got " << op->args_.size();
+  if (op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch()) {
+    auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
+    auto tmp_type = ir::As<ir::TileType>(op->args_[1]->GetType());
+    auto dst_var = codegen.GetCurrentResultVar();
+    auto dst_type = dst_var ? ir::As<ir::TileType>(dst_var->GetType()) : nullptr;
+    INTERNAL_CHECK(src_type && tmp_type && dst_type);
+    RequireStaticValidShapeForPtoas(src_type, "tile.cast", "src", op->span_);
+    RequireStaticValidShapeForPtoas(tmp_type, "tile.cast", "tmp", op->args_[1]->span_);
+    RequireStaticValidShapeForPtoas(dst_type, "tile.cast", "dst", op->span_);
+
+    const std::string src_ssa = EnsureStaticViewTileSsa(op->args_[0], codegen, "tcvt_src_view");
+    const std::string tmp_ssa = EnsureStaticViewTileSsa(op->args_[1], codegen, "tcvt_tmp_view");
+    const std::string dst_ssa = EnsureStaticViewTileSsa(dst_var, codegen, "tcvt_dst_view");
+
+    int mode = op->GetKwarg<int>("mode", 2);
+    CHECK(mode >= 0 && mode < static_cast<int>(round_modes.size())) << "Round mode out of range: " << mode;
+    std::string config_attr = std::string("{rmode = #pto<round_mode ") + round_modes.at(mode) + ">}";
+    EmitInsOutsWithViewTypes(codegen, "pto.tcvt",
+                             {{src_ssa, GetTileViewTypeAnnotation(op->args_[0], codegen)},
+                              {tmp_ssa, GetTileViewTypeAnnotation(op->args_[1], codegen)}},
+                             dst_ssa, dst_type, config_attr);
+    return "";
+  }
+  return MakeModalCodegenPTO("pto.tcvt", op->args_.size(), "mode", round_modes, "Round", "rmode",
+                             "round_mode", op, codegen);
+}
+
+static std::string MakeRemainderCodegenPTO(const std::string& pto_op_name, size_t arity,
+                                           const char* precision_attr_kind, const CallPtr& op,
+                                           codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, pto_op_name, arity);
+  auto src_type = As<ir::TileType>(op->args_[0]->GetType());
+  INTERNAL_CHECK_SPAN(src_type, op->span_)
+      << "Internal error: " << op->op_->name_ << " first argument must be a TileType";
+
+  const bool is_a5 = codegen.GetBackendHandler()->GetPtoTargetArch() == "a5";
+  if (!is_a5) {
+    const bool is_floor_remainder = pto_op_name == "pto.trem" || pto_op_name == "pto.trems";
+    const bool is_scalar_remainder = pto_op_name == "pto.trems" || pto_op_name == "pto.tfmods";
+    const bool supported = is_floor_remainder
+                               ? (src_type->dtype_ == DataType::INT32 || src_type->dtype_ == DataType::FP32)
+                               : src_type->dtype_ == DataType::FP32;
+    CHECK_SPAN(supported, op->span_)
+        << op->op_->name_ << " with dtype " << src_type->dtype_.ToString()
+        << " is not supported on A2/A3; tile.rem/tile.rems support INT32 or FP32, while "
+           "tile.fmod/tile.fmods support FP32 only";
+
+    const auto src_valid_shape = ir::GetValidShape(src_type);
+    if (is_scalar_remainder) {
+      const auto one = std::make_shared<ir::ConstInt>(1, DataType::INDEX, op->span_);
+      for (size_t i = 0; i < src_valid_shape.size(); ++i) {
+        CHECK_SPAN(ir::ProveValidExtentLessEqual(one, src_valid_shape[i]) == ir::ProofResult::kTrue,
+                   op->span_)
+            << op->op_->name_
+            << " on A2/A3 requires every source valid_shape extent to be provably positive, but got "
+            << ir::FormatShape(src_valid_shape);
+      }
+    }
+
+    if (pto_op_name == "pto.trems" && src_type->dtype_ == DataType::INT32) {
+      constexpr int64_t kA2A3Int32RemainderLimit = int64_t{1} << 24;
+      if (auto scalar = As<ir::ConstInt>(op->args_[1])) {
+        CHECK_SPAN(scalar->value_ >= -kA2A3Int32RemainderLimit && scalar->value_ <= kA2A3Int32RemainderLimit,
+                   op->args_[1]->span_)
+            << "tile.rems on A2/A3 requires an INT32 scalar in [-2^24, 2^24], but got " << scalar->value_;
+      }
+    }
+
+    if (is_floor_remainder) {
+      const auto& tmp = op->args_.back();
+      auto tmp_type = As<ir::TileType>(tmp->GetType());
+      INTERNAL_CHECK_SPAN(tmp_type, op->span_)
+          << "Internal error: " << op->op_->name_ << " tmp argument must be a TileType";
+      const auto tmp_valid_shape = ir::GetValidShape(tmp_type);
+      INTERNAL_CHECK_SPAN(src_type->shape_.size() == 2 && src_valid_shape.size() == 2 &&
+                              tmp_type->shape_.size() == 2 && tmp_valid_shape.size() == 2,
+                          op->span_)
+          << "Internal error: A2/A3 remainder source and tmp must be 2D";
+
+      const int64_t required_rows = pto_op_name == "pto.trem" ? 2 : 1;
+      const auto required_row_expr =
+          std::make_shared<ir::ConstInt>(required_rows, DataType::INDEX, op->span_);
+      CHECK_SPAN(
+          ir::ProveValidExtentLessEqual(required_row_expr, tmp_type->shape_[0]) == ir::ProofResult::kTrue,
+          tmp->span_)
+          << op->op_->name_ << " on A2/A3 requires tmp physical rows >= " << required_rows;
+      CHECK_SPAN(
+          ir::ProveValidExtentLessEqual(src_type->shape_[1], tmp_type->shape_[1]) == ir::ProofResult::kTrue,
+          tmp->span_)
+          << op->op_->name_ << " on A2/A3 requires tmp physical columns to cover all source columns";
+      CHECK_SPAN(
+          ir::ProveValidExtentLessEqual(required_row_expr, tmp_valid_shape[0]) == ir::ProofResult::kTrue,
+          tmp->span_)
+          << op->op_->name_ << " on A2/A3 requires tmp valid rows >= " << required_rows;
+      CHECK_SPAN(
+          ir::ProveValidExtentLessEqual(src_valid_shape[1], tmp_valid_shape[1]) == ir::ProofResult::kTrue,
+          tmp->span_)
+          << op->op_->name_
+          << " on A2/A3 requires tmp valid columns to provably cover the source valid columns";
+
+      const auto tmp_memref = tmp_type->memref_.value_or(nullptr);
+      INTERNAL_CHECK_SPAN(tmp_memref, op->span_)
+          << "Internal error: " << op->op_->name_ << " tmp must carry a MemRef before PTO codegen";
+      const size_t source_count = pto_op_name == "pto.trem" ? 2 : 1;
+      for (size_t i = 0; i < source_count; ++i) {
+        auto source_type = As<ir::TileType>(op->args_[i]->GetType());
+        const auto source_memref = source_type ? source_type->memref_.value_or(nullptr) : nullptr;
+        INTERNAL_CHECK_SPAN(source_memref, op->span_)
+            << "Internal error: " << op->op_->name_ << " source must carry a MemRef before PTO codegen";
+        CHECK_SPAN(!ir::MemRef::MayAlias(tmp_memref, source_memref), op->span_)
+            << op->op_->name_ << " on A2/A3 requires tmp not to overlap source operand " << i;
+      }
+    }
+  }
+
+  std::string result;
+  if (precision_attr_kind != nullptr) {
+    result = MakePrecisionCodegenPTO(pto_op_name, arity, precision_attr_kind, op, codegen_base);
+  } else {
+    result = MakeNaryCodegenPTO(pto_op_name, arity, op, codegen_base);
+  }
+
+  if (!is_a5 && pto_op_name == "pto.trem" && src_type->dtype_ == DataType::INT32) {
+    // The A2/A3 INT32 TREM implementation restores rhs after its quotient
+    // calculation, then converts rhs in-place to FP32 again for sign correction.
+    // Restore that second conversion before any later consumer observes rhs.
+    const auto rhs_type = As<ir::TileType>(op->args_[1]->GetType());
+    INTERNAL_CHECK_SPAN(rhs_type, op->span_) << "Internal error: tile.rem second argument must be a TileType";
+    const auto rhs_fp32_type = std::make_shared<ir::TileType>(
+        rhs_type->shape_, DataType::FP32, rhs_type->memref_, rhs_type->tile_view_, rhs_type->memory_space_);
+    const std::string rhs_fp32 =
+        EnsureTileViewSsa(op->args_[1], rhs_fp32_type, codegen, "trem_rhs_fp32_view");
+    const std::string rhs_int32 = EnsureStaticViewTileSsa(op->args_[1], codegen, "trem_rhs_int32_view");
+    EmitInsOutsWithViewTypes(codegen, "pto.tcvt",
+                             {{rhs_fp32, codegen.GetViewTileBufTypeStringFromTileType(rhs_fp32_type)}},
+                             rhs_int32, rhs_type, "{rmode = #pto<round_mode ROUND>}");
+  }
+  return result;
+}
+
 // Helper function for full op
 static std::string MakeFullCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                       codegen::CodegenBase& codegen_base) {
@@ -307,23 +463,46 @@ static std::string MakeAssignCodegenPTO(const std::string& pto_op_name, const Ca
 static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                     codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  INTERNAL_CHECK_SPAN(op->args_.size() == 2, op->span_)
-      << "Operation:[" << pto_op_name << "] requires 2 arguments (start, shape), but got "
+  INTERNAL_CHECK_SPAN(op->args_.size() == 2 || op->args_.size() == 3, op->span_)
+      << "Operation:[" << pto_op_name << "] requires 2 or 3 arguments (start, shape[, tmp]), but got "
       << op->args_.size();
+  const bool level3 = codegen.GetBackendHandler()->RequiresLevel3TmpScratch();
   bool descending = op->GetKwarg<bool>("descending");
   std::string src = codegen.GetExprAsCode(op->args_[0]);
   std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  std::string tmp;
+  std::string tmp_type;
+  if (op->args_.size() == 3 && level3) {
+    // A2/A3 level3 TCI verifies tmp/dst static valid_shape; bridge alloc_tile views.
+    tmp = EnsureStaticViewTileSsa(op->args_[2], codegen, "ci_tmp_view");
+    tmp_type = codegen.GetViewTileBufTypeStringFromTileType(As<ir::TileType>(op->args_[2]->GetType()));
+  } else if (op->args_.size() == 3) {
+    tmp = codegen.GetExprAsCode(op->args_[2]);
+    tmp_type = codegen.GetExprTypeAnnotation(op->args_[2]);
+  }
   std::string config_attr = descending ? "{descending = true}" : "{descending = false}";
-  std::string dst = codegen.GetCurrentResultTarget();
-  std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+  auto dst_var = codegen.GetCurrentResultVar();
+  INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: tile.ci requires an assignment target";
+  auto dst_type = As<ir::TileType>(dst_var->GetType());
+  INTERNAL_CHECK_SPAN(dst_type, op->span_) << "Internal error: tile.ci result must be a TileType";
+  const std::string dst = (op->args_.size() == 3 && level3)
+                              ? EnsureStaticViewTileSsa(dst_var, codegen, "ci_dst_view")
+                              : codegen.GetCurrentResultTarget();
+  const std::string dst_type_str = (op->args_.size() == 3 && level3)
+                                       ? codegen.GetViewTileBufTypeStringFromTileType(dst_type)
+                                       : codegen.GetCurrentResultTileBufTypeString();
   std::ostringstream oss;
   oss << pto_op_name << " ins(" << src;
-  if (!src_type.empty()) {
+  if (!tmp.empty()) {
+    oss << ", " << tmp;
+  }
+  if (!src_type.empty() || !tmp_type.empty()) {
     oss << " : " << src_type;
+    if (!tmp.empty()) oss << ", " << tmp_type;
   }
   oss << ") outs(" << dst;
-  if (!dst_type.empty()) {
-    oss << " : " << dst_type;
+  if (!dst_type_str.empty()) {
+    oss << " : " << dst_type_str;
   }
   oss << ") " << config_attr;
   codegen.Emit(oss.str());
@@ -571,10 +750,21 @@ static std::string MakePreluCodegenPTO(const CallPtr& op, codegen::CodegenBase& 
     }
   }
 
-  EmitInsOuts(codegen, "pto.tprelu",
-              {{codegen.GetExprAsCode(op->args_[0]), codegen.GetExprTypeAnnotation(op->args_[0])},
-               {codegen.GetExprAsCode(op->args_[1]), codegen.GetExprTypeAnnotation(op->args_[1])},
-               {codegen.GetExprAsCode(op->args_[2]), codegen.GetExprTypeAnnotation(op->args_[2])}});
+  RequireStaticValidShapeForPtoas(src_type, "tile.prelu", "src", op->span_);
+  RequireStaticValidShapeForPtoas(slope_type, "tile.prelu", "slope", op->span_);
+  RequireStaticValidShapeForPtoas(tmp_type, "tile.prelu", "tmp", op->args_[2]->span_);
+  RequireStaticValidShapeForPtoas(dst_type, "tile.prelu", "dst", op->span_);
+
+  const std::string src_ssa = EnsureStaticViewTileSsa(op->args_[0], codegen, "prelu_src_view");
+  const std::string slope_ssa = EnsureStaticViewTileSsa(op->args_[1], codegen, "prelu_slope_view");
+  const std::string tmp_ssa = EnsureStaticViewTileSsa(op->args_[2], codegen, "prelu_tmp_view");
+  const std::string dst_ssa = EnsureStaticViewTileSsa(dst_var, codegen, "prelu_dst_view");
+
+  EmitInsOutsWithViewTypes(codegen, "pto.tprelu",
+                           {{src_ssa, GetTileViewTypeAnnotation(op->args_[0], codegen)},
+                            {slope_ssa, GetTileViewTypeAnnotation(op->args_[1], codegen)},
+                            {tmp_ssa, GetTileViewTypeAnnotation(op->args_[2], codegen)}},
+                           dst_ssa, dst_type);
   return "";
 }
 
@@ -591,13 +781,11 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.add",             "pto.tadd",             2},
     {"tile.sub",             "pto.tsub",             2},
     {"tile.mul",             "pto.tmul",             2},
-    {"tile.rem",             "pto.trem",             3},  // src0, src1, tmp
     // Tile x Tile partial-combine operations
     {"tile.part_add",        "pto.tpartadd",         2},
     {"tile.part_mul",        "pto.tpartmul",         2},
     {"tile.part_max",        "pto.tpartmax",         2},
     {"tile.part_min",        "pto.tpartmin",         2},
-    {"tile.fmod",            "pto.tfmod",            2},
     // Tile x Tile bitwise operations
     {"tile.and",             "pto.tand",             2},
     {"tile.or",              "pto.tor",              2},
@@ -623,8 +811,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     {"tile.subs",            "pto.tsubs",            2},
     {"tile.muls",            "pto.tmuls",            2},
     {"tile.divs",            "pto.tdivs",            2},
-    {"tile.rems",            "pto.trems",            3},  // src0, scalar, tmp
-    {"tile.fmods",           "pto.tfmods",           2},
     {"tile.ands",            "pto.tands",            2, 1},
     {"tile.ors",             "pto.tors",             2, 1},
     {"tile.xors",            "pto.txors",            3, 1},  // src0, scalar, tmp
@@ -714,6 +900,30 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       }
       reg_entry.set_output_layout(ir::TileLayout::row_major);
     }
+  }
+
+  struct RemainderOpEntry {
+    const char* op_name;
+    const char* pto_op_name;
+    size_t arity;
+    const char* precision_attr_kind;
+  };
+  static constexpr RemainderOpEntry kRemainderOps[] = {
+      {"tile.rem", "pto.trem", 3, "rem_precision"},
+      {"tile.rems", "pto.trems", 3, nullptr},
+      {"tile.fmod", "pto.tfmod", 2, "fmod_precision"},
+      {"tile.fmods", "pto.tfmods", 2, nullptr},
+  };
+  for (const auto& entry : kRemainderOps) {
+    if (exclude_ops.count(entry.op_name) > 0) continue;
+    auto reg_entry = backend.RegisterOp(entry.op_name);
+    reg_entry.f_codegen([entry](const CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeRemainderCodegenPTO(entry.pto_op_name, entry.arity, entry.precision_attr_kind, op, codegen);
+    });
+    for (size_t i = 0; i < entry.arity; ++i) {
+      reg_entry.set_input_layout(i, ir::TileLayout::row_major);
+    }
+    reg_entry.set_output_layout(ir::TileLayout::row_major);
   }
 
   if (exclude_ops.count("tile.sels") == 0) {
@@ -848,7 +1058,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     return MakeSingleOperandCodegenPTO({"tile.row_expand", "pto.trowexpand", 1, ""}, op, codegen);
   });
   reg("tile.fillpad_expand", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakeSingleOperandCodegenPTO({"tile.fillpad_expand", "pto.tfillpad_expand", 0, " (src, shape)"}, op,
+    return MakeSingleOperandCodegenPTO({"tile.fillpad_expand", "pto.tfillpad", 0, " (src, shape)"}, op,
                                        codegen);
   });
 
@@ -862,8 +1072,7 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   if (exclude_ops.count("tile.cast") == 0) {
     backend.RegisterOp("tile.cast")
         .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-          return MakeModalCodegenPTO("pto.tcvt", 1, "mode", round_modes, "Round", "rmode", "round_mode", op,
-                                     codegen);
+          return MakeTcvtCodegenPTO(op, codegen);
         })
         .set_input_layout(0, ir::TileLayout::row_major)
         .set_output_layout(ir::TileLayout::row_major);
@@ -894,7 +1103,27 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
           INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
               << "tile.col_sum requires 1 or 2 arguments, but got " << op->args_.size();
           std::string config_attr = op->args_.size() == 2 ? " {isBinary = true}" : "";
-          codegen.Emit("pto.tcolsum " + GenerateInsOutsClause(op, codegen, config_attr));
+          const bool needs_static_view =
+              op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch();
+          if (needs_static_view) {
+            auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
+            auto tmp_type = ir::As<ir::TileType>(op->args_[1]->GetType());
+            auto dst_var = codegen.GetCurrentResultVar();
+            auto dst_type = dst_var ? ir::As<ir::TileType>(dst_var->GetType()) : nullptr;
+            INTERNAL_CHECK(src_type && tmp_type && dst_type);
+            RequireStaticValidShapeForPtoas(src_type, "tile.col_sum", "src", op->span_);
+            RequireStaticValidShapeForPtoas(tmp_type, "tile.col_sum", "tmp", op->args_[1]->span_);
+            RequireStaticValidShapeForPtoas(dst_type, "tile.col_sum", "dst", op->span_);
+            const std::string src_ssa = EnsureStaticViewTileSsa(op->args_[0], codegen, "colsum_src_view");
+            const std::string tmp_ssa = EnsureStaticViewTileSsa(op->args_[1], codegen, "colsum_tmp_view");
+            const std::string dst_ssa = EnsureStaticViewTileSsa(dst_var, codegen, "colsum_dst_view");
+            EmitInsOutsWithViewTypes(codegen, "pto.tcolsum",
+                                     {{src_ssa, GetTileViewTypeAnnotation(op->args_[0], codegen)},
+                                      {tmp_ssa, GetTileViewTypeAnnotation(op->args_[1], codegen)}},
+                                     dst_ssa, dst_type, config_attr);
+          } else {
+            codegen.Emit("pto.tcolsum " + GenerateInsOutsClause(op, codegen, config_attr));
+          }
           return std::string("");
         });
   }
@@ -969,17 +1198,14 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   // Xt register, but the `pto.*` tile ops expose it only as the choice between
   // the accumulating and the non-accumulating op, so a runtime predicate lowers
   // to a branch over the two.  No phi is needed: both arms write `dst` in place.
-  // `supports_init_cond` must track the op's own type deduction: `tile.gemv_acc`
-  // still accepts exactly 3 arguments, so accepting a 4th here would only create
-  // an unreachable branch behind a `CHECK` that fires earlier in deduction.
-  auto make_acc_codegen = [](const std::string& pto_op, const std::string& init_pto_op,
-                             bool supports_init_cond) {
-    return [pto_op, init_pto_op, supports_init_cond](const ir::CallPtr& op,
-                                                     codegen::CodegenBase& codegen_base) -> std::string {
+  // Both ops reaching here accept the predicate: GEMV is a matmul whose M is 1,
+  // run on the same cube MAD, so it carries the same `cmatrixInit` bit.
+  auto make_acc_codegen = [](const std::string& pto_op, const std::string& init_pto_op) {
+    return [pto_op, init_pto_op](const ir::CallPtr& op, codegen::CodegenBase& codegen_base) -> std::string {
       auto& codegen = AsPto(codegen_base);
-      INTERNAL_CHECK_SPAN(op->args_.size() == 3 || (supports_init_cond && op->args_.size() == 4), op->span_)
-          << pto_op << " requires 3 arguments (acc, lhs, rhs)"
-          << (supports_init_cond ? " or 4 with init_cond" : "") << ", but got " << op->args_.size();
+      INTERNAL_CHECK_SPAN(op->args_.size() == 3 || op->args_.size() == 4, op->span_)
+          << pto_op << " requires 3 arguments (acc, lhs, rhs) or 4 with init_cond, but got "
+          << op->args_.size();
 
       std::string dst = codegen.GetCurrentResultTarget();
       std::string lhs = codegen.GetExprAsCode(op->args_[1]);
@@ -1033,8 +1259,17 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       }
 
       // A literal predicate picks one arm outright; only a runtime one branches.
+      // Both spellings reach here: a DSL `init_cond=True/False` arrives as a
+      // BOOL-typed ConstInt, while a predicate the arithmetic simplifier folded
+      // (e.g. `ko == 0` after LowerPipelineLoops replicates the K-loop) arrives
+      // as a ConstBool.  Missing either one leaves an `scf.if` on a compile-time
+      // constant, doubling the emitted MADs.
       if (auto init_const = As<ir::ConstInt>(op->args_[3])) {
         codegen.Emit(build(/*initializing=*/init_const->value_ != 0));
+        return "";
+      }
+      if (auto init_bool = As<ir::ConstBool>(op->args_[3])) {
+        codegen.Emit(build(/*initializing=*/init_bool->value_));
         return "";
       }
 
@@ -1099,11 +1334,11 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     };
   };
 
-  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc", "pto.tmatmul", /*supports_init_cond=*/true));
+  reg("tile.matmul_acc", make_acc_codegen("pto.tmatmul.acc", "pto.tmatmul"));
   reg("tile.gemv", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeGemvCodegenPTO("pto.tgemv", 2, op, codegen);
   });
-  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc", "pto.tgemv", /*supports_init_cond=*/false));
+  reg("tile.gemv_acc", make_acc_codegen("pto.tgemv.acc", "pto.tgemv"));
   reg("tile.matmul_mx_acc", make_mx_acc_codegen("pto.tmatmul.mx.acc"));
   reg("tile.gemv_bias", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeGemvCodegenPTO("pto.tgemv.bias", 3, op, codegen);

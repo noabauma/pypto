@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -21,7 +22,6 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/backend/common/backend.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -65,6 +65,20 @@ bool HasKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const
                      [&name](const auto& kwarg) { return kwarg.first == name; });
 }
 
+/// True when a `tile.load`'s source tensor carries the NZ layout.
+///
+/// `BlockNzTensorViews` has already put such a load into its final form — a
+/// blocked rank-(r+2) GM window feeding a logical 2D tile — so this pass must
+/// leave it alone rather than collapse the window or re-deduce the tile type.
+bool IsNzSourceLoad(const std::vector<ExprPtr>& args) {
+  if (args.empty()) return false;
+  auto tensor = AsVarLike(args[0]);
+  if (!tensor) return false;
+  auto tensor_type = AsTensorTypeLike(tensor->GetType());
+  return tensor_type && tensor_type->tensor_view_.has_value() &&
+         tensor_type->tensor_view_->layout == TensorLayout::NZ;
+}
+
 /// Carry the assignment's MemRef onto a type re-deduced by `OpRegistry::Create`.
 ///
 /// Re-deducing yields authoritative shape / dtype / view metadata but never a
@@ -78,11 +92,154 @@ bool HasKwarg(const std::vector<std::pair<std::string, std::any>>& kwargs, const
 /// The MemRef is read from the *assigned Var*, not from the RHS Call: ConvertToSSA
 /// merges it into the Var's type only, and op type deduction leaves the Call's
 /// type MemRef-less. Sourcing it from `call->GetType()` silently matches nothing.
+///
+/// The memory space is carried across for the same reason and from the same
+/// place. Re-deducing a `tile.load` / `tile.create` from args + kwargs yields an
+/// unset space whenever the producer left `target_memory` off (the normal case
+/// now that unset means "the compiler will place it"), while the annotated Var
+/// still holds whatever the author wrote. Dropping it loses a stated fact; worse,
+/// pairing a MemRef with an unset space trips the TileType invariant that the two
+/// must agree (`src/ir/type.cpp` ValidateTileMemorySpaceConsistency), so the pass
+/// throws on perfectly valid DSL. The DSL already refuses a MemRef annotation
+/// without an explicit space, so whenever `memref` is present the Var's space is
+/// too.
 TypePtr WithCarriedMemRef(const TypePtr& deduced, const AssignStmtPtr& assign) {
   if (!assign || !assign->var_) return deduced;
   auto memref = GetTypeMemRef(assign->var_->GetType());
-  if (!memref.has_value() || GetTypeMemRef(deduced).has_value()) return deduced;
-  return CloneTypeWithMemRef(deduced, memref);
+
+  std::optional<MemorySpace> carried_space;
+  if (auto var_tile = As<TileType>(assign->var_->GetType())) {
+    if (auto deduced_tile = As<TileType>(deduced); deduced_tile && !deduced_tile->memory_space_.has_value()) {
+      carried_space = var_tile->memory_space_;
+    }
+  }
+
+  if (!memref.has_value() || GetTypeMemRef(deduced).has_value()) {
+    // No MemRef to merge, but a stated space may still need carrying.
+    if (!carried_space.has_value()) return deduced;
+    auto deduced_tile = As<TileType>(deduced);
+    return std::make_shared<TileType>(deduced_tile->shape_, deduced_tile->dtype_, deduced_tile->memref_,
+                                      deduced_tile->tile_view_, carried_space);
+  }
+  return CloneTypeWithMemRef(deduced, memref, carried_space);
+}
+
+/**
+ * @brief Flatten a >2D `tile.create` / `tile.full` allocation to its 2D form.
+ *
+ * A batched Acc accumulator packs its pages along COLUMNS, not rows: `[M, B*N]`
+ * with page `b` at `[0, b*N]`. A row window of a multi-block-column L0C tile is
+ * strided and the MAD has no destination stride, so the generic `[B*M, N]`
+ * collapse would be silently mis-addressed. See `BuildAccPackingMap` for the
+ * chain analysis that decides which allocations are packed this way.
+ *
+ * @return The Var bound to the flattened allocation.
+ */
+VarPtr EmitFlattenedTileAlloc(const CallPtr& call, const AssignStmtPtr& assign,
+                              const TileTypePtr& result_tile, const std::string& op_name,
+                              const FlattenContext& ctx, const OpRegistry& op_registry, const Span& span,
+                              std::vector<StmtPtr>* result) {
+  // A batched Acc accumulator packs its pages along COLUMNS, not rows:
+  // [M, B*N] with page b at [0, b*N]. A row window of a multi-block-column
+  // L0C tile is strided and the MAD has no destination stride, so the
+  // generic [B*M, N] collapse would be silently mis-addressed. See
+  // BuildAccPackingMap for the chain analysis that decides this.
+  const auto* acc_plan = ctx.AccPackingForVar(assign->var_);
+  auto [merged, last] =
+      acc_plan ? std::pair<int64_t, int64_t>{acc_plan->rows, acc_plan->batch_count * acc_plan->cols}
+               : ComputeMergedShape(result_tile->shape_, op_name);
+
+  // Rebuild the call with 2D shape
+  auto new_shape_tuple = MakeShapeTupleFromInts({merged, last}, span);
+  std::vector<ExprPtr> new_args;
+  // First arg is the shape tuple
+  new_args.push_back(new_shape_tuple);
+  // Remaining args (e.g., fill value for tile.full)
+  for (size_t i = 1; i < call->args_.size(); ++i) {
+    new_args.push_back(Substitute(call->args_[i], ctx.var_map));
+  }
+
+  // The accumulator's only legal home is Acc, and stating it here (rather
+  // than leaving it to InferTileMemorySpace, pass 17) is what makes the
+  // per-page windows an Acc parent's windows from pass 13 onward — so
+  // CanonicalizeTileSlice (pass 16) sees them as accumulator windows and
+  // leaves them alone instead of materializing them as Vec extracts.
+  auto create_kwargs = call->kwargs_;
+  if (acc_plan) {
+    create_kwargs.erase(std::remove_if(create_kwargs.begin(), create_kwargs.end(),
+                                       [](const auto& kw) { return kw.first == "target_memory"; }),
+                        create_kwargs.end());
+    create_kwargs.emplace_back("target_memory", MemorySpace::Acc);
+  }
+  auto deduced = op_registry.Create(op_name, new_args, create_kwargs, span);
+  auto created_type = WithCarriedMemRef(deduced->GetType(), assign);
+  auto new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_, deduced->attrs_,
+                                         created_type, deduced->span_);
+  auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, created_type, assign->var_->span_);
+  result->push_back(std::make_shared<AssignStmt>(flat_var, new_call, assign->span_));
+  return flat_var;
+}
+
+/**
+ * @brief Emit the per-page drain of a column-packed batched accumulator.
+ *
+ * The pages sit side by side in ONE `[M, B*N]` Acc tile, so there is no single
+ * 2D buffer whose row-major collapse is the `[B, M, N]` output window. Each page
+ * is stored as a column window at its own batch offset — the same per-page shape
+ * `LowerBatchMatmul`'s direct-store fusion already emits, straight out of L0C
+ * with no Vec staging (a store whose source is an Acc tile classifies CUBE, so
+ * it needs no cross-core move).
+ *
+ * `BuildAccPackingMap` has already verified the store is the 3-arg form with
+ * tensor-rank offsets, so the checks below guard a pass invariant, not user
+ * input.
+ *
+ * @return The Var bound by the last page's store, which threads the tensor.
+ */
+VarPtr EmitPackedAccumulatorDrain(const AccPackingPlan& plan, const CallPtr& call,
+                                  const AssignStmtPtr& assign, const FlattenContext& ctx,
+                                  const OpRegistry& op_registry, const Span& span,
+                                  std::vector<StmtPtr>* result) {
+  auto packed = Substitute(call->args_[0], ctx.var_map);
+  auto offsets = As<MakeTuple>(Substitute(call->args_[1], ctx.var_map));
+  ExprPtr out_tensor = Substitute(call->args_[2], ctx.var_map);
+  INTERNAL_CHECK_SPAN(offsets && offsets->elements_.size() == plan.nd_shape.size(), span)
+      << "Internal error: column-packed accumulator drain expects rank-" << plan.nd_shape.size()
+      << " tile.store offsets";
+
+  const size_t batch_rank = plan.batch_dims.size();
+  std::vector<ExprPtr> partition_shape;
+  partition_shape.reserve(plan.nd_shape.size());
+  for (size_t i = 0; i < batch_rank; ++i) {
+    partition_shape.push_back(std::make_shared<ConstInt>(1, DataType::INDEX, span));
+  }
+  partition_shape.push_back(std::make_shared<ConstInt>(plan.rows, DataType::INDEX, span));
+  partition_shape.push_back(std::make_shared<ConstInt>(plan.cols, DataType::INDEX, span));
+
+  auto page_shape = MakeShapeTupleFromInts({plan.rows, plan.cols}, span);
+  VarPtr last_store;
+  for (int64_t batch = 0; batch < plan.batch_count; ++batch) {
+    const std::string suffix = std::to_string(batch);
+    auto page_offset = MakeShapeTupleFromInts({0, batch * plan.cols}, span);
+    auto page = op_registry.Create("tile.slice", {packed, page_shape, page_offset}, span);
+    auto page_var = std::make_shared<Var>("acc_drain_" + suffix, page->GetType(), span);
+    result->push_back(std::make_shared<AssignStmt>(page_var, page, assign->span_));
+
+    auto batch_indices = BuildBatchIndices(batch, plan.batch_dims);
+    auto store_offsets = std::make_shared<MakeTuple>(
+        BuildBatchAdjustedOffsets(offsets->elements_, batch_indices, batch_rank, span), span);
+    auto page_store = op_registry.Create(
+        "tile.store",
+        {page_var, store_offsets, out_tensor, std::make_shared<MakeTuple>(partition_shape, span)},
+        call->kwargs_, span);
+    last_store = std::make_shared<Var>(assign->var_->name_hint_ + "_" + suffix, page_store->GetType(),
+                                       assign->var_->span_);
+    result->push_back(std::make_shared<AssignStmt>(last_store, page_store, assign->span_));
+    out_tensor = last_store;
+  }
+  INTERNAL_CHECK_SPAN(last_store, span)
+      << "Internal error: a column-packed accumulator always has at least one page";
+  return last_store;
 }
 
 /**
@@ -706,7 +863,14 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
         // A natural Mat load lowers to ND2NZ, which requires a 2D GlobalTensor.
         // Materialize that source-window collapse in IR with tensor.view; plain
         // Vec loads and transposed Mat loads keep their tensor-rank source window.
-        if (IsNaturalNzMatLoad(result_tile, pending_batch_matmul_mat)) {
+        // The collapse below exists because a natural Mat load lowers to ND2NZ,
+        // which pto-isa only accepts on a 2D GlobalTensor. An NZ *source* takes
+        // the NZ2NZ path instead, and BlockNzTensorViews (which runs right after
+        // this pass) will give it the blocked rank-(r+2) window that path wants.
+        // Collapsing here would flatten the fractal dims into a row count and
+        // destroy that structure, so leave the window at tensor rank and only
+        // flatten the tile.
+        if (IsNaturalNzMatLoad(result_tile, pending_batch_matmul_mat) && !IsNzSourceLoad(sub_args)) {
           auto tensor = AsVarLike(sub_args[0]);
           auto tensor_type = tensor ? AsTensorTypeLike(tensor->GetType()) : nullptr;
           INTERNAL_CHECK_SPAN(tensor && tensor_type, span)
@@ -784,6 +948,15 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     // over the original tensor-rank window to produce the 2D result.
     // Signature: (tile, offsets, output_tensor[, shapes])
     if (IsOp(call, "tile.store")) {
+      // ---- Column-packed batched accumulator: one store per batch page ----
+      // See EmitPackedAccumulatorDrain for why the pages cannot share one 2D
+      // buffer, and BuildAccPackingMap for the chain analysis that decides it.
+      if (const auto* acc_plan = ctx.AccPackingFor(call->args_[0])) {
+        ctx.Insert(assign->var_,
+                   EmitPackedAccumulatorDrain(*acc_plan, call, assign, ctx, op_registry, span, &result));
+        continue;
+      }
+
       auto orig_tile_type = As<TileType>(call->args_[0]->GetType());
 
       std::vector<ExprPtr> new_args;
@@ -841,25 +1014,8 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
     if (IsOp(call, "tile.create") || IsOp(call, "tile.full")) {
       auto result_tile = As<TileType>(call->GetType());
       if (result_tile && result_tile->shape_.size() > 2) {
-        auto [merged, last] = ComputeMergedShape(result_tile->shape_, op_name);
-
-        // Rebuild the call with 2D shape
-        auto new_shape_tuple = MakeShapeTupleFromInts({merged, last}, span);
-        std::vector<ExprPtr> new_args;
-        // First arg is the shape tuple
-        new_args.push_back(new_shape_tuple);
-        // Remaining args (e.g., fill value for tile.full)
-        for (size_t i = 1; i < call->args_.size(); ++i) {
-          new_args.push_back(Substitute(call->args_[i], ctx.var_map));
-        }
-
-        auto deduced = op_registry.Create(op_name, new_args, call->kwargs_, span);
-        auto created_type = WithCarriedMemRef(deduced->GetType(), assign);
-        auto new_call = std::make_shared<Call>(deduced->op_, deduced->args_, deduced->kwargs_,
-                                               deduced->attrs_, created_type, deduced->span_);
-        auto flat_var = std::make_shared<Var>(assign->var_->name_hint_, created_type, assign->var_->span_);
-        result.push_back(std::make_shared<AssignStmt>(flat_var, new_call, assign->span_));
-        ctx.Insert(assign->var_, flat_var);
+        ctx.Insert(assign->var_, EmitFlattenedTileAlloc(call, assign, result_tile, op_name, ctx, op_registry,
+                                                        span, &result));
         continue;
       }
       // ≤2D: pass through
@@ -1036,6 +1192,12 @@ FunctionPtr Rewrite(const FunctionPtr& func) {
   auto& op_registry = OpRegistry::GetInstance();
 
   rewrite_internal::FlattenContext ctx;
+  // Decide the batched-accumulator packing ONCE, over the whole function: a
+  // chain routinely spans blocks (create outside the K loop, batch_matmul_acc
+  // inside it, store after it) and TransformBody's own pre-scan is per-block, so
+  // nothing block-local can tell the `tile.create` to allocate [M, B*N]. Shared
+  // by pointer because FlattenContext is copied once per nested block.
+  ctx.acc_packing = rewrite_internal::BuildAccPackingMap(func);
 
   auto body_stmts = FlattenToStmts(func->body_);
   auto new_stmts = rewrite_internal::TransformBody(body_stmts, ctx, op_registry);

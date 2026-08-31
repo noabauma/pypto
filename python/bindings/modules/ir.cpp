@@ -194,6 +194,59 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
           vars.push_back(nb::cast<VarPtr>(elem));
         }
         kwargs.emplace_back(key, std::move(vars));
+      } else if (key == kAttrCachePolicyParams) {
+        // ``cache_policy`` on an outlined Function: (param index, policy) pairs,
+        // reconstructed from a printed pass dump by ast_parser._parse_attr_pair.
+        std::vector<std::pair<int32_t, int>> decls;
+        for (auto elem : seq) {
+          const bool is_pair = (nb::isinstance<nb::tuple>(elem) || nb::isinstance<nb::list>(elem)) &&
+                               nb::len(nb::cast<nb::sequence>(elem)) == 2;
+          if (!is_pair) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected an (int, int) pair)");
+          }
+          auto pair = nb::cast<nb::sequence>(elem);
+          auto it = pair.begin();
+          nb::handle idx_obj = *it;
+          nb::handle policy_obj = *(++it);
+          if (nb::isinstance<nb::bool_>(idx_obj) || !nb::isinstance<nb::int_>(idx_obj) ||
+              nb::isinstance<nb::bool_>(policy_obj) || !nb::isinstance<nb::int_>(policy_obj)) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected an (int, int) pair)");
+          }
+          int64_t idx = nb::cast<int64_t>(idx_obj);
+          if (idx < std::numeric_limits<int32_t>::min() || idx > std::numeric_limits<int32_t>::max()) {
+            throw pypto::ValueError("List value " + std::to_string(idx) + " for key: " + key +
+                                    " is out of int32 range");
+          }
+          decls.emplace_back(static_cast<int32_t>(idx), nb::cast<int>(policy_obj));
+        }
+        kwargs.emplace_back(key, std::move(decls));
+      } else if (key == kAttrCachePolicyVars) {
+        // ``pl.set_cache_policy(t, policy)`` scope attr, written by the DSL
+        // parser: a list of ``(Var, int)`` pairs. Keyed rather than sniffed for
+        // the same reason as the arms above — a bare pair list says nothing
+        // about which half is the reference.
+        std::vector<std::pair<VarPtr, int>> decls;
+        for (auto elem : seq) {
+          const bool is_pair = (nb::isinstance<nb::tuple>(elem) || nb::isinstance<nb::list>(elem)) &&
+                               nb::len(nb::cast<nb::sequence>(elem)) == 2;
+          if (!is_pair) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected a (Var, int) pair)");
+          }
+          auto pair = nb::cast<nb::sequence>(elem);
+          auto it = pair.begin();
+          nb::handle var_obj = *it;
+          nb::handle policy_obj = *(++it);
+          if (!nb::isinstance<Var>(var_obj) || nb::isinstance<nb::bool_>(policy_obj) ||
+              !nb::isinstance<nb::int_>(policy_obj)) {
+            throw pypto::TypeError("Unsupported list element type for key: " + key +
+                                   " (expected a (Var, int) pair)");
+          }
+          decls.emplace_back(nb::cast<VarPtr>(var_obj), nb::cast<int>(policy_obj));
+        }
+        kwargs.emplace_back(key, std::move(decls));
       } else if (nb::len(seq) > 0 && nb::isinstance<Var>(*seq.begin())) {
         // Open-world key holding a Var list — ``pl.func_attr({"operands": [x, w]})``.
         // Function attrs are an open key namespace, so no reserved-key list can
@@ -365,7 +418,8 @@ void BindIR(nb::module_& m) {
           nb::arg("prefix") = "pl", nb::arg("concise") = false, nb::arg("format") = true,
           "Convert to Python-style string representation.\n\n"
           "Args:\n"
-          "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')\n"
+          "    prefix: Module prefix (default 'pl'). 'pld' is reserved for\n"
+          "        pypto.language.distributed when printing a Program\n"
           "    concise: If true, omit intermediate type annotations (default false)\n"
           "    format: If true, apply registered format callback (default true)");
 
@@ -406,6 +460,17 @@ void BindIR(nb::module_& m) {
       .value("min", PadValue::min, "Min value padding")
       .export_values();
 
+  // CachePolicy enum - declared GM cache-access policy for a tensor read.
+  // nb::is_arithmetic like AtomicType: the policy rides the `tile.load` "cache"
+  // kwarg as a plain `int`, so the DSL needs `int(policy)` to work.
+  nb::enum_<CachePolicy>(ir, "CachePolicy", nb::is_arithmetic(),
+                         "GM cache-access policy declared for a tensor read")
+      .value("DEFAULT", CachePolicy::kDefault, "Ordinary cached GM access")
+      .value("BYPASS", CachePolicy::kBypass,
+             "Streaming access declared to bypass the cache: asserts this tensor has no reuse "
+             "worth caching and that nothing writes those bytes while the kernel runs")
+      .export_values();
+
   // TensorView - struct for tensor view information - must be before TensorType
   nb::class_<TensorView>(ir, "TensorView",
                          "Tensor view representation with stride, layout, valid shape, and pad mode")
@@ -433,7 +498,8 @@ void BindIR(nb::module_& m) {
   tvs.def("build_logical_strides_from_layout", &tensor_view_semantics::BuildLogicalStridesFromLayout,
           nb::arg("shape"), nb::arg("layout"),
           "Build packed canonical strides for (shape, layout). "
-          "Raises ValueError on NZ layout or DN with rank < 2.");
+          "NZ is row-major over its blocked rank-(r+2) shape, the same rule as ND. "
+          "Raises ValueError on DN with rank < 2.");
 
   tvs.def(
       "derive_layout_from_strides",
@@ -758,6 +824,25 @@ void BindIR(nb::module_& m) {
       nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("span"),
       "Create a Call expression with args and kwargs");
 
+  // Underscore-prefixed: NOT a public API. Compiler-internal counterpart of
+  // `create_op_call`, it reaches operators marked `internal_only`, which
+  // `CreateUserFacing` rejects by design. Its only caller is the round-trip
+  // parser, rebuilding a printer-emitted internal dispatch
+  // (`pl.builtin.<ns>.<op>(...)`) that no DSL wrapper can spell; that caller
+  // re-checks the invariants the printer stamps before calling in, so the
+  // guard `internal_only` provides is enforced at the user-facing surface
+  // rather than dropped. `create_op_call` still routes through
+  // `CreateUserFacing` and is unaffected.
+  ir.def(
+      "_create_internal_op_call",
+      [](const std::string& op_name, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const Span& span) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        return OpRegistry::GetInstance().CreateInternal(op_name, args, kwargs, span);
+      },
+      nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("span"),
+      "Create a Call expression for a compiler-internal operator (round-trip parser only)");
+
   ir.def(
       "set_call_attrs",
       [](const CallPtr& call, const nb::dict& attrs_dict) -> CallPtr {
@@ -781,6 +866,26 @@ void BindIR(nb::module_& m) {
   ir.def(
       "get_op", [](const std::string& op_name) { return OpRegistry::GetInstance().GetOp(op_name); },
       nb::arg("op_name"), "Get an operator instance by name");
+
+  ir.def(
+      "get_op_output_arity",
+      [](const std::string& op_name) { return OpRegistry::GetInstance().GetEntry(op_name).GetOutputArity(); },
+      nb::arg("op_name"), "Number of values an operator produces (>1 means a TupleType result)");
+
+  ir.def(
+      "op_arg_is_workspace",
+      [](const std::string& op_name, size_t arg_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).IsWorkspaceArg(arg_index);
+      },
+      nb::arg("op_name"), nb::arg("arg_index"),
+      "Whether an argument was declared compiler-supplied scratch rather than a result");
+
+  ir.def(
+      "get_op_argument_count",
+      [](const std::string& op_name) {
+        return OpRegistry::GetInstance().GetEntry(op_name).GetArgumentCount();
+      },
+      nb::arg("op_name"), "Number of arguments an operator's registration documents");
 
   ir.def(
       "get_op_memory_spec",
@@ -823,6 +928,56 @@ void BindIR(nb::module_& m) {
         return result;
       },
       nb::arg("op_name"), "Get memory space specification for a registered operator");
+
+  nb::enum_<ArgEffect>(ir, "ArgEffect", "What executing an operator does to the buffer one argument names")
+      .value("Read", ArgEffect::Read, "Read, never written")
+      .value("Write", ArgEffect::Write, "Overwritten without being read first")
+      .value("ReadWrite", ArgEffect::ReadWrite, "Read and written (accumulate, atomic, in-place update)");
+
+  nb::enum_<WriteChannel>(ir, "WriteChannel", "The hardware path an operator's writes travel")
+      .value("Dma", WriteChannel::Dma, "MTE3 / DMA store path")
+      .value("Scalar", WriteChannel::Scalar, "Scalar D-cache write path");
+
+  ir.def(
+      "get_op_arg_effect",
+      [](const std::string& op_name, size_t arg_index, nb::kwargs kwargs) -> ArgEffect {
+        const auto& entry = OpRegistry::GetInstance().GetEntry(op_name);
+        // The same conversion every other kwarg-taking binding uses. Rolling a
+        // local int/str pair here rejected the enum-valued kwargs an operator
+        // legitimately carries — `tile.mgather`'s `target_memory` is a
+        // `MemorySpace`, and it is exactly what that operator's effect resolver
+        // reads.
+        nb::dict kwargs_dict;
+        for (auto [key, value] : kwargs) {
+          kwargs_dict[key] = value;
+        }
+        return entry.GetArgEffect(arg_index, ConvertKwargsDict(kwargs_dict));
+      },
+      nb::arg("op_name"), nb::arg("arg_index"), nb::arg("kwargs"),
+      "Effect an operator has on one positional argument, for a call carrying the given kwargs");
+
+  ir.def(
+      "op_has_declared_arg_effects",
+      [](const std::string& op_name) {
+        return OpRegistry::GetInstance().GetEntry(op_name).HasDeclaredArgEffects();
+      },
+      nb::arg("op_name"), "Whether an operator declared its per-argument effects (False = never classified)");
+
+  ir.def(
+      "op_has_declared_arg_effect",
+      [](const std::string& op_name, size_t arg_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).HasDeclaredArgEffect(arg_index);
+      },
+      nb::arg("op_name"), nb::arg("arg_index"),
+      "Whether the registration reached a verdict about this argument in particular");
+
+  ir.def(
+      "get_op_write_channel",
+      [](const std::string& op_name) -> nb::object {
+        auto channel = OpRegistry::GetInstance().GetEntry(op_name).GetWriteChannel();
+        return channel.has_value() ? nb::cast(*channel) : nb::none();
+      },
+      nb::arg("op_name"), "The hardware path an operator's writes travel, or None when it declared none");
 
   // Var - const shared_ptr
   auto var_class = nb::class_<Var, Expr>(ir, "Var", "Variable reference expression");
@@ -1126,6 +1281,27 @@ void BindIR(nb::module_& m) {
           lst.append(nb::cast(v));
         }
         result[key.c_str()] = lst;
+      } else if (value.type() == typeid(std::vector<std::pair<VarPtr, int>>)) {
+        // Used by ScopeStmt attrs["cache_policy_vars"] — the parse-time
+        // ``pl.set_cache_policy`` declarations, as ``list[tuple[Var, int]]``.
+        const auto& decls =
+            AnyCast<std::vector<std::pair<VarPtr, int>>>(value, "converting to Python: " + key);
+        nb::list lst;
+        for (const auto& [v, policy] : decls) {
+          lst.append(nb::make_tuple(nb::cast(v), nb::cast(policy)));
+        }
+        result[key.c_str()] = lst;
+      } else if (value.type() == typeid(std::vector<std::pair<int32_t, int>>)) {
+        // Used by Function attrs["cache_policy"] — the same declarations after
+        // the scope outliner resolved them to param indices, as
+        // ``list[tuple[int, int]]``.
+        const auto& decls =
+            AnyCast<std::vector<std::pair<int32_t, int>>>(value, "converting to Python: " + key);
+        nb::list lst;
+        for (const auto& [idx, policy] : decls) {
+          lst.append(nb::make_tuple(nb::cast(idx), nb::cast(policy)));
+        }
+        result[key.c_str()] = lst;
       } else if (value.type() == typeid(VarPtr)) {
         // Used by ScopeStmt attrs["task_id_var"] (single producer TaskId Var).
         result[key.c_str()] = nb::cast(AnyCast<VarPtr>(value, "converting to Python: " + key));
@@ -1426,7 +1602,7 @@ void BindIR(nb::module_& m) {
       .value("Cluster", ScopeKind::Cluster, "Cluster scope for co-scheduled AIC + AIV groups")
       .value("Hierarchy", ScopeKind::Hierarchy, "Distributed hierarchy scope (uses level/role)")
       .value("Spmd", ScopeKind::Spmd, "SPMD dispatch scope (core_num/sync_start)")
-      .value("Runtime", ScopeKind::Runtime, "Runtime orchestration scope (PTO2_SCOPE wrapper)")
+      .value("Runtime", ScopeKind::Runtime, "Runtime orchestration scope (SIMPLER_SCOPE wrapper)")
       .value("CommDomain", ScopeKind::CommDomain,
              "Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch window buffers)")
       .value("SplitAiv", ScopeKind::SplitAiv, "Explicit AIV-split region (pl.split_aiv)")
@@ -1579,8 +1755,8 @@ void BindIR(nb::module_& m) {
   // RuntimeScopeStmt
   auto runtime_scope_stmt_class = nb::class_<RuntimeScopeStmt, ScopeStmt>(
       ir, "RuntimeScopeStmt",
-      "Runtime orchestration scope: emits PTO2_SCOPE() (manual=False) or "
-      "PTO2_SCOPE(PTO2ScopeMode::MANUAL) (manual=True) wrappers in codegen");
+      "Runtime orchestration scope: emits SIMPLER_SCOPE() (manual=False) or "
+      "SIMPLER_SCOPE(ScopeMode::MANUAL) (manual=True) wrappers in codegen");
   runtime_scope_stmt_class.def(nb::init<bool, std::string, const StmtPtr&, const Span&>(),
                                nb::arg("manual") = false, nb::arg("name_hint") = "", nb::arg("body"),
                                nb::arg("span"), "Create a Runtime scope statement");
@@ -1730,6 +1906,10 @@ void BindIR(nb::module_& m) {
   ir.def("is_incore_type", &IsInCoreType, nb::arg("func_type"),
          "Check if a FunctionType is an InCore variant (InCore, AIC, or AIV)");
 
+  // IsOrchestrationLike helper
+  ir.def("is_orchestration_like", nb::overload_cast<FunctionType>(&IsOrchestrationLike), nb::arg("func_type"),
+         "Check if a FunctionType has an orchestration body (Orchestration or Graph)");
+
   // LevelToLinquLevel helper
   ir.def("level_to_linqu_level", &LevelToLinquLevel, nb::arg("level"),
          "Map Level enum value to Linqu hierarchy level number (0-7)");
@@ -1848,7 +2028,8 @@ void BindIR(nb::module_& m) {
       "Print IR node (Expr, Stmt, Function, or Program) in Python IR syntax.\n\n"
       "Args:\n"
       "    node: IR node to print\n"
-      "    prefix: Module prefix (default 'pl' for 'import pypto.language as pl')\n"
+      "    prefix: Module prefix (default 'pl'). 'pld' is reserved for\n"
+      "        pypto.language.distributed when printing a Program\n"
       "    concise: If true, omit intermediate type annotations (default false)\n"
       "    format: If true, apply registered format callback (default true)\n"
       "    explicit_layout: If true, print every tile's fully-resolved\n"

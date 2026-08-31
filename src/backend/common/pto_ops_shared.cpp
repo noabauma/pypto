@@ -368,6 +368,105 @@ std::string GenerateInsOutsClause(const CallPtr& op, codegen::PTOCodegen& codege
   return oss.str();
 }
 
+namespace {
+
+std::shared_ptr<const ir::TileType> GetTileTypeFromExpr(const ir::ExprPtr& expr) {
+  if (auto var = ir::As<ir::Var>(expr)) {
+    return ir::As<ir::TileType>(var->GetType());
+  }
+  if (auto iter_arg = ir::As<ir::IterArg>(expr)) {
+    return ir::As<ir::TileType>(iter_arg->GetType());
+  }
+  return nullptr;
+}
+
+}  // namespace
+
+bool HasStaticValidShape(const std::shared_ptr<const ir::TileType>& tile_type) {
+  if (!tile_type) return false;
+  const auto tile_view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
+  const auto& valid = tile_view.valid_shape;
+  if (valid.empty()) return false;
+  return std::all_of(valid.begin(), valid.end(),
+                     [](const ir::ExprPtr& dim) { return ir::As<ir::ConstInt>(dim) != nullptr; });
+}
+
+void RequireStaticValidShapeForPtoas(const std::shared_ptr<const ir::TileType>& tile_type,
+                                     std::string_view op_name, std::string_view role, const ir::Span& span) {
+  CHECK_SPAN(HasStaticValidShape(tile_type), span)
+      << op_name << " on A2/A3 requires compile-time static valid_shape on " << role
+      << " for PTOAS level3 tmp verification";
+}
+
+std::string GetTileViewTypeAnnotation(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen) {
+  if (auto tile_type = GetTileTypeFromExpr(expr)) {
+    if (tile_type->memref_.has_value()) {
+      return codegen.GetViewTileBufTypeStringFromTileType(tile_type);
+    }
+  }
+  return "";
+}
+
+std::string EnsureTileViewSsa(const ir::ExprPtr& expr,
+                              const std::shared_ptr<const ir::TileType>& view_tile_type,
+                              codegen::PTOCodegen& codegen, const std::string& temp_prefix) {
+  INTERNAL_CHECK(view_tile_type) << "Internal error: EnsureTileViewSsa requires a TileType view";
+  const std::string view_type = codegen.GetViewTileBufTypeStringFromTileType(view_tile_type);
+  std::string current_ssa = codegen.GetExprAsCode(expr);
+  const std::string current_type = codegen.GetExprTypeAnnotation(expr);
+  if (!current_type.empty() && current_type == view_type) {
+    return current_ssa;
+  }
+  std::string view_ssa = codegen.NewNamedTemp(temp_prefix);
+  codegen.RegisterTileBufType(view_ssa, view_type);
+  codegen.RegisterTileViewName(view_ssa);
+  std::ostringstream oss;
+  oss << view_ssa << " = pto.treshape " << current_ssa;
+  if (!current_type.empty()) {
+    oss << " : " << current_type << " -> " << view_type;
+  }
+  codegen.Emit(oss.str());
+  return view_ssa;
+}
+
+std::string EnsureStaticViewTileSsa(const ir::ExprPtr& expr, codegen::PTOCodegen& codegen,
+                                    const std::string& temp_prefix) {
+  auto tile_type = GetTileTypeFromExpr(expr);
+  INTERNAL_CHECK(tile_type) << "Internal error: EnsureStaticViewTileSsa requires a TileType expression";
+  return EnsureTileViewSsa(expr, tile_type, codegen, temp_prefix);
+}
+
+void EmitInsOutsWithViewTypes(codegen::PTOCodegen& codegen, std::string_view pto_op_name,
+                              const std::vector<std::pair<std::string, std::string>>& ins,
+                              const std::string& result_ssa,
+                              const std::shared_ptr<const ir::TileType>& result_tile_type,
+                              const std::string& config_attr) {
+  std::ostringstream oss;
+  oss << pto_op_name << " ins(";
+  std::string type_annot;
+  for (size_t i = 0; i < ins.size(); ++i) {
+    if (i > 0) oss << ", ";
+    oss << ins[i].first;
+    if (!ins[i].second.empty()) {
+      if (!type_annot.empty()) type_annot += ", ";
+      type_annot += ins[i].second;
+    }
+  }
+  if (!config_attr.empty()) {
+    oss << " " << config_attr;
+  }
+  if (!type_annot.empty()) {
+    oss << " : " << type_annot;
+  }
+  const std::string result_type = codegen.GetViewTileBufTypeStringFromTileType(result_tile_type);
+  oss << ") outs(" << result_ssa;
+  if (!result_type.empty()) {
+    oss << " : " << result_type;
+  }
+  oss << ")";
+  codegen.Emit(oss.str());
+}
+
 // Emit `<pto_op> ins(<op0>, <op1>, ... [: <types>]) outs(<result> [: <result_type>])`
 // for handlers that build the operand list explicitly rather than mapping
 // op->args_ 1:1 (that case is GenerateInsOutsClause). Each `ins` entry is
@@ -491,9 +590,21 @@ void CheckSubviewTileCompat(const ir::TileType& source, const ir::TileType& resu
                                         << res_v.fractal << "); pto.subview requires identical fractal";
   CHECK(src_v.pad == res_v.pad)
       << op_name << ": pad mismatch between source and result; pto.subview requires identical pad mode";
+  // An Acc compact mismatch is reachable from ordinary DSL: a matmul whose lhs carries a
+  // narrowed valid row count produces a compact L0C tile (stride ceil(validRow/16)*16), while a
+  // plain `tile.create(target_memory=Acc)` window stays non-compact (stride = physical rows).
+  // The two really do address L0C at different pitches, so the copy is not expressible as a
+  // subview — say so in the user's terms rather than in `pto.subview`'s (#2470).
+  const bool acc_windows =
+      source.GetMemorySpace() == ir::MemorySpace::Acc && result.GetMemorySpace() == ir::MemorySpace::Acc;
   CHECK(src_v.compact == res_v.compact)
-      << op_name
-      << ": compact mismatch between source and result; pto.subview requires identical compact mode";
+      << op_name << ": compact mismatch between source and result; pto.subview requires identical "
+      << "compact mode"
+      << (acc_windows ? "; the two accumulator windows disagree on their L0C fractal stride. A matmul "
+                        "whose lhs carries narrowed valid rows writes L0C at ceil(validRow/16)*16, "
+                        "and no wider full-height accumulator window can view that layout. Drop the "
+                        "narrowing from the matmul operand and compute the full tile."
+                      : "");
   CHECK(src_v.pad == ir::PadValue::null)
       << op_name << ": pto.subview does not support pad_value (" << static_cast<int>(src_v.pad)
       << "); apply tile.fillpad on the result tile instead of carrying a pad on the slice/assemble window";

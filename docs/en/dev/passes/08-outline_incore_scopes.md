@@ -51,8 +51,11 @@ program_outlined = outline_pass(program)
 5. **Replace Scope**: Replace `InCoreScopeStmt` with:
    - Call to outlined function with input arguments
    - AssignStmt for each output variable
-6. **Add to Program**: Add outlined function to program's function list
-7. **Promote the parent**: an Opaque parent that outlined at least one scope becomes
+6. **Thread control flow**: when the scope sat inside a loop or an `if`, the fresh
+   name bound for a store target defined outside that statement becomes a real
+   carry; a target created inside the body remains local (below)
+7. **Add to Program**: Add outlined function to program's function list
+8. **Promote the parent**: an Opaque parent that outlined at least one scope becomes
    `Orchestration` — and its param dyn-dim reads are folded first (below)
 
 **Param dyn-dim reads fold on promotion**: a tensor's declared extent *is* its
@@ -111,27 +114,76 @@ skip the store-target export entirely (the buffer is already visible to the
 caller through its write parameter), so their body keeps the original rebind —
 the capture still becomes a parameter, which is the part that was broken.
 
+**Which operators write** is not decided here. Each operator declares the
+effect it has on every argument (`set_arg_effect`, see
+[Operators](../ir/05-operators.md#argument-effects)), and `InferParamDirections`
+reads that. Before, this pass recognised exactly two writers — `tile.store` and
+`tensor.assemble` — so a scope whose only write to a captured tensor went
+through `tensor.write`, `tensor.expand_clone`, `pld.system.notify`,
+`pld.tile.put` or any other writer left that tensor looking untouched: the
+parameter stayed `In`, the caller got no dependency on the write, and the two
+passes that later re-derive directions disagreed with this one about the same
+call.
+
 **Write direction: `Out` unless the body reads**: a captured tensor the scope
-writes — a `tile.store` target or a `tensor.assemble` destination — is lifted
-off `In` by `InferParamDirections`. Which write direction it earns is decided by
-whether the body also *reads* it. Both write ops update a sub-region of the
-destination **in place**: the untouched region is neither loaded nor re-stored,
-so appearing in that destination slot moves no data into the scope and is not a
-read. A parameter whose only uses are destination slots is therefore `Out`;
-anything else — feeding a `tensor.slice`, a compute op, or a callee's `In`/`InOut`
-param — makes it `InOut`. Under SSA the post-write state binds to a fresh Var, so
-reading *that* alias counts too: the alias names the same buffer, and a read over
-a region the scope never wrote does need the incoming contents. Unrecognised uses
-count as reads, so the inference can only err towards `InOut`.
+writes is lifted off `In` by `InferParamDirections`. Which write direction it
+earns is decided by whether the body also *reads* it. An argument the operator
+declares `Write` updates a sub-region of the destination **in place**: the
+untouched region is neither loaded nor re-stored, so appearing in that
+destination slot moves no data into the scope and is not a read. A parameter
+whose only uses are such slots is therefore `Out`; anything else — feeding a
+`tensor.slice`, a compute op, or a callee's `In`/`InOut` param — makes it
+`InOut`. An argument declared `ReadWrite` stays on the read path, which is how
+an atomic store or assemble (`out += x` reads the accumulator) and an
+`AtomicAdd` notify keep their destination `InOut` while the plain forms do not —
+one rule, stated per operator, rather than a carve-out per pass. Under SSA the
+post-write state binds to a fresh Var, so reading *that* alias counts too: the
+alias names the same buffer, and a read over a region the scope never wrote does
+need the incoming contents. Unrecognised uses count as reads, so the inference
+can only err towards `InOut`.
 
 Two keys are excluded: `dump_vars` and `arg_direction_overrides_vars` name a
 tensor as bookkeeping (dump marking, `NoDep` opt-out) rather than accessing it.
 
-Each source of evidence — the read scan, the store-target set, the assemble scan,
-and each inner callee's declared slot — is a *lower* bound on the accesses, so
-they are merged along `In < Out < InOut` rather than overwriting one another. A
-plain assignment would let a callee that declares its slot `Out` erase a read the
-body really performs.
+Each source of evidence — the read scan, the store-target set, the body's
+declared writes, and each inner callee's declared slot — is a *lower* bound on
+the accesses, so no source may overwrite another. The body-side sources merge
+along `In < Out < InOut`.
+
+The callee slots do **not**, and this is the one place the ordering does not
+apply. `In` is the seeded *no evidence yet* floor, so it cannot also stand for
+"somebody read this" — reading it that way would promote every write-only
+capture to `InOut`, the false read of issue #2415. Folding the callee directions
+one call at a time therefore lost information: a capture handed to one callee's
+`In` slot and another's `Out` slot merged to `In`, then to `Out`, dropping the
+read. The callees' evidence is instead accumulated as two independent flags —
+`In`/`InOut` marks a read, `Out`/`InOut` marks a write — and the direction is
+derived once at the end, so such a capture comes out `InOut` while a capture
+only ever written still comes out `Out`.
+
+The read half of that verdict draws on the body scan as well as the callee
+slots, because a capture can be read by the body and overwritten by a callee:
+
+```python
+with pl.cluster():
+    value = pl.load(shared, [0, 0], [16, 128])  # this body reads it
+    self.overwrite(shared)                      # and a callee overwrites it
+```
+
+`shared` is `InOut`. Consulting only the callee slots would call it `Out` and
+tell the wrapper it need not stage the very contents `pl.load` consumes. The
+body scan can be trusted here because it skips the arguments a callee declares
+`Out` — the user-function counterpart of a builtin's declared write slot — so
+handing a capture to a write-only slot is not itself counted as a read.
+
+That skip covers `pl.submit` as well as a plain call. The base visitor does not
+forward `Submit` to the `Call` handler, so a launch needs its own rule or every
+launch argument counts as a read and a capture handed only to an `Out` slot
+comes back `InOut`. `Submit` maps `args_[i]` to `params_[i]` over a prefix
+(`args_.size() <= params_.size()`; the omitted tail is runtime-allocated), and
+the trailing `CommCtx` params that would break that identity are materialised by
+pass 43, long after any outliner runs. Its `deps_` are always read — they are
+TaskId values the launch consumes, never a write destination.
 
 **Hierarchy scopes are an exception.** `OutlineScope` deliberately leaves
 `store_output_set` empty for `ScopeKind::Hierarchy` (the buffer is already
@@ -146,7 +198,7 @@ approximation. The direction propagates into
 argument from the *callee's* direction, so a false `InOut` turns disjoint
 per-rank slices of one `pl.Out` tensor into a cross-rank write dependency
 (issue #2415). Ordering a write-only parameter genuinely needs is not lost:
-[`DeriveCallDirections`](37-derive_call_directions.md) re-derives the
+[`DeriveCallDirections`](38-derive_call_directions.md) re-derives the
 *call-site* direction and promotes a callee `Out` back to `InOut` under a
 sequential ancestor, behind a prior writer of the same root, or when the root is
 an enclosing `InOut` parameter.
@@ -181,6 +233,30 @@ automatically):
   `@pl.jit.host` program without manually renaming shared helper internals. The
   same rule applies to the sibling `OutlineHierarchyScopes` and
   `OutlineClusterScopes` passes (which share the outlining utility).
+
+**Cache-policy declarations become param indices**: a
+`pl.set_cache_policy(t, pl.CachePolicy.BYPASS)` statement in the scope body is
+hoisted by the parser onto the scope's `cache_policy_vars` attr
+(`std::vector<std::pair<VarPtr, int>>`, keyed by Var identity). This pass
+resolves each Var through the same captured-input index map the `no_dep_args`
+translation uses and re-emits the list as the outlined function's `cache_policy`
+attr — `std::vector<std::pair<int32_t, int>>` (param index, `CachePolicy` as
+int), sorted by index so declaration order and capture order cannot change the
+IR. The scope attr is **consumed here and never propagated**: from this point the
+function attr is the single carrier, until
+[`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) turns it into a
+`cache` kwarg on each `tile.load` and erases it. Param indices are only valid
+across that window — later passes both append to
+([`InjectGMPipeBuffer`](23-inject_gm_pipe_buffer.md),
+[`MaterializeDistTensorCtx`](44-materialize_dist_tensor_ctx.md)) and prepend onto
+([`MaterializeValidShapeSymbols`](49-materialize_valid_shape_symbols.md)) param
+lists. Two user errors are rejected here with `CHECK_SPAN`: a declaration naming
+a tensor the scope body does not capture (it is neither read nor written, so no parameter
+carries the policy), and `BYPASS` on a parameter `InferParamDirections` resolved
+to `Out` / `InOut` (a bypassing read of bytes the same kernel writes is a
+coherency bug). The translation lives in the shared outlining utility, so the
+sibling `OutlineHierarchyScopes` path stamps the attr the same way. See
+[GM Cache-Access Policy](../language/05-cache-policy.md).
 
 ## Example
 
@@ -261,6 +337,64 @@ def main_incore_0(self, a, b, out):
     return (out, out_b)  # out_a → param `out`; out_b is kernel-local, kept as-is
 ```
 
+### Store Targets Written Inside Control Flow
+
+A scope that writes a captured tensor is replaced by a call whose result is bound
+to a *fresh* SSA name (`out` -> `out__ssa_v1`), and every later reference to that
+tensor resolves to the fresh one. When the scope sits inside a loop or an `if`,
+the fresh name is bound **inside the body**, so a reference after the statement
+would be reading a Var that is out of scope. The pass therefore threads the
+rename out as a real carry: the value on entry seeds a new `IterArg`, the body
+yields the fresh Var, and a new `return_var` is what the following statements see.
+
+That applies only when the target's incoming value is defined outside the
+control-flow body. A scratch tensor created in the body is recreated on every
+execution: its fresh post-store name is used by later statements in the same
+body, but it does not become an `IterArg`, a yielded value, or a `return_var` of
+the enclosing statement.
+
+**Before** (the scope writes `out` once per iteration, the ReturnStmt reads it):
+
+```python
+for i in pl.range(4):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        t = pl.load(a, [i * 64, 0], [64, 128])
+        pl.store(pl.mul(t, 2.0), [i * 64, 0], out)
+return out
+```
+
+**After**:
+
+```python
+for i__idx_v0, (out__iter_v1,) in pl.range(4, init_values=(out__ssa_v0,)):
+    out__ssa_v1 = self.k_incore_0(a__ssa_v0, i__idx_v0, out__iter_v1)
+    out__rv_v1 = pl.yield_(out__ssa_v1)
+return out__rv_v1
+```
+
+An `if` gets the same treatment, and the branch that did not write yields the
+value it came in with — synthesising an `else` when the source had none, so the
+untaken path still produces a value.
+
+Rules the carry follows:
+
+| Situation | Result |
+| --------- | ------ |
+| N sibling scopes write one target in one body | one slot; the body yields the last value |
+| Target defined in the same control-flow body | local rename only; no carry on that statement |
+| Nested loops | the inner carry re-emerges as an outer carry only when the target is also defined outside the outer body |
+| The target already *is* one of the loop's iter_args | no new slot; later references resolve to that slot's `return_var` |
+| Scope at the function's top level | unchanged — the fresh name is already in scope |
+
+**Codegen is unchanged.** The yielded value is the call's result on a parameter
+the callee returns, so
+[`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md) puts it in the iter_arg's
+alias class (its written-arg and `TupleGetItemExpr` rules) and marks the carry
+**trivial**: iter_arg and return_var both emit as the init value's name. The carry
+is SSA bookkeeping, not a new buffer. Nothing miscompiled without it either --
+every SSA version of an orchestration tensor denotes the same GM buffer -- but the
+def-use graph was wrong, and `SSAVerify` / `UseAfterDef` reject that IR.
+
 ## Implementation
 
 **Header**: `include/pypto/ir/transforms/passes.h`
@@ -305,7 +439,7 @@ passes.def("outline_incore_scopes", &pass::OutlineIncoreScopes, "Outline InCore 
 explicit `pl.split_aiv` regions (`SplitAivScopeStmt`) cannot coexist on one
 scope (the outliner bridges a single region's mode into a function-level
 representative `split`, which would silently collide with the user's
-`pl.split`). See [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) for how
+`pl.split`). See [`LowerAutoVectorSplit`](21-lower_auto_vector_split.md) for how
 the surviving mechanism is lowered.
 
 **Any** `pl.split(...)` is rejected, `SplitMode.NONE` included (RFC #1820). NONE
@@ -346,7 +480,21 @@ onto the function only when all regions agree *and* that mode is a real split:
 absent key, so a `split=SplitMode.NONE` entry was invisible to every consumer —
 and the parser drops it, which made print → parse lossy (`Kwargs size mismatch`).
 The authoritative per-region mode always rides `SplitAivScopeStmt::split_`, which
-[`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) consumes. The printer
+[`LowerAutoVectorSplit`](21-lower_auto_vector_split.md) consumes. The printer
 applies the same rule as a backstop: it omits a `split` attr of `SplitMode.NONE`
 so IR that bypassed this pass (a pre-existing `.pto` blob, a programmatically
 built `Function`) still prints in the canonical, re-parsable form.
+
+## Pass Properties
+
+| Property | Value |
+| -------- | ----- |
+| Required | SSAForm |
+| Produced | SSAForm, SplitIncoreOrch, AivSplitValid |
+| Invalidated | — |
+
+`AivSplitValid` opens here. The pass preserves the first-class `SplitAivScopeStmt` regions inside
+each outlined InCore function, so the structural region verifier can run from this point until
+[`LowerAutoVectorSplit`](21-lower_auto_vector_split.md) erases the node and invalidates the
+property. `ConvertTensorToTileOps` and `InferTileMemorySpace` re-verify it in between, once the
+boundary's memory side becomes observable.

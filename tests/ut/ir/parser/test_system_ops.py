@@ -74,6 +74,83 @@ def _find_calls_in_func(func: ir.Function, op_name: str) -> list[ir.Call]:
     return found
 
 
+def test_comm_ctx_param_is_spelled_with_the_wrapper_only():
+    """A context parameter is spelled ``pld.CommCtx``; the raw name is not exported.
+
+    ``CommCtxType`` follows ``AsyncEventType`` & co.: the resolver accepts it,
+    but no namespace defines it. Python evaluates parameter annotations before
+    the parser runs, so the raw name cannot appear in that position at all.
+    """
+
+    @pl.program
+    class Wrapper:
+        @pl.function
+        def worker(self, data: pld.DistributedTensor[[64], pl.FP32], ctx: pld.CommCtx):
+            pld.system.wait(data, offsets=[0], expected=1, cmp=pld.WaitCmp.Eq)
+
+    assert isinstance(_get_func(Wrapper, "worker").params[-1].type, ir.CommCtxType)
+    assert not hasattr(pld, "CommCtxType")
+
+
+def test_comm_ctx_raw_type_name_resolves_in_a_local_binding():
+    """``CommCtxType`` stays a legacy alias, reachable where Python does not evaluate.
+
+    Local-variable annotations are never evaluated at runtime, so the raw name
+    reaches the resolver — the same path that keeps ``pl.AsyncEventType``
+    working. Both spellings must build identical IR.
+    """
+
+    def src(spelling: str) -> str:
+        return (
+            "@pl.program\n"
+            "class P:\n"
+            "    @pl.function\n"
+            "    def worker(self, data: pld.DistributedTensor[[64], pl.FP32]):\n"
+            f"        ctx: pld.{spelling} = pld.get_comm_ctx(data)\n"
+            "        return pld.system.rank(ctx)\n"
+        )
+
+    ir.assert_structural_equal(pl.parse_program(src("CommCtxType")), pl.parse_program(src("CommCtx")))
+
+
+def test_comm_ctx_param_prints_with_the_wrapper_spelling():
+    """The printer emits ``pld.CommCtx``, like every other singleton marker.
+
+    ``pld.system.rank`` is typed ``(ctx: CommCtx)``, so IR printed with a
+    materialized context parameter — the shape ``MaterializeDistTensorCtx``
+    produces — only type checks when the printer uses the wrapper name.
+    """
+
+    @pl.program
+    class P:
+        @pl.function
+        def worker(self, data: pld.DistributedTensor[[64], pl.FP32], ctx: pld.CommCtx):
+            return pld.system.rank(ctx)
+
+    printed = str(P)
+    assert "ctx: pld.CommCtx)" in printed
+    assert "pld.CommCtxType" not in printed
+    ir.assert_structural_equal(pl.parse_program(printed), P)
+
+
+def test_comm_ctx_param_feeds_rank_like_a_queried_handle():
+    """A materialized ctx parameter is usable wherever a queried handle is.
+
+    This is the shape ``MaterializeDistTensorCtx`` produces, and it only type
+    checks with the wrapper spelling — ``pld.system.rank`` takes a ``CommCtx``.
+    """
+
+    @pl.program
+    class P:
+        @pl.function
+        def worker(self, data: pld.DistributedTensor[[64], pl.FP32], ctx: pld.CommCtx):
+            return pld.system.rank(ctx)
+
+    func = _get_func(P, "worker")
+    assert isinstance(func.params[-1].type, ir.CommCtxType)
+    assert len(_find_calls_in_func(func, "pld.system.rank")) == 1
+
+
 def test_get_comm_ctx_returns_comm_ctx_typed_call():
     """``pld.get_comm_ctx(data)`` parses to a Call of type CommCtxType."""
 

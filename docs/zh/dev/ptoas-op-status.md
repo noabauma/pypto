@@ -4,7 +4,7 @@
 行 = **最新 PTOAS 提供的公共及兼容 op**。接口基线为 Little-oil/PTOAS `main`
 `d852dd2dba3e5bf7a69ce8324eb88afc336e8a33`：manual 公共接口 189 个，加当前
 `PTOOps.td` 仍保留的 source-only 兼容/tile 接口 15 个，共 204 个。列状态按
-**PyPTO 当前源码**核实（最后更新 2026-08-11）。后续每加或修改一个 op，只更新本表对应行。
+**PyPTO 当前源码**核实（最后更新 2026-08-14）。后续每加或修改一个 op，只更新本表对应行。
 
 本表包含公共/兼容接口中 PyPTO 级别为 `internal` 的 op；另有 `PTOOps.td` 中 32 个仅供
 lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO、VMI、SIMT 等其他 dialect。
@@ -79,7 +79,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tdiv | TDIV | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 真机已验证；A5 真机待验证 |
 | pto.tmax | TMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tmin | TMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.trem | TREM | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
+| pto.trem | TREM | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 FP32 及 ISA 定义域 `[-2^24, 2^24]` 内的 INT32 同名真机 ST 已通过，覆盖定义域边界、完整与尾部 valid shape；A5 真机待验证 |
 | pto.tpartadd | TPARTADD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tpartmax | TPARTMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tpartmin | TPARTMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
@@ -94,7 +94,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tdivs | TDIVS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tmaxs | TMAXS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tmins | TMINS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.trems | TREMS | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
+| pto.trems | TREMS | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 FP32 及 `[-2^24, 2^24]` 内的 INT32 scalar 同名真机 ST 已通过，覆盖 INT32 正负边界、负值与尾部 valid shape；A5 真机待验证 |
 | pto.taddc | TADD + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.tsubc | TSUB + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.taddsc | TADDS + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
@@ -110,8 +110,8 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.trelu | TRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tlrelu | TLRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.taddrelu | VADDRELU | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
-| pto.tfmod | TFMOD | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
-| pto.tfmods | TFMODS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
+| pto.tfmod | TFMOD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 FP32 tile-tile 同名真机 ST 已通过，覆盖完整与尾部 valid shape；A5 真机待验证 |
+| pto.tfmods | TFMODS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 FP32 scalar 同名真机 ST 已通过，覆盖负值与尾部 valid shape；A5 真机待验证 |
 | pto.tpow | TPOW | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tpows | TPOWS | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.trandom | TRANDOM | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | PTOAS source-only 兼容接口 |
@@ -194,7 +194,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tget_scale_addr | GetScaleAddr + TASSIGN | tile | ✅ | ✅ | ✅ | ❌ | — | NEW frontend+codegen；Mat→scale `tmov` 按源序发射，PTOAS `PTOA5NormalizeTMovPass` 重排为 bind-before-fill；见 [operators MX 约束](ir/05-operators.md#mx--ascend950ptoas-约束) |
 | pto.tmov.fp | TMOV_FP | tile | ✅ | ❌ | ❌ | ❌ | — | 已有 backend hook，缺 IR/Python 前端与 ST |
 | pto.tquant | TQUANT | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
-| pto.tquant.mx | TQUANT (overload) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
+| pto.tquant.mx | TQUANT (overload) | tile | ✅ | ✅ | ❌ | ✅ | — | A5 仅 MXFP8 独立量化前端+codegen+真机 ST（`group_axis` A/B）；MXFP4 quant 暂缓 |
 | pto.tstore_fp | TSTORE_FP | tile | ✅ | ❌ | ❌ | ❌ | — | 当前 backend 发 `pto.tstore.fp` |
 | pto.tdequant | TDEQUANT | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | **同步（8）** |  |  |  |  |  |  |  |  |

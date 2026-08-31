@@ -11,6 +11,7 @@
 
 #include "pypto/codegen/pto/pto_codegen.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
@@ -496,32 +497,39 @@ bool ShouldAliasArrayUpdateResultToInput(const AssignStmtPtr& stmt) {
 
 const auto& FlattenBody = transform_utils::FlattenToStmts;
 
-// Collects `<var> = TupleGetItemExpr(tuple_var, i)` AssignStmts. IRVisitor
-// auto-recurses through all statement kinds (Seq/For/If/While/Scope/Inline/...),
-// so this stays correct regardless of where the tuple-returning call is nested.
+// Indexes every `<var> = TupleGetItemExpr(tuple_var, i)` AssignStmt in a body,
+// keyed by the tuple Var. One walk builds the whole index, so a multi-output
+// emitter resolves its DPS destinations by lookup rather than by rescanning the
+// body per call. IRVisitor auto-recurses through all statement kinds
+// (Seq/For/If/While/Scope/Inline/...), so this stays correct regardless of where
+// the tuple-returning call is nested.
 class TupleConsumerCollector : public ir::IRVisitor {
  public:
-  explicit TupleConsumerCollector(const ir::Var* tuple_var, size_t arity)
-      : tuple_var_(tuple_var), elements_(arity, nullptr) {}
-
-  [[nodiscard]] const std::vector<ir::VarPtr>& elements() const { return elements_; }
+  [[nodiscard]] std::map<const ir::Var*, std::vector<ir::VarPtr>> Take() { return std::move(index_); }
 
  protected:
   void VisitStmt_(const ir::AssignStmtPtr& op) override {
     if (auto tge = As<ir::TupleGetItemExpr>(op->value_)) {
-      if (auto base = As<ir::Var>(tge->tuple_)) {
-        if (base.get() == tuple_var_ && tge->index_ >= 0 &&
-            static_cast<size_t>(tge->index_) < elements_.size()) {
-          elements_[tge->index_] = op->var_;
-        }
+      if (auto base = As<ir::Var>(tge->tuple_); base && tge->index_ >= 0) {
+        auto& elements = index_[base.get()];
+        const auto index = static_cast<size_t>(tge->index_);
+        if (elements.size() <= index) elements.resize(index + 1, nullptr);
+        // Only one Var can be the hardware destination for an element. A second
+        // binding would silently win, and the first one's own allocation would
+        // stay unwritten for its consumers to read as uninitialized data.
+        INTERNAL_CHECK_SPAN(!elements[index], op->span_)
+            << "Internal error: element " << index << " of tuple '" << base->name_hint_
+            << "' is bound twice, by '" << elements[index]->name_hint_ << "' and '" << op->var_->name_hint_
+            << "'; only one of them can name the destination the "
+            << "instruction writes";
+        elements[index] = op->var_;
       }
     }
     ir::IRVisitor::VisitStmt_(op);
   }
 
  private:
-  const ir::Var* tuple_var_;
-  std::vector<ir::VarPtr> elements_;
+  std::map<const ir::Var*, std::vector<ir::VarPtr>> index_;
 };
 
 }  // namespace
@@ -845,6 +853,16 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   fs_.Reset();
   fs_.current_function = func;
 
+  // Index every `<var> = <tuple>[i]` binding once. A multi-output op's Call does
+  // not carry its DPS destinations in args_ — the parser desugars them into
+  // separate AssignStmts — so an emitter has to look them up. Resolving each
+  // call by rescanning the body would be O(body) per call.
+  {
+    TupleConsumerCollector collector;
+    collector.VisitStmt(func->body_);
+    fs_.tuple_element_index = collector.Take();
+  }
+
   // Collect dyn-dim Vars from tensor-parameter shapes once. The same list
   // drives both name reservation (Site A below) and the trailing %argN: index
   // params on the MLIR signature (Site B further down) -- a single source of
@@ -1145,11 +1163,20 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
         continue;
       }
       if (fs_.ffts_workspace_vars.count(var.get()) > 0) continue;
+      // PTOAS / pto-isa special requirement (MX GM scale rank-5):
+      //   Generic parameter make_tensor_view stays logical rank-2 + layout=mx_*.
+      //   That path does not expand SFractal [16,2] correctly for A5 TLoad
+      //   (expands e.g. [64,4] to Shape<1,1,1,64,4> and fails staticShape[3]==16).
+      //   Skip it here; MX tile.load owns the packed expansion via
+      //   EmitMxPhysicalView (see that helper for a with/without example).
+      const bool is_mx_tensor =
+          tensor_type->tensor_view_.has_value() && IsMxTensorLayout(tensor_type->tensor_view_->layout);
+      RegisterBasePtr(var, GetVarName(var));
+      if (is_mx_tensor) continue;
       std::string tensor_view = NewNamedTemp(var->name_hint_ + "_view");
       BindTensorView(var, tensor_view);
       // Remember the base pointer so mid-body pl.read/pl.write resolve to !pto.ptr
       // even after a slice-assign rebinds the var to its tensor_view.
-      RegisterBasePtr(var, GetVarName(var));
 
       for (const auto& j : tensor_type->shape_) {
         if (As<ir::ConstInt>(j)) {
@@ -1260,6 +1287,13 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
   for (const auto& param : func->params_) {
     auto tensor_type = ir::AsTensorTypeLike(param->GetType());
     if (!tensor_type) continue;
+    // PTOAS / pto-isa: MX tile.load owns its packed rank-5 view
+    // (EmitMxPhysicalView).  Do not register a generic logical rank-2 parameter
+    // view for these tensors — that would reintroduce the broken SFractal
+    // expansion described on EmitMxPhysicalView.
+    if (tensor_type->tensor_view_.has_value() && IsMxTensorLayout(tensor_type->tensor_view_->layout)) {
+      continue;
+    }
     // Core-group outlining keeps the complete public signature on both the
     // AIC and AIV functions.  Do not materialize a view for a tensor that the
     // outlined body does not reference: PTOAS cannot infer a non-ND layout for
@@ -1451,6 +1485,13 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   // extent is conveyed via valid_row / valid_col operands below.
   fields.type_str = GetTileBufTypeStringFromTileType(tile_type);
 
+  // Every `pto.alloc_tile` PyPTO emits passes through here, so this is the one
+  // place a physically illegal box grid can be caught with the IR location and
+  // an actionable remedy -- rather than by PTOAS, whose message names its own
+  // internals and points at whichever line the location happened to carry.
+  CheckBoxedTileExtents(*tile_type, ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_)),
+                        current_span_);
+
   // Cast a non-index integer SSA to `index` (PTOAS expects index typed
   // valid_row / valid_col operands). Floating-point operands are rejected.
   auto cast_to_index = [&](const std::string& ssa, const ir::ExprPtr& expr) -> std::string {
@@ -1482,6 +1523,11 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   // FP4 Vec tile_bufs use PTOAS's physical x2-carrier coordinates along the
   // BLayout packed axis. PyPTO keeps logical nibble shapes internally; matrix
   // spaces are excluded because TMATMUL_MX has its own logical-dimension ABI.
+  //
+  // PTOAS special requirement (FP4 Vec physical valid_shape): valid_row /
+  // valid_col operands on pto.alloc_tile must use the packed physical extent
+  // (logical / 2) on that axis. Skipping this conversion makes PTOAS reject
+  // or mis-size the tile relative to the f4E2M1x2 carrier.
   const auto memory_space = tile_type->GetMemorySpace();
   const auto tile_view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
   const bool packed_fp4_vec =
@@ -2256,11 +2302,48 @@ ir::VarPtr PTOCodegen::GetCurrentResultVar() const { return fs_.current_result_v
 std::vector<ir::VarPtr> PTOCodegen::ResolveTupleResultElements(const ir::VarPtr& tuple_var,
                                                                size_t arity) const {
   INTERNAL_CHECK(tuple_var) << "Internal error: ResolveTupleResultElements requires non-null tuple_var";
-  INTERNAL_CHECK(fs_.current_function)
-      << "Internal error: ResolveTupleResultElements requires current_function";
-  TupleConsumerCollector collector(tuple_var.get(), arity);
-  collector.VisitStmt(fs_.current_function->body_);
-  return collector.elements();
+  std::vector<ir::VarPtr> elements(arity, nullptr);
+  const auto it = fs_.tuple_element_index.find(tuple_var.get());
+  if (it == fs_.tuple_element_index.end()) return elements;
+  const size_t resolved = std::min(arity, it->second.size());
+  std::copy_n(it->second.begin(), resolved, elements.begin());
+  return elements;
+}
+
+std::vector<ir::VarPtr> PTOCodegen::ResolveTupleResultElements(const ir::CallPtr& op) const {
+  INTERNAL_CHECK(op && op->op_)
+      << "Internal error: ResolveTupleResultElements requires a call with an operator";
+  const auto& entry = ir::OpRegistry::GetInstance().GetEntry(op->op_->name_);
+  const size_t arity = entry.GetOutputArity();
+  INTERNAL_CHECK_SPAN(arity > 1, op->span_)
+      << "Internal error: '" << op->op_->name_ << "' has output arity " << arity
+      << "; only a multi-output operator has tuple elements to resolve";
+  return ResolveTupleResultElements(GetCurrentResultVar(), arity);
+}
+
+std::vector<PTOCodegen::TupleOutput> PTOCodegen::PrepareTupleOutputs(const ir::CallPtr& op) {
+  const auto element_vars = ResolveTupleResultElements(op);
+  std::vector<TupleOutput> outputs;
+  outputs.reserve(element_vars.size());
+  for (size_t i = 0; i < element_vars.size(); ++i) {
+    // The hardware writes every destination whether or not the program reads it,
+    // so a missing binding is not "an output nobody wanted" — it is a buffer the
+    // intrinsic is about to scribble into with no allocation behind it.
+    INTERNAL_CHECK_SPAN(element_vars[i], op->span_)
+        << "Internal error: '" << op->op_->name_ << "' output " << i << " has no `<var> = tuple[" << i
+        << "]` binding to name its destination";
+    auto tile_type = ir::GetTileTypeWithMemRef(element_vars[i]->GetType());
+    INTERNAL_CHECK_SPAN(tile_type, element_vars[i]->span_)
+        << "Internal error: '" << op->op_->name_ << "' output " << i
+        << " must have TileType with MemRef set by InitMemRef";
+    // Eagerly allocate: the destinations are written by this instruction, before
+    // the `<var> = tuple[i]` AssignStmts that would otherwise emit them. The
+    // emission is idempotent, so those AssignStmts then skip re-emitting.
+    EmitAllocTileForVar(element_vars[i], tile_type);
+    outputs.push_back(TupleOutput{GetVarName(element_vars[i]), GetTileBufTypeStringFromTileType(tile_type),
+                                  element_vars[i], tile_type});
+  }
+  return outputs;
 }
 
 void PTOCodegen::Emit(const std::string& line) { stream_ << GetIndent() << line << LocSuffix() << "\n"; }
@@ -2475,6 +2558,11 @@ std::string PTOCodegen::TryGetTensorView(const VarPtr& tensor_var) const {
   return "";
 }
 
+bool PTOCodegen::NoteCacheBypassWarned(const ir::Var* tensor) {
+  INTERNAL_CHECK(tensor != nullptr) << "Internal error: null tensor passed to NoteCacheBypassWarned";
+  return fs_.cache_bypass_warned.insert(tensor).second;
+}
+
 std::string PTOCodegen::GetOrCreateTensorView(const VarPtr& tensor_var) {
   std::string view = TryGetTensorView(tensor_var);
   INTERNAL_CHECK_SPAN(!view.empty(), tensor_var->span_)
@@ -2530,20 +2618,40 @@ std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
 
   // `pto.alloc_tile` conveys the valid extent through `valid_row` / `valid_col`
   // operands, so ExtractTileTypeInfo always renders `v_row=?, v_col=?`. A view op
-  // that takes NO such operands — `pto.treshape` — cannot: ptoas default-
+  // that takes NO such operands — `pto.treshape` — cannot: PTOAS default-
   // constructs its destination tile from the result type alone, so a dynamic
   // valid leaves the tile's valid extent at zero and every consumer silently
   // becomes a no-op. Render static valid dims whenever the view's effective
   // valid_shape is statically known.
+  //
+  // This static-valid type string is the PTOAS-facing half of
+  // EmitStaticValidTileView (pto.tquant.mx / X-to-ZZ requireStaticShape): the
+  // treshape result type must carry concrete v_row/v_col, not `?`.
+  //
+  // PTOAS special requirement (FP4 Vec physical valid_shape): when the tile is
+  // FP4 in Vec, also convert the BLayout packed axis from logical nibble
+  // extent to f4E2M1x2 physical extent (/2) so the static type matches the
+  // carrier coordinates PTOAS expects on that tile_buf.
   const auto view = ir::tile_view_semantics::GetEffectiveTileView(*tile_type);
   const auto& valid = view.valid_shape;
+  const bool packed_fp4_vec = tile_type->dtype_ == DataType::FP4 && *memory_space == ir::MemorySpace::Vec;
+  const size_t packed_dim = view.blayout == ir::TileLayout::col_major ? 0 : 1;
+  auto physical_valid = [&](int64_t value, size_t dim) {
+    if (packed_fp4_vec && dim == packed_dim) {
+      CHECK(value > 0 && value % 2 == 0) << "FP4 Vec view valid_shape packed dimension must be a positive "
+                                            "even logical extent for PTOAS, got "
+                                         << value;
+      return value / 2;
+    }
+    return value;
+  };
   if (valid.size() == 1) {
     // Match ComputeAllocTileFields / ExtractTileTypeInfo: a 1-D valid_shape
     // maps to rows=1, cols=shape[0]. Without this a 1-D reshape view keeps the
     // dynamic zero-valid extent and its consumers become silent no-ops.
     if (auto v_col = As<ir::ConstInt>(valid[0])) {
       c.v_row = 1;
-      c.v_col = v_col->value_;
+      c.v_col = physical_valid(v_col->value_, 1);
       c.v_row_dynamic = false;
       c.v_col_dynamic = false;
     }
@@ -2551,8 +2659,8 @@ std::string PTOCodegen::GetViewTileBufTypeStringFromTileType(
     auto v_row = As<ir::ConstInt>(valid[0]);
     auto v_col = As<ir::ConstInt>(valid[1]);
     if (v_row && v_col) {
-      c.v_row = v_row->value_;
-      c.v_col = v_col->value_;
+      c.v_row = physical_valid(v_row->value_, 0);
+      c.v_col = physical_valid(v_col->value_, 1);
       c.v_row_dynamic = false;
       c.v_col_dynamic = false;
     }

@@ -339,6 +339,23 @@ class StructuralHasher {
         // structural_equal compares it element-wise.
         const auto& idxs = AnyCast<std::vector<int32_t>>(value, "hashing kwarg: " + key);
         for (int32_t v : idxs) h = hash_combine(h, std::hash<int32_t>{}(v));
+      } else if (value.type() == typeid(std::vector<std::pair<int32_t, int>>)) {
+        // ``kAttrCachePolicyParams`` on an outlined Function: (param index,
+        // policy) pairs. Both halves are integers, so both are hashed in order;
+        // structural_equal compares the vector element-wise.
+        const auto& pairs = AnyCast<std::vector<std::pair<int32_t, int>>>(value, "hashing kwarg: " + key);
+        for (const auto& [idx, policy] : pairs) {
+          h = hash_combine(h, std::hash<int32_t>{}(idx));
+          h = hash_combine(h, std::hash<int>{}(policy));
+        }
+      } else if (value.type() == typeid(std::vector<std::pair<VarPtr, int>>)) {
+        // ``kAttrCachePolicyVars`` on a ScopeStmt: (Var, policy) pairs. Only the
+        // policy half is hashed — the Var half is skipped for the same reason as
+        // the Var-valued attrs below (HashNode is auto-mapping-counter-order
+        // dependent). structural_equal still compares the Vars, so this only
+        // makes the hash coarser, never wrong.
+        const auto& pairs = AnyCast<std::vector<std::pair<VarPtr, int>>>(value, "hashing kwarg: " + key);
+        for (const auto& entry : pairs) h = hash_combine(h, std::hash<int>{}(entry.second));
       } else if (value.type() == typeid(VarPtr) || value.type() == typeid(std::vector<VarPtr>) ||
                  value.type() == typeid(ExprPtr)) {
         // Var-/Expr-valued attrs (task_id_var / manual_dep_edges / dump_vars /
@@ -546,9 +563,21 @@ StructuralHasher::result_type StructuralHasher::HashType(const TypePtr& type) {
         INTERNAL_CHECK(dim) << "structural_hash encountered null stride dimension in TileView";
         h = hash_combine(h, HashNode(dim));
       }
-      // Hash start_offset
-      INTERNAL_CHECK(tv.start_offset) << "structural_hash encountered null start_offset in TileView";
-      h = hash_combine(h, HashNode(tv.start_offset));
+      // Hash start_offset. Unlike valid_shape / stride elements, a null
+      // start_offset is a legal TileView state, not a construction bug: the
+      // default ctor leaves it unset (type.h), pl.TileView(...) defaults it to
+      // None, and IsImplicitPrintedTileView reads non-null as "explicit
+      // offset". EqualType compares it through the null-tolerant Equal(...)
+      // (structural_equal.cpp), so asserting here broke equal => equal-hash by
+      // aborting on a type structural_equal happily accepts. Hash the
+      // presence tag the way the optional fields around this branch do, and
+      // mirror ir::Hash(const TileView&)'s null tolerance (type.cpp).
+      if (tv.start_offset) {
+        h = hash_combine(h, static_cast<result_type>(1));  // indicate presence
+        h = hash_combine(h, HashNode(tv.start_offset));
+      } else {
+        h = hash_combine(h, static_cast<result_type>(0));  // indicate absence
+      }
       // Hash blayout
       h = hash_combine(h, static_cast<result_type>(tv.blayout));
       // Hash slayout

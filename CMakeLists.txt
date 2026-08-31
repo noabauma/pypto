@@ -56,7 +56,32 @@ endif()
 # Compiler flags
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0")
 set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG")
+
+# RelWithDebInfo's debug level is a knob rather than a literal, because its two
+# consumers want different things from it. Level 2 is what a developer needs
+# under a debugger: locals and types. Level 1 keeps function descriptions and
+# the line-number tables -- everything libbacktrace reads to turn a PC into the
+# `File "src/...", line N` frames tests/ut/core/test_error.py pins -- and drops
+# the rest.
+#
+# Measured on this tree with gcc 15.2, the compiler CI builds with: the
+# extension goes 304 MiB -> 62.5 MiB and the wheel around it 111 MiB -> 18 MiB,
+# the compile is about a third faster, and the backtraces come out
+# byte-identical. .debug_line survives at 6.2 MiB; .debug_loclists (variable
+# locations) goes to zero and .debug_info drops 206 MiB -> 22 MiB.
+#
+# The default stays 2, so a local build is exactly what it was. CI passes 1: it
+# never attaches a debugger to what it builds, and it pays for the difference
+# once per build and eight more times per run in wheel installs.
+set(PYPTO_DEBUG_INFO_LEVEL "2" CACHE STRING
+    "Debug info level for RelWithDebInfo builds: 2 = full, 1 = backtraces only")
+set_property(CACHE PYPTO_DEBUG_INFO_LEVEL PROPERTY STRINGS 0 1 2 3)
+if(NOT PYPTO_DEBUG_INFO_LEVEL MATCHES "^[0-3]$")
+    message(FATAL_ERROR
+        "PYPTO_DEBUG_INFO_LEVEL must be a gcc/clang debug level 0-3, got "
+        "'${PYPTO_DEBUG_INFO_LEVEL}'")
+endif()
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g${PYPTO_DEBUG_INFO_LEVEL} -O2 -DNDEBUG")
 
 # Fix debug info paths when building in a temp directory (e.g., pip install)
 # This remaps paths in DWARF debug info so backtraces show clean relative paths
@@ -101,6 +126,7 @@ set(PYPTO_SOURCES
     src/ir/op/tile_ops/matmul.cpp
     src/ir/op/tile_ops/matmul_mx.cpp
     src/ir/op/tile_ops/memory.cpp
+    src/ir/op/tile_ops/quant_mx.cpp
     src/ir/op/tile_ops/reduction.cpp
     src/ir/op/tile_ops/transform.cpp
     src/ir/op/tile_ops/unary.cpp
@@ -157,6 +183,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/dsa/memref_dsa_adapter.cpp
     src/ir/transforms/dsa/reuse_penalty_recognizer.cpp
     src/ir/transforms/allocate_memory_addr_pass.cpp
+    src/ir/transforms/block_nz_tensor_views_pass.cpp
     src/ir/transforms/canonicalize_tile_slice_pass.cpp
     src/ir/transforms/fold_no_op_reshape_pass.cpp
     src/ir/transforms/stamp_tfree_split_pass.cpp
@@ -171,6 +198,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/materialize_comm_domain_scopes_pass.cpp
     src/ir/transforms/lower_host_tensor_collectives_pass.cpp
     src/ir/transforms/materialize_dist_tensor_ctx_pass.cpp
+    src/ir/transforms/legalize_graph_boundary_pass.cpp
     src/ir/transforms/materialize_valid_shape_symbols_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
@@ -197,6 +225,13 @@ set(PYPTO_SOURCES
     src/ir/transforms/lower_auto_vector_split_pass.cpp
     src/ir/transforms/split_vector_kernel_pass.cpp
     src/ir/transforms/auto_tile_matmul_l0_pass.cpp
+    src/ir/transforms/window_externalization/analysis.cpp
+    src/ir/transforms/window_externalization/callee_rewrite.cpp
+    src/ir/transforms/window_externalization/common.cpp
+    src/ir/transforms/window_externalization/localizers.cpp
+    src/ir/transforms/window_externalization/orch_rewriter.cpp
+    src/ir/transforms/window_externalization/pass.cpp
+    src/ir/transforms/flatten_tile_nd_to_2d/acc_packing.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/analysis.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/batch_matmul.cpp
     src/ir/transforms/flatten_tile_nd_to_2d/pass.cpp
@@ -218,6 +253,8 @@ set(PYPTO_SOURCES
     src/ir/transforms/canonicalize_io_order_pass.cpp
     src/ir/transforms/structural_equal.cpp
     src/ir/transforms/structural_hash.cpp
+    src/ir/transforms/utils/acc_init_builder.cpp
+    src/ir/transforms/utils/narrow_loop_carry.cpp
     src/ir/transforms/utils/buffer_root_collector.cpp
     src/ir/transforms/utils/core_affinity.cpp
     src/ir/transforms/utils/core_side_ops.cpp
@@ -230,14 +267,15 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/normalize_stmt_structure.cpp
     src/ir/transforms/utils/op_predicates.cpp
     src/ir/transforms/utils/parent_stmt_analysis.cpp
+    src/ir/transforms/utils/pipeline_loop_utils.cpp
     src/ir/transforms/utils/return_lineage_utils.cpp
+    src/ir/transforms/utils/result_alias_utils.cpp
     src/ir/transforms/utils/scope_outline_utils.cpp
     src/ir/transforms/utils/split_axis_utils.cpp
     src/ir/transforms/utils/stmt_dependency_analysis.cpp
     src/ir/transforms/utils/transform_utils.cpp
     src/ir/transforms/utils/wrapper_call_utils.cpp
     src/ir/transforms/utils/window_alias_utils.cpp
-    src/ir/transforms/utils/window_externalization.cpp
     src/ir/transforms/visitor.cpp
 
     # IR - Verifier
@@ -246,8 +284,10 @@ set(PYPTO_SOURCES
     src/ir/verifier/mixed_kernel_expanded_verifier.cpp
     src/ir/verifier/verify_hard_syncall_occupancy.cpp
     src/ir/verifier/verify_aiv_split.cpp
+    src/ir/verifier/verify_acc_compact.cpp
     src/ir/verifier/verify_acc_to_gm_store.cpp
     src/ir/verifier/verify_atomic_add_dtype.cpp
+    src/ir/verifier/warning_in_param_written.cpp
     src/ir/verifier/verify_ssa_pass.cpp
     src/ir/verifier/verify_no_nested_call_pass.cpp
     src/ir/verifier/verify_no_nested_incore.cpp
@@ -269,11 +309,13 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_call_directions.cpp
     src/ir/verifier/verify_tile_type_coherence.cpp
     src/ir/verifier/verify_assign_type_symmetry.cpp
+    src/ir/verifier/verify_graph_functions.cpp
     src/ir/verifier/verify_orchestration_references.cpp
     src/ir/verifier/verify_tensor_view_canonical.cpp
     src/ir/verifier/diagnostic_check_registry.cpp
     src/ir/verifier/warning_unused_var.cpp
     src/ir/verifier/warning_out_param_write_dropped.cpp
+    src/ir/verifier/warning_scalar_write_line_shared.cpp
     src/ir/verifier/perf_hint_tile_innermost_dim.cpp
 
     # IR - Serialization

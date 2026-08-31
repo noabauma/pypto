@@ -208,6 +208,11 @@ REGISTER_OP("builtin.tensor.allreduce")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.allreduce")
+    // Host-level collective: same read/write shape as the pld.tensor.* form
+    // it lowers from — the data window is updated in place and the signal is
+    // written by the notify phase and read by the wait phase.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
+    .set_arg_effect(1, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceBuiltinTensorAllReduceType);
 
 REGISTER_OP("builtin.tensor.allreduce_ring")
@@ -220,6 +225,11 @@ REGISTER_OP("builtin.tensor.allreduce_ring")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.allreduce_ring")
+    // Host-level collective: same read/write shape as the pld.tensor.* form
+    // it lowers from — the data window is updated in place and the signal is
+    // written by the notify phase and read by the wait phase.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
+    .set_arg_effect(1, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceBuiltinTensorAllReduceRingType);
 
 // ============================================================================
@@ -258,6 +268,8 @@ REGISTER_OP("pld.tensor.barrier")
     .set_op_category("DistributedOp")
     .add_argument("signal", "Window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .no_memory_spec()
+    // Composite collective — signal is written by the notify phase and read by the wait phase.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceTensorBarrierType);
 
 // ============================================================================
@@ -311,6 +323,9 @@ REGISTER_OP("pld.tensor.broadcast")
     .add_argument("signal", "Window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .set_attr<int>("root")
     .no_memory_spec()
+    // Composite collective — target is read on the root and written on every rank; signal is notify+wait.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
+    .set_arg_effect(1, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceTensorBroadcastType);
 
 // ============================================================================
@@ -430,6 +445,15 @@ REGISTER_OP("pld.tensor.allgather")
     .add_argument("target", "Window-bound DistributedTensor[NR, SIZE] — gathered result in-place (InOut)")
     .add_argument("signal", "Window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .no_memory_spec()
+    // notify+wait.
+    // Composite collective — the data destination is overwritten, not updated:
+    // the lowering only pushes into it (`pld.tile.put`) and never loads from it,
+    // so nothing moves into the kernel through it. Declaring `ReadWrite` here
+    // would make the enclosing parameter `InOut`, stage the buffer host->device
+    // and invent a dependency on its incoming content. The signal is genuinely
+    // both: written by the notify phase and read by the wait phase.
+    .set_arg_effect(1, ArgEffect::Write)
+    .set_arg_effect(2, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceTensorAllGatherType);
 
 // ============================================================================
@@ -526,6 +550,15 @@ REGISTER_OP("pld.tensor.all_to_all")
                   "Window-bound DistributedTensor [NR, SIZE] — receives the result in-place (InOut)")
     .add_argument("signal", "Window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .no_memory_spec()
+    // is notify+wait.
+    // Composite collective — the data destination is overwritten, not updated:
+    // the lowering only pushes into it (`pld.tile.put`) and never loads from it,
+    // so nothing moves into the kernel through it. Declaring `ReadWrite` here
+    // would make the enclosing parameter `InOut`, stage the buffer host->device
+    // and invent a dependency on its incoming content. The signal is genuinely
+    // both: written by the notify phase and read by the wait phase.
+    .set_arg_effect(1, ArgEffect::Write)
+    .set_arg_effect(2, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceTensorAllToAllType);
 
 // ============================================================================
@@ -601,9 +634,10 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << target_dim0->value_ << ")";
 
   // send_counts: per-destination row counts, read at runtime by the lowering
-  // (``tensor.read``) to bound each destination's push loop — this is what
-  // makes the exchange genuinely variable-size rather than a padded transfer
-  // of the full MAX_RECV capacity.  Tensor-like so counts that live in a
+  // (``tensor.read``) and used for two distinct things — it sizes the TPUT
+  // transfer extent (so only the payload crosses the wire, not the full
+  // MAX_RECV capacity) and it is published to the peer as recv_counts (so the
+  // receiver knows which rows are valid).  Tensor-like so counts that live in a
   // window (e.g. published by a preceding exchange) are accepted too.
   auto counts_type = AsTensorTypeLike(args[3]->GetType());
   CHECK(counts_type) << "pld.tensor.all_to_all_v send_counts must be a Tensor or DistributedTensor, got "
@@ -661,23 +695,21 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
 REGISTER_OP("pld.tensor.all_to_all_v")
     .set_description(
         "All-to-all: variable-size personalized exchange (push-based, "
-        "window-as-result).  Each rank pushes a full MAX_RECV-row capacity "
-        "block to each peer via ``pld.tile.put``, into a 2D staging window "
-        "[NR*MAX_RECV, SIZE] addressed with flat row-index arithmetic "
-        "``dest*MAX_RECV+r``; only ``send_counts[dest]`` of those rows — a "
-        "runtime, data-dependent count — are logically valid.  MAX_RECV is "
-        "the compile-time per-peer capacity; counts above it are clamped.  "
-        "The push always transfers the full MAX_RECV-row capacity block per "
-        "destination (a compile-time-sized ``pld.tile.put``, independent of "
-        "the runtime count) — rows beyond a sender's actual count still cross "
-        "the wire, but the receiver skips them using ``recv_counts`` "
-        "(MPI_Alltoallv semantics apply to the logical result, not the wire "
-        "transfer).  During the same push phase each rank also publishes "
-        "``min(send_counts[dest], MAX_RECV)`` into peer ``dest``'s "
+        "window-as-result).  Each rank pushes ``rows = clamp(send_counts[dest], "
+        "0, MAX_RECV)`` rows to each peer via ``pld.tile.put``, into a 2D "
+        "staging window [NR*MAX_RECV, SIZE] addressed with flat row-index "
+        "arithmetic ``dest*MAX_RECV+r``; MAX_RECV is the compile-time per-peer "
+        "capacity.  The transfer extent is the runtime count ``[rows, SIZE]``, "
+        "so only the payload crosses the wire — rows past the transfer extent "
+        "in the receiver's capacity slot are left unwritten, never filled with "
+        "the sender's surplus.  Those bytes are UNINITIALISED and may decode as "
+        "NaN/Inf, unlike the finite FP32 surplus the old full-capacity push left "
+        "there: trim to ``recv_counts`` BEFORE computing over the capacity "
+        "block, or NaN propagates into otherwise-valid rows.  During the same push phase "
+        "each rank publishes that same clamped count into peer ``dest``'s "
         "``recv_counts[my_rank, 0]`` via ``pld.system.notify`` (Set) — the "
         "receive-side count vector (MPI_Alltoallv recvcounts) identifying how "
-        "many of the physically-transferred rows are logically valid, so the "
-        "receiver can skip the rest. "
+        "many rows are logically valid, so the receiver skips the rest.  "
         "Returns the target window so the caller can read back via "
         "``tile.load`` — same pattern as the symmetric "
         "``pld.tensor.all_to_all`` intrinsic.")
@@ -696,6 +728,16 @@ REGISTER_OP("pld.tensor.all_to_all_v")
                   "Window-bound INT32 DistributedTensor [NR, 1] — after the barrier, "
                   "recv_counts[src, 0] holds how many rows src sent to this rank (InOut)")
     .no_memory_spec()
+    // stays read-only.
+    // Composite collective — the data destination is overwritten, not updated:
+    // the lowering only pushes into it (`pld.tile.put`) and never loads from it,
+    // so nothing moves into the kernel through it. Declaring `ReadWrite` here
+    // would make the enclosing parameter `InOut`, stage the buffer host->device
+    // and invent a dependency on its incoming content. The signal is genuinely
+    // both: written by the notify phase and read by the wait phase.
+    .set_arg_effect(1, ArgEffect::Write)
+    .set_arg_effect(2, ArgEffect::ReadWrite)
+    .set_arg_effect(4, ArgEffect::Write)
     .f_deduce_type(DeduceTensorAllToAllVType);
 
 // ============================================================================
@@ -754,6 +796,9 @@ REGISTER_OP("pld.tensor.reduce_scatter")
     .add_argument("signal", "Window-bound INT32 DistributedTensor used as cross-rank barrier (InOut)")
     .set_attr<int>("op")
     .no_memory_spec()
+    // Composite collective — same five-phase shape as allreduce.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
+    .set_arg_effect(1, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceTensorReduceScatterType);
 
 // ============================================================================
@@ -782,6 +827,10 @@ REGISTER_OP("builtin.tensor.barrier")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.barrier")
+    // Host-level collective: same read/write shape as the pld.tensor.* form
+    // it lowers from — the data window is updated in place and the signal is
+    // written by the notify phase and read by the wait phase.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceBuiltinTensorBarrierType);
 
 // ============================================================================
@@ -824,6 +873,11 @@ REGISTER_OP("builtin.tensor.broadcast")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.broadcast")
+    // Host-level collective: same read/write shape as the pld.tensor.* form
+    // it lowers from — the data window is updated in place and the signal is
+    // written by the notify phase and read by the wait phase.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
+    .set_arg_effect(1, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceBuiltinTensorBroadcastType);
 
 // ============================================================================
@@ -867,6 +921,11 @@ REGISTER_OP("builtin.tensor.reduce_scatter")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.reduce_scatter")
+    // Host-level collective: same read/write shape as the pld.tensor.* form
+    // it lowers from — the data window is updated in place and the signal is
+    // written by the notify phase and read by the wait phase.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
+    .set_arg_effect(1, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceBuiltinTensorReduceScatterType);
 
 // ============================================================================
@@ -945,6 +1004,14 @@ REGISTER_OP("builtin.tensor.allgather")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.allgather")
+    // Composite collective — the data destination is overwritten, not updated:
+    // the lowering only pushes into it (`pld.tile.put`) and never loads from it,
+    // so nothing moves into the kernel through it. Declaring `ReadWrite` here
+    // would make the enclosing parameter `InOut`, stage the buffer host->device
+    // and invent a dependency on its incoming content. The signal is genuinely
+    // both: written by the notify phase and read by the wait phase.
+    .set_arg_effect(1, ArgEffect::Write)
+    .set_arg_effect(2, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceBuiltinTensorAllGatherType);
 
 // ============================================================================
@@ -1030,6 +1097,14 @@ REGISTER_OP("builtin.tensor.all_to_all")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.all_to_all")
+    // Composite collective — the data destination is overwritten, not updated:
+    // the lowering only pushes into it (`pld.tile.put`) and never loads from it,
+    // so nothing moves into the kernel through it. Declaring `ReadWrite` here
+    // would make the enclosing parameter `InOut`, stage the buffer host->device
+    // and invent a dependency on its incoming content. The signal is genuinely
+    // both: written by the notify phase and read by the wait phase.
+    .set_arg_effect(1, ArgEffect::Write)
+    .set_arg_effect(2, ArgEffect::ReadWrite)
     .f_deduce_type(DeduceBuiltinTensorAllToAllType);
 
 // ============================================================================
@@ -1184,6 +1259,15 @@ REGISTER_OP("builtin.tensor.all_to_all_v")
     .no_memory_spec()
     .set_internal_only(true)
     .set_template_dir(":pypto.runtime.builtins.collectives.all_to_all_v")
+    // Composite collective — the data destination is overwritten, not updated:
+    // the lowering only pushes into it (`pld.tile.put`) and never loads from it,
+    // so nothing moves into the kernel through it. Declaring `ReadWrite` here
+    // would make the enclosing parameter `InOut`, stage the buffer host->device
+    // and invent a dependency on its incoming content. The signal is genuinely
+    // both: written by the notify phase and read by the wait phase.
+    .set_arg_effect(1, ArgEffect::Write)
+    .set_arg_effect(2, ArgEffect::ReadWrite)
+    .set_arg_effect(4, ArgEffect::Write)
     .f_deduce_type(DeduceBuiltinTensorAllToAllVType);
 
 }  // namespace ir

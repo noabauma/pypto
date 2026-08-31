@@ -62,7 +62,8 @@ program_simplified = simplify_pass(program)
    - `AssignStmt`：对不在 `multi_assigned_` 中的标量 LHS `Var`，把化简后的 RHS 注册到分析器。函数体顶层的 `ConstInt`/`ConstFloat`/`ConstBool` RHS 会被完整绑定（字面量代入下游使用点）；符号 RHS，或循环/分支内部的常量，只贡献一个 `ConstIntBound`，使恒死的分支守卫得以折叠而不会内联该标量。每个绑定都会被记录，以便所在区域的访问器在退出时解绑。
    - `ForStmt`：在访问循环体前重建 `iter_args_`，使体内的引用对应到新的标识；如果 `start_` 与 `stop_` 都折叠为 `ConstInt` 且 `stop > start`，则在访问循环体期间把循环变量绑定到这一区间，退出时解绑；体内绑定的标量在访问结束后解绑；在访问体之后重建 `return_vars_`，让体内发现的折叠也反映到返回类型中。纯单次/零次循环还会被原地折叠 —— 见下文「控制流折叠」。
    - `IfStmt`：进入 `Analyzer::GetConstraintContext(cond)` 处理 then 分支，进入 `Not(cond)` 处理 else 分支；每个分支内绑定的标量会在该分支结束后解绑，以免泄漏到另一分支或越过 `IfStmt`。可由分析器证明的条件也会被折叠 —— 见下文「控制流折叠」。
-   - `WhileStmt` / `SpmdScopeStmt`：以同样的区域化标量解绑方式访问循环体；`SpmdScopeStmt` 还会折叠 `core_num_`（如 `MAX // TILE` 这样的闭包算术，可能需要 SSA 之后再化简一次）。
+   - `WhileStmt`：除没有循环边界外与 `ForStmt` 相同 —— 在访问条件与循环体前重建 `iter_args_`，在访问循环体前后快照并恢复 `var_remap_`，随后重建 `return_vars_`，并采用同样的区域化标量解绑方式。先重建 `iter_args_` 是必需的，而非可有可无：`IterArg` 的*使用*与其声明是同一个节点并携带 `initValue_`，因此当分析器改写了 init 之后，基类 `IRMutator` 会在第一处使用点新建一个 `IterArg`。以循环头为准写入 `var_remap_`，可使所有引用都解析到同一个节点；若省略这一步，循环头仍指向旧的 `IterArg`，而体内所有使用都指向一个未定义的克隆节点（表现为 `UseAfterDef` 失败）。
+   - `SpmdScopeStmt`：以同样的区域化标量解绑方式访问其语句体，并额外折叠 `core_num_`（如 `MAX // TILE` 这样的闭包算术，可能需要 SSA 之后再化简一次）。
 3. **类型重建**：`SimplifyType` 递归地处理 `TensorType`、`TileType`、`TupleType`，对每一个嵌入的表达式（shape、stride、valid_shape、start_offset、view 字段）调用 `SimplifyExpr`。当无变化时保留原对象，使往返一致性检查仍然便宜。
 4. **标量 DCE**：mutator 完成后，`dce::EliminateDeadScalarAssignments` 在展平的函数体上运行，删除所有「全部使用都被折掉了」的标量 `AssignStmt`。该 DCE 是保守的：永远不会删除 Call 支撑的赋值，因为 IR 目前还没有纯度标注，`Call` 可能存在可观察的副作用。
 5. **循环状态修复**：如果 DCE 删除了任何语句，由 `loop_repair::MakeBody` 重新组装函数体，确保循环携带元信息（yield/return 映射）保持一致。
@@ -77,6 +78,18 @@ program_simplified = simplify_pass(program)
 在循环体上使用 `DeepClone` 且 `clone_def_vars=true`（而非就地的 `var_remap_` 覆盖），是为了让展开后的循环体在每个定义点获得全新的 `Var` 标识，与 `LoopUnrollMutator` 保持一致。这样提升后的副本在结构上与原（已丢弃的）循环体相互独立，并使重新访问时能在与外围作用域不同的标识上绑定循环体内的标量。
 
 `return_vars` 通过 `var_remap_` 代换而非直接产出 `AssignStmt(rv, yielded)`，这是有意为之：编排（orchestration）代码生成器的角色感知命名消歧（`role == "out"` 等）会把多个 role 标签的 SSA 版本折叠到同一个 C++ 标识符，于是 `out__rv_v2 = out__co_l0_rv_v3` 这样的别名赋值会下沉为不合法的 `auto out = out;`。在使用点代换可以完全绕开消歧。
+
+#### 逃逸的 return var
+
+代换只能作用于「`var_remap_` 条目仍然有效时被访问到」的使用点，而 `ForStmt`、`WhileStmt`、`IfStmt` 在离开各自的体时都会把 `var_remap_` 恢复到进入前的基线，以免体内的 remap 改写兄弟语句或循环之后的代码。活过这次恢复的使用点会继续指向原始 `Var` —— 而折叠恰好删除了它唯一的定义，形成 `UseAfterDefCheck` 会报告的悬空引用。
+
+`ReturnVarEscapeIndex`（位于 `simplify_pass.cpp` 的前置分析）按折叠点逐一判定。它对函数体做一次遍历，用前序编号标记所有会恢复 `var_remap_` 的作用域，使每个作用域拥有其子树的连续 id 区间 `[id, end)`；于是「`v` 的所有使用点都在作用域 `S` 内」只需两次整数比较。单调递增的 tick 则把使用点与折叠点排序，因此同一作用域内*位于折叠点之前*的读取同样计为逃逸。一次遍历加上每个折叠点 O(1) 的查询，使 Simplify 仍在 O(N log N) 预算之内。
+
+索引中不存在的语句一律回答「不逃逸」，即保持代换。这涵盖了嵌套在 Fold B `DeepClone` 循环体内部的折叠 —— 克隆体的 `Var` 标识在建索引之后才产生。克隆体内的 `Var` 在其外部不可达，因此唯一未覆盖的情形是：克隆体*内部*存在一个恢复作用域，横亘在这样的折叠点与其 return var 的后续使用点之间 —— 只可能出现在 pre-SSA，且不比本索引引入之前的行为更差。为每个克隆体重新建索引可以补上这一点，但嵌套单次循环将因此付出 O(N²) 的遍历代价。
+
+对逃逸的 `return_vars[i]`，`LiftBodyToReturnVars` 不再记录 remap，而是在折叠点产出 `AssignStmt(return_vars[i], yielded_value[i])`。该赋值必须留在被提升的区域*内部*：yielded 值可能引用循环体内的局部 `Var`，无法外提到循环之后；而在 leak 语义下「最后一次迭代最后写入」恰好就是循环后读取所期望的值。
+
+SSA 形式下不存在逃逸：区域内定义的值不会在区域外被引用，且每个使用点都被其定义支配。由于流水线只在 `ConvertToSSA` 之后运行 Simplify（第 5 和第 46 位），该物化路径在流水线中不会触发 —— 它服务于直接对 pre-SSA IR 运行 Simplify 的调用方，而在那里上述别名赋值的顾虑并不成立，因为 SSA 转换仍会在其后运行。
 
 两种折叠在同一次 Pass 中可以叠加：当 Fold B 把 `loop_var → 0` 代入循环体后，类似 `if loop_var == 0` 的谓词会变成 `if 0 == 0` → `ConstBool(true)`，紧接着就被 Fold A 折掉，无需再跑一次 Simplify。
 
@@ -187,6 +200,48 @@ for ob in pl.range(0, 68, 2):
 ```
 
 分析器在访问循环体期间得知 `ob ∈ [0, 68)`，因此 `off` 的 `AssignStmt` 为 `off` 注册了 `[256, 17408]` 的 `ConstIntBound`。`CanProve(Not(off == 0))` 随后成功，Fold A 丢弃死的 then 分支。`off` 只用于分析、不会被代换，因此保留下来的 `later_chunk(off)` 仍引用该标量。（若折叠后 `off` 不再被使用，标量 DCE 会删除其绑定。）
+
+### 索引边界从何而来
+
+`INDEX` 是所有索引计算的 dtype，而它是**有符号的**——codegen 为其发射 `arith.cmpi slt` 与
+`arith.maxsi`。因此仅凭 dtype 无法证明变量的符号，分析器把未绑定的 `INDEX` Var 视为
+`[-inf, +inf]`。非负性必须被建立，而不能被假定：
+
+| 来源 | 边界 | 由谁建立 |
+| ---- | ---- | -------- |
+| 被赋值的标量 | 其 RHS 的区间 | `BindScalarBound`，来自被产生的值 |
+| 循环变量 | `[start, stop)`；`stop` 为符号时取 `[start, +inf)` | `IRMutatorWithAnalyzer` 处理 `ForStmt`，要求步长为正 |
+| 分支条件 | 该约束的区间 | 该分支作用域内的 `EnterConstraint` |
+| block / subblock 内建 op | `[0, +inf)`；block *数量* 为 `[1, +inf)` | 该 op 自身语义，在 `ConstIntBoundAnalyzer` 中 |
+| 整个 shape / valid-shape 维度 | `[0, +inf)` | `DimensionSymbolScope`，包裹 write-union 证明 |
+| 运行时标量参数 | `[-inf, +inf]` | 无——取值由调用方决定 |
+
+最后三行正是关键区别，且没有一条是关于 `INDEX` 类型的事实。`tile.get_subblock_idx()` 非负，是因为该
+op **返回什么**；维度非负，是因为它是元素个数。
+
+**第二条规则止于维度本身。** `DimensionSymbolScope` 只绑定**本身就是裸符号**的维度，绝不深入到复合
+表达式内部。字段是 `valid_shape` 只能说明该字段是 extent，并不能说明计算它的每个变量都是 extent：
+
+```python
+valid = pl.max(-x, 0)    # 基于有符号运行时标量的合法动态 extent
+```
+
+假定 `x >= 0` 会把它折叠为常量 `0`，读起来就是空区域，从而静默缩小结果。offset 则完全不绑定——offset
+中的 `max(x, 0)` 是刻意的钳位，其意义恰恰在于 `x` 可能为负，折叠成 `x` 会移动 store 写入的区域。
+
+```python
+pos: pl.Scalar[pl.INDEX] = base - 1   # [-1, +inf)
+if pos >= 0:                          # 有效守卫，予以保留
+    if pos < 8:
+        read_row(pos)
+```
+
+在一刀切的 `[0, +inf)` 默认区间下，`pos >= 0` 被证明为恒真，Fold A 丢弃外层守卫——只剩下界检查
+独自成立，而负的 `pos` 恰好能通过它，带着随后被钳位到第 0 行的索引进入 `read_row`
+（issue #2500）。对裸的 `Scalar[pl.INDEX]` 参数同样成立：调用方可以传入 `-1`。
+
+这也是为什么 `ConstIntBound` 的约束作用域在退出时会**恢复**显式的 `[-inf, +inf]` 绑定而不是删除
+它——在 extent 规则下，被删除的条目会退回 `[0, +inf)`，而那并非该变量原本的边界。
 
 ### 单次循环折叠（Fold B）
 

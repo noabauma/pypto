@@ -35,7 +35,7 @@ the granularity of the pass's structurally-comparable output products: the
 ``devices`` list and ``slots`` vector of each emitted
 :class:`ir.CommDomainScopeStmt`. Slot ``WindowBuffer``s are hand-built from
 the pass's documented semantics (device-descriptor table + slot/alloc-order
-rules in ``docs/en/dev/passes/37-materialize_comm_domain_scopes.md``) and compared with
+rules in ``docs/en/dev/passes/42-materialize_comm_domain_scopes.md``) and compared with
 ``enable_auto_mapping=True`` so freshly-constructed Vars match the
 pass-produced ones by structural isomorphism rather than identity.
 
@@ -151,10 +151,17 @@ def _flatten_stmts(stmt: ir.Stmt) -> list[ir.Stmt]:
         result.extend(_flatten_stmts(stmt.body))
     if isinstance(stmt, ir.ForStmt):
         result.extend(_flatten_stmts(stmt.body))
+    if isinstance(stmt, ir.WhileStmt):
+        result.extend(_flatten_stmts(stmt.body))
     return result
 
 
 def _apply(program: ir.Program) -> ir.Program:
+    # Run ConvertToSSA first, matching the real pipeline (pass_manager.py runs
+    # it before these passes): loop-carried data becomes an IterArg, the exact
+    # shape the passes must handle — without this the loop tests assert against
+    # IR the compiler never produces (review #2504).
+    program = cast(ir.Program, passes.convert_to_ssa()(program))
     return cast(ir.Program, passes.materialize_comm_domain_scopes()(_synthesize(program)))
 
 
@@ -328,11 +335,11 @@ def test_explicit_allreduce_assignment_keeps_user_signal():
     assert synthetic_assigns == []
     assert len(allreduces) == 1
     assert len(allreduces[0].args) == 2
-    assert _as_var(allreduces[0].args[1]).name_hint == "signal"
+    assert _as_var(allreduces[0].args[1]).name_hint == "signal__ssa_v0"
 
     scopes = _get_comm_domain_scopes(host)
     assert len(scopes) == 1
-    assert [slot.base.name_hint for slot in scopes[0].slots] == ["data_buf", "signal_buf"]
+    assert [slot.base.name_hint for slot in scopes[0].slots] == ["data_buf__ssa_v0", "signal_buf__ssa_v0"]
 
 
 def test_implicit_allreduce_signal_is_materialized_in_data_comm_domain():
@@ -381,10 +388,80 @@ def test_implicit_allreduce_signal_is_materialized_in_data_comm_domain():
 
     scopes = _get_comm_domain_scopes(host)
     assert len(scopes) == 1
+    # Shared signal binding is hoisted to the top of the body, so its slot precedes data_buf.
     assert [slot.base.name_hint for slot in scopes[0].slots] == [
-        "data_buf",
         "__allreduce_signal_buf_0",
+        "data_buf__ssa_v0",
     ]
+
+
+def test_implicit_allreduce_over_distinct_subsets_gets_distinct_signals():
+    """One shared signal per data-buffer lineage, not per function.
+
+    Two data buffers dispatched to disjoint device subsets ({0,1} and {2,3}),
+    each reduced implicitly, must each get its own synthesized signal. A single
+    per-function shared signal would merge both subsets into the signal's
+    coverage while each data buffer keeps its own domain, so
+    LowerHostTensorCollectives would reject every call (data and signal in
+    different comm-domain scopes).
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            buf_a = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            buf_b = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            data_a = pld.window(buf_a, [256], dtype=pl.FP32)
+            data_b = pld.window(buf_b, [256], dtype=pl.FP32)
+            self.chip_orch(data_a, device=0)
+            self.chip_orch(data_a, device=1)
+            self.chip_orch(data_b, device=2)
+            self.chip_orch(data_b, device=3)
+            data_a = pld.tensor.allreduce(data_a, op=pld.ReduceOp.Sum)
+            data_b = pld.tensor.allreduce(data_b, op=pld.ReduceOp.Sum)
+            return data_a
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    signal_windows = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt.value
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
+    ]
+
+    # Two distinct data lineages -> two distinct synthesized signals.
+    assert len(signal_windows) == 2
+    assert len(allreduces) == 2
+    signal_names = {stmt.var.name_hint for stmt in signal_windows}
+    assert len(signal_names) == 2
+    for ar in allreduces:
+        assert len(ar.args) == 2
+        assert _as_var(ar.args[1]).name_hint in signal_names
+
+    # After materialization, each (data, signal) pair lands in its own
+    # comm-domain scope: {0,1} for buf_a and {2,3} for buf_b.
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 2
+    assert list(scopes[0].devices) == [0, 1]
+    assert [slot.base.name_hint for slot in scopes[0].slots] == ["__allreduce_signal_buf_0", "buf_a__ssa_v0"]
+    assert list(scopes[1].devices) == [2, 3]
+    assert [slot.base.name_hint for slot in scopes[1].slots] == ["__allreduce_signal_buf_1", "buf_b__ssa_v0"]
 
 
 def test_optional_signal_allreduce_round_trips_before_materialization():
@@ -525,6 +602,56 @@ def test_synthesize_multicore_allreduce_signal_uses_core_lanes_and_bytes():
     assert alloc_size.left.right.value == 4
 
 
+def test_implicit_allreduce_core_num_widening_sizes_signal_to_max():
+    """Two implicit allreduces over the same data buffer with different
+    core_num share ONE synthesized signal, sized to the widest core_num (the
+    allow_wider_lanes contract in LowerHostTensorCollectives)."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            a = pld.tensor.allreduce(data, core_num=1)
+            b = pld.tensor.allreduce(data, core_num=4)
+            return a, b
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    signal_windows = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
+    ]
+    assert len(signal_windows) == 1
+    assert len(allreduces) == 2
+    signal_type = signal_windows[0].var.type
+    assert isinstance(signal_type, ir.DistributedTensorType)
+    assert isinstance(signal_type.shape[1], ir.ConstInt)
+    assert signal_type.shape[1].value == 4  # widened to the max core_num
+    # Both calls reuse the one shared signal.
+    signals = {_as_var(_as_call(stmt.value).args[1]).name_hint for stmt in allreduces}
+    assert signals == {signal_windows[0].var.name_hint}
+
+
 def test_synthesized_allreduce_signal_round_trips_after_materialization():
     @pl.program
     class P:
@@ -642,7 +769,11 @@ def test_implicit_allreduce_signal_names_are_program_unique():
         ),
     )
 
-    result = _apply(program)
+    # NOTE: deliberately NOT `_apply` (which runs ConvertToSSA first) — this
+    # test pre-defines user vars named `__allreduce_*`, which SSA cannot rename
+    # (reserved `__` delimiter in auto-name bases) and which are exactly what
+    # the synthesized-name-uniqueness contract must dodge.
+    result = cast(ir.Program, passes.materialize_comm_domain_scopes()(_synthesize(program)))
     hosts = [_get_func(result, "host_orch_a"), _get_func(result, "host_orch_b")]
     allreduce_signal_args = [
         _as_var(_as_call(stmt.value).args[1]).name_hint
@@ -671,20 +802,28 @@ def test_implicit_allreduce_signal_names_are_program_unique():
         "__allreduce_signal_1",
         "__allreduce_signal_2",
     ]
+    # One shared signal per data-buffer lineage (one per function here, since
+    # each reduces a single buffer), hoisted to the top of the body:
+    # host_orch_a's shared binding is __allreduce_signal_1 (skipping the
+    # user-pre-used _0 names) and precedes the user's hand-written signal.
     assert world_size_vars == [
-        "__allreduce_signal_world_size_0",
         "__allreduce_signal_world_size_1",
+        "__allreduce_signal_world_size_0",
         "__allreduce_signal_world_size_2",
     ]
     assert signal_slots == [
-        "__allreduce_signal_buf_0",
         "__allreduce_signal_buf_1",
+        "__allreduce_signal_buf_0",
         "__allreduce_signal_buf_2",
     ]
     assert len(signal_slots) == len(set(signal_slots))
 
 
-def test_consecutive_implicit_allreduces_get_fresh_signal_slots():
+def test_consecutive_implicit_allreduces_share_one_signal_slot():
+    """Consecutive implicit allreduces over the same buffer share ONE
+    synthesized signal slot (safe since the host builtin kernels self-clear
+    their barrier cells after each call)."""
+
     @pl.program
     class P:
         @pl.function(type=pl.FunctionType.Orchestration)
@@ -705,11 +844,65 @@ def test_consecutive_implicit_allreduces_get_fresh_signal_slots():
     host = _get_func(result, "host_orch")
     scopes = _get_comm_domain_scopes(host)
     assert len(scopes) == 1
+    # Shared binding is hoisted to the top, so the signal buffer slot precedes data_buf.
     assert [slot.base.name_hint for slot in scopes[0].slots] == [
-        "data_buf",
         "__allreduce_signal_buf_0",
-        "__allreduce_signal_buf_1",
+        "data_buf__ssa_v0",
     ]
+    allreduces = [
+        _as_call(stmt.value)
+        for stmt in _flatten_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
+    ]
+    assert len(allreduces) == 2
+    assert _as_var(allreduces[0].args[1]).name_hint == "__allreduce_signal_0"
+    assert _as_var(allreduces[1].args[1]).name_hint == "__allreduce_signal_0"
+
+
+def test_implicit_allreduce_inside_loop_uses_shared_signal():
+    """An implicit-signal allreduce inside a for loop is accepted (previously
+    rejected as a single-use signal) and reuses the buffer's one shared
+    signal, hoisted outside the loop."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            for it in pl.range(2):
+                data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    signal_windows = [
+        stmt
+        for stmt in _flatten_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt
+        for stmt in _flatten_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
+    ]
+    # One shared signal hoisted to the top; the (single) in-loop allreduce reuses it.
+    assert len(signal_windows) == 1
+    assert len(allreduces) == 1
+    assert _as_var(_as_call(allreduces[0].value).args[1]).name_hint == signal_windows[0].var.name_hint
 
 
 def test_synthesize_allreduce_signals_reserves_existing_alloc_names():
@@ -746,7 +939,9 @@ def test_synthesize_allreduce_signals_reserves_existing_alloc_names():
         and stmt.value.op.name == _OP_PLD_TENSOR_ALLOC_WINDOW_BUFFER
     ]
 
-    assert alloc_names == ["__allreduce_signal_buf_0", "__allreduce_signal_buf_1"]
+    # Shared binding is hoisted to the top, so the synthesized alloc precedes the
+    # user's pre-existing __allreduce_signal_buf_0 alloc.
+    assert alloc_names == ["__allreduce_signal_buf_1", "__allreduce_signal_buf_0"]
 
 
 def test_ssa_allreduce_result_keeps_source_window_lineage():
@@ -784,10 +979,11 @@ def test_ssa_allreduce_result_keeps_source_window_lineage():
     scopes = _get_comm_domain_scopes(host)
 
     assert len(scopes) == 1
+    # Shared signal binding is hoisted to the top of the body, so its slot precedes data_buf.
     assert [slot.base.name_hint for slot in scopes[0].slots] == [
-        "data_buf",
-        "signal_buf",
         "__allreduce_signal_buf_0",
+        "data_buf__ssa_v0",
+        "signal_buf__ssa_v0",
     ]
 
 
@@ -830,9 +1026,10 @@ def test_return_implicit_allreduce_is_lifted_for_host_lowering():
 
     scopes = _get_comm_domain_scopes(host)
     assert len(scopes) == 1
+    # Shared signal binding is hoisted to the top of the body, so its slot precedes data_buf.
     assert [slot.base.name_hint for slot in scopes[0].slots] == [
-        "data_buf",
         "__allreduce_signal_buf_0",
+        "data_buf__ssa_v0",
     ]
 
 
@@ -873,7 +1070,7 @@ def test_return_explicit_allreduce_is_lifted_for_host_lowering():
     assert synthetic_assigns == []
     assert len(allreduce_assigns) == 1
     assert allreduce_assigns[0].var.name_hint.startswith("__allreduce_result_")
-    assert _as_var(_as_call(allreduce_assigns[0].value).args[1]).name_hint == "signal"
+    assert _as_var(_as_call(allreduce_assigns[0].value).args[1]).name_hint == "signal__ssa_v0"
     assert len(returns) == 1
     assert isinstance(returns[0].value[0], ir.Var)
     assert returns[0].value[0] is allreduce_assigns[0].var
@@ -913,9 +1110,10 @@ def test_implicit_allreduce_eval_stmt_gets_signal():
 
     scopes = _get_comm_domain_scopes(host)
     assert len(scopes) == 1
+    # Shared signal binding is hoisted to the top of the body, so its slot precedes data_buf.
     assert [slot.base.name_hint for slot in scopes[0].slots] == [
-        "data_buf",
         "__allreduce_signal_buf_0",
+        "data_buf__ssa_v0",
     ]
 
 
@@ -955,14 +1153,14 @@ def test_explicit_allreduce_eval_stmt_keeps_user_signal():
 
     assert synthetic_assigns == []
     assert len(allreduces) == 1
-    assert _as_var(allreduces[0].args[1]).name_hint == "signal"
+    assert _as_var(allreduces[0].args[1]).name_hint == "signal__ssa_v0"
 
 
-def test_implicit_allreduce_in_loop_is_rejected():
-    """The HOST-rail signal synthesis cannot allocate a fresh signal per dynamic
-    iteration, so an allreduce that omits its signal is rejected inside a loop.
-    Passing one explicitly is accepted - see the ``_is_accepted`` cases below.
-    """
+def test_implicit_allreduce_in_while_loop_uses_shared_signal():
+    """An implicit-signal allreduce inside a while loop is accepted: ONE shared
+    signal is synthesized (hoisted before the loop) and the in-loop call reuses
+    it — safe because the host builtin kernels self-clear their barrier cells
+    after each call."""
 
     @pl.program
     class P:
@@ -976,33 +1174,32 @@ def test_implicit_allreduce_in_loop_is_rejected():
             data = pld.window(data_buf, [256], dtype=pl.FP32)
             for r in pl.range(pld.world_size()):
                 self.chip_orch(data, device=r)
-            for _ in pl.range(2):
-                data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
-            return data
-
-    with pytest.raises(ValueError, match="without an explicit signal is not supported inside a for/while"):
-        _apply(P)
-
-
-def test_implicit_allreduce_in_while_loop_is_rejected():
-    @pl.program
-    class P:
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
-            return data
-
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(self):
-            data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
-            data = pld.window(data_buf, [256], dtype=pl.FP32)
             for r in pl.range(pld.world_size()):
                 self.chip_orch(data, device=r)
             while True:
                 data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
             return data
 
-    with pytest.raises(ValueError, match="without an explicit signal is not supported inside a for/while"):
-        _apply(P)
+    synthesized = _synthesize(P)
+    host = _get_func(synthesized, "host_orch")
+    signal_windows = [
+        stmt
+        for stmt in _flatten_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_WINDOW
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt
+        for stmt in _flatten_stmts(host.body)
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
+    ]
+    assert len(signal_windows) == 1
+    assert len(allreduces) == 1
+    assert _as_var(_as_call(allreduces[0].value).args[1]).name_hint == signal_windows[0].var.name_hint
 
 
 def test_explicit_allreduce_in_loop_is_accepted():

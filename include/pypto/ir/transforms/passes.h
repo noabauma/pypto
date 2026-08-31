@@ -141,7 +141,10 @@ Pass CreateProgramPass(std::function<ProgramPtr(const ProgramPtr&)> transform, c
 /**
  * @brief Create an init memref pass
  *
- * Initializes MemRef for all variables in functions.
+ * Materializes compiler-owned PTO level3 scratch after tile rewriting, then
+ * initializes MemRef for all variables in functions. The scratch becomes an
+ * ordinary tile allocation so PyPTO/DSA-RP can reuse and place it; PTOAS-owned
+ * level2 planning is left untouched.
  * Sets memory space to UB by default, or DDR for tile.load/tile.store operands.
  */
 Pass InitMemRef();
@@ -265,6 +268,28 @@ Pass MaterializeDistTensorCtx();
  * the symbol has to resolve to it.
  */
 Pass MaterializeValidShapeSymbols();
+
+/**
+ * @brief Make every FunctionType::Graph function legal to record and replay
+ *
+ * Hoists each boundary scalar a Graph body *derives* out to its call sites: the
+ * host_build_graph runtime tracks a boundary scalar by the address of its
+ * argument slot, so a value computed inside the region has no slot and would be
+ * frozen at its first-call value on every later replay, with no warning.
+ *
+ * Also rejects, at compile time, the boundary shapes the runtime would decline
+ * to cache — an oversized or empty tensor boundary, runtime-allocated outputs,
+ * a *computed* return value, nested graphs, and call sites carrying explicit
+ * dependencies or a dispatch predicate. Returning a parameter is allowed:
+ * `return c` for an `InOut` parameter is the DSL's spelling for writing in place
+ * and lowers to an alias, so only a genuinely new value is refused —
+ * `rt_submit_graph` yields a valid task id solely on a cache hit, so nothing may
+ * depend on a graph call's result. Almost all of those degrade to a silent
+ * non-graph fallback at runtime, which no numerical test can detect.
+ *
+ * @return Program-level pass
+ */
+Pass LegalizeGraphBoundary();
 
 /**
  * @brief Create a loop unrolling pass
@@ -463,6 +488,35 @@ Pass ConvertTensorToTileOps();
 Pass OptimizeOrchTensors();
 
 /**
+ * @brief Rewrite logical ``pl.NZ`` tensors into pto-isa's blocked NZ form
+ *
+ * A ``pl.Tensor[[..., R, C], dtype, pl.NZ]`` annotation asserts that the GM
+ * bytes are already in PTO-native NZ fractal order while the DSL keeps the
+ * logical shape and slicing. pto-isa describes such a buffer with a blocked
+ * rank-(r+2) GlobalTensor, so this pass rewrites:
+ *
+ *   - every NZ ``TensorType`` shape to ``[..., C/c0, R/16, 16, c0]``, where
+ *     ``c0`` is the number of elements in a 32-byte C0 line (``256 / bits``);
+ *     strides stay empty for ``MaterializeTensorStrides``, whose plain
+ *     row-major rule already yields pto-isa's NZ strides once blocked;
+ *   - every consuming ``tile.load``'s offsets / shapes / valid_shape into
+ *     blocked coordinates, preserving the logical 2-D destination ``TileType``.
+ *
+ * Milestone 1 scope: read-only, ``target_memory=Mat`` only, whole-byte dtypes,
+ * static shapes, ``R % 16 == 0`` and ``C % c0 == 0`` with equally aligned slice
+ * offsets. Anything else is rejected rather than silently mis-addressed.
+ *
+ * Requirements:
+ * - Input IR must have tile ops (run ConvertTensorToTileOps first)
+ * - Must run **after** FlattenTileNdTo2D (requires ``TileOps2D``): the
+ *   destination tile must already be the logical 2-D operand, or the rewritten
+ *   ``tile.load`` has a type annotation and argument ranks that cannot both be
+ *   printed. FlattenTileNdTo2D skips its ND2NZ window collapse for NZ sources,
+ *   so the logical window is still intact here.
+ */
+Pass BlockNzTensorViews();
+
+/**
  * @brief Flatten ND tile ops to 2D in InCore functions
  *
  * Merges all dimensions except the last into a single dimension.
@@ -646,6 +700,9 @@ Pass InferTileMemorySpace();
  * immediately before each ``tile.matmul_mx`` / ``_acc`` / ``_bias`` and rewrites
  * the matmul to consume the bound scale SSA values.
  *
+ * Applies to all InCore-variant functions (``InCore``, ``AIC``, ``AIV``), including
+ * mixed-kernel cube/vector bodies written directly as AIC/AIV.
+ *
  * Bindings are not reused across consumers because tget mutates a shared
  * physical scale buffer whose aliases cannot be represented by SSA identity.
  * The pass therefore inserts a fresh binding at every consumer even when its
@@ -765,11 +822,12 @@ Pass Simplify();
  *
  * Lowering rules live in a file-local dispatch table inside
  * ``src/ir/transforms/lower_composite_ops_pass.cpp``. Today the pass handles
- * ``tile.sin`` / ``tile.cos`` and explicit-signal InCore
- * ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered later
- * by ``LowerHostTensorCollectives``. Future composite ops (softmax, gelu,
- * layernorm, ...) are added by appending a rule function + one dispatch-table
- * row, without touching the mutator.
+ * ``tile.sin`` / ``tile.cos``, packed ``tile.tquant_mx``, and explicit-signal
+ * InCore ``pld.tensor.allreduce``; host-level allreduce is skipped and lowered
+ * later by ``LowerHostTensorCollectives``. Future single-result composite ops
+ * (softmax, gelu, layernorm, ...) are added by appending a rule function + one
+ * dispatch-table row. Multi-result rules may also need projection remapping in
+ * the mutator, as ``tile.tquant_mx`` does.
  *
  * FP32-only for the trig rules — non-FP32 inputs are rejected at
  * op-construction time by the op deducer, never reaching this pass.
@@ -899,7 +957,7 @@ Pass FoldNoOpReshape();
  * @brief Materialize implicit orchestration scopes as explicit RuntimeScopeStmt nodes
  *
  * The simpler runtime wraps regions of an Orchestration function in
- * ``PTO2_SCOPE()`` blocks. Historically the orchestration codegen decided where
+ * ``SIMPLER_SCOPE()`` blocks. Historically the orchestration codegen decided where
  * to emit those wrappers from the for/if structure: the whole function body, and
  * each ForStmt / IfStmt branch body, were wrapped implicitly (suppressed inside a
  * manual ``RuntimeScopeStmt``). That embedded codegen policy in the printer.
@@ -910,7 +968,7 @@ Pass FoldNoOpReshape();
  *  - wrapping each ForStmt body and each IfStmt then/else body,
  *
  * while skipping insertion anywhere inside a manual ``RuntimeScopeStmt`` (the
- * runtime forbids AUTO nested in MANUAL). Codegen then emits ``PTO2_SCOPE`` only
+ * runtime forbids AUTO nested in MANUAL). Codegen then emits ``SIMPLER_SCOPE`` only
  * from ``RuntimeScopeStmt`` nodes, staying 1:1 with the IR.
  *
  * Runs last in the pipeline (after the final Simplify) so no other transform has
@@ -930,7 +988,7 @@ Pass MaterializeRuntimeScopes();
  *    variable is declared and the yield assigns back to it (issue #1286).
  *
  * Inside a ``pl.manual_scope`` a ``Scalar[TASK_ID]`` carry additionally lowers to
- * a ``PTO2TaskId[N]`` array whose extent N comes from the loop's (or a threaded
+ * a ``TaskId[N]`` array whose extent N comes from the loop's (or a threaded
  * inner loop's) constant trip count.
  *
  * The orchestration codegen used to derive both from an alias-equivalence

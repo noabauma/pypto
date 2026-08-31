@@ -26,6 +26,7 @@
 #include "pypto/backend/common/backend_config.h"
 #include "pypto/backend/common/backend_handler.h"
 #include "pypto/core/any_cast.h"
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/core_affinity_kind.h"
 #include "pypto/ir/expr.h"
@@ -123,7 +124,10 @@ class DeferredWaiterCallSiteValidator : public IRVisitor {
                   const Span& span) {
     auto global = As<GlobalVar>(op);
     INTERNAL_CHECK_SPAN(global, span) << "Internal error: deferred waiter call target is not a GlobalVar";
-    CHECK_SPAN(caller_->func_type_ == FunctionType::Orchestration, span)
+    // Orchestration-like, not strictly Orchestration: this asks "is the caller a
+    // task-level orchestration body", which a Graph body is. Only the single
+    // compilation entry keeps the strict comparison.
+    CHECK_SPAN(IsOrchestrationLike(caller_->func_type_), span)
         << "deferred waiter '" << global->name_
         << "' must be dispatched directly from an Orchestration function via a task-level "
            "pl.at(CORE_GROUP) scope";
@@ -149,8 +153,12 @@ class DeferredWaiterCallSiteValidator : public IRVisitor {
 // These ops are folded into ExpandMixedKernel's cross-core boundary machinery:
 // aiv_shard (cube -> vector, full -> half) becomes a CUBE_TO_VECTOR boundary,
 // aic_gather (vector -> cube, half -> full) a VECTOR_TO_CUBE boundary. The
-// direction is authoritative by op name — both ops keep the input's memory
-// space (set_output_memory_inherit_input), so it cannot be derived from memory.
+// direction is authoritative by op name: each op's declared memory names only
+// its CONSUMING lane (set_output_memory — Vec for the shard, Mat for the
+// gather), and the operand's space is deliberately left undeclared, so the
+// direction cannot be read off a single type. The operand must still be
+// PRODUCED on the pushing lane for the fold to be well-formed —
+// CheckOpDrivenBoundaryOperands enforces that below.
 
 const std::string* GetSplitReshapeOpName(const CallPtr& call) {
   if (!call) return nullptr;
@@ -366,7 +374,8 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
                                                     call->args_[0],
                                                     call->GetType(),
                                                     /*op_driven=*/true,
-                                                    call->GetKwarg<int>("split", 0)};
+                                                    call->GetKwarg<int>("split", 0),
+                                                    call->GetKwarg<int>("lane_stride", 0)};
       } else if (call) {
         auto dir = ClassifyMoveDirection(call);
         if (dir != CVDirection::NONE) {
@@ -399,16 +408,199 @@ void CollectCVBoundaryMoves(const std::vector<StmtPtr>& stmts,
   }
 }
 
+/// The lane a boundary op's RESULT is bound on: its CONSUMING lane, which is
+/// where `BuildCoreBody` emits the tpop. The producing lane only ever sees a
+/// tpush, and a tpush binds nothing — so a boundary result exists on exactly
+/// one lane, not both.
+std::optional<CoreAffinity> BoundaryResultLane(const CallPtr& call) {
+  if (IsOp(call, "tile.aiv_shard")) return CoreAffinity::VECTOR;
+  if (IsOp(call, "tile.aic_gather")) return CoreAffinity::CUBE;
+  // A C/V-crossing tile.move lands in its target memory, on that memory's lane.
+  switch (ClassifyMoveDirection(call)) {
+    case CVDirection::CUBE_TO_VECTOR:
+      return CoreAffinity::VECTOR;
+    case CVDirection::VECTOR_TO_CUBE:
+      return CoreAffinity::CUBE;
+    case CVDirection::NONE:
+      break;
+  }
+  return std::nullopt;
+}
+
+/// The single lane `operand` is bound on, or nullopt when every lane holds a
+/// definition (so no push can dangle) or the lane cannot be resolved.
+/// `producer_call` receives the defining call when there is one, for the
+/// diagnostic.
+std::optional<CoreAffinity> OperandDefiningLane(
+    const ExprPtr& operand, const std::unordered_map<const Var*, CoreAffinity>& var_affinity,
+    const std::unordered_map<const Var*, StmtPtr>& def_map, CallPtr* producer_call) {
+  // An operand written inline rather than bound to a name — `aiv_shard(full(...))`
+  // — has no defining statement to filter out of a lane, so nothing dangles; it is
+  // instead EMITTED inside the tpush, asking the pushing lane to run the op itself
+  // (a UB write on a core with no UB). Same defect, different shape, so classify
+  // the call directly. Only a definite single-lane answer is actionable: MIXED
+  // (a nested crossing) and SHARED have no one producing lane here.
+  if (auto call = transform_utils::AsCallOrSubmitView(operand)) {
+    *producer_call = call;
+    const CoreAffinity affinity = ClassifyCallAffinity(call);
+    if (affinity == CoreAffinity::CUBE || affinity == CoreAffinity::VECTOR) return affinity;
+    return std::nullopt;
+  }
+
+  auto var = AsVarLike(operand);
+  if (!var) return std::nullopt;
+  // No entry means no defining AssignStmt in this body — a parameter, a free
+  // variable, or a loop-carried IterArg the ForStmt binds. None of those is
+  // filtered out of a lane, so the push has a definition either way.
+  auto aff_it = var_affinity.find(var.get());
+  if (aff_it == var_affinity.end()) return std::nullopt;
+  if (auto def_it = def_map.find(var.get()); def_it != def_map.end()) {
+    if (auto assign = As<AssignStmt>(def_it->second)) {
+      *producer_call = transform_utils::AsCallOrSubmitView(assign->value_);
+    }
+  }
+  switch (aff_it->second) {
+    case CoreAffinity::CUBE:
+    case CoreAffinity::VECTOR:
+      return aff_it->second;
+    case CoreAffinity::MIXED:
+      // The producer IS a crossing, so it binds a result on its consuming lane
+      // only — chaining another boundary onto it in the SAME direction leaves
+      // the second push without a definition. The inverse chain (shard then
+      // gather) is fine and resolves to the lane that does hold it.
+      return *producer_call ? BoundaryResultLane(*producer_call) : std::nullopt;
+    case CoreAffinity::SHARED:
+      return std::nullopt;  // duplicated onto both lanes
+  }
+  return std::nullopt;
+}
+
+/// Reject an op-driven boundary whose operand is bound on the lane that
+/// consumes it, instead of the lane that pushes it.
+///
+/// `SplitReshapeDirection` names the pushing lane from the op name alone, while
+/// the statement partition keeps every producer on the lane its own affinity
+/// names. The two agree for a genuine crossing and disagree exactly when the
+/// operand is bound on the far side: `BuildCoreBody` then emits the tpush on a
+/// lane whose body never defines the value (the producer is filtered out by the
+/// `affinity == skip_affinity` arm), and the dangling reference reaches PTO
+/// codegen as `no MLIR mapping for MemRef base` — pointing at an orphan
+/// `Mem.Vec` allocation in a cube kernel, nine passes from the source line that
+/// caused it.
+///
+/// Rejected rather than lowered: `pl.aiv_shard` MEANS "cross the AIC/AIV
+/// boundary", so a value the consuming lane already holds has no crossing to
+/// name. The AivSplitValid verifier's boundary memory contract (check (d))
+/// refuses the same authoring error one level up, with the `pl.split_aiv`
+/// region still in scope; this is the pass establishing that invariant itself,
+/// so a build with verification disabled fails here with the user's span rather
+/// than in codegen.
+///
+/// Walks in program order and reports the first violation, so a body with
+/// several mis-routed boundaries names the same op on every run — and the one
+/// the author should fix first. Iterating `boundary_moves` instead would visit
+/// them in statement-POINTER order; ordering by span does not repair that,
+/// because hand-built IR shares one `Span::unknown()` across every statement.
+void CheckOpDrivenBoundaryOperands(const std::vector<StmtPtr>& stmts,
+                                   const std::map<const Stmt*, CVBoundaryMove>& boundary_moves,
+                                   const std::unordered_map<const Var*, CoreAffinity>& var_affinity,
+                                   const std::unordered_map<const Var*, StmtPtr>& def_map) {
+  for (const auto& stmt : stmts) {
+    if (auto bm_it = boundary_moves.find(stmt.get()); bm_it != boundary_moves.end()) {
+      const auto& bm = bm_it->second;
+      if (bm.op_driven) {
+        CallPtr producer_call;
+        auto lane = OperandDefiningLane(bm.source_tile, var_affinity, def_map, &producer_call);
+        const bool cube_to_vector = (bm.direction == CVDirection::CUBE_TO_VECTOR);
+        const CoreAffinity pushing = cube_to_vector ? CoreAffinity::CUBE : CoreAffinity::VECTOR;
+        if (lane.has_value() && *lane != pushing) {
+          auto source_var = AsVarLike(bm.source_tile);
+          const std::string operand_name = source_var ? "'" + source_var->name_hint_ + "'" : "(inline)";
+          std::string producer_op;
+          if (auto op = As<Op>(producer_call ? producer_call->op_ : nullptr)) {
+            producer_op = " by '" + op->name_ + "'";
+          }
+          const bool chained_boundary = producer_call && BoundaryResultLane(producer_call).has_value();
+          const char* op_name = cube_to_vector ? "pl.aiv_shard" : "pl.aic_gather";
+          const char* producer_lane = (*lane == CoreAffinity::CUBE) ? "CUBE" : "VECTOR";
+          const char* crossing = cube_to_vector ? "CUBE -> VECTOR" : "VECTOR -> CUBE";
+          const char* pushing_lane = cube_to_vector ? "CUBE" : "VECTOR";
+          const char* hint =
+              chained_boundary ? " Its producer is itself a cross-core boundary, which binds a result on its"
+                                 " consuming lane only — the value cannot cross a second time in the same"
+                                 " direction, because the first crossing already delivered it there."
+              : cube_to_vector
+                  ? " A vector-produced value (pl.full / pl.load) already lives on the AIV lane and"
+                    " has no boundary to cross: drop the pl.aiv_shard and use the value directly,"
+                    " authoring it at the per-lane extent inside the region — or lane-localize the"
+                    " load with the region's aiv_id."
+                  : " Gather the value only after it has been computed by vector ops on the AIV lane.";
+          CHECK_SPAN(false, stmt->span_)
+              << "'" << op_name << "' operand " << operand_name << " is produced on the " << producer_lane
+              << " lane" << producer_op << ", but '" << op_name << "' is the " << crossing
+              << " crossing and pushes from the " << pushing_lane << " lane, which never defines it." << hint;
+        }
+      }
+    }
+
+    if (auto for_stmt = As<ForStmt>(stmt)) {
+      CheckOpDrivenBoundaryOperands(FlattenBody(for_stmt->body_), boundary_moves, var_affinity, def_map);
+    } else if (auto if_stmt = As<IfStmt>(stmt)) {
+      CheckOpDrivenBoundaryOperands(FlattenBody(if_stmt->then_body_), boundary_moves, var_affinity, def_map);
+      if (if_stmt->else_body_.has_value()) {
+        CheckOpDrivenBoundaryOperands(FlattenBody(*if_stmt->else_body_), boundary_moves, var_affinity,
+                                      def_map);
+      }
+    } else if (auto while_stmt = As<WhileStmt>(stmt)) {
+      CheckOpDrivenBoundaryOperands(FlattenBody(while_stmt->body_), boundary_moves, var_affinity, def_map);
+    } else if (auto seq = As<SeqStmts>(stmt)) {
+      CheckOpDrivenBoundaryOperands(seq->stmts_, boundary_moves, var_affinity, def_map);
+    }
+  }
+}
+
 // ============================================================================
 // TPUSH / TPOP creation helpers
 // ============================================================================
 
-std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0) {
-  return {{"split", std::any(split)}};
+std::vector<std::pair<std::string, std::any>> MakeSplitKwargs(int split = 0, int lane_stride = 0) {
+  std::vector<std::pair<std::string, std::any>> kwargs{{"split", std::any(split)}};
+  // The partition stride only rides along when a ragged boundary was rebalanced
+  // (see split_axis::ResolveLaneStride). PTO codegen ignores it — it prints only
+  // id and split — but the torch reference runtime needs it to cut the two lanes
+  // where the compiler did.
+  if (lane_stride > 0) {
+    kwargs.emplace_back("lane_stride", std::any(lane_stride));
+  }
+  return kwargs;
 }
 
-CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0) {
-  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split), span);
+/// The pto-isa split code for an op-driven boundary's tpush / tpop pair.
+///
+/// ``CVBoundaryMove::split`` is the authored MODE (see cross_core.cpp); the code
+/// additionally encodes how the two lanes' runtime extents relate, which only
+/// the FULL-width tile can tell us: the shard's operand (Cube -> Vector) or the
+/// gather's result (Vector -> Cube). Both sides of the pipe run this on the same
+/// inputs, so the AIC and AIV bodies always agree on the code.
+int BoundaryTransportSplitCode(const CVBoundaryMove& bm, const Span& span) {
+  const SplitMode mode = SplitModeFromSplitCode(bm.split);
+  if (mode == SplitMode::None) return kSplitNone;
+  const int split_dim = split_axis::SplitDimension(mode);
+  if (bm.direction == CVDirection::CUBE_TO_VECTOR) {
+    // `lane_stride` is what LowerAutoVectorSplit actually partitioned by: absent
+    // (0) for the default box partition, the balanced stride when it rebalanced
+    // a ragged boundary across the lanes.
+    ExprPtr lane_stride =
+        bm.lane_stride > 0 ? std::make_shared<ConstInt>(bm.lane_stride, DataType::INDEX, span) : nullptr;
+    return split_axis::ShardSplitCode(mode, bm.source_tile->GetType(), split_dim, lane_stride,
+                                      "tile.aiv_shard", span);
+  }
+  return split_axis::GatherSplitCode(mode, bm.result_type, split_dim, "tile.aic_gather", span);
+}
+
+CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0,
+                    int lane_stride = 0) {
+  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride), span);
 }
 
 CallPtr CreateTpop(const std::string& op_name, const TypePtr& result_type, const Span& span,
@@ -431,13 +623,88 @@ CallPtr CreateMove(const ExprPtr& tile, MemorySpace target_memory, const TypePtr
   return std::make_shared<Call>(op, std::vector<ExprPtr>{tile}, std::move(kwargs), result_type, span);
 }
 
-// ============================================================================
-// Parameterized Core Body Builder (shared by AIC and AIV)
-// ============================================================================
-
 MemorySpace GetBoundaryTpopMemory(CoreSide side) {
   return (side == CoreSide::AIC) ? MemorySpace::Mat : MemorySpace::Vec;
 }
+
+// ============================================================================
+// Hand-written cross-core pipe: V->C push layout adaptation
+// ============================================================================
+
+/// Give a hand-written `pl.tpush_to_aic` the same fractal adapter the compiler
+/// inserts for the pipes it builds itself.
+///
+/// The boundary-move path below adapts every V->C push on a backend whose
+/// cross-core boundary carries fractal layout (BackendHandler::
+/// RequiresVtoCFractalAdapt). A hand-written pipe -- pl.reserve_buffer +
+/// pl.{aic,aiv}_initialize_pipe + pl.tpush_to_aic, authored directly in an AIV
+/// function -- never reaches it, because this pass expands InCore functions and
+/// passes every other function through untouched. On Ascend950 that shipped a
+/// bare ND tile into a FIFO the cube reads as fractal, so every element of the
+/// popped tile landed somewhere else: tests/st/runtime/cross_core
+/// test_multiple_pipes_nosplit returns 256/256 wrong values on board while
+/// passing on a5sim (which does not model the on-chip FIFO layout) and on
+/// Ascend910B (which needs no adapter: push/pop goes ub -> gm -> mat and takes
+/// ND directly).
+///
+/// The target view does not depend on where the consumer pops to -- the handler
+/// maps Mat, Left and Right alike onto one fractal view -- so keying off Mat,
+/// the cube-side transfer memory the op-driven branch below already uses, is
+/// exact rather than a guess, and needs no cross-function analysis to find the
+/// matching tpop.
+class AdaptManualVtoCPush : public IRMutator {
+ protected:
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    auto call = As<Call>(op->expr_);
+    if (!call || !IsOp(call, "tile.tpush_to_aic") || call->args_.size() != 1) {
+      return IRMutator::VisitStmt_(op);
+    }
+    const ExprPtr& source = call->args_[0];
+    auto src_type = As<TileType>(source->GetType());
+    INTERNAL_CHECK_SPAN(src_type, op->span_) << "Internal error: tile.tpush_to_aic source must be a TileType";
+
+    // Backend gate lives here, not around the caller's loop: a program with no
+    // hand-written push must not require a configured backend to walk this phase.
+    const auto* handler = PassContext::Current()->GetBackendHandler();
+    if (!handler->RequiresVtoCFractalAdapt()) {
+      return IRMutator::VisitStmt_(op);
+    }
+    const TileView src_view = tile_view_semantics::GetEffectiveTileView(*src_type);
+    const TileView fractal_view =
+        handler->BuildCrossCoreTransferView(GetBoundaryTpopMemory(CoreSide::AIC), src_view);
+    // Already in the boundary layout: either a second run of this pass, or an
+    // author who staged the move by hand. Either way there is nothing to add.
+    if (fractal_view.blayout == src_view.blayout && fractal_view.slayout == src_view.slayout) {
+      return IRMutator::VisitStmt_(op);
+    }
+
+    auto adapted_type = std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt,
+                                                   fractal_view, MemorySpace::Vec);
+    std::string src_name = "tile";
+    if (auto sv = AsVarLike(source)) {
+      src_name = sv->name_hint_;
+    }
+    const bool is_nz = (fractal_view.blayout == TileLayout::col_major);
+    auto adapted_var = std::make_shared<Var>(src_name + (is_nz ? "_nz" : "_zn"), adapted_type, op->span_);
+    auto adapt_call = CreateMove(source, MemorySpace::Vec, adapted_type, op->span_);
+
+    // Rebuild rather than CreateTpush: a hand-written push carries its own
+    // kwargs (`split`, and `id` selecting one of several pipes), and dropping
+    // `id` would silently collapse a multi-pipe program onto one FIFO. attrs_
+    // rides along for the same reason -- this rewrite replaces the pushed tile
+    // and nothing else, so it must not quietly drop compiler metadata a caller
+    // or an earlier pass attached to the op.
+    auto adapted_push = std::make_shared<Call>(call->op_, std::vector<ExprPtr>{adapted_var}, call->kwargs_,
+                                               call->attrs_, call->GetType(), call->span_);
+    std::vector<StmtPtr> out{std::make_shared<AssignStmt>(adapted_var, adapt_call, op->span_),
+                             std::make_shared<EvalStmt>(adapted_push, op->span_)};
+    return SeqStmts::Flatten(std::move(out), op->span_);
+  }
+};
+
+// ============================================================================
+// Parameterized Core Body Builder (shared by AIC and AIV)
+// ============================================================================
 
 TypePtr BuildBoundaryTpopType(CoreSide side, const TypePtr& original_type) {
   auto tt = std::dynamic_pointer_cast<const TileType>(original_type);
@@ -762,12 +1029,25 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
         // off this transfer memory rather than the op's result memory — which
         // names the other lane whenever this side is the producer.
         const MemorySpace xfer_ms = GetBoundaryTpopMemory(side);
-        const int op_split = bm.op_driven ? bm.split : 0;
+        // The transport carries the pto-isa split CODE, not the authored mode:
+        // when the two AIV lanes' extents differ by one — an odd physical box,
+        // or an odd valid extent inside an even one — the pair takes the ODD
+        // code, whose lane 1 band sits one cell past its own extent. Derived
+        // from the FULL (cube-side) tile: the shard's operand, the gather's
+        // result.
+        const int op_split = bm.op_driven ? BoundaryTransportSplitCode(bm, stmt->span_) : kSplitNone;
+        // Only the Cube -> Vector direction is ever rebalanced, so only its
+        // transport carries the stride.
+        const int op_lane_stride =
+            (bm.op_driven && bm.direction == CVDirection::CUBE_TO_VECTOR) ? bm.lane_stride : 0;
         if (bm.direction == push_direction) {
           ExprPtr push_source = bm.source_tile;
           // AIV V->C push: insert tile.move (tmov) to adapt the source into
           // the required fractal layout before tpush.
-          // On Ascend950: Left -> NZ, Right -> ZN.
+          // On Ascend950 both cross as NZ: Left -> NZ, and Right -> NZ too, because
+          // V2C inserts the Vec tile into the Mat FIFO via TINSERT_IMPL<TInsertMode::NZ>.
+          // A Right operand does end up ZN, but only after the cube side's own
+          // Mat -> Right tile.move, one step past this boundary.
           // On Ascend910B: don't need to adapt layout! push/pop will be ub -> gm -> mat, ub -> gm can
           // directly use nd
           if (side == CoreSide::AIV && handler->RequiresVtoCFractalAdapt()) {
@@ -805,7 +1085,7 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             push_source = tmov_var;
           }
           result.push_back(std::make_shared<EvalStmt>(
-              CreateTpush(push_op, push_source, stmt->span_, op_split), stmt->span_));
+              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride), stmt->span_));
         } else {
           // Op-driven pop: the half/full shape comes from the op result type and
           // the memory from this side's transfer memory; the explicit follow-on
@@ -863,8 +1143,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           tpop_var_remap[tpop_var.get()] = tpop_var;
           // tile.move boundary tpops carry no split kwarg here (assigned later by
           // SplitVectorKernel); op-driven tpops stamp the op's split now.
-          auto pop_kwargs =
-              bm.op_driven ? MakeSplitKwargs(op_split) : std::vector<std::pair<std::string, std::any>>{};
+          auto pop_kwargs = bm.op_driven ? MakeSplitKwargs(op_split, op_lane_stride)
+                                         : std::vector<std::pair<std::string, std::any>>{};
           result.push_back(std::make_shared<AssignStmt>(
               tpop_var, CreateTpop(pop_op, tpop_result_type, stmt->span_, pop_kwargs), stmt->span_));
           if (needs_post_move) {
@@ -1195,6 +1475,12 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   std::unordered_map<const Var*, StmtPtr> original_def_map;
   BuildDefMap(stmts, original_def_map);
 
+  // The op-name-derived push lane must agree with where the operand is actually
+  // produced, or the pushing lane's body would reference a value it never
+  // defines. Checked before either body is built, so the failure names the
+  // user's boundary op instead of surfacing in codegen.
+  CheckOpDrivenBoundaryOperands(stmts, boundary_moves, var_affinity, original_def_map);
+
   // Boundary-generated tpops never reuse the source-tpop Var (CollectCVBoundaryMoves
   // skips moves whose source comes from a tpop), so no original-tpop statements need
   // to be suppressed. Keep the set empty so BuildCoreBody's tpop-superseded check is
@@ -1270,17 +1556,34 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
     return std::make_pair(fresh_params, param_map);
   };
 
-  // Helper to pre-seed tpop var remappings into a DeepClone map.
-  // Maps both the original dest_var and the clean_var itself to prevent
-  // DeepClone from creating yet another fresh copy at the AssignStmt DefField.
-  auto seed_tpop_remap = [](std::unordered_map<const Var*, ExprPtr>& clone_map,
-                            const std::unordered_map<const Var*, VarPtr>& tpop_remap) {
+  // Rewrite the vars a boundary tpop replaced (the op result / the move source)
+  // onto that tpop's own Var, in the lane body, BEFORE the clone.
+  //
+  // This used to be seeded into the DeepClone map instead, which additionally
+  // needed `clone_map[tpop_var] = tpop_var` so the AssignStmt DefField did not
+  // mint a THIRD identity. That self-seed is what made it wrong: DeepClone skips
+  // RemapType for an already-mapped Var (deep_clone_utils.cpp `CloneVar`), so a
+  // tpop Var whose TileType embeds a body-local Var kept pointing at the
+  // PRE-clone one while the definition itself got a fresh clone — a dangling
+  // cross-reference that fails UseAfterDef. A `pl.split_aiv` boundary is exactly
+  // that shape: LocalizeExplicitBoundaryValid writes the lane's `valid_shape`
+  // as an expression over the region's own `aiv_id = tile.get_subblock_idx()`
+  // binding, and BuildCoreBody copies it onto the tpop result type.
+  //
+  // Substituting first leaves the body referencing only `tpop_var`, so DeepClone
+  // treats it as an ordinary local: one fresh clone at its definition site, with
+  // its type remapped along with everything else.
+  auto apply_tpop_remap = [](const StmtPtr& body_stmt,
+                             const std::unordered_map<const Var*, VarPtr>& tpop_remap) {
+    std::unordered_map<const Var*, VarPtr> subst;
     for (const auto& [orig_ptr, tpop_var] : tpop_remap) {
-      clone_map[orig_ptr] = tpop_var;
-      // Also seed the tpop_var itself to prevent DeepClone from re-cloning it
-      // when it encounters it as an AssignStmt LHS (DefField).
-      clone_map[tpop_var.get()] = tpop_var;
+      // A tpop Var maps to itself in `tpop_remap` (it is registered there so
+      // FinalizeTpopTfrees can find it); substituting it onto itself is a no-op
+      // that only costs a cycle check.
+      if (orig_ptr == tpop_var.get()) continue;
+      subst[orig_ptr] = tpop_var;
     }
+    return subst.empty() ? body_stmt : transform_utils::Substitute(body_stmt, subst);
   };
 
   // Shared GM tensor origin map (used by both lanes). Built from the ORIGINAL
@@ -1292,14 +1595,14 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
 
   // Create AIC function with deep clone (fresh Vars for all params and locals)
   auto [aic_params, aic_map] = make_param_map();
-  seed_tpop_remap(aic_map, aic_tpop_remap);
   // Repoint AIC-lane references to GM tensor versions written on the AIV lane
   // (e.g. a vector tile.store feeding a cube matmul consumer) onto the shared
   // base parameter; otherwise the cube consumer references an unbound free Var
-  // and PTO codegen cannot resolve its tensor view. Runs AFTER seed_tpop_remap
-  // so boundary-tpop remaps win (already-mapped refs are skipped) and BEFORE the
-  // clone so DeepClone applies the repoint.
-  auto aic_body_stmt = MakeBody(aic_final, func->span_);
+  // and PTO codegen cannot resolve its tensor view. Runs AFTER apply_tpop_remap
+  // so boundary-tpop results are already bound to their tpop Var (and therefore
+  // defined in the body, which this skips) and BEFORE the clone so DeepClone
+  // applies the repoint.
+  auto aic_body_stmt = apply_tpop_remap(MakeBody(aic_final, func->span_), aic_tpop_remap);
   RemapDanglingGmRefsToParam(aic_body_stmt, aic_map, gm_origin_map, func);
   auto [aic_cloned_body, aic_clone_map_unused] = DeepClone(aic_body_stmt, aic_map);
   (void)aic_clone_map_unused;
@@ -1310,7 +1613,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // Create AIV function with deep clone (fresh Vars for all params and locals,
   // ensuring no shared Var pointers with AIC for structural equality)
   auto [aiv_params, aiv_map] = make_param_map();
-  seed_tpop_remap(aiv_map, aiv_tpop_remap);
+  auto aiv_body_stmt = apply_tpop_remap(MakeBody(aiv_final, func->span_), aiv_tpop_remap);
 
   // Map dangling tile.store result vars to the store destination's fresh param.
   // When a tile.store is on the AIC side, its result var is stripped from the AIV body,
@@ -1319,7 +1622,6 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   {
     // Collect all vars defined in the AIV body
     var_collectors::VarDefUseCollector aiv_def_collector;
-    auto aiv_body_stmt = MakeBody(aiv_final, func->span_);
     aiv_def_collector.VisitStmt(aiv_body_stmt);
 
     // Scan original body recursively for tile.store AssignStmts
@@ -1352,12 +1654,13 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
     // versions of a GM tensor written on the AIC lane and consumed here. Uses
     // the shared GM origin map (with IfStmt-phi propagation) and the symmetric
     // repoint helper also applied to the AIC lane. Refs already in aiv_map (the
-    // tile.store-result block above, params, tpop remaps) are skipped, so this
-    // is purely additive over prior AIV behavior.
+    // tile.store-result block above, params) and refs defined in the body (every
+    // boundary tpop result, bound by apply_tpop_remap) are skipped, so this is
+    // purely additive over prior AIV behavior.
     RemapDanglingGmRefsToParam(aiv_body_stmt, aiv_map, gm_origin_map, func);
   }
 
-  auto [aiv_cloned_body, aiv_clone_map_unused] = DeepClone(MakeBody(aiv_final, func->span_), aiv_map);
+  auto [aiv_cloned_body, aiv_clone_map_unused] = DeepClone(aiv_body_stmt, aiv_map);
   (void)aiv_clone_map_unused;
   auto aiv_attrs = func->attrs_;
   if (needs_dual_aiv_dispatch) {
@@ -2072,6 +2375,33 @@ Pass ExpandMixedKernel() {
     // to AIV, or left alone because it was not InCore) carries the same stamp
     // and must not keep it either.
     for (auto& func : new_functions) func = StripCorePlacement(func);
+
+    // Phase 6: give every hand-written V->C push the boundary's fractal layout.
+    //
+    // The sweep covers EVERY emitted AIV function rather than only the ones
+    // that were already typed AIV on entry. `tile.tpush_to_aic` declares
+    // CoreAffinity::VECTOR, so it is legal to author one inside an InCore body:
+    // a pure-vector body reaches AIV through the conversion above, and a mixed
+    // body carries the statement into its expanded AIV half. Both produce their
+    // AIV function after the per-function loop, so a hook there would leave
+    // exactly the bare ND push this adapter exists to prevent.
+    //
+    // Running last also makes the boundary-move path's own adapters harmless:
+    // AdaptManualVtoCPush leaves a push whose source already carries the
+    // boundary view alone, so the pushes that path staged are not touched twice.
+    // The backend is consulted inside the mutator, on the first V->C push it
+    // meets, rather than as a guard around this loop: a program with no
+    // hand-written push must not require a configured backend just to walk past
+    // this phase.
+    for (auto& func : new_functions) {
+      if (func->func_type_ != FunctionType::AIV) continue;
+      AdaptManualVtoCPush adapter;
+      auto adapted_body = adapter.VisitStmt(func->body_);
+      if (adapted_body == func->body_) continue;
+      auto adapted = std::make_shared<Function>(*func);
+      adapted->body_ = adapted_body;
+      func = adapted;
+    }
 
     return std::make_shared<Program>(new_functions, program->name_, program->span_);
   };

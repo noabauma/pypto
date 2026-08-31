@@ -218,10 +218,67 @@ def test_dsl_view_preserves_distributed_tensor_wrapper():
 
 
 def test_nz_target_rejected():
-    """NZ on TensorType is forbidden (NZ is tile-only / fractal)."""
+    """tensor.view cannot mint an NZ layout.
+
+    NZ is legal on a TensorType, but only in the blocked rank-(r+2) form that
+    BlockNzTensorViews derives from the source tensor — it is not a layout a
+    view site gets to choose.
+    """
     src = _tensor_var([8, 4])
-    with pytest.raises(ValueError, match="NZ layout is not allowed"):
+    with pytest.raises(ValueError, match="cannot produce an NZ layout"):
         ir.op.tensor.view(src, layout=ir.TensorLayout.NZ)
+
+
+@pytest.mark.parametrize(
+    ("source_layout", "source_shape", "target_layout", "target_shape"),
+    [
+        pytest.param(ir.TensorLayout.MX_A_ZZ, [32, 4], ir.TensorLayout.ND, [1, 128], id="a-to-nd"),
+        pytest.param(ir.TensorLayout.ND, [1, 128], ir.TensorLayout.MX_A_ZZ, [32, 4], id="nd-to-a"),
+        pytest.param(ir.TensorLayout.MX_B_NN, [4, 32], ir.TensorLayout.ND, [1, 128], id="b-to-nd"),
+        pytest.param(ir.TensorLayout.ND, [1, 128], ir.TensorLayout.MX_B_NN, [4, 32], id="nd-to-b"),
+    ],
+)
+def test_shaped_nd_mx_backing_view_is_allowed(source_layout, source_shape, target_layout, target_shape):
+    """FP8E8M0 storage may alias packed ND and either complete MX scale layout."""
+    source_view = None if source_layout == ir.TensorLayout.ND else ir.TensorView([], source_layout)
+    src = _tensor_var(source_shape, dtype=DataType.FP8E8M0, view=source_view)
+
+    call = ir.op.tensor.view(src, target_shape, layout=target_layout)
+
+    out = call.type
+    assert isinstance(out, ir.TensorType)
+    assert _values_of(out.shape) == target_shape
+    view = _result_view(call)
+    assert view is not None
+    assert view.layout == target_layout
+
+
+def test_mx_backing_view_rejects_scalar_access():
+    """Scalar addressing cannot flatten packed MX scale bytes as ordinary ND."""
+    src = _tensor_var([1, 128], dtype=DataType.FP8E8M0)
+    mx = ir.op.tensor.view(src, [32, 4], layout=ir.TensorLayout.MX_A_ZZ)
+    value = ir.Var("value", ir.ScalarType(DataType.FP8E8M0), _span())
+
+    with pytest.raises(ValueError, match="tensor.read does not support MX-layout tensors"):
+        ir.op.tensor.read(mx, [0, 2])
+    with pytest.raises(ValueError, match="tensor.write does not support MX-layout tensors"):
+        ir.op.tensor.write(mx, [0, 2], value)
+
+
+def test_mx_a_backing_view_rejects_non_scale_dtype():
+    """The MX_A_ZZ backing alias is limited to E8M0 scale storage."""
+    src = _tensor_var([1, 128], dtype=DataType.FP32)
+
+    with pytest.raises(ValueError, match="does not support MX layouts except shaped ND/MX_A_ZZ/MX_B_NN"):
+        ir.op.tensor.view(src, [32, 4], layout=ir.TensorLayout.MX_A_ZZ)
+
+
+def test_mx_a_backing_view_requires_explicit_shape():
+    """An MX_A_ZZ layout flip without a backing shape remains unsupported."""
+    src = _tensor_var([1, 128], dtype=DataType.FP8E8M0)
+
+    with pytest.raises(ValueError, match="does not support MX layouts except shaped ND/MX_A_ZZ/MX_B_NN"):
+        ir.op.tensor.view(src, layout=ir.TensorLayout.MX_A_ZZ)
 
 
 def test_cross_layout_flip_below_rank_2_rejected():

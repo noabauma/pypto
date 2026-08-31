@@ -47,7 +47,9 @@ For each `FunctionType::InCore` function:
 
 4. **Insert tile.store (exit stores)**: For each return value converted from `TensorType` to `TileType`, add an `Out` parameter and insert `tile.store(tile, zeros, out_param)`. If the return value comes from a `tile.assemble` loop, the loop is rewritten to use `tile.store` directly (conversion-time assemble-loop rewrite; distinct from `OptimizeOrchTensors` Pattern 3 which handles cross-function optimization).
 
-5. **Upgrade written param directions**: An alias-origin analysis (`AnalyzeCallAccess`) attributes every read/write back to the parameter it originates from, then upgrades each `In` param that is written to `Out` (write-only) or `InOut` (read and written). Write targets recognised: `tile.store`, `tensor.write`, `tensor.assemble`, `pld.tile.remote_store`, `pld.tile.put` / `pld.tile.get`, `pld.system.notify` (`NotifyOp.Set` makes its `target` write-only; `NotifyOp.AtomicAdd` makes it read+write), `system.syncall` (workspace), plus the composite collectives `pld.tensor.allreduce` / `allgather` / `reduce_scatter` / `barrier` / `broadcast` / `all_to_all(_v)`, whose signal and target operands are marked read+write here because this pass runs upstream of `LowerCompositeOps`. Any other op's args count as reads only. Params the user already declared `Out` / `InOut` are left as-is.
+5. **Upgrade written param directions**: An alias-origin analysis (`AnalyzeCallAccess`) attributes every read/write back to the parameter it originates from, then upgrades each `In` param that is written to `Out` (write-only) or `InOut` (read and written). Which argument an operator writes is **not** decided here — it is read from that operator's registry declaration (`set_arg_effect`, see [Operators](../ir/05-operators.md#argument-effects)), so `tile.store`, `tile.mscatter`, `tensor.write`, `tensor.assemble`, `tensor.expand_clone`, the `pld.tile.*` / `pld.tensor.*` push and pull family, `pld.system.notify`, `system.syncall` and the composite collectives all reach the same analysis through one table. An argument declared `Write` is not counted as a read: a store landing on a sub-region never reads the untouched remainder. Kwarg-dependent effects resolve per call, so an atomic store or an `AtomicAdd` notify marks its destination read+write while the plain forms do not. Params the user already declared `Out` / `InOut` are left as-is.
+
+   An operator that never declared its effects still counts as reading every argument. That default is now confined to operators the registry has nothing to say about — most of them functional — rather than being the fallback for a hand-maintained list that a new write operator silently escaped.
 
 ### GM Store Coherence Restriction
 
@@ -98,6 +100,27 @@ output[0:1, 0:32] = staged
 Using `tensor.write` for every element is also supported when a single bulk
 store is not practical.
 
+### Cache-Policy Declarations → `tile.load` `cache` Kwarg
+
+This pass is where a declared GM cache policy stops being metadata and becomes
+part of the access. [`OutlineIncoreScopes`](08-outline_incore_scopes.md) left the
+declarations on the InCore function as the `cache_policy` attr —
+`std::vector<std::pair<int32_t, int>>` (param index, `CachePolicy` as int).
+Phase 1 turns those indices back into param `Var` identities once per function,
+then adds `{"cache", <policy>}` to every `tile.load` whose source arg is a listed
+param: the entry loads it synthesises, the consumer-driven Mat loads, the
+input-space bridge loads, and any `tile.load` already in the body (user-written
+or produced by an earlier pass). The attr is **erased** when the transformed
+function is rebuilt — nothing downstream may see it, because its param indices go
+stale the moment a later pass grows the param list.
+
+Precedence is per access: an explicit `pl.load(..., cache=...)` kwarg already on
+the load always wins over the scope declaration, in both directions, so
+`cache=pl.CachePolicy.DEFAULT` opts one read back into the cache inside a
+bypassing scope. From here the kwarg simply rides the op through the remaining
+passes to codegen, the way `target_memory` does. See
+[GM Cache-Access Policy](../language/05-cache-policy.md).
+
 ### Phase 2a: Propagate Added Outputs Through Spmd/Group Wrappers
 
 `OutlineClusterScopes` produces Spmd/Group wrappers that are transparent 1:1
@@ -135,7 +158,144 @@ already rewritten in Phase 1 / 2a.
 
 When `tensor.slice` feeds into `tensor.matmul` or `tensor.matmul_acc`, the slice must produce a Mat-space tile instead of a Vec-space tile. The pass pre-scans for this pattern and emits a natural Mat `tile.load`; a transposed operand (`a_trans` for LHS, `b_trans` for RHS) gets a zero-copy `tile.transpose_view` at the matmul site.
 
-The demand is propagated **through** zero-copy metadata ops that declare `set_output_memory_inherit_input()` — `tensor.slice`, `tensor.view`, `tensor.reshape`, `tensor.reinterpret_view`, `tensor.set_validshape`. So an operand written as `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` still loads straight to Mat. An op that aliases its input's storage but omits that declaration breaks the chain: the operand materializes in Vec and needs a `tile.move` to Mat, which is a vector→cube boundary that flips an otherwise pure-CUBE InCore scope to `MIXED` and makes [`ExpandMixedKernel`](21-expand_mixed_kernel.md) split it into an AIC/AIV pair.
+The demand is propagated **through** zero-copy metadata ops that declare `set_output_memory_inherit_input()` — `tensor.slice`, `tensor.view`, `tensor.reshape`, `tensor.reinterpret_view`, `tensor.set_validshape`. So an operand written as `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` still loads straight to Mat. An op that aliases its input's storage but omits that declaration breaks the chain: the operand materializes in Vec and needs a `tile.move` to Mat, which is a vector→cube boundary that flips an otherwise pure-CUBE InCore scope to `MIXED` and makes [`ExpandMixedKernel`](22-expand_mixed_kernel.md) split it into an AIC/AIV pair.
+
+## Cube Operand M-Axis Boxing
+
+A cube operand has two independent extents, and only one of them is constrained.
+
+- The **logical** extent is essentially free. `pto.tmatmul` derives `M`, `K`, and
+  `N` from the operands' *valid* region, bounded at `[1, 4095]` with no
+  divisibility rule; `pto.mad` carries a `disable_gemv` clause whose whole
+  purpose is selecting the L0A organization at `%m == 1`.
+- The **physical** extent must be a whole number of NZ fractal boxes. A box is
+  16 rows tall on every generation and dtype; it is
+  `32 bytes / sizeof(dtype)` wide (16 for FP16, 32 for INT8). ptoas enforces it
+  directly — `'pto.alloc_tile' op expects result boxed tile rows to be a
+  multiple of innerRows (16)` — and pto-isa's `TExtract` repeats it as a static
+  assertion on the Mat source it reads.
+
+So every cube tile the matmul's M axis runs through is allocated with that extent
+rounded up to the box, and the tensor's true extent declared as `valid_shape`:
+
+```python
+# Before  (M = 100)
+y = tensor.matmul(a, b)          # a: Tensor[[100, 256]]
+
+# After
+a_mat = pl.tile.load(a, [0, 0], [112, 256], [100, 256], target_memory=pl.Mem.Mat)
+y_tile = pl.tile.matmul(a_mat, b_mat)   # Tile[[112, 512]] valid [100, 512]
+```
+
+The padding is free on both axes of the cost model. A `tile.load` moves only the
+valid extent, so the DMA is unchanged; and the MAD cost is `ceil(M/16)` passes,
+which rounding M up to a multiple of 16 leaves unchanged. The hardware addresses
+the narrower valid region inside the full box through compact mode, and
+`tile.store` writes only the valid rows, so the observable result is identical.
+
+Making M a multiple of 16 here is also what keeps
+[`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md) legal at the boundary: that pass
+picks a 16-aligned tile and peels the remainder, and a multiple of 16 can only be
+split into 16-aligned pieces, tail included. It therefore needs no boundary
+special case.
+
+### Which axis carries M
+
+M does not always land on the row axis. An `a_trans` operand is loaded
+*naturally* and reinterpreted by a zero-copy `tile.transpose_view`, so its
+loaded tile has `K` on rows and `M` on **columns** — the box rule follows M to
+whichever axis holds it (`InputSpaceReq::cube_m_axis` resolves the axis from the
+operand's own transpose flag):
+
+```python
+# a: Tensor[[128, 100]], a_trans=True — M is the load's column extent
+a_mat = pl.tile.load(a, [0, 0], [128, 112], [128, 100], target_memory=pl.Mem.Mat)
+a_t   = pl.tile.transpose_view(a_mat)   # Tile[[112, 128]] valid [100, 128]
+```
+
+That also means the *granularity* differs per tile even though the padded extent
+must not: an Acc box is 16 rows for every dtype, while a transposed operand's
+column box is `32 / sizeof(dtype)`. A transposed INT8 operand therefore needs 32,
+and the accumulator paired with it has to adopt that same 32 — each taking its
+own would give a 128-row product against a 112-row accumulator, which
+`tile.matmul_acc` rejects. `InputSpaceReq::m_align_from_arg` names the left
+operand as the single decider, and the alignment is the lcm of its box and the
+accumulator's 16 rows (every granularity involved is a power of two, so the lcm
+is the max).
+
+The rule rides on the *demand*, not on one code path. Four sites can answer a
+matmul's operand requirement, and all four box: `BridgeInputSpaces` for an operand
+that is still a tensor at the call; `HandleConsumerDrivenLoad` when a
+`tensor.slice` (or any `set_output_memory_inherit_input()` chain) answers it at
+the producer; the Phase-1 entry loop when the producer is a parameter, which
+is what a `pl.matmul(pl.set_validshape(a, ...), b)` reaches; and
+`HandleBoxedAccCreate` for an accumulator, which is allocated rather than loaded.
+`ConsumerSpaceReq` therefore carries the box flag alongside the memory space. When
+several consumers share one producer, the rows are boxed only if every one of them
+asks for it, so a consumer that reads the tile at its declared physical shape is
+never handed a padded one.
+
+### `tensor.matmul_acc` boxes its accumulator with its operand
+
+`tensor.matmul_acc` takes exactly `tensor.matmul`'s M constraint, because the two
+cube tiles the M axis runs through must be boxed *together*: `tile.matmul_acc`
+requires the accumulator and the matrix product to agree on physical M, so boxing
+the left operand alone would trade a ptoas rejection for an operand-mismatch one.
+
+The accumulator is never loaded — nothing but the matrix unit writes L0C — so its
+allocation is the site that answers the demand. `HandleBoxedAccCreate` rewrites
+the `tensor.create` that seeds it, and the narrowing rides on a separate
+`tile.set_validshape` because `tile.create` takes no valid extent:
+
+```python
+# Before  (M = 100)
+acc = pl.create_tensor([100, 64], pl.FP32)
+c = pl.matmul_acc(acc, a, b)
+
+# After
+acc_storage = pl.tile.create([112, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+acc_tile = pl.tile.set_validshape(acc_storage, 100, 64)   # Tile[[112, 64]] valid [100, 64]
+a_mat = pl.tile.load(a, [0, 0], [112, 128], [100, 128], target_memory=pl.Mem.Mat)
+c_tile = pl.tile.matmul_acc(acc_tile, a_mat, b_mat)
+```
+
+Two details this path settles that the operand path does not:
+
+- **The space is stated, not left to [`InferTileMemorySpace`](18-infer_tile_memory_space.md).**
+  The plain `tensor.create` conversion deliberately leaves `target_memory` unset,
+  having no consumer context to derive it from; here there is one, and it is the
+  same demand that asked for the boxing. Stating it also matters for correctness:
+  an Acc tile's implicit view is boxed NZ, so a seed left unresolved would carry
+  the raw row-major view and disagree with the `tile.matmul_acc` result it is
+  carried against across a split-K loop.
+- **The demand crosses the loop carry.** A split-K accumulator is allocated before
+  the loop and reaches its `tile.matmul_acc` as an `IterArg`, so
+  `ConsumerSpaceCollector` matches operands with `AsVarLike` (an `IterArg` carries
+  its own `ObjectKind`) and records a propagation edge from each `IterArg` to the
+  value that seeds it.
+
+The boxed accumulator is declared **compact**. `mad` lays the product out at a
+pitch of `ceil(validRow/16)*16` — 112 for a 100-row product — while a
+non-compact reader derives its stride from the physical row count, which the box
+rounded to 112 or, at a 32-row alignment, to 128. Compact makes every reader
+recompute the pitch `mad` actually used; without it `AccCompactValid` rejects the
+program (issue #2470).
+
+Scope, and what is deliberately left out:
+
+| Case | Boxed? | Why |
+| ---- | ------ | --- |
+| 2-D `tensor.matmul` left operand | Yes, on rows | Its row axis is M, whose box height is 16 for every dtype |
+| 2-D `tensor.matmul_acc` left operand and accumulator | Yes, on rows | Same axis, same rule — and the op requires the two to agree on physical M, so they move together |
+| `a_trans` left operand, and the accumulator paired with it | Yes, on columns | The natural load's row axis is K, so M is the column extent; the accumulator adopts that operand's column granularity via `m_align_from_arg` |
+| Right operand | No | Its rows are `K`, the reduction axis — padding it would feed uninitialised L1 into the sum unless the hardware masks by valid col, which is unverified |
+| Output `N` | No | Same open question as `K`; [`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md)'s `PH-AT-007` declines it for the same reason |
+| Rank >= 3 operand | No | It lowers to `tile.batch_matmul`, whose rows [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) row-packs into one `[B*M, N]` tile — the box rule binds that packed extent, not this dimension |
+| Dynamic M extent | No | No compile-time box to round to |
+
+Every case this pass declines still reaches a PyPTO-level error rather than a
+ptoas one: [PTO codegen](../codegen/00-pto_codegen.md#boxed-tile-extents)
+validates the box grid of every `pto.alloc_tile` it emits.
 
 ## Transpose Lowering
 
@@ -257,7 +417,7 @@ for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
 oi = pl.matmul(full, v, out_dtype=pl.FP32)               # Tensor, OUTSIDE the region
 ```
 
-This pass lowers each **1:1** to its tile op (`tensor.aiv_shard` → `tile.aiv_shard`, `tensor.aic_gather` → `tile.aic_gather`), so from here on the IR is byte-identical to what the AUTO `pl.split` path produces via [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md) (pass 20). `ExpandMixedKernel` (pass 21) then folds both into the cross-core `tpush`/`tpop` machinery.
+This pass lowers each **1:1** to its tile op (`tensor.aiv_shard` → `tile.aiv_shard`, `tensor.aic_gather` → `tile.aic_gather`), so from here on the IR is byte-identical to what the AUTO `pl.split` path produces via [`LowerAutoVectorSplit`](21-lower_auto_vector_split.md) (pass 20). `ExpandMixedKernel` (pass 21) then folds both into the cross-core `tpush`/`tpop` machinery.
 
 **Constraints** (enforced by the tensor-level deducer and the DSL parser, not this pass):
 
@@ -320,6 +480,40 @@ Key changes:
 - `Out` parameter `ret0_out` added to InCore function
 - `tensor.create` inserted at orchestration call site
 
+## Loop-Carry Valid-Shape Repair
+
+`tensor.matmul` drops its operands' `valid_shape`, so an accumulator only becomes narrower
+than the seed it is carried from once this pass produces a `tile.matmul` over a
+row-narrowed left operand:
+
+```python
+acc = pl.create_tensor([M, N], dtype=pl.INT32)          # full box
+for k0 in pl.pipeline(0, K, K_TILE, stage=2):
+    xk = pl.slice(x, [M, K_TILE], [m0, k0], valid_shape=[v, K_TILE])   # runtime v
+    acc = pl.matmul_acc(acc, xk, wk, b_trans=True)      # narrowed, compact result
+```
+
+The carry is typed from its **init value alone** — `ConvertToSSA` mints the `IterArg` from
+the seed, this pass re-mints it from the converted seed, and both force the loop's
+`return_var` back to that type — so the narrowing dies at the loop boundary. `mad` writes
+L0C at an N-fractal stride of `ceil(v/16)*16` while a reader that believes the full box
+height walks it at the physical row pitch, corrupting every N-fractal above the first
+(issue #2470).
+
+Before returning, this pass therefore calls `narrow_loop_carry::NarrowAccCarries` on each
+function: an Acc carry seeded by `tile.create` is re-declared at the extent its yields
+prove — `tile.create(compact=True)` plus `tile.set_validshape` — and the body's def-use
+closure is re-typed through the operators' own deducers. Repairing it in the pass that
+creates it keeps the pipeline verifiable; leaving it would publish a carry the `TypeCheck`
+diagnostic and the `AccCompactValid` property verifier reject. `FlattenTileNdTo2D` calls
+the same helper, for an ND seed whose narrowing only appears when `tile.batch_matmul` is
+unrolled into 2D matmuls.
+
+A carry is left exactly as it is when the two readings of its buffer cannot disagree — a
+single-fractal-block `[16, N]` accumulator packs to its physical rows whatever its valid
+rows — or when the narrowed extent is only computed inside the loop body, where the
+re-declared seed could not name it.
+
 ## Implementation
 
 **Header**: `include/pypto/ir/transforms/passes.h`
@@ -328,15 +522,17 @@ Key changes:
 
 **Python binding**: `python/bindings/modules/passes.cpp`
 
-**Tests**: `tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py`
+**Tests**: `tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py`, `tests/ut/ir/transforms/test_narrow_loop_carry_valid_shape.py` (the carry repair)
 
 ## Pass Properties
 
 | Property | Value |
 | -------- | ----- |
 | Required | SSAForm, SplitIncoreOrch, NormalizedStmtStructure |
-| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure |
-| Invalidated | — |
+| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure, AivSplitValid |
+| Invalidated | AivSplitValid |
+
+`AivSplitValid` is both invalidated and re-produced, which forces a second verification of the split regions here. `OutlineIncoreScopes` establishes the property while the AIV-split boundary is still `tensor.aiv_shard` / `tensor.aic_gather`; a TensorType carries no memory space, so the verifier's boundary memory-contract check is necessarily skipped there. This pass rewrites those ops to their tile form and attaches the declared boundary memory, which is exactly what that check inspects.
 
 ## Key Components
 

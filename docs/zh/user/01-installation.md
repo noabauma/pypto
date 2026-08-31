@@ -102,8 +102,22 @@ OK
 | C++ 编译器 | C++17 | GCC 或 Clang。`CMAKE_CXX_STANDARD 17` 是强制要求而非建议 |
 | numpy | ≥ 2.0 | 自动安装 |
 | torch | ≥ 2.0 | 自动安装，但请先装 CPU 版（见下） |
-| nanobind | ≥ 2.0 | 仅构建期需要，自动获取 |
+| nanobind | ≥ 2.0, < 3 | 仅构建期需要，自动获取 |
 | scikit-build-core | ≥ 0.10 | 构建后端，自动获取 |
+
+上表给出的是 pypto 兼容的版本范围。CI 实际构建所用的确切版本固定在仓库根目录的
+`build-constraints.txt` 中。本地复现 CI 构建时，把它指给 pip：
+
+```bash
+PIP_BUILD_CONSTRAINT=$PWD/build-constraints.txt \
+PIP_CONSTRAINT=$PWD/build-constraints.txt \
+    pip install -e .
+```
+
+两个变量都要传，因为它们覆盖不同的 pip 版本：`PIP_BUILD_CONSTRAINT` 是 pip 26.2
+起用于约束构建依赖的变量，`PIP_CONSTRAINT` 则是更早版本在该场景下认的那个。只传后者
+的话，较新的 pip 会重新自由解析 `[build-system] requires`，构建出来的就不是 CI 验证
+过的那一份了。
 
 **先装 CPU 版 torch，再装 PyPTO。** `pip install -e .` 会把 `torch>=2.0.0` 解析到默认
 wheel，它携带完整 CUDA 栈 —— 约 2GB，而 PyPTO 的工作流一点也用不到。先从 CPU 索引安装
@@ -126,6 +140,16 @@ pip install -e ".[dev]"     # 可编辑 + pytest、ruff、pyright、clang-tidy
 
 ```bash
 CMAKE_BUILD_TYPE=Release pip install .
+```
+
+`RelWithDebInfo` 携带完整调试信息 —— 调试器需要它，它也占了产物的绝大部分：扩展模块
+304 MiB，其中 292 MiB 是 DWARF。设置 `PYPTO_DEBUG_INFO_LEVEL=1` 只保留 backtrace 会读的
+部分（函数描述与行号表），扩展模块降到 62 MiB、其 wheel 降到 18 MiB，编译快约三分之一，
+而错误信息里的 `C++ Traceback` 完全不变。失去的是局部变量和类型信息，所以准备挂调试器时
+请保持默认值：
+
+```bash
+SKBUILD_CMAKE_DEFINE=PYPTO_DEBUG_INFO_LEVEL=1 pip install .
 ```
 
 检测到 `ccache` 时会自动启用，能显著降低重复构建的成本：

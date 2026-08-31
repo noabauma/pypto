@@ -265,8 +265,13 @@ TypePtr DeduceTensorReinterpretViewType(const std::vector<ExprPtr>& args,
   const DataType target_dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
   const TensorLayout layout =
       tensor_type->tensor_view_.has_value() ? tensor_type->tensor_view_->layout : TensorLayout::ND;
+  // NZ is a legal TensorType layout (in its blocked form), but reinterpreting a
+  // fractal-blocked buffer under a new dtype would silently change which bytes
+  // each element maps to — the fractal geometry is dtype-dependent (c0 = 32 /
+  // sizeof(dtype)). Refuse rather than mis-address.
   CHECK_SPAN(layout != TensorLayout::NZ, args[0]->span_)
-      << kOpName << " does not support boxed/fractal NZ tensor layout";
+      << kOpName << " does not support the NZ layout: its fractal blocking depends on the element "
+      << "size, so reinterpreting the dtype would remap every element. Slice the NZ tensor directly.";
   CHECK_SPAN(layout != TensorLayout::DN || tensor_type->shape_.size() >= 2, args[0]->span_)
       << kOpName << " requires rank >= 2 for DN layout";
 
@@ -357,7 +362,7 @@ TypePtr DeduceTensorTransposeType(const std::vector<ExprPtr>& args,
   //     drive the implicit "swap last two dims" path used by DN-source loads.
   //
   //  2. Explicit strides. tensor.transpose at orchestration level lowers to
-  //     runtime ChipTensor::transpose, a metadata-only swap of shapes / offsets;
+  //     runtime TaskTensor::transpose, a metadata-only swap of shapes / offsets;
   //     the underlying GM data stays in the source's row-major layout. So the
   //     physical strides for the post-transpose view are the source's strides
   //     reordered at (axis1, axis2). Recording those strides on the result
@@ -480,12 +485,32 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
   TensorLayout src_layout =
       src_type->tensor_view_.has_value() ? src_type->tensor_view_->layout : TensorLayout::ND;
   TensorLayout new_layout = requested_layout.value_or(src_layout);
-  CHECK_SPAN(!IsMxTensorLayout(src_layout) && !IsMxTensorLayout(new_layout), args[0]->span_)
-      << "tensor.view does not support MX layouts";
-  CHECK(new_layout != TensorLayout::NZ)
-      << "tensor.view: NZ layout is not allowed on TensorType (NZ is tile-only)";
+  const bool has_shape = args.size() >= 2;
+  // FP8E8M0 scale buffers may alias between packed ND storage and the Cube
+  // consumer layouts. MX_A_ZZ covers LeftScale boxes; MX_B_NN covers RightScale.
+  const bool is_mx_scale_backing_nd_view =
+      has_shape && src_type->dtype_ == DataType::FP8E8M0 &&
+      ((src_layout == TensorLayout::MX_A_ZZ && new_layout == TensorLayout::ND) ||
+       (src_layout == TensorLayout::ND && new_layout == TensorLayout::MX_A_ZZ) ||
+       (src_layout == TensorLayout::MX_B_NN && new_layout == TensorLayout::ND) ||
+       (src_layout == TensorLayout::ND && new_layout == TensorLayout::MX_B_NN));
+  CHECK_SPAN((!IsMxTensorLayout(src_layout) && !IsMxTensorLayout(new_layout)) || is_mx_scale_backing_nd_view,
+             args[0]->span_)
+      << "tensor.view does not support MX layouts except shaped ND/MX_A_ZZ/MX_B_NN backing views "
+         "for FP8E8M0";
+  // NZ is a legal TensorType layout (in its blocked form), but tensor.view
+  // reinterprets shape/strides, and a blocked NZ view's dims are a fractal
+  // decomposition rather than free axes — re-viewing them would break the
+  // addressing. Milestone 1 therefore keeps NZ out of tensor.view entirely.
+  // Source first: when the source is NZ, ``new_layout`` defaults to it, so
+  // checking the destination first would report the derived symptom instead of
+  // the annotation the user actually wrote.
   CHECK(src_layout != TensorLayout::NZ)
-      << "tensor.view: src has NZ layout (NZ is tile-only and not allowed on TensorType)";
+      << "tensor.view does not support an NZ source: its dims are a fractal decomposition, "
+      << "so re-viewing them would break the fractal addressing. Slice the NZ tensor directly.";
+  CHECK(new_layout != TensorLayout::NZ)
+      << "tensor.view cannot produce an NZ layout: the blocked NZ shape is derived from the "
+      << "source tensor by BlockNzTensorViews, not chosen at a view site";
 
   if (src_type->tensor_view_.has_value() && !src_type->tensor_view_->stride.empty()) {
     auto canon_check = tensor_view_semantics::CheckCanonicalView(
@@ -495,7 +520,6 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
   }
 
   std::vector<ExprPtr> new_shape;
-  const bool has_shape = args.size() >= 2;
   const bool has_explicit_valid_shape = args.size() == 3;
   if (has_shape && src_type->tensor_view_.has_value() && !src_type->tensor_view_->stride.empty()) {
     auto packed_stride = tensor_view_semantics::BuildLogicalStridesFromLayout(src_type->shape_, src_layout);
@@ -807,6 +831,21 @@ REGISTER_OP("tensor.set_validshape")
     .add_argument("valid_rows", "Number of valid rows (ScalarType INDEX/INT64/UINT64)")
     .add_argument("valid_cols", "Number of valid columns (ScalarType INDEX/INT64/UINT64)")
     .set_output_memory_inherit_input()
+    // Metadata-only: no data moves, so the result names the same buffer as the
+    // input. Orthogonal to the space-inheritance above (see
+    // OpRegistryEntry::OutputMemoryInheritsInput).
+    //
+    // ConvertTensorToTileOps rewrites this op to `tile.set_validshape` before
+    // any param-lineage consumer runs, so nothing reads this today. Declared
+    // anyway because it is true, and because the alternative failure is silent:
+    // a lineage walk that cannot see the aliasing reports the result as a fresh
+    // kernel allocation.
+    .set_output_reuses_input(0)
+    // The in-place slot is metadata, not data: this op rebinds the valid extent
+    // and moves nothing, so no dependency edge should order against it. A
+    // verdict on record — the gate requires one, and "writes nothing" is the
+    // honest answer rather than an omission.
+    .no_arg_writes()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTensorSetValidShapeType(args, kwargs);

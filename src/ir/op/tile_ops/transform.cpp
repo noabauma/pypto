@@ -329,6 +329,22 @@ TypePtr DeduceTileReshapeType(const std::vector<ExprPtr>& args,
   tile_view.pad = source_view.pad;
   tile_view.compact = source_view.compact;
 
+  if (tile_view_semantics::ShapeExprListsEquivalent(new_shape, tile_type->shape_)) {
+    // An identity reshape does not move bytes, so it is a view onto the same address
+    // arithmetic: it keeps the WHOLE source view -- layout triple, `stride` and
+    // `start_offset` included -- and the source's memory space. Rebuilding the view from
+    // the shape instead yields the space-agnostic flat default, which
+    // `NormalizeImplicitTileView` rescues only for a view that collapses -- and an Acc box
+    // that is narrowed, padded or declared compact never does, so the flat layout would
+    // stick and its reader would walk L0C as if it were a plain row-major buffer
+    // (issue #2470). Dropping an explicit `stride` / `start_offset` would relocate a
+    // strided sub-view outright.
+    TileView identity_view = source_view;
+    identity_view.valid_shape = tile_view.valid_shape;
+    return std::make_shared<TileType>(new_shape, tile_type->dtype_, std::nullopt, identity_view,
+                                      tile_type->GetMemorySpace());
+  }
+
   tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(new_shape);
 
   return std::make_shared<TileType>(new_shape, tile_type->dtype_, std::nullopt, tile_view);
@@ -348,8 +364,16 @@ TypePtr DeduceTileReinterpretViewType(const std::vector<ExprPtr>& args,
 
   const DataType target_dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
   const TileView source_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
-  CHECK_SPAN(source_view.slayout == TileLayout::none_box, args[0]->span_)
-      << kOpName << " only supports flat tiles with slayout=none_box; boxed/fractal tiles are unsupported";
+  const bool complete_mx_scale_layout =
+      (source_view.blayout == TileLayout::row_major && source_view.slayout == TileLayout::row_major) ||
+      (source_view.blayout == TileLayout::col_major && source_view.slayout == TileLayout::col_major);
+  const bool mx_scale_byte_alias =
+      source_view.fractal == tile_view_semantics::kMXScaleFractal && complete_mx_scale_layout &&
+      ((tile_type->dtype_ == DataType::UINT8 && target_dtype == DataType::FP8E8M0) ||
+       (tile_type->dtype_ == DataType::FP8E8M0 && target_dtype == DataType::UINT8));
+  CHECK_SPAN(source_view.slayout == TileLayout::none_box || mx_scale_byte_alias, args[0]->span_)
+      << kOpName
+      << " only supports flat tiles with slayout=none_box, except UINT8/FP8E8M0 MX-scale byte aliases";
   CHECK_SPAN(source_view.blayout == TileLayout::row_major || source_view.blayout == TileLayout::col_major,
              args[0]->span_)
       << kOpName << " requires row_major or col_major blayout";
@@ -662,6 +686,9 @@ REGISTER_OP("tile.assemble")
     .add_argument("target", "Target tile (TileType)")
     .add_argument("source", "Source tile to write (TileType)")
     .add_argument("offset", "Offset dimensions (TupleType of ScalarType(INT64/UINT64/INDEX))")
+    // Rewrites the offset sub-region of `target` and passes the rest through to
+    // the result, so the prior content is read. Tile-local, hence no channel.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .set_output_memory_inherit_input()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
@@ -874,6 +901,8 @@ REGISTER_OP("tile.scatter_update")
     .set_input_memory(2, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .set_output_reuses_input(0)
+    // DPS: the indexed rows are rewritten, every other row passes through.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileScatterUpdateType(args, kwargs);
@@ -976,7 +1005,23 @@ TypePtr DeduceTileSetValidShapeType(const std::vector<ExprPtr>& args,
   // row_major / fractal=1024, a [M, 1] Vec tile is col_major, ...). Default-
   // constructing a TileView here would pin the raw row_major / none_box /
   // fractal=512 defaults onto an alias of, e.g., an Acc accumulator.
+  // The inherited `compact` is deliberately kept as-is, including for an Acc
+  // alias. This op is metadata-only and may run *after* the buffer was written,
+  // so the stride its readers must use is the one the producing `mad` already
+  // laid the bytes out at — not one derived from the new valid rows. Narrowing
+  // a fully-written accumulator here must therefore leave its non-compact
+  // reading pitch alone.
   TileView tile_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+  if (tile_type->dtype_ == DataType::FP4 && tile_type->memory_space_ == MemorySpace::Vec) {
+    const size_t packed_dim = tile_view.blayout == TileLayout::col_major ? 0 : 1;
+    const ExprPtr& packed_valid = args[packed_dim + 1];
+    auto packed_const = As<ConstInt>(packed_valid);
+    CHECK_SPAN(packed_const, packed_valid->span_)
+        << "tile.set_validshape requires the packed FP4 valid dimension to be a static positive even value";
+    CHECK_SPAN(packed_const->value_ > 0 && packed_const->value_ % 2 == 0, packed_valid->span_)
+        << "tile.set_validshape requires the packed FP4 valid dimension to be a positive even value, but got "
+        << packed_const->value_;
+  }
   tile_view.valid_shape = {args[1], args[2]};
 
   return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);

@@ -30,7 +30,7 @@ There are **fifteen ops** and **four ABI enums**:
 | `pld.tensor.reduce_scatter` | reduce and scatter chunks across ranks | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.allgather` | gather data from all ranks via window | `DistributedTensorType` (same as src) | builtin collective |
 | `pld.tensor.all_to_all` | push-based symmetric personalized exchange — every rank pushes its per-destination chunks to every peer's window via `pld.tensor.put` (TPUT), returns window as result | `DistributedTensorType` (same as src) | composite / HOST builtin |
-| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes the full MAX_RECV-row block per destination into a flat 2D staging window (transfer size is the full per-destination capacity block), and publishes `min(send_counts[dest], MAX_RECV)` into peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set) so the receiver can skip rows beyond its count; returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin |
+| `pld.tensor.all_to_all_v` | variable-size all-to-all (MPI_Alltoallv) — pushes `clamp(send_counts[dest], 0, MAX_RECV)` rows per destination into a flat 2D staging window (transfer size is the runtime row count, so padding never crosses the wire), and publishes that same clamped count into peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set) so the receiver knows which rows are valid; returns window as result (same window-as-result pattern as symmetric `all_to_all`) | `DistributedTensorType` (same as target) | composite / HOST builtin |
 | `pld.system.notify` | signal a peer's slot | `Unknown` (side effect) | TNOTIFY |
 | `pld.system.wait` | block on own slot | `Unknown` (side effect) | TWAIT |
 | `pld.system.defer_wait` | defer this task's logical completion on a local counter | `Unknown` (side effect) | Simpler completion runtime (no PTOAS wait op) |
@@ -101,7 +101,7 @@ The flag is orthogonal to affinity (it constrains replication, not placement).
 Its only consumer is `LowerAutoVectorSplit`'s `pl.split_aiv` region placement
 stamp, which pins a region's no-duplicate calls to the AIV lane; see
 `docs/en/dev/ir/05-operators.md` and
-`docs/en/dev/passes/20-lower_auto_vector_split.md`.
+`docs/en/dev/passes/21-lower_auto_vector_split.md`.
 
 **Comm ops written outside every region are still duplicated onto both lanes,
 and nothing diagnoses it.** Putting the comm phase in a `pl.split_aiv` region is
@@ -412,17 +412,41 @@ Variable-size all-to-all (MPI_Alltoallv). Flat 2D layouts:
 - `recv_counts` — DistributedTensor INT32 `[NR, 1]` (InOut recvcounts)
 
 `MAX_RECV = target.shape[0] // NR`. Lowering reads `send_counts[dest]` at
-runtime, clamps to `MAX_RECV`, and publishes the **clamped** count into peer
-`recv_counts[my_rank, 0]` via `pld.system.notify` (Set). The push itself
-always transfers the full `MAX_RECV`-row capacity block per destination —
-independent of the runtime count — so rows beyond a sender's actual count
-still cross the wire; after the barrier the receiver uses `recv_counts[src, 0]`
-to skip those rows (MPI_Alltoallv semantics apply to the logical result, not
-the wire transfer). On the InCore path the transfer is a compile-time-sized
-`pld.tile.put` (PTOAS requires static partition-view dims); on the HOST path
-the kernel derives `MAX_RECV` at entry from the runtime rank count
+runtime, clamps it to `[0, MAX_RECV]`, and publishes the **clamped** count into
+peer `recv_counts[my_rank, 0]` via `pld.system.notify` (Set). The push transfers
+exactly that many rows — the transfer shape is the runtime `[rows, SIZE]`, not
+the compile-time capacity — so padding rows never cross the wire. After the
+barrier the receiver uses `recv_counts[src, 0]` to identify the valid rows; the
+remainder of its capacity slot is never written at all. Window memory is not
+*guaranteed* zeroed and can carry over within a process, so those untouched
+bytes are undefined.
+
+> [!WARNING]
+> **Trim to `recv_counts` before doing arithmetic over the capacity block.**
+> The untouched tail is *uninitialised*, so it can decode as **NaN or Inf** —
+> not merely as a wrong-but-finite value. This is a change in kind, not just in
+> value: the previous full-capacity push left the sender's surplus rows there,
+> which were always finite FP32. Code that reduces or otherwise computes across
+> the dense `[NR*MAX_RECV, SIZE]` block and masks by `recv_counts` *afterwards*
+> — the natural MoE-dispatch shape — was correct before and will now propagate
+> NaN into otherwise-valid rows. Mask first, then compute.
+
+The clamp is two-sided, and the lower bound is load-bearing in two places: it
+keeps a negative `send_counts` from becoming a negative transfer extent, and —
+because the published count is that same clamped value — a negative
+`send_counts[dest]` now publishes `recv_counts = 0` rather than the negative
+number itself. Both rails changed together, so they remain bit-for-bit
+identical on a negative input.
+
+On the InCore path this is a `pld.tile.put` whose transfer shape is the runtime
+count, fed through a static `[1, SIZE]` staging tile that the TPUT engine
+auto-chunks; PTOAS accepts dynamic partition-view dims on `pto.comm.tput`
+(`TPutOp::verify` passes `AllowDynamicPartitionView`), and no `chunk_rows` attr
+is needed because the staging tile is explicit. On the HOST path the kernel
+derives `MAX_RECV` at entry from the runtime rank count
 (`target.shape[0] / nranks`), so it is always consistent with the devices
-actually running.
+actually running. Both rails apply the identical two-sided clamp and the same
+`[rows, SIZE]` extent, keeping them bit-for-bit identical on the wire.
 
 **InCore composite** (`LowerCompositeOps`): the primitive above, decomposed
 into `pld.tile.put` + `pld.system.notify`/`wait` inside a chip kernel.
@@ -504,7 +528,7 @@ dynamic physical target dimension is bound from that tensor parameter.
   every row of the signal afterward.
 
 Host-orchestrator user code may omit `signal` outside `for` and `while` loops;
-the [`SynthesizeAllReduceSignals`](passes/40-synthesize_allreduce_signals.md)
+the [`SynthesizeAllReduceSignals`](passes/41-synthesize_allreduce_signals.md)
 pass inserts a private INT32 signal window with semantic shape
 `[world_size, core_num]`
 for that call (mesh mode only — `mode="ring"` requires an explicit signal). The
@@ -667,11 +691,11 @@ than a PTO tensor view.
 ## Pipeline integration
 
 Comm domains and their slot allocations are materialised by the
-[`MaterializeCommDomainScopes`](passes/41-materialize_comm_domain_scopes.md) pass, which wraps each
+[`MaterializeCommDomainScopes`](passes/42-materialize_comm_domain_scopes.md) pass, which wraps each
 host_orch body in nested `CommDomainScopeStmt` nodes (one per inferred comm domain) and produces the
 per-window `WindowBuffer` records that the runtime binds physical buffers to.
 Host-level tensor collectives are then lowered by
-[`LowerHostTensorCollectives`](passes/42-lower_host_tensor_collectives.md) into internal builtin chip
+[`LowerHostTensorCollectives`](passes/43-lower_host_tensor_collectives.md) into internal builtin chip
 dispatches before the final `Simplify`.
 
 ## Testing

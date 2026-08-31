@@ -50,8 +50,10 @@ program_outlined = outline_pass(program)
 5. **替换作用域**：将 `InCoreScopeStmt` 替换为：
    - 带有输入参数的提取函数调用
    - 每个输出变量对应一个 AssignStmt
-6. **添加到程序**：将提取的函数添加到程序的函数列表中
-7. **提升父函数**：至少提取出一个作用域的 Opaque 父函数将变为 `Orchestration`——
+6. **贯穿控制流**：当作用域位于循环或 `if` 内部时，为在该语句外定义的写目标绑定的
+   新名字变成真正的循环携带值（loop carry）；在该控制流语句体内创建的目标仍保持局部（见下）
+7. **添加到程序**：将提取的函数添加到程序的函数列表中
+8. **提升父函数**：至少提取出一个作用域的 Opaque 父函数将变为 `Orchestration`——
    并在此之前先折叠其参数动态维度读取（见下）
 
 **参数动态维度读取在提升时折叠**：tensor 声明的 extent *就是*它的运行期
@@ -106,22 +108,60 @@ IR 上。若被捕获变量是被 `tile.store` 之外的方式重新绑定，则
 store 目标导出（该缓冲区已经通过写方向参数对调用方可见），因此其函数体保留原有的
 重新绑定——被捕获变量仍然会成为参数，而这正是此前出问题的部分。
 
-**写方向：除非函数体读取，否则为 `Out`**：作用域写入的被捕获 tensor——`tile.store`
-的目标或 `tensor.assemble` 的目的操作数——会被 `InferParamDirections` 从 `In`
-提升。具体得到哪个写方向，取决于函数体是否**同时读取**它。这两个写操作都是**就地**
-更新目的操作数的一个子区域：未被写到的区域既不会被 load 也不会被重新 store，因此
-出现在该目的槽位并不会把数据带入作用域，不算读取。只出现在目的槽位的参数因此是
-`Out`；其它任何使用——喂给 `tensor.slice`、计算算子，或作为被调函数的 `In`/`InOut`
-实参——都会使其成为 `InOut`。SSA 下写后状态会绑定到一个新 Var，读取**该别名**同样算读：
+**哪些算子写入**不在这里判定。每个算子在注册表上声明它对各个实参的效应
+（`set_arg_effect`，参见[算子](../ir/05-operators.md#参数效应argument-effects)），
+`InferParamDirections` 直接读取该声明。此前本 pass 只识别 `tile.store` 与
+`tensor.assemble` 两个写算子，因此一个作用域若通过 `tensor.write`、
+`tensor.expand_clone`、`pld.system.notify`、`pld.tile.put` 或任何其它写算子写入被捕获
+tensor，该 tensor 看起来就完全没被动过：参数停留在 `In`，调用方拿不到对这次写入的依赖，
+而后续两个重新推导方向的 pass 会与本 pass 对同一次调用给出不同答案。
+
+**写方向：除非函数体读取，否则为 `Out`**：作用域写入的被捕获 tensor 会被
+`InferParamDirections` 从 `In` 提升。具体得到哪个写方向，取决于函数体是否**同时读取**
+它。被算子声明为 `Write` 的实参是**就地**更新目的操作数的一个子区域：未被写到的区域既
+不会被 load 也不会被重新 store，因此出现在该目的槽位并不会把数据带入作用域，不算读取。
+只出现在这类槽位的参数因此是 `Out`；其它任何使用——喂给 `tensor.slice`、计算算子，或
+作为被调函数的 `In`/`InOut` 实参——都会使其成为 `InOut`。被声明为 `ReadWrite` 的实参
+留在读取路径上：原子 store / assemble（`out += x` 会读取累加器）与 `AtomicAdd` 形式的
+notify 因此保持目的操作数为 `InOut`，而普通形式不会——这是按算子陈述的一条规则，而不是
+每个 pass 各自开一个特例。SSA 下写后状态会绑定到一个新 Var，读取**该别名**同样算读：
 它指向同一块 buffer，而对作用域从未写过的区域的读取确实需要入参内容。无法识别的使用一律
 按读取处理，因此该推导只会偏向 `InOut`。
 
 两个键除外：`dump_vars` 与 `arg_direction_overrides_vars` 只是把张量作为**记账**引用
 （dump 标记、`NoDep` 退出），并不访问其内容。
 
-每一个证据来源——读取扫描、store 目标集合、assemble 扫描，以及每个内层被调函数声明的
-槽位——都只是访问集合的**下界**，因此它们按 `In < Out < InOut` 合并，而不是互相覆盖。
-直接赋值会让一个把槽位声明为 `Out` 的被调函数抹掉函数体真实发生的读取。
+每一个证据来源——读取扫描、store 目标集合、函数体内被声明的写入，以及每个内层被调函数声明的
+槽位——都只是访问集合的**下界**，任何一个来源都不得覆盖另一个。函数体一侧的来源按
+`In < Out < InOut` 合并。
+
+被调函数的槽位**不按**该序合并，这是唯一的例外。`In` 是初始化时的"尚无证据"地板，
+因此它不能同时表示"有人读过"——那样理解会把每一个只写的 capture 提升为 `InOut`，
+即 issue #2415 所说的虚假读取。于是逐个调用折叠会丢失信息：一个 capture 若分别传给
+某个被调函数的 `In` 槽和另一个的 `Out` 槽，先合并成 `In`、再合并成 `Out`，读取被丢掉。
+改为把被调函数的证据累积成两个独立标志——`In`/`InOut` 记为读、`Out`/`InOut` 记为写——
+最后一次性推导方向，这样上述 capture 得到 `InOut`，而只被写入的 capture 仍然是 `Out`。
+
+该判定的"读"这一半同时取自函数体扫描与被调函数槽位，因为一个 capture 可能被函数体读取、
+又被某个被调函数覆写：
+
+```python
+with pl.cluster():
+    value = pl.load(shared, [0, 0], [16, 128])  # 函数体读取
+    self.overwrite(shared)                      # 被调函数覆写
+```
+
+`shared` 是 `InOut`。若只看被调函数槽位就会判成 `Out`，等于告诉 wrapper 无需搬入
+`pl.load` 正要消费的那份内容。函数体扫描在此可信，是因为它会跳过被调函数声明为 `Out`
+的实参——那是内建算子声明写槽在用户函数一侧的对应物——因此把 capture 交给只写槽位
+本身不再被算作一次读取。
+
+该跳过同样适用于 `pl.submit`，而不只是普通调用。基础 visitor 不会把 `Submit` 转发到
+`Call` 处理函数，因此任务提交需要自己的规则；否则每个提交实参都算作读取，只传给 `Out`
+槽位的 capture 就会变成 `InOut`。`Submit` 的 `args_[i]` 按前缀映射到 `params_[i]`
+（`args_.size() <= params_.size()`，省略的尾部由运行时分配），而会破坏该 identity 的
+尾随 `CommCtx` 形参由第 43 个 pass 生成，远在任何 outliner 之后。它的 `deps_` 始终按
+读取处理——那是本次提交消费的 TaskId 值，绝非写入目的地。
 
 **Hierarchy 作用域是例外。** `OutlineScope` 对 `ScopeKind::Hierarchy` 有意保持
 `store_output_set` 为空（无需显式返回输出，buffer 已对调用方可见），因此被 Hierarchy
@@ -132,7 +172,7 @@ store 目标导出（该缓冲区已经通过写方向参数对调用方可见�
 `DistributedCodegen::EmitCallToWorker`，后者按**被调函数**的方向为每个 rank 的
 chip dispatch 实参打标签，于是一个错误的 `InOut` 会把同一个 `pl.Out` tensor 上
 互不相交的各 rank 切片变成跨 rank 写依赖（issue #2415）。而只写参数真正需要的
-定序不会因此丢失：[`DeriveCallDirections`](37-derive_call_directions.md) 会重新
+定序不会因此丢失：[`DeriveCallDirections`](38-derive_call_directions.md) 会重新
 推导**调用点**方向——在顺序执行的外层循环内、在同一 root 的前序写者之后，或该
 root 是外层函数的 `InOut` 形参时，把被调函数的 `Out` 重新提升为 `InOut`。
 
@@ -161,6 +201,24 @@ root 是外层函数的 `InOut` 形参时，把被调函数的 `Out` 重新提�
   这样无需手动重命名共享 helper 的内部 `name_hint`，即可把可独立运行的子 kernel
   组合进一个 `@pl.jit.host` 程序。同一规则也适用于共用外提工具的兄弟 pass
   `OutlineHierarchyScopes` 与 `OutlineClusterScopes`。
+
+**缓存策略声明变为参数索引**：作用域 body 中的
+`pl.set_cache_policy(t, pl.CachePolicy.BYPASS)` 语句已由 parser 提升到作用域的
+`cache_policy_vars` attr 上（`std::vector<std::pair<VarPtr, int>>`，按 Var 身份索引）。
+本 pass 用与 `no_dep_args` 转换相同的"已捕获输入索引表"逐个解析这些 Var，并把该列表
+重新发出为外提函数的 `cache_policy` attr —— `std::vector<std::pair<int32_t, int>>`
+（参数索引，`CachePolicy` 的 int 值），按索引排序，使声明顺序与捕获顺序都无法改变 IR。
+作用域 attr **在此处被消费，绝不向下传播**：从这里开始，函数 attr 是唯一载体，直到
+[`ConvertTensorToTileOps`](10-convert_tensor_to_tile_ops.md) 把它变成每条 `tile.load`
+上的 `cache` kwarg 并擦除它为止。参数索引仅在该窗口内有效 —— 后续 pass 既会向参数列表
+追加（[`InjectGMPipeBuffer`](23-inject_gm_pipe_buffer.md)、
+[`MaterializeDistTensorCtx`](44-materialize_dist_tensor_ctx.md)），也会向前插入
+（[`MaterializeValidShapeSymbols`](49-materialize_valid_shape_symbols.md)）。本 pass 用
+`CHECK_SPAN` 拒绝两类用户错误：声明所指的张量未被作用域 body 捕获（既不读也不写，因而
+没有参数承载该策略），以及对 `InferParamDirections` 判定为 `Out` / `InOut` 的参数声明
+`BYPASS`（对同一 kernel 自己会写的字节做 bypass 读取，是一致性缺陷）。该转换位于共享的
+外提工具中，因此兄弟路径 `OutlineHierarchyScopes` 会以同样方式打上该 attr。参见
+[GM 缓存访问策略](../language/05-cache-policy.md)。
 
 ## 示例
 
@@ -241,6 +299,58 @@ def main_incore_0(self, a, b, out):
     return (out, out_b)  # out_a → param `out`; out_b is kernel-local, kept as-is
 ```
 
+### 在控制流内部写入的写目标（store target）
+
+写入被捕获张量的作用域会被替换为一次调用，其结果绑定到一个**全新的** SSA 名字
+（`out` -> `out__ssa_v1`），此后对该张量的每一次引用都解析到这个新名字。当作用域位于
+循环或 `if` 内部时，这个新名字绑定在**作用域体内部**，因此语句之后的引用读到的是一个
+已经超出作用域（out of scope）的 Var。为此本 pass 将该重命名贯穿出去，做成真正的循环
+携带值（loop carry）：入口处的值作为新 `IterArg` 的初值，作用域体 yield 新的 Var，
+新增的 `return_var` 才是后续语句看到的值。
+
+这只适用于进入控制流作用域体之前已经定义的目标。在作用域体内创建的 scratch 张量会在
+每次执行时重新创建：其 store 后的新名字仍供同一作用域体中的后续语句使用，但不会成为
+外层语句的 `IterArg`、yield 值或 `return_var`。
+
+**变换前**（作用域每次迭代写一次 `out`，ReturnStmt 读取它）：
+
+```python
+for i in pl.range(4):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        t = pl.load(a, [i * 64, 0], [64, 128])
+        pl.store(pl.mul(t, 2.0), [i * 64, 0], out)
+return out
+```
+
+**变换后**：
+
+```python
+for i__idx_v0, (out__iter_v1,) in pl.range(4, init_values=(out__ssa_v0,)):
+    out__ssa_v1 = self.k_incore_0(a__ssa_v0, i__idx_v0, out__iter_v1)
+    out__rv_v1 = pl.yield_(out__ssa_v1)
+return out__rv_v1
+```
+
+`if` 同样如此处理，未写入的分支 yield 它进入时的值——源码没有 `else` 时会合成一个，
+使未走到的路径也能产出一个值。
+
+携带值遵循的规则：
+
+| 场景 | 结果 |
+| ---- | ---- |
+| 同一作用域体内 N 个同级作用域写同一目标 | 只增加一个槽位；作用域体 yield 最后一个值 |
+| 目标在当前控制流作用域体内定义 | 只做局部重命名；不在该语句上创建携带值 |
+| 嵌套循环 | 仅当目标也在外层作用域体之外定义时，内层携带值才继续作为外层携带值贯穿出去 |
+| 目标本身已是该循环的 iter_arg | 不新增槽位；后续引用解析到该槽位的 `return_var` |
+| 作用域位于函数顶层 | 保持不变——新名字本就在作用域内 |
+
+**代码生成不受影响。** yield 的值是被调函数在其返回的参数上的调用结果，因此
+[`ClassifyIterArgCarry`](47-classify_iter_arg_carry.md) 会把它归入该 iter_arg 的别名类
+（其被写实参规则与 `TupleGetItemExpr` 规则），并将该携带值标记为 **trivial**：
+iter_arg 与 return_var 都按初值的名字发射。这个携带值是 SSA 记账，而非新缓冲区。
+没有它同样不会编译错——编排层张量的每个 SSA 版本都指向同一块 GM 缓冲区——但 def-use
+图是错的，`SSAVerify` / `UseAfterDef` 会拒绝这样的 IR。
+
 ## 实现
 
 **头文件**：`include/pypto/ir/transforms/passes.h`
@@ -284,7 +394,7 @@ passes.def("outline_incore_scopes", &pass::OutlineIncoreScopes, "Outline InCore 
 承载于作用域自身的 `split_`）与显式 `pl.split_aiv` 区域（`SplitAivScopeStmt`）不能在同一
 作用域共存（outliner 会把单个区域的模式桥接为函数级代表 `split`，从而与用户的
 `pl.split` 静默冲突）。幸存机制如何下降见
-[`LowerAutoVectorSplit`](20-lower_auto_vector_split.md)。
+[`LowerAutoVectorSplit`](21-lower_auto_vector_split.md)。
 
 **任何** `pl.split(...)` 都会被拒绝，包括 `SplitMode.NONE`（RFC #1820）。NONE 本身不
 携带拆分，但把它写在同时持有区域的作用域上，读起来仍像"在一个作用域里混用了自动与手动
@@ -319,6 +429,19 @@ passes.def("outline_incore_scopes", &pass::OutlineIncoreScopes, "Outline InCore 
 `Function::GetSplitMode()` 把存储的 `0` 与缺失的键同样映射为 `nullopt`，因此
 `split=SplitMode.NONE` 这一项对所有消费方都不可见；而 parser 会在回读时丢弃它，导致
 print → parse 有损（`Kwargs size mismatch`）。权威的逐区域模式始终承载于
-`SplitAivScopeStmt::split_`，由 [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md)
+`SplitAivScopeStmt::split_`，由 [`LowerAutoVectorSplit`](21-lower_auto_vector_split.md)
 消费。printer 以同一规则兜底：省略取值为 `SplitMode.NONE` 的 `split` 属性，使绕过本 Pass
 的 IR（此前写出的 `.pto`、以编程方式构造的 `Function`）依然以规范、可重新解析的形式打印。
+
+## Pass 属性
+
+| 属性 | 值 |
+| ---- | -- |
+| 所需 | SSAForm |
+| 产生 | SSAForm, SplitIncoreOrch, AivSplitValid |
+| 失效 | — |
+
+`AivSplitValid` 的验证窗口从这里打开。本 Pass 在每个被外提的 InCore 函数内保留第一类
+`SplitAivScopeStmt` 区域，因此结构化区域 verifier 可以从此处一直运行到
+[`LowerAutoVectorSplit`](21-lower_auto_vector_split.md) 擦除该节点并使属性失效为止。
+其间 `ConvertTensorToTileOps` 与 `InferTileMemorySpace` 会在边界内存变得可观察后各重新验证一次。

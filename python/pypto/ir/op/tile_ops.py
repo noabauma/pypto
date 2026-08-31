@@ -138,18 +138,22 @@ def alloc(
 def create(
     shape: Sequence[int | Expr] | _ir_core.MakeTuple,
     dtype: DataType,
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     transpose: bool | None = None,
     span: Span | None = None,
     *,
     flat_layout: bool | None = None,
+    compact: bool | None = None,
 ) -> Call:
     """Create a tile from a shape.
 
     Args:
         shape: Shape of the tile, or a MakeTuple
         dtype: Data type of the tile
-        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right)
+        target_memory: Target memory space (MemorySpace.Vec, .Mat, .Left, .Right).
+            ``None`` (the default) leaves the space unset so InferTileMemorySpace
+            places the tile from consumer demand; the kwarg is then omitted from
+            the op entirely.
         transpose: When True, allocate the transposed Mat (ZN) fractal layout
             (blayout=row_major, slayout=col_major) — the layout a matmul ``b_trans``
             B-operand carries, and the only Mat layout a DN-source ``gather_row``
@@ -163,17 +167,28 @@ def create(
             ``target_memory=Mat`` and is mutually exclusive with ``transpose``.
             Default ``None`` keeps the canonical layout. Kept keyword-only so
             it does not shift ``span``'s positional slot for existing callers.
+        compact: Keyword-only. Compiler-internal. When True, declare that this
+            L0C buffer holds a valid-region-packed product, i.e. that its
+            N-fractal pitch is ``ceil(validRow/16)*16`` rather than the physical
+            row count -- the layout ``mad`` writes when the matmul's left operand
+            is row-narrowed. Requires ``target_memory=Acc``. Kernels do not set
+            this: ``AutoTileMatmulL0`` declares it on the accumulator seed it
+            synthesizes, and every reader of that accumulator inherits it.
 
     Returns:
         Call expression that returns a TileType with the created tile
     """
     actual_span = _get_span_or_capture(span)
     shape_tuple = _to_make_tuple(shape, actual_span)
-    kwargs: dict[str, Any] = {"dtype": dtype, "target_memory": target_memory}
+    kwargs: dict[str, Any] = {"dtype": dtype}
+    if target_memory is not None:
+        kwargs["target_memory"] = target_memory
     if transpose is not None:
         kwargs["transpose"] = transpose
     if flat_layout is not None:
         kwargs["flat_layout"] = flat_layout
+    if compact is not None:
+        kwargs["compact"] = compact
     return _ir_core.create_op_call("tile.create", [shape_tuple], kwargs, actual_span)
 
 
@@ -185,9 +200,10 @@ def load(
     offsets: Sequence[int | Expr] | _ir_core.MakeTuple,
     shapes: Sequence[int | Expr] | _ir_core.MakeTuple,
     valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
-    target_memory: MemorySpace = MemorySpace.Vec,
+    target_memory: MemorySpace | None = None,
     clamp: bool = False,
     span: Span | None = None,
+    cache: int | None = None,
 ) -> Call:
     """Copy data from tensor to specified memory level.
 
@@ -201,20 +217,32 @@ def load(
         offsets: Offsets in each dimension (sequence of scalars), or a MakeTuple.
             Always in the source tensor's coordinate system.
         shapes: Shape of the region to load in each dimension (sequence of scalars),
-            or a MakeTuple. Always in the source tensor's coordinate system.
+            or a MakeTuple. Always in the source tensor's coordinate system. Every
+            element must be an integer scalar, as for ``offsets``.
         valid_shape: Valid shape of the tile in each dimension (sequence of scalars), or a
             MakeTuple. When provided, sets TileView.valid_shape in the output TileType.
             When omitted, shapes is used as valid_shape. Useful for dynamic shapes where
             the actual valid data region differs from the allocated tile size.
             Uses the same coordinate convention as shapes. This is a *request*: it
-            narrows the tile, but cannot widen it past what the source has.
-        target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat).
-            MX-layout tensors require an explicit MemorySpace.Mat.
+            narrows the tile, but cannot widen it past what the source has. Every
+            element must be an integer scalar — one extent per dimension, never a
+            nested tuple.
+        target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
+            ``None`` (the default) leaves the space unset so InferTileMemorySpace
+            places the tile from consumer demand; the kwarg is then omitted from
+            the op entirely. MX-layout tensors require an explicit MemorySpace.Mat.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts that ``offsets + valid_shape`` stays inside the source
             and is rejected when that provably fails; with ``clamp=True`` the
             request is cut back to the source edge instead.
         span: Optional source span for debugging (auto-captured if not provided)
+        cache: ``CachePolicy`` underlying int — 0 (``kDefault``, ordinary cached
+            GM read) or 1 (``kBypass``, declared streaming read). ``None`` (the
+            default) means the caller stated no policy and omits the kwarg, so
+            ordinary loads are unchanged and a scope-level declaration may still
+            stamp one later. An explicit 0 is NOT the same as ``None``: it is
+            recorded, and it is what makes ``cache=CachePolicy.DEFAULT`` opt a
+            single read back into the cache inside a bypassing scope.
 
     Returns:
         Call expression that returns a TileType with the copied data
@@ -233,8 +261,9 @@ def load(
             f"(MX scale loads are L1/Mat only); got {target_memory}"
         )
 
-    # Validate target_memory: only Vec and Mat are allowed for load
-    if target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
+    # Validate target_memory: only Vec and Mat are allowed for load. ``None``
+    # leaves the space unset so InferTileMemorySpace places the tile.
+    if target_memory is not None and target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
         raise ValueError(
             f"target_memory for tile.load must be MemorySpace.Vec or MemorySpace.Mat, got {target_memory}"
         )
@@ -245,9 +274,16 @@ def load(
     shapes_tuple = _to_make_tuple(shapes, actual_span)
     _validate_offsets_shapes(offsets_tuple, shapes_tuple)
 
-    kwargs: dict[str, Any] = {"target_memory": target_memory}
+    kwargs: dict[str, Any] = {}
+    if target_memory is not None:
+        kwargs["target_memory"] = target_memory
     if clamp:
         kwargs["clamp"] = True
+    # `is not None`, not truthiness: an explicit `cache=0` (DEFAULT) is a real
+    # per-access override that must out-rank a scope declaration, so it has to
+    # survive into the IR. Only an unstated policy omits the kwarg.
+    if cache is not None:
+        kwargs["cache"] = cache
 
     valid_shape_tuple = shapes_tuple
     if valid_shape is not None:
@@ -282,7 +318,8 @@ def store(
         offsets: Offsets in each dimension (sequence of scalars), or a MakeTuple
         output_tensor: Output tensor (TensorType)
         shapes: ND partition shape (sequence of ints), or None for 2D tiles. Normally
-            injected automatically by FlattenTileNdTo2D for ND tensors.
+            injected automatically by FlattenTileNdTo2D for ND tensors. Every element
+            must be an integer scalar, as for ``offsets``.
         span: Optional source span for debugging (auto-captured if not provided)
         atomic: ``AtomicType`` underlying int — 0 (``kNone``, plain overwrite) or
             1 (``kAdd``, atomic-add into global memory). The kwarg is omitted
@@ -684,6 +721,8 @@ def ci(
     dtype: DataType = DataType.INT32,
     descending: bool = False,
     span: Span | None = None,
+    *,
+    tmp: Expr | None = None,
 ) -> Call:
     """Generate a contiguous integer sequence into a tile (pto.tci).
 
@@ -702,6 +741,7 @@ def ci(
         dtype: Destination dtype. Must be one of {INT16, INT32}.
         descending: If True, generate a descending sequence.
         span: Optional source span for debugging (auto-captured if not provided).
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
 
     Returns:
         Call expression that returns a TileType with the generated sequence.
@@ -716,7 +756,10 @@ def ci(
         start_expr = ConstInt(start, dtype, actual_span)
     shape_tuple = _to_make_tuple(shape, actual_span)
     kwargs: dict[str, Any] = {"dtype": dtype, "descending": descending}
-    return _ir_core.create_op_call("tile.ci", [start_expr, shape_tuple], kwargs, actual_span)
+    args = [start_expr, shape_tuple]
+    if tmp is not None:
+        args.append(tmp)
+    return _ir_core.create_op_call("tile.ci", args, kwargs, actual_span)
 
 
 arange = ci
@@ -972,33 +1015,50 @@ def sub(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
     return _create_tile_binary_call("tile.sub", "tile.subs", lhs, rhs, actual_span)
 
 
-def rem(lhs: Expr, rhs: Expr, tmp: Expr, span: Span | None = None) -> Call:
+def rem(
+    lhs: Expr,
+    rhs: Expr,
+    tmp: Expr,
+    span: Span | None = None,
+    *,
+    high_precision: bool = False,
+) -> Call:
     """Element-wise remainder (modulo) of two tiles.
 
     Computes lhs % rhs element-wise. Maps to the TREM hardware intrinsic.
+    On A2/A3, every INT32 input element must be in ``[-2**24, 2**24]``.
 
     Args:
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile (TileType)
-        tmp: Temporary tile (TileType) required by the hardware
+        tmp: Same-dtype 2D scratch tile. On A2/A3 its physical and valid
+            capacity must provably provide at least two rows and cover every
+            ``lhs`` column, and it must not overlap either source.
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision TREM mode.
+            This mode is defined only for FP32 and is ignored by A2/A3 hardware.
 
     Returns:
         Call expression for element-wise remainder
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.rem", [lhs, rhs, tmp], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tile.rem", [lhs, rhs, tmp], kwargs, actual_span)
 
 
 def rems(lhs: Expr, rhs: int | float | Expr, tmp: Expr, span: Span | None = None) -> Call:
     """Element-wise remainder (modulo) of tile and scalar.
 
     Computes lhs % rhs element-wise. Maps to the TREMS hardware intrinsic.
+    On A2/A3, source valid extents must be provably positive and every INT32
+    source element and scalar must be in ``[-2**24, 2**24]``.
 
     Args:
         lhs: Tile (TileType)
         rhs: Scalar (int/float/Expr with ScalarType)
-        tmp: Temporary tile (TileType) required by the hardware
+        tmp: Same-dtype 2D scratch tile. On A2/A3 its physical and valid
+            capacity must provably provide at least one row and cover every
+            ``lhs`` column, and it must not overlap ``lhs``.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1081,29 +1141,39 @@ def part_min(src0: Expr, src1: Expr, span: Span | None = None) -> Call:
     return _ir_core.create_op_call("tile.part_min", [src0, src1], {}, actual_span)
 
 
-def fmod(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
-    """Element-wise floating-point remainder of two tiles.
+def fmod(
+    lhs: Expr,
+    rhs: Expr,
+    span: Span | None = None,
+    *,
+    high_precision: bool = False,
+) -> Call:
+    """Element-wise truncating remainder of two tiles.
 
-    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
-    ``torch.fmod``). Maps to the TFMOD hardware intrinsic.
+    Computes the truncating remainder of lhs / rhs element-wise (matching
+    ``torch.fmod``; the result follows the dividend sign). Maps to TFMOD.
 
     Args:
         lhs: Left-hand side tile (TileType)
         rhs: Right-hand side tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
+        high_precision: Whether to select PTOAS's high-precision TFMOD mode.
+            This mode is defined only for FP32.
 
     Returns:
-        Call expression for element-wise floating-point remainder
+        Call expression for element-wise truncating remainder
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.fmod", [lhs, rhs], {}, actual_span)
+    kwargs: dict[str, Any] = {"high_precision": True} if high_precision else {}
+    return _ir_core.create_op_call("tile.fmod", [lhs, rhs], kwargs, actual_span)
 
 
 def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
-    """Element-wise floating-point remainder of tile and scalar.
+    """Element-wise truncating remainder of tile and scalar.
 
-    Computes the IEEE-style remainder of lhs / rhs element-wise (matching
-    ``torch.fmod``). Maps to the TFMODS hardware intrinsic.
+    Computes the truncating remainder of lhs / rhs element-wise (matching
+    ``torch.fmod``; the result follows the dividend sign). Maps to TFMODS.
+    A2/A3 requires every source valid extent to be provably positive.
 
     Args:
         lhs: Tile (TileType)
@@ -1111,7 +1181,7 @@ def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for element-wise floating-point remainder with scalar
+        Call expression for element-wise truncating remainder with scalar
     """
     actual_span = _get_span_or_capture(span)
     rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
@@ -1428,7 +1498,7 @@ def sel(mask: Expr, lhs: Expr, rhs: Expr, tmp: Expr, span: Span | None = None) -
         mask: Predicate mask tile (TileType); encoding is target-defined
         lhs: Source tile 0, selected where mask is true (TileType)
         rhs: Source tile 1, selected where mask is false (TileType)
-        tmp: Scratch tile required by TSEL (TileType UINT8 [1, 32] on A2/A3)
+        tmp: Scratch tile required by TSEL (TileType UINT32 [1, 16] on A2/A3)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1697,6 +1767,8 @@ def cast(
     target_type: int | DataType,
     mode: str | int = "round",
     span: Span | None = None,
+    *,
+    tmp: Expr | None = None,
 ) -> Call:
     """Cast tile to target data type (element-wise).
 
@@ -1706,6 +1778,8 @@ def cast(
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
         span: Optional source span for debugging (auto-captured if not provided)
+        tmp: Optional A2/A3 PTOAS scratch tile for non-saturating narrowing
+             tcvt. Normally compiler-generated.
 
     Returns:
         Call expression for element-wise cast to target dtype
@@ -1718,7 +1792,8 @@ def cast(
 
     actual_span = _get_span_or_capture(span)
     kwargs: dict[str, Any] = {"target_type": target_type, "mode": mode_val}
-    return _ir_core.create_op_call("tile.cast", [tile], kwargs, actual_span)
+    args: list[Expr] = [tile] if tmp is None else [tile, tmp]
+    return _ir_core.create_op_call("tile.cast", args, kwargs, actual_span)
 
 
 def log(tile: Expr, span: Span | None = None, *, high_precision: bool = False) -> Call:
@@ -1779,6 +1854,77 @@ def not_(tile: Expr, span: Span | None = None) -> Call:
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.not", [tile], {}, actual_span)
+
+
+# ============================================================================
+# MX Quantization Operations
+# ============================================================================
+
+
+def tquant_mx(
+    src: Expr,
+    *,
+    group_axis: int,
+    dtype: DataType = DataType.FP8E4M3FN,
+    span: Span | None = None,
+) -> Call:
+    """MX block-32 dynamic quantization returning quantized data and scale."""
+    actual_span = _get_span_or_capture(span)
+    kwargs: dict[str, Any] = {"dtype": dtype, "group_axis": group_axis}
+    return _ir_core.create_op_call("tile.tquant_mx", [src], kwargs, actual_span)
+
+
+def tquant_mx_raw(
+    src: Expr,
+    max_scratch: Expr,
+    scaling_scratch: Expr,
+    *,
+    dtype: DataType = DataType.FP8E4M3FN,
+    group_axis: int = 1,
+    span: Span | None = None,
+) -> Call:
+    """Build the compiler-internal value-returning raw MX quantization Call.
+
+    Returns ``TupleType{INT8 dst, UINT8 exp}``. ``max_scratch`` / ``scaling_scratch``
+    are write-only per-group workspaces (same role as ``gather_compare``'s tmp).
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call(
+        "tile.tquant_mx_raw",
+        [src, max_scratch, scaling_scratch],
+        {"dtype": dtype, "group_axis": group_axis},
+        actual_span,
+    )
+
+
+def tmov_x2zz(
+    src: Expr,
+    tmp: Expr,
+    *,
+    group_axis: int = 1,
+    dst_rows: int | None = None,
+    dst_cols: int | None = None,
+    span: Span | None = None,
+) -> Call:
+    """Exponent X-to-ZZ layout conversion returning a UINT8 ZZ tile.
+
+    ``tmp`` is a write-only workspace. Axis1 requires capacity
+    ``64 + ceil(rows/16) * cols`` bytes and ``dst_rows``/``dst_cols`` (ZZ ``[M,G]``)
+    because TQUANT emits a legacy-flat exp ``[1, M*G]``. Axis0 requires a minimal
+    32-byte-aligned Vec pad. A5-only.
+    """
+    actual_span = _get_span_or_capture(span)
+    kwargs: dict[str, Any] = {"group_axis": group_axis}
+    if dst_rows is not None:
+        kwargs["dst_rows"] = int(dst_rows)
+    if dst_cols is not None:
+        kwargs["dst_cols"] = int(dst_cols)
+    return _ir_core.create_op_call(
+        "tile.tmov_x2zz",
+        [src, tmp],
+        kwargs,
+        actual_span,
+    )
 
 
 # ============================================================================
@@ -1928,6 +2074,8 @@ def batch_matmul_acc(
     lhs: Expr,
     rhs: Expr,
     span: Span | None = None,
+    *,
+    init_cond: Expr | None = None,
 ) -> Call:
     """Batch matrix multiplication with accumulation.
 
@@ -1935,17 +2083,26 @@ def batch_matmul_acc(
     rhs. The broadcast batch shape must equal acc's batch shape (acc is the in-place
     accumulation target and is not broadcast).
 
+    ``init_cond`` behaves exactly as it does on
+    [`matmul_acc`][pypto.ir.op.tile_ops.matmul_acc]: where the predicate holds,
+    ``acc`` is overwritten with ``lhs @ rhs`` instead of accumulated into.
+    ``FlattenTileNdTo2D`` forwards it to every 2D ``tile.matmul_acc`` it unrolls
+    this op into — each of those is the sole writer of its own row band of the
+    accumulator, so the predicate applies band by band.
+
     Args:
         acc: Accumulator tile (TileType, at least 2D)
         lhs: Left-hand side tile (TileType, at least 2D)
         rhs: Right-hand side tile (TileType, at least 2D)
         span: Optional source span for debugging (auto-captured if not provided)
+        init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
     Returns:
         Call expression for batch matrix multiplication with accumulation
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.batch_matmul_acc", [acc, lhs, rhs], {}, actual_span)
+    args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
+    return _ir_core.create_op_call("tile.batch_matmul_acc", args, {}, actual_span)
 
 
 def gemv(lhs: Expr, rhs: Expr, span: Span | None = None, *, acc_phase: str = "unspecified") -> Call:
@@ -1975,11 +2132,18 @@ def gemv_acc(
     span: Span | None = None,
     *,
     acc_phase: str = "unspecified",
+    init_cond: Expr | None = None,
 ) -> Call:
     """GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N].
 
     ``acc`` must use the GEMV output dtype. The logical K extents and lhs/rhs
     dtype requirements are identical to :func:`gemv`.
+
+    With ``init_cond``, the accumulator's initial value is conditional: on the
+    steps where the predicate holds, ``acc`` is overwritten with ``lhs @ rhs``
+    instead of accumulated into. GEMV runs on the same cube MAD as
+    :func:`matmul_acc`, so it carries the same predicate; see that function for
+    the split-K ``k == 0`` idiom this removes the peel from.
 
     Args:
         acc: Accumulator tile (TileType [1, N])
@@ -1987,12 +2151,14 @@ def gemv_acc(
         rhs: Right-hand side tile (TileType [K, N])
         acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
         span: Optional source span for debugging (auto-captured if not provided)
+        init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
     Returns:
         Call expression for GEMV with accumulation
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gemv_acc", [acc, lhs, rhs], {"acc_phase": acc_phase}, actual_span)
+    args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
+    return _ir_core.create_op_call("tile.gemv_acc", args, {"acc_phase": acc_phase}, actual_span)
 
 
 def gemv_bias(
@@ -2955,17 +3121,29 @@ def _resolve_tpop_type(
     return None
 
 
-def tpush_to_aiv(tile: Expr, *, split: int, id: int | None = None, span: Span | None = None) -> Call:
+def tpush_to_aiv(
+    tile: Expr,
+    *,
+    split: int,
+    lane_stride: int | None = None,
+    id: int | None = None,
+    span: Span | None = None,
+) -> Call:
     """Push tile data from AIC to AIV via cross-core pipe.
 
     Args:
         tile: Tile data to push
-        split: Split mode (0=none, 1=up-down, 2=left-right)
+        split: pto-isa split code (0=none, 1/2=up-down/left-right, 3/4=the same
+            axes over an odd extent)
+        lane_stride: Partition stride carried when a ragged boundary was
+            balanced across the two AIV lanes; omit for the box partition
         id: Optional frontend pipe id. Omit to use PTOAS default id 0.
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    kwargs = {"split": split}
+    kwargs: dict[str, Any] = {"split": split}
+    if lane_stride is not None:
+        kwargs["lane_stride"] = lane_stride
     if id is not None:
         kwargs["id"] = id
     return _ir_core.create_op_call("tile.tpush_to_aiv", [tile], kwargs, actual_span)
@@ -2987,7 +3165,7 @@ def tpush_to_aic(tile: Expr, *, split: int, id: int | None = None, span: Span | 
     return _ir_core.create_op_call("tile.tpush_to_aic", [tile], kwargs, actual_span)
 
 
-def aiv_shard(tile: Expr, *, split: int, span: Span | None = None) -> Call:
+def aiv_shard(tile: Expr, *, split: int, lane_stride: int | None = None, span: Span | None = None) -> Call:
     """Cross the AIC -> AIV boundary, halving on the split axis (full -> half).
 
     ``split=1`` / ``2`` halve the named axis. ``split=0`` (a task-parallel
@@ -2997,10 +3175,16 @@ def aiv_shard(tile: Expr, *, split: int, span: Span | None = None) -> Call:
     Args:
         tile: Input tile (TileType; 2D unless split=0)
         split: Split mode (0=no split axis, 1=up-down/axis0, 2=left-right/axis1)
+        lane_stride: Partition stride stamped by LowerAutoVectorSplit when it
+            balances a ragged boundary across the two AIV lanes; omit for the
+            default box partition
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    return _ir_core.create_op_call("tile.aiv_shard", [tile], {"split": split}, actual_span)
+    kwargs: dict[str, Any] = {"split": split}
+    if lane_stride is not None:
+        kwargs["lane_stride"] = lane_stride
+    return _ir_core.create_op_call("tile.aiv_shard", [tile], kwargs, actual_span)
 
 
 def aic_gather(tile: Expr, *, split: int, span: Span | None = None) -> Call:
@@ -3025,6 +3209,7 @@ def tpop_from_aic(
     shape: list[int] | None = None,
     dtype: DataType | None = None,
     split: int = 0,
+    lane_stride: int | None = None,
     id: int | None = None,
     span: Span | None = None,
 ) -> Call:
@@ -3034,13 +3219,18 @@ def tpop_from_aic(
         result_type: Explicit result type (e.g. TileType). Mutually exclusive with shape/dtype.
         shape: Shape of the tile to receive (alternative to result_type).
         dtype: Data type of the tile to receive (alternative to result_type).
-        split: Split mode (0=none, 1=up-down, 2=left-right)
+        split: pto-isa split code (0=none, 1/2=up-down/left-right, 3/4=the same
+            axes over an odd extent)
+        lane_stride: Partition stride carried when a ragged boundary was
+            balanced across the two AIV lanes; omit for the box partition
         id: Optional frontend pipe id. Omit to use PTOAS default id 0.
         span: Optional source span
     """
     actual_span = _get_span_or_capture(span, frame_offset=1)
     resolved_type = _resolve_tpop_type(result_type, shape, dtype, MemorySpace.Vec)
-    kwargs = {"split": split}
+    kwargs: dict[str, Any] = {"split": split}
+    if lane_stride is not None:
+        kwargs["lane_stride"] = lane_stride
     if id is not None:
         kwargs["id"] = id
     if resolved_type is not None:
@@ -3084,22 +3274,27 @@ def tpop_from_aiv(
 # ============================================================================
 
 
-def sort32(src: Expr, idx: Expr, span: Span | None = None) -> Call:
+def sort32(src: Expr, idx: Expr, span: Span | None = None, *, tmp: Expr | None = None) -> Call:
     """Sort fixed 32-element blocks with explicit index tile.
 
     Sorts 32-element blocks in src and permutes idx accordingly.
-    Output tile stores sorted value-index pairs with doubled last dimension.
+    Output tile stores 8-byte value-index pairs. Its last dimension is 2x the
+    input width for FP32 and 4x the input width for FP16.
 
     Args:
         src: Input value tile (TileType, FP16 or FP32, Vec memory)
         idx: Input index tile (TileType, Vec memory) with sequential offsets
         span: Optional source span for debugging
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
 
     Returns:
-        Call expression returning sorted tile with doubled last dimension
+        Call expression returning the dtype-dependent expanded sort output
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.sort32", [src, idx], {}, actual_span)
+    args = [src, idx]
+    if tmp is not None:
+        args.append(tmp)
+    return _ir_core.create_op_call("tile.sort32", args, {}, actual_span)
 
 
 # ============================================================================
@@ -3223,7 +3418,7 @@ def gather_compare(
     :class:`Call` whose result type is a ``TupleType{dst, cdst}``::
 
         dst  : TileType, [rows, out_cols], INT32  — gathered indices
-        cdst : TileType, [rows],           count_dtype — per-row match count
+        cdst : TileType, [1, rows],        count_dtype — per-row match count
 
     The DSL form ``d, c = pl.tile.gather_compare(src, kvalue, tmp, ...)`` is
     desugared by the parser into ``_tuple = call; d = _tuple[0]; c = _tuple[1]``.

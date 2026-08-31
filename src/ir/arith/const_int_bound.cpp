@@ -32,6 +32,7 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memref.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/transforms/base/functor.h"
 #include "pypto/ir/type.h"
@@ -202,19 +203,19 @@ class ConstIntBoundAnalyzer::Impl : public ExprFunctor<Bound> {
   Bound VisitExpr_(const VarPtr& op) override {
     auto it = var_map_.find(op.get());
     if (it != var_map_.end()) return it->second;
-    return DefaultBoundFromDtype(op.get());
+    return DefaultBound();
   }
 
   Bound VisitExpr_(const IterArgPtr& op) override {
     // IterArg is a Var subclass — look up in var_map_
     auto it = var_map_.find(op.get());
     if (it != var_map_.end()) return it->second;
-    return DefaultBoundFromDtype(op.get());
+    return DefaultBound();
   }
 
   Bound VisitExpr_(const MemRefPtr& /*op*/) override { return Everything(); }
   Bound VisitExpr_(const WindowBufferPtr& /*op*/) override { return Everything(); }
-  Bound VisitExpr_(const CallPtr& /*op*/) override { return Everything(); }
+  Bound VisitExpr_(const CallPtr& op) override { return BoundFromOpSemantics(op->op_); }
   Bound VisitExpr_(const SubmitPtr& /*op*/) override { return Everything(); }
   Bound VisitExpr_(const MakeTuplePtr& /*op*/) override { return Everything(); }
   Bound VisitExpr_(const TupleGetItemExprPtr& /*op*/) override { return Everything(); }
@@ -376,15 +377,37 @@ class ConstIntBoundAnalyzer::Impl : public ExprFunctor<Bound> {
   }
 
  private:
-  /// INDEX-typed variables are implicitly non-negative; other types use full range.
-  static Bound DefaultBoundFromDtype(const Expr* expr) {
-    if (auto st = std::dynamic_pointer_cast<const ScalarType>(expr->GetType())) {
-      if (st->dtype_ == DataType::INDEX) {
-        return {0, Bound::kPosInf};
-      }
+  /// The range a builtin's own semantics establish for its result.
+  ///
+  /// These are the hardware identity queries: which block / subblock this
+  /// instance is, and how many there are. A block index is never negative and a
+  /// block count is never zero -- facts about what the op returns, not about
+  /// `INDEX`, which is signed and proves nothing (issue #2500). Keeping them
+  /// here ties each range to the op that guarantees it, instead of to a dtype
+  /// default that would also cover unrelated user scalars.
+  ///
+  /// Without this, a shard extent such as `min(max(rows - aiv_id * 8, 0), 8)`
+  /// no longer folds to `max(rows - aiv_id * 8, 0)`, because an unbounded
+  /// `aiv_id` lets `rows - aiv_id * 8` exceed the tile.
+  static Bound BoundFromOpSemantics(const OpPtr& op) {
+    if (!op) return Everything();
+    if (IsOp(op, "tile.get_block_idx") || IsOp(op, "tile.get_subblock_idx") ||
+        IsOp(op, "tensor.get_block_idx") || IsOp(op, "tensor.get_subblock_idx")) {
+      return {0, Bound::kPosInf};
+    }
+    if (IsOp(op, "tile.get_block_num") || IsOp(op, "tensor.get_block_num")) {
+      return {1, Bound::kPosInf};
     }
     return Everything();
   }
+
+  /// The bound a Var carries when nothing has bound it.
+  ///
+  /// Always unbounded. No dtype implies a sign: `INDEX` is signed, and a Var of
+  /// it -- a derived scalar or a caller-supplied parameter alike -- can be
+  /// negative at runtime (issue #2500). A caller that knows better binds the
+  /// variable; nothing is assumed on its behalf here.
+  static Bound DefaultBound() { return Everything(); }
 
   Analyzer* parent_;
   std::unordered_map<const Expr*, Bound> var_map_;
@@ -397,10 +420,25 @@ class ConstIntBoundAnalyzer::Impl : public ExprFunctor<Bound> {
 std::function<void()> ConstIntBoundAnalyzer::Impl::EnterConstraint(const ExprPtr& constraint) {
   std::vector<std::pair<const Expr*, Bound>> recovery;
 
+  // A strict comparison is recorded as the equivalent closed bound. Only integers
+  // have a predecessor, so `x > c` is `x >= c + 1` for them and merely `x >= c` for
+  // everything else: applying the unit step to a float variable records `f >= 2`
+  // for `f > 1.0`, which excludes the legal value 1.5 and lets CanProve() fold a
+  // nested `f >= 2.0` to always-true. The relaxed bound stays sound — a float
+  // variable keeps contributing bounds, just without the strictness.
+  auto IsIntegerScalar = [](const VarPtr& var) {
+    auto scalar_type = As<ScalarType>(var->GetType());
+    return scalar_type && scalar_type->dtype_.IsInt();
+  };
+  auto StrictBound = [&](const VarPtr& var, int64_t bound, int64_t unit) {
+    return IsIntegerScalar(var) ? InfAwareAdd(bound, unit) : bound;
+  };
+
   // Helper: try to tighten bound for a variable.
-  auto TryTighten = [&](const Expr* var_ptr, const Bound& new_bound) {
+  auto TryTighten = [&](const VarPtr& var, const Bound& new_bound) {
+    const Expr* var_ptr = var.get();
     auto it = var_map_.find(var_ptr);
-    Bound old = (it != var_map_.end()) ? it->second : DefaultBoundFromDtype(var_ptr);
+    Bound old = (it != var_map_.end()) ? it->second : DefaultBound();
     recovery.emplace_back(var_ptr, old);
     var_map_[var_ptr] = {std::max(old.min_value, new_bound.min_value),
                          std::min(old.max_value, new_bound.max_value)};
@@ -413,10 +451,10 @@ std::function<void()> ConstIntBoundAnalyzer::Impl::EnterConstraint(const ExprPtr
     if (auto ge = As<Ge>(expr)) {
       if (auto var = As<Var>(ge->left_)) {
         auto rb = VisitExpr(ge->right_);
-        if (rb.is_const()) TryTighten(var.get(), {rb.min_value, Bound::kPosInf});
+        if (rb.is_const()) TryTighten(var, {rb.min_value, Bound::kPosInf});
       } else if (auto var = As<Var>(ge->right_)) {
         auto lb = VisitExpr(ge->left_);
-        if (lb.is_const()) TryTighten(var.get(), {Bound::kNegInf, lb.max_value});
+        if (lb.is_const()) TryTighten(var, {Bound::kNegInf, lb.max_value});
       }
       return;
     }
@@ -424,10 +462,10 @@ std::function<void()> ConstIntBoundAnalyzer::Impl::EnterConstraint(const ExprPtr
     if (auto gt = As<Gt>(expr)) {
       if (auto var = As<Var>(gt->left_)) {
         auto rb = VisitExpr(gt->right_);
-        if (rb.is_const()) TryTighten(var.get(), {InfAwareAdd(rb.min_value, 1), Bound::kPosInf});
+        if (rb.is_const()) TryTighten(var, {StrictBound(var, rb.min_value, 1), Bound::kPosInf});
       } else if (auto var = As<Var>(gt->right_)) {
         auto lb = VisitExpr(gt->left_);
-        if (lb.is_const()) TryTighten(var.get(), {Bound::kNegInf, InfAwareAdd(lb.max_value, -1)});
+        if (lb.is_const()) TryTighten(var, {Bound::kNegInf, StrictBound(var, lb.max_value, -1)});
       }
       return;
     }
@@ -435,10 +473,10 @@ std::function<void()> ConstIntBoundAnalyzer::Impl::EnterConstraint(const ExprPtr
     if (auto le = As<Le>(expr)) {
       if (auto var_l = As<Var>(le->left_)) {
         auto rb = VisitExpr(le->right_);
-        if (rb.is_const()) TryTighten(var_l.get(), {Bound::kNegInf, rb.max_value});
+        if (rb.is_const()) TryTighten(var_l, {Bound::kNegInf, rb.max_value});
       } else if (auto var_r = As<Var>(le->right_)) {
         auto lb = VisitExpr(le->left_);
-        if (lb.is_const()) TryTighten(var_r.get(), {lb.min_value, Bound::kPosInf});
+        if (lb.is_const()) TryTighten(var_r, {lb.min_value, Bound::kPosInf});
       }
       return;
     }
@@ -446,10 +484,10 @@ std::function<void()> ConstIntBoundAnalyzer::Impl::EnterConstraint(const ExprPtr
     if (auto lt = As<Lt>(expr)) {
       if (auto var = As<Var>(lt->left_)) {
         auto rb = VisitExpr(lt->right_);
-        if (rb.is_const()) TryTighten(var.get(), {Bound::kNegInf, InfAwareAdd(rb.max_value, -1)});
+        if (rb.is_const()) TryTighten(var, {Bound::kNegInf, StrictBound(var, rb.max_value, -1)});
       } else if (auto var = As<Var>(lt->right_)) {
         auto lb = VisitExpr(lt->left_);
-        if (lb.is_const()) TryTighten(var.get(), {InfAwareAdd(lb.min_value, 1), Bound::kPosInf});
+        if (lb.is_const()) TryTighten(var, {StrictBound(var, lb.min_value, 1), Bound::kPosInf});
       }
       return;
     }
@@ -457,10 +495,10 @@ std::function<void()> ConstIntBoundAnalyzer::Impl::EnterConstraint(const ExprPtr
     if (auto eq = As<Eq>(expr)) {
       if (auto var = As<Var>(eq->left_)) {
         auto rb = VisitExpr(eq->right_);
-        if (rb.is_const()) TryTighten(var.get(), rb);
+        if (rb.is_const()) TryTighten(var, rb);
       } else if (auto var = As<Var>(eq->right_)) {
         auto lb = VisitExpr(eq->left_);
-        if (lb.is_const()) TryTighten(var.get(), lb);
+        if (lb.is_const()) TryTighten(var, lb);
       }
       return;
     }

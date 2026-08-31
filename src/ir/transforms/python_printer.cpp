@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -128,6 +129,33 @@ std::string CastModeToString(int mode) {
     default:
       throw ValueError("Cast round mode must be in range [0, 6], got " + std::to_string(mode));
   }
+}
+
+/// Spell a lowercase IR attr value as its Python enum member name.
+/// ``"soft"`` -> ``"SOFT"``, for the enums whose members are named after the
+/// attr string they lower to.
+std::string AttrValueToEnumMember(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+  return value;
+}
+
+/// Spell a cross-core `core_type` attr as its `pl.KernelType` member.
+///
+/// Both sync families name the same kernel, in their own vocabulary:
+/// `system.syncall` writes a participant set (`"aic_only"` / `"aiv_only"` /
+/// `"mix"`), the event ops pin one kernel (`"aic"` / `"aiv"`). Returns nullptr
+/// for a spelling the op cannot carry, which is a malformed attr.
+const char* CoreTypeToKernelMember(const std::string& value, bool is_syncall) {
+  if (is_syncall) {
+    if (value == "aic_only") return "AIC";
+    if (value == "aiv_only") return "AIV";
+    if (value == "mix") return "MIX";
+    return nullptr;
+  }
+  if (value == "aic") return "AIC";
+  if (value == "aiv") return "AIV";
+  return nullptr;
 }
 
 /// Whether an op's printed DSL spelling needs a trailing underscore.
@@ -426,6 +454,18 @@ class IRPythonPrinter : public IRVisitor {
   // returns true when something was printed. Common to InCore/Hierarchy scope
   // printers so the parser can recover the marker after a print/reparse roundtrip.
   bool PrintScopeNoDepsAttr(const ScopeStmtPtr& op);
+
+  // Surface ``ScopeStmt.attrs[kAttrCachePolicyVars]`` as leading marker
+  // STATEMENTS in the scope body — ``pl.set_cache_policy(t, pl.CachePolicy.X)``
+  // — and NOT as a header kwarg the way ``no_dep_args=`` / ``dumps=`` do,
+  // because a statement is the DSL surface the parser accepts. The parser
+  // hoists the markers back onto the scope attr wherever they appear in the
+  // body, so the roundtrip is position-normalising: however the user ordered
+  // them, they print first. Emitted from whichever scope object carries the
+  // attr — in the Spmd inlining branches that is the nested InCore, not ``op``.
+  // Returns true when something was printed, so a caller whose body may be
+  // empty can tell whether a ``pass`` filler is still needed.
+  bool PrintScopeCachePolicyStmts(const ScopeStmtPtr& op);
 
   // Emit ``deps=[t1, t2]`` if the scope carries ``kAttrManualDepEdges``; returns
   // true when something was printed. Mirrors PrintScopeNoDepsAttr — the parser
@@ -730,7 +770,11 @@ std::string IRPythonPrinter::Print(const TypePtr& type) {
   }
 
   if (As<CommCtxType>(type)) {
-    return "pld.CommCtxType";
+    // Singleton marker — printed with the public DSL wrapper name, matching the
+    // ``pl.AsyncEvent`` family below. ``pld`` is hardcoded rather than derived
+    // from ``prefix_`` because that prefix aliases only ``pypto.language``; the
+    // text parser injects ``pld`` into the exec namespace itself.
+    return "pld.CommCtx";
   }
 
   // Async-prefetch handle markers — fieldless singletons, rendered as bare
@@ -882,6 +926,32 @@ void IRPythonPrinter::PrintAttrValue(const std::any& value, const Span& span) {
       INTERNAL_CHECK_SPAN(vars[i], span)
           << "Internal error: null Var in attr list; the DSL has no null-Var syntax to round-trip";
       stream_ << GetVarName(vars[i].get());
+    }
+    stream_ << "]";
+  } else if (t == typeid(std::vector<std::pair<int32_t, int>>)) {
+    // ``kAttrCachePolicyParams`` on an outlined Function: (param index, policy)
+    // pairs. Printed as a list of tuples so a pass dump taken between
+    // OutlineIncoreScopes and ConvertTensorToTileOps — the only window where
+    // this attr exists — round-trips instead of aborting.
+    const auto& pairs = std::any_cast<std::vector<std::pair<int32_t, int>>>(value);
+    stream_ << "[";
+    for (size_t i = 0; i < pairs.size(); ++i) {
+      if (i > 0) stream_ << ", ";
+      stream_ << "(" << pairs[i].first << ", " << pairs[i].second << ")";
+    }
+    stream_ << "]";
+  } else if (t == typeid(std::vector<std::pair<VarPtr, int>>)) {
+    // ``kAttrCachePolicyVars``. On a ScopeStmt this attr is surfaced as
+    // ``pl.set_cache_policy(...)`` marker statements instead (see
+    // PrintScopeCachePolicyStmts); this arm is the generic-attr fallback, so a
+    // dump never aborts on a carrier the scope printer did not claim.
+    const auto& pairs = std::any_cast<std::vector<std::pair<VarPtr, int>>>(value);
+    stream_ << "[";
+    for (size_t i = 0; i < pairs.size(); ++i) {
+      if (i > 0) stream_ << ", ";
+      INTERNAL_CHECK_SPAN(pairs[i].first, span)
+          << "Internal error: null Var in attr list; the DSL has no null-Var syntax to round-trip";
+      stream_ << "(" << GetVarName(pairs[i].first.get()) << ", " << pairs[i].second << ")";
     }
     stream_ << "]";
   } else if (t == typeid(VarPtr)) {
@@ -1177,7 +1247,11 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
       }
     }
     if (mode == "soft") {
-      stream_ << R"(mode="soft", core_type=")" << core_type << R"(", gm_workspace=)";
+      const char* kernel = CoreTypeToKernelMember(core_type, /*is_syncall=*/true);
+      INTERNAL_CHECK_SPAN(kernel != nullptr, op->span_)
+          << "Internal error: system.syncall core_type must be aic_only|aiv_only|mix, got " << core_type;
+      stream_ << "mode=" << prefix_ << ".SyncAllMode.SOFT, core_type=" << prefix_ << ".KernelType." << kernel
+              << ", gm_workspace=";
       VisitExpr(op->args_[0]);
       if (op->args_.size() == 2) {
         stream_ << ", used_cores=";
@@ -1204,6 +1278,24 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   // a shape. Print it as a kwarg so the round-trip matches the Python signature.
   const bool gather_row_kw_valid =
       (IsOp(op, "tile.gather_row") || IsOp(op, "tensor.gather_row")) && op->args_.size() == 6;
+  // The optional `init_cond` operand is keyword-only in two DSL signatures,
+  // because another parameter already owns positional slot 4:
+  //   ``tensor.matmul_acc(acc, lhs, rhs, a_trans, b_trans, init_cond)`` — the
+  //     predicate printed positionally re-parses as a transpose flag, and then
+  //     collides with the printed ``a_trans=`` kwarg.
+  //   ``tile.gemv_acc(acc, lhs, rhs, acc_phase, *, init_cond)`` — it would bind
+  //     to ``acc_phase``, which is likewise also printed as a kwarg.
+  // ``tile.matmul_acc`` takes the predicate in positional slot 4 and needs no
+  // such fixup.
+  const bool acc_kw_init_cond =
+      (IsOp(op, "tensor.matmul_acc") || IsOp(op, "tile.gemv_acc")) && op->args_.size() == 4;
+  // tile.ci keeps dtype/descending in their established positional slots; its
+  // compiler-generated third IR operand therefore prints as keyword-only tmp.
+  const bool ci_kw_tmp = IsOp(op, "tile.ci") && op->args_.size() == 3;
+  // tile.cast keeps (tile, target_type, mode) as the public signature; its
+  // compiler-generated scratch operand likewise prints as keyword-only tmp.
+  const bool cast_kw_tmp = IsOp(op, "tile.cast") && op->args_.size() == 2;
+  const bool sort32_kw_tmp = IsOp(op, "tile.sort32") && op->args_.size() == 3;
   const bool mgather = IsOp(op, "tile.mgather");
   const int mgather_coalesce = mgather ? op->GetKwarg<int>("coalesce", 0) : 0;
   const bool mgather_kw_scratch = mgather && mgather_coalesce == 1 && op->args_.size() >= 3;
@@ -1213,6 +1305,10 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   // Print positional arguments
   for (size_t i = 0; i < op->args_.size(); ++i) {
     if (gather_row_kw_valid && i == 5) continue;
+    if (acc_kw_init_cond && i == 3) continue;
+    if (ci_kw_tmp && i == 2) continue;
+    if (cast_kw_tmp && i == 1) continue;
+    if (sort32_kw_tmp && i == 2) continue;
     if (mgather && i >= 2) continue;
     if (i > 0) stream_ << ", ";
 
@@ -1235,6 +1331,26 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   if (gather_row_kw_valid) {
     stream_ << ", valid_shape=";
     VisitExpr(op->args_[5]);
+    need_comma = true;
+  }
+  if (acc_kw_init_cond) {
+    stream_ << ", init_cond=";
+    VisitExpr(op->args_[3]);
+    need_comma = true;
+  }
+  if (ci_kw_tmp) {
+    stream_ << ", tmp=";
+    VisitExpr(op->args_[2]);
+    need_comma = true;
+  }
+  if (cast_kw_tmp) {
+    stream_ << ", tmp=";
+    VisitExpr(op->args_[1]);
+    need_comma = true;
+  }
+  if (sort32_kw_tmp) {
+    stream_ << ", tmp=";
+    VisitExpr(op->args_[2]);
     need_comma = true;
   }
   if (mgather_kw_scratch) {
@@ -1317,7 +1433,22 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     } else if (value.type() == typeid(bool)) {
       stream_ << (AnyCast<bool>(value, "printing kwarg: " + key) ? "True" : "False");
     } else if (value.type() == typeid(std::string)) {
-      stream_ << "'" << AnyCast<std::string>(value, "printing kwarg: " + key) << "'";
+      const auto str_val = AnyCast<std::string>(value, "printing kwarg: " + key);
+      // The cross-core sync ops take enum-typed DSL kwargs but store the PTO-ISA
+      // spelling as a string attr. Restore the enum form so the printed call is
+      // type-correct for static checkers and re-parses (the DSL rejects strings).
+      const bool is_syncall = IsOp(op, "system.syncall");
+      const bool is_sync_event = IsOp(op, "system.sync_set") || IsOp(op, "system.sync_wait");
+      if (key == "core_type" && (is_syncall || is_sync_event)) {
+        const char* kernel = CoreTypeToKernelMember(str_val, is_syncall);
+        INTERNAL_CHECK_SPAN(kernel != nullptr, op->span_)
+            << "Internal error: " << op->op_->name_ << " carries an unknown core_type " << str_val;
+        stream_ << prefix_ << ".KernelType." << kernel;
+      } else if (is_syncall && key == "mode") {
+        stream_ << prefix_ << ".SyncAllMode." << AttrValueToEnumMember(str_val);
+      } else {
+        stream_ << "'" << str_val << "'";
+      }
     } else if (value.type() == typeid(double)) {
       stream_ << FormatFloatLiteral(AnyCast<double>(value, "printing kwarg: " + key));
     } else if (value.type() == typeid(float)) {
@@ -1940,6 +2071,29 @@ bool IRPythonPrinter::PrintScopeDepsAttr(const ScopeStmtPtr& op) {
   return PrintScopeVarListKwarg(op, kAttrManualDepEdges, "deps");
 }
 
+// One ``<indent>pl.set_cache_policy(<tensor>, pl.CachePolicy.<NAME>)`` line per
+// declaration. Callers invoke this after ``IncreaseIndent()`` and before the
+// body block, so the markers lead the scope body exactly as the parser expects
+// to find them. Null Vars are skipped for the same reason
+// ``PrintScopeVarListKwarg`` skips them: the rendered Python must stay valid.
+bool IRPythonPrinter::PrintScopeCachePolicyStmts(const ScopeStmtPtr& op) {
+  if (!op) return false;
+  bool printed = false;
+  for (const auto& [k, v] : op->attrs_) {
+    if (k != kAttrCachePolicyVars) continue;
+    const auto* entries = std::any_cast<std::vector<std::pair<VarPtr, int>>>(&v);
+    if (!entries) continue;
+    for (const auto& [var, policy] : *entries) {
+      if (!var) continue;
+      stream_ << GetIndent() << prefix_ << ".set_cache_policy(" << GetVarName(var.get()) << ", " << prefix_
+              << ".CachePolicy."
+              << AttrValueToEnumMember(CachePolicyToString(static_cast<CachePolicy>(policy))) << ")\n";
+      printed = true;
+    }
+  }
+  return printed;
+}
+
 void IRPythonPrinter::PrintScopeOptimizations(SplitMode split, const ScopeStmtPtr& slot_num_holder) {
   const bool has_mode = split != SplitMode::None;
   const bool has_slot_num = slot_num_holder && slot_num_holder->HasAttr("slot_num");
@@ -2040,6 +2194,7 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
   IncreaseIndent();
+  PrintScopeCachePolicyStmts(op);
   PrintStmtBlock(op->body_);
   DecreaseIndent();
 }
@@ -2063,6 +2218,7 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   PrintScopeTaskIdVarSuffix(op);
   stream_ << ":\n";
   IncreaseIndent();
+  PrintScopeCachePolicyStmts(op);
   PrintStmtBlock(op->body_);
   DecreaseIndent();
 }
@@ -2112,7 +2268,18 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     PrintScopeTaskIdVarSuffix(op);
     stream_ << ":\n";
     IncreaseIndent();
-    if (!SpmdInlineBodyRebuildsCarrier(incore)) {
+    // The inlining branches below drop the nested ``pl.at(level=CORE_GROUP)``
+    // header, and a ``pl.set_cache_policy`` written inside the Spmd body
+    // attaches to that inner InCore scope — so its declarations must be printed
+    // here, from ``incore``, or they are lost. When the carrier is spelled out
+    // instead, the nested InCore prints its own markers and re-printing them
+    // here would duplicate them.
+    const bool inlines_incore_body = SpmdInlineBodyRebuildsCarrier(incore);
+    PrintScopeCachePolicyStmts(op);
+    if (inlines_incore_body) {
+      PrintScopeCachePolicyStmts(incore);
+    }
+    if (!inlines_incore_body) {
       // Print the body as-is. Either inlining would drop the carrier — the parser
       // re-synthesises an InCore only for a body that carries a split or reads the
       // per-block index, so the carrier must be spelled out as a nested
@@ -2155,6 +2322,9 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     PrintScopePredicateAttr(op);
     stream_ << "):\n";
     IncreaseIndent();
+    // The for-form drops the nested ``pl.at(level=CORE_GROUP)`` header, so the
+    // inner InCore's declarations are printed here or they are lost.
+    const bool printed_cache_policy = PrintScopeCachePolicyStmts(incore);
     // Emit the InCore body skipping the get_block_idx binding we just
     // materialized as the loop variable. ShouldSuppressPlaceholder keeps the
     // ``with pl.at(...) as tid:`` round-trip working if such a scope ever
@@ -2166,7 +2336,11 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
         PrintStmtBlock(incore_seq->stmts_[i]);
         if (i + 1 < incore_seq->stmts_.size()) stream_ << "\n";
       }
-    } else {
+    } else if (!printed_cache_policy) {
+      // Only a body with nothing left after the loop-var binding needs the
+      // ``pass`` filler — the marker statements above already count as body
+      // content, and printing ``pass`` after them is both redundant and (were
+      // the markers ever dropped) a silent loss of the declaration.
       stream_ << GetIndent() << "pass\n";
     }
     DecreaseIndent();
@@ -2953,15 +3127,19 @@ static std::unordered_map<const Var*, std::string> CollectDynVarMapping(const Pr
 }
 
 void IRPythonPrinter::VisitProgram(const ProgramPtr& program) {
-  // Print program header comment
-  stream_ << "# pypto.program: " << (program->name_.empty() ? "Program" : program->name_) << "\n";
+  CHECK(prefix_ != "pld")
+      << "Python printer prefix 'pld' is reserved for pypto.language.distributed; choose another prefix";
 
-  // Print import statement based on prefix
-  if (prefix_ == "pl") {
-    stream_ << "import pypto.language as pl\n\n";
-  } else {
-    stream_ << "from pypto import language as " << prefix_ << "\n\n";
-  }
+  // Render everything below the imports into a scratch buffer first. Whether the
+  // program needs ``import pypto.language.distributed as pld`` is only knowable
+  // once the body exists: every distributed spelling is hardcoded with the
+  // ``pld.`` prefix (types, ops, and the comm-domain comment alike), so a plain
+  // substring search over the rendered body is an exact test. Without the import
+  // the output references an unbound name and is not valid standalone Python --
+  // it only re-parses because the text parser injects ``pld`` into the exec
+  // namespace itself.
+  std::ostringstream body;
+  stream_.swap(body);
 
   // Emit pl.dynamic() declarations for dynamic shape variables used in function signatures.
   // Uses pointer-identity-aware collection so distinct Var* with the same name_hint_
@@ -3005,6 +3183,21 @@ void IRPythonPrinter::VisitProgram(const ProgramPtr& program) {
 
   current_program_ = prev_program;
   DecreaseIndent();
+
+  // Restore the caller's stream and prepend the header + imports the body needs.
+  const std::string body_str = stream_.str();
+  stream_.swap(body);
+
+  stream_ << "# pypto.program: " << (program->name_.empty() ? "Program" : program->name_) << "\n";
+  if (prefix_ == "pl") {
+    stream_ << "import pypto.language as pl\n";
+  } else {
+    stream_ << "from pypto import language as " << prefix_ << "\n";
+  }
+  if (body_str.find("pld.") != std::string::npos) {
+    stream_ << "import pypto.language.distributed as pld\n";
+  }
+  stream_ << "\n" << body_str;
 }
 
 std::string IRPythonPrinter::PrintExprForType(const ExprPtr& expr) {

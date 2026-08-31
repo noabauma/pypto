@@ -35,9 +35,11 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/pipe.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/stmt.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/utils/memref_utils.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 #include "src/backend/common/pto_ops_internal.h"
 
 namespace pypto {
@@ -55,10 +57,6 @@ using ir::Var;
 using pto_ops_detail::AsPto;
 using pto_ops_detail::CheckSafeIdentifier;
 using pto_ops_detail::EmitIndexOperand;
-using pto_ops_detail::EmitPartitionViewPTO;
-using pto_ops_detail::GetDimStrings;
-using pto_ops_detail::GetSizeCodes;
-using pto_ops_detail::MakePartitionTensorViewType;
 
 static bool IsSameDimExpr(const ExprPtr& lhs, const ExprPtr& rhs) {
   if (lhs == rhs) {
@@ -117,16 +115,30 @@ static bool EmitTpushTransportValidShape(const char* target, const CallPtr& op, 
   ExprPtr transport_row = shape[0];
   ExprPtr transport_col = shape[1];
 
-  // A no-split Acc->Vec FIFO slot is laid out using the source's physical box.
-  // Both dimensions therefore need to be full for TPUSH, even though later
-  // vector compute/store must continue to see the narrower logical shape. An
-  // empty tile remains an empty protocol operation and must not be widened.
+  // A no-split Acc->Vec FIFO slot is laid out using the source's physical box,
+  // so a partially written COLUMN range leaves stale bytes *inside* the valid
+  // rows -- those columns must be transported at the full box width. An empty
+  // tile remains an empty protocol operation and must not be widened at all.
+  //
+  // The ROW extent is the opposite: it must stay exactly as the producer wrote
+  // it. Every L0C reader derives its source pitch from validRow --
+  // `ceil(validRow/16)*16` for a compact tile, `TileData::Rows` otherwise
+  // (pto-isa `tstore_common.hpp`, `TStoreAccNz2nd`) -- and `mad` laid the
+  // result out at the pitch implied by the L0A operand's *valid* rows
+  // (`TMatmul.hpp`: `uint16_t m = aMatrix.GetValidRow()`). Widening the rows
+  // here re-derives that pitch from the physical box, so TPUSH walks L0C at a
+  // stride `mad` never wrote at: with a 64-row box valid to 16 the push picks
+  // up N-fractal 4j for every fractal j, silently corrupting the valid rows
+  // (issue #2510). Rows past validRow stay stale in the slot, which is exactly
+  // what a narrowed valid_shape already promises about its invalid region --
+  // and the transport moves validRow rows instead of the whole box.
   if (acc_to_vec_no_split) {
     for (const auto& valid_dim : valid_shape) {
       if (auto dim_const = As<ir::ConstInt>(valid_dim); dim_const && dim_const->value_ == 0) {
         return false;
       }
     }
+    transport_row = valid_shape[0];
   }
 
   // For the 910B no-split dual-AIV path there is NO genuine cross-core row
@@ -150,6 +162,24 @@ static bool EmitTpushTransportValidShape(const char* target, const CallPtr& op, 
       return false;
     }
   }
+
+  // A genuine row split needs the full box in the slot -- lane 1 reads the band
+  // starting at the box half, which only exists if the producer wrote it -- but
+  // writing it means reading L0C at the physical pitch, which is not the pitch
+  // `mad` used for a row-narrowed operand. The two requirements are mutually
+  // exclusive, so the shape is refused here instead of being lowered into
+  // silently skewed data (measured: a 64-row box valid to 16 across
+  // `pl.split(UP_DOWN)` returns 1808 of 8192 elements wrong). Gated on the
+  // pitches actually differing, so a single-fractal-block accumulator -- where
+  // `ceil(validRow/16)*16 == Rows` -- keeps crossing as before.
+  CHECK_SPAN(!(split != 0 && tile_view.compact == ir::CompactMode::normal) ||
+                 ir::AccPitchesCoincide(valid_shape[0], shape[0]),
+             op->span_)
+      << "a row-narrowed matmul accumulator cannot cross a split Cube-to-Vector boundary: mad wrote "
+      << "L0C at the pitch implied by the matmul's valid rows, while a split transport must carry "
+      << "the full physical box so both vector lanes receive their band. Either drop the row "
+      << "narrowing on the matmul's left operand (narrow the result with pl.set_validshape "
+      << "instead), or route the accumulator through GM and dequantize it in a second scope.";
 
   if (IsSameDimExpr(transport_row, valid_shape[0]) && IsSameDimExpr(transport_col, valid_shape[1])) {
     return false;
@@ -223,9 +253,14 @@ static std::string MakeTpushCodegenPTO(const char* target, const CallPtr& op,
   INTERNAL_CHECK_SPAN(tile, op->span_) << op_name << " first argument must be a Var or IterArg";
 
   const int split = op->GetKwarg<int>("split", -1);
-  CHECK(split >= 0 && split <= 2) << op_name
-                                  << " requires 'split' attribute (0=none, 1=up-down, 2=left-right), got "
-                                  << split;
+  CHECK(ir::IsValidSplitCode(split))
+      << op_name
+      << " requires 'split' attribute (0=none, 1=up-down, 2=left-right, 3=up-down/odd, "
+         "4=left-right/odd), got "
+      << split;
+  CHECK(!(ir::IsOddSplitCode(split) && std::string_view(target) == "aic"))
+      << op_name << ": pto-isa has no odd split for the Vector -> Cube direction (split = " << split
+      << "). Only the Cube -> Vector shard splits an odd axis.";
 
   std::string tile_buf = codegen.GetExprAsCode(op->args_[0]);
   std::string tile_type = codegen.GetExprTypeAnnotation(op->args_[0]);
@@ -257,9 +292,14 @@ static std::string MakeTpopCodegenPTO(const char* target, const CallPtr& op,
       << op_name << " takes no arguments, got " << op->args_.size();
 
   const int split = op->GetKwarg<int>("split", 0);
-  CHECK(split >= 0 && split <= 2) << op_name
-                                  << " requires 'split' attribute (0=none, 1=up-down, 2=left-right), got "
-                                  << split;
+  CHECK(ir::IsValidSplitCode(split))
+      << op_name
+      << " requires 'split' attribute (0=none, 1=up-down, 2=left-right, 3=up-down/odd, "
+         "4=left-right/odd), got "
+      << split;
+  CHECK(!(ir::IsOddSplitCode(split) && std::string_view(target) == "aiv"))
+      << op_name << ": pto-isa has no odd split for the Vector -> Cube direction (split = " << split
+      << "). Only the Cube -> Vector shard splits an odd axis.";
 
   std::string result_buf = codegen.GetCurrentResultTarget();
   INTERNAL_CHECK_SPAN(!result_buf.empty(), op->span_) << op_name << " requires assignment target (tile_buf)";
@@ -300,11 +340,25 @@ static std::string MakeTpopCodegenPTO(const char* target, const CallPtr& op,
   // tile CAN carry a dynamic physical extent (ReshapeSplitAxis lowers a dynamic
   // split axis to floordiv(dim, 2)). Without this the pop would reach that
   // INTERNAL_CHECK instead of falling back to the direct-TPOP path.
+  // An ODD split is the one case that must NOT take the full-box path: the two
+  // lanes pop different extents (ceil / floor), and pto-isa derives lane 1's
+  // slot offset from the popped tile's own RUNTIME valid extents
+  // (TILE_UP_DOWN_ODD: subAIVOffset = subBlockId * (validRow + subBlockId) *
+  // validCol). Widening either lane to the box would place lane 1 one cell past
+  // the producer's band. Such a tile carries a per-lane (non-static) valid
+  // extent anyway, so this only makes the requirement explicit.
   const bool use_full_box =
-      std::string_view(target) == "aic" && !logical_row.empty() && !logical_col.empty() &&
-      has_static_logical_shape && !statically_empty && result_tile_type &&
+      std::string_view(target) == "aic" && !ir::IsOddSplitCode(split) && !logical_row.empty() &&
+      !logical_col.empty() && has_static_logical_shape && !statically_empty && result_tile_type &&
       result_tile_type->GetMemorySpace() == ir::MemorySpace::Vec && result_tile_type->shape_.size() >= 2 &&
       As<ir::ConstInt>(result_tile_type->shape_[0]) && As<ir::ConstInt>(result_tile_type->shape_[1]);
+  // PTOAS enforces the same contract from the other side ("expects odd C2V
+  // split tpop to provide per-sub-core valid_row and valid_col operands"), so
+  // fail here with the op's own span rather than in the assembler.
+  INTERNAL_CHECK_SPAN(!ir::IsOddSplitCode(split) || (!logical_row.empty() && !logical_col.empty()), op->span_)
+      << "Internal error: " << op_name
+      << " with an odd split must carry per-lane valid_row / valid_col operands; the split-axis "
+         "localization in LowerAutoVectorSplit produces them";
   std::string transport_row = logical_row;
   std::string transport_col = logical_col;
   if (use_full_box) {
@@ -630,9 +684,10 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
         << "system.syncall (soft " << core_type << ") requires gm_workspace and optional used_cores, got "
         << op->args_.size() << " operands";
 
-    // gm_workspace: shared GM int32 tensor -> pto.partition_view over the whole
-    // buffer. PTO-ISA uses one exclusive 64-byte cache line, so a statically
-    // shaped workspace must contain at least 16 int32 elements.
+    // gm_workspace: shared GM int32 tensor. PTOAS v0.60's tile-native soft
+    // SYNCALL ABI takes the raw GM pointer and constructs its fixed 16-element
+    // GlobalTensor internally. PTO-ISA uses one exclusive 64-byte cache line,
+    // so a statically shaped workspace must contain at least 16 int32 elements.
     auto gm_var = AsVarLike(op->args_[0]);
     CHECK_SPAN(gm_var, op->span_) << "system.syncall soft: gm_workspace must be a tensor variable";
     auto gm_tt = As<ir::TensorType>(gm_var->GetType());
@@ -662,18 +717,9 @@ void RegisterCrossCoreOps(Backend& backend, const std::unordered_set<std::string
           << " INT32 elements (64 bytes), got " << static_capacity;
     }
 
-    const std::string gm_view = codegen.GetOrCreateTensorView(gm_var);
-    const std::string gm_view_type = codegen.GetTensorViewTypeString(gm_tt.get());
-    const std::string partition_type = MakePartitionTensorViewType(GetDimStrings(gm_tt->shape_), dtype_str);
-    const std::vector<std::string> offset_codes(gm_tt->shape_.size(),
-                                                codegen.GetOrEmitConstant(int64_t{0}, DataType::INDEX));
-    const std::vector<std::string> size_codes = GetSizeCodes(gm_tt->shape_, codegen);
-    const std::string gm_pview = EmitPartitionViewPTO(gm_var->name_hint_ + "_syncgm", gm_view, gm_view_type,
-                                                      partition_type, offset_codes, size_codes, codegen);
-
-    // Assemble the operand and type lists: gm_pview[, used_cores].
-    std::vector<std::string> operands = {gm_pview};
-    std::vector<std::string> types = {partition_type};
+    // Assemble the operand and type lists: gm_ptr[, used_cores].
+    std::vector<std::string> operands = {codegen.GetTensorBasePtr(gm_var)};
+    std::vector<std::string> types = {"!pto.ptr<i32>"};
     if (op->args_.size() == 2) {
       CHECK_SPAN(ExprIsI32Scalar(op->args_[1]), op->span_)
           << "system.syncall soft: used_cores must be an INT32 scalar";

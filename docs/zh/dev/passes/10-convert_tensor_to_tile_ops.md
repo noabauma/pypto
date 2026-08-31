@@ -47,7 +47,9 @@ program_tiled = convert_pass(program)
 
 4. **插入 tile.store（出口存储）**：对每个从 `TensorType` 转换为 `TileType` 的返回值，添加 `Out` 参数并插入 `tile.store(tile, zeros, out_param)`。如果返回值来自 `tile.assemble` 循环，则将循环重写为直接使用 `tile.store`（转换时 assemble-loop 重写；与 `OptimizeOrchTensors` 模式 3 不同，该模式处理跨函数优化）。
 
-5. **升级被写入参数的方向（direction）**：通过别名溯源分析（`AnalyzeCallAccess`）把每次读/写归属到其来源参数，再把被写入的 `In` 参数升级为 `Out`（只写）或 `InOut`（既读又写）。识别为写目标的 op：`tile.store`、`tensor.write`、`tensor.assemble`、`pld.tile.remote_store`、`pld.tile.put` / `pld.tile.get`、`pld.system.notify`（`NotifyOp.Set` 使其 `target` 为只写，`NotifyOp.AtomicAdd` 使其为读+写）、`system.syncall`（workspace），以及复合集合通信 `pld.tensor.allreduce` / `allgather` / `reduce_scatter` / `barrier` / `broadcast` / `all_to_all(_v)` —— 由于本 pass 运行在 `LowerCompositeOps` 之前，这些 op 的 signal / target 操作数在此直接标记为读+写。其余 op 的实参一律只计为读。用户已显式声明为 `Out` / `InOut` 的参数保持不变。
+5. **升级被写入参数的方向（direction）**：通过别名溯源分析（`AnalyzeCallAccess`）把每次读/写归属到其来源参数，再把被写入的 `In` 参数升级为 `Out`（只写）或 `InOut`（既读又写）。**某个算子写哪个实参不再由本 pass 判定**，而是读取该算子在注册表上的声明（`set_arg_effect`，参见 [算子](../ir/05-operators.md#参数效应argument-effects)）；因此 `tile.store`、`tile.mscatter`、`tensor.write`、`tensor.assemble`、`tensor.expand_clone`、`pld.tile.*` / `pld.tensor.*` 推送与拉取家族、`pld.system.notify`、`system.syncall` 以及复合集合通信都经由同一张表进入本分析。被声明为 `Write` 的实参不计为读：只写入子区域的 store 从不读取未触及的部分。由 kwarg 决定的效应按调用逐个解析，因此原子 store 或 `AtomicAdd` 形式的 notify 会把目的操作数标记为读+写，而普通形式不会。用户已显式声明为 `Out` / `InOut` 的参数保持不变。
+
+   从未声明效应的算子仍然按"读取全部实参"处理。该默认值如今只覆盖注册表无话可说的算子（其中绝大多数是纯函数式的），而不再是一张手工维护清单的兜底——新增的写类算子曾经可以悄无声息地从这张清单里漏掉。
 
 ### GM 存储一致性限制
 
@@ -92,6 +94,23 @@ output[0:1, 0:32] = staged
 
 如果不适合使用单次批量存储，也可以对所有元素统一使用 `tensor.write`。
 
+### 缓存策略声明 → `tile.load` 的 `cache` kwarg
+
+本 pass 是声明式 GM 缓存策略从元数据变成访问本身的地方。
+[`OutlineIncoreScopes`](08-outline_incore_scopes.md) 把这些声明留在 InCore 函数的
+`cache_policy` attr 上 —— `std::vector<std::pair<int32_t, int>>`（参数索引，
+`CachePolicy` 的 int 值）。阶段一在每个函数上把这些索引一次性还原为参数 `Var` 身份，
+随后为每条源实参属于列表中参数的 `tile.load` 加上 `{"cache", <policy>}`：包括它合成的
+入口 load、consumer-driven 的 Mat load、输入空间桥接（input-space bridge）load，以及
+body 中本就存在的任何 `tile.load`（用户手写的，或更早的 pass 产生的）。该 attr 在重建
+变换后的函数时被**擦除** —— 下游不允许看到它，因为只要后续 pass 增长参数列表，其中的
+参数索引就会失效。
+
+优先级按单次访问判定：load 上已有的显式 `pl.load(..., cache=...)` kwarg 在两个方向上
+都优先于作用域声明，因此 `cache=pl.CachePolicy.DEFAULT` 可以在 bypass 作用域内把某一次
+读取单独放回缓存。从这里开始，该 kwarg 只是像 `target_memory` 一样随 op 穿过剩余的
+pass 抵达 codegen。参见 [GM 缓存访问策略](../language/05-cache-policy.md)。
+
 ### 阶段二a：通过 Spmd/Group 包装函数转发新增 Out 参数
 
 `OutlineClusterScopes` 产生的 Spmd/Group 包装函数是对其参数到单个内部 InCore
@@ -124,7 +143,125 @@ InCore、Spmd、Group 函数在本阶段被跳过 —— 它们已在阶段一 /
 
 当 `tensor.slice` 的结果被 `tensor.matmul` 或 `tensor.matmul_acc` 使用时，slice 必须生成 Mat 空间的 tile 而非 Vec 空间。本 pass 预扫描此模式，生成自然的 Mat `tile.load`；转置操作数（LHS 用 `a_trans`，RHS 用 `b_trans`）在 matmul 处叠加零拷贝 `tile.transpose_view`。
 
-该需求会**穿过**声明了 `set_output_memory_inherit_input()` 的零拷贝元数据 op 继续向上传播 —— `tensor.slice`、`tensor.view`、`tensor.reshape`、`tensor.reinterpret_view`、`tensor.set_validshape`。因此 `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` 这样的操作数仍然直接加载到 Mat。若某个别名输入存储的 op 漏掉该声明，传播链就会断开：操作数被物化到 Vec，再通过 `tile.move` 桥接到 Mat，而这是一个 vector→cube 边界，会把本应是纯 CUBE 的 InCore scope 判定为 `MIXED`，导致 [`ExpandMixedKernel`](21-expand_mixed_kernel.md) 将其拆分为 AIC/AIV 两个函数。
+该需求会**穿过**声明了 `set_output_memory_inherit_input()` 的零拷贝元数据 op 继续向上传播 —— `tensor.slice`、`tensor.view`、`tensor.reshape`、`tensor.reinterpret_view`、`tensor.set_validshape`。因此 `pl.matmul(pl.set_validshape(a[:, :K], rows, K), b)` 这样的操作数仍然直接加载到 Mat。若某个别名输入存储的 op 漏掉该声明，传播链就会断开：操作数被物化到 Vec，再通过 `tile.move` 桥接到 Mat，而这是一个 vector→cube 边界，会把本应是纯 CUBE 的 InCore scope 判定为 `MIXED`，导致 [`ExpandMixedKernel`](22-expand_mixed_kernel.md) 将其拆分为 AIC/AIV 两个函数。
+
+## Cube 操作数的 M 轴分形对齐（M-Axis Boxing）
+
+一个 cube 操作数有两个彼此独立的尺寸概念，而只有其中一个受到约束。
+
+- **逻辑（logical）尺寸**基本不受限。`pto.tmatmul` 从操作数的 *valid* 区域推导
+  `M`、`K`、`N`，取值范围 `[1, 4095]`，没有整除要求；`pto.mad` 的 `disable_gemv`
+  子句存在的唯一目的，就是在 `%m == 1` 时选择 L0A 的组织方式。
+- **物理（physical）尺寸**必须是整数个 NZ 分形块。块高在所有代次和所有 dtype 下都是
+  16 行；块宽是 `32 字节 / sizeof(dtype)`（FP16 为 16，INT8 为 32）。ptoas 直接强制
+  这一点 —— `'pto.alloc_tile' op expects result boxed tile rows to be a multiple of
+  innerRows (16)` —— pto-isa 的 `TExtract` 也对其读取的 Mat 源 tile 用静态断言
+  重复了同一条约束。
+
+因此凡是 matmul M 轴穿过的 cube tile，该轴的物理尺寸都向上对齐到分形块，
+并把张量的真实尺寸声明为 `valid_shape`：
+
+```python
+# 转换前（M = 100）
+y = tensor.matmul(a, b)          # a: Tensor[[100, 256]]
+
+# 转换后
+a_mat = pl.tile.load(a, [0, 0], [112, 256], [100, 256], target_memory=pl.Mem.Mat)
+y_tile = pl.tile.matmul(a_mat, b_mat)   # Tile[[112, 512]]，valid [100, 512]
+```
+
+这份 padding 在代价模型的两个维度上都是免费的：`tile.load` 只搬运 valid 区域，DMA 不变；
+MAD 的代价是 `ceil(M/16)` 个 pass，把 M 向上取整到 16 的倍数不会改变它。硬件通过
+compact 模式寻址整块内部更窄的 valid 区域，`tile.store` 也只写回 valid 行，因此可观测
+结果完全一致。
+
+在这里把 M 变成 16 的倍数，同时也是
+[`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md) 在边界处保持合法的原因：该 pass 选择
+16 对齐的 tile 并剥离余数，而 16 的倍数只能被切分成同样 16 对齐的块（尾块也不例外），
+所以它不需要任何边界特判。
+
+### M 落在哪条轴上
+
+M 并不总是落在行轴。`a_trans` 操作数按*自然*方式加载、再由零拷贝的
+`tile.transpose_view` 重解释，因此其加载 tile 的行轴是 `K`、**列**轴才是 `M` ——
+分形规则会跟随 M 到它实际所在的那条轴（`InputSpaceReq::cube_m_axis` 由该操作数自身的
+转置标志解析出轴号）：
+
+```python
+# a: Tensor[[128, 100]]，a_trans=True —— M 是本次加载的列尺寸
+a_mat = pl.tile.load(a, [0, 0], [128, 112], [128, 100], target_memory=pl.Mem.Mat)
+a_t   = pl.tile.transpose_view(a_mat)   # Tile[[112, 128]]，valid [100, 128]
+```
+
+这也意味着：虽然对齐后的尺寸必须一致，各 tile 自身的*粒度*却不同 —— Acc 块在所有
+dtype 下都是 16 行，而转置操作数的列块是 `32 / sizeof(dtype)`。因此转置的 INT8
+操作数需要 32，与之配对的累加器也必须采用同一个 32；各取各的粒度会得到 128 行的乘积
+与 112 行的累加器，而 `tile.matmul_acc` 会拒绝这一组合。
+`InputSpaceReq::m_align_from_arg` 指定左操作数为唯一决定者，最终对齐值取它的块尺寸与
+累加器 16 行的最小公倍数（所涉粒度均为 2 的幂，故最小公倍数即最大值）。
+
+这条规则挂在「需求」上，而不是挂在某一条代码路径上。有四处可以满足 matmul 操作数的需求，
+四处都会按 M 所在的轴对齐：操作数在调用点仍是张量时由 `BridgeInputSpaces` 处理；`tensor.slice`
+（以及任何 `set_output_memory_inherit_input()` 传播链）在生产者处满足需求时由
+`HandleConsumerDrivenLoad` 处理；生产者是函数参数时由 Phase-1 入口循环处理 ——
+`pl.matmul(pl.set_validshape(a, ...), b)` 走的正是这一条；累加器不是被加载而是被分配的，
+由 `HandleBoxedAccCreate` 处理。因此 `ConsumerSpaceReq`
+在携带内存空间的同时也携带对齐标记。当多个消费者共享同一个生产者时，只有它们全部提出
+该需求时才会对齐，从而保证按声明物理尺寸读取该 tile 的消费者不会拿到被 padding 过的 tile。
+
+### `tensor.matmul_acc` 的累加器与其操作数一同对齐
+
+`tensor.matmul_acc` 与 `tensor.matmul` 的 M 约束完全相同，因为 M 轴穿过的两个 cube tile
+必须**同时**对齐：`tile.matmul_acc` 要求累加器与乘积的物理 M 一致，只对左操作数做对齐
+只会把 ptoas 的拒绝换成一个操作数不匹配的报错。
+
+累加器从不被加载 —— 除矩阵单元外没有任何部件写 L0C —— 因此满足该需求的位置是它的分配点。
+`HandleBoxedAccCreate` 改写为它做种子的 `tensor.create`；由于 `tile.create` 不接受 valid
+尺寸，收窄由一条独立的 `tile.set_validshape` 承担：
+
+```python
+# 转换前（M = 100）
+acc = pl.create_tensor([100, 64], pl.FP32)
+c = pl.matmul_acc(acc, a, b)
+
+# 转换后
+acc_storage = pl.tile.create([112, 64], dtype=pl.FP32, target_memory=pl.Mem.Acc, compact=True)
+acc_tile = pl.tile.set_validshape(acc_storage, 100, 64)   # Tile[[112, 64]]，valid [100, 64]
+a_mat = pl.tile.load(a, [0, 0], [112, 128], [100, 128], target_memory=pl.Mem.Mat)
+c_tile = pl.tile.matmul_acc(acc_tile, a_mat, b_mat)
+```
+
+这条路径需要额外确定两件操作数路径上没有的事：
+
+- **内存空间在此显式声明，而不是留给 [`InferTileMemorySpace`](18-infer_tile_memory_space.md)。**
+  普通的 `tensor.create` 转换刻意不写 `target_memory`，因为它没有消费者上下文可供推导；
+  而这里有，且正是提出对齐需求的那一个。显式声明还关乎正确性：Acc tile 的隐式 view 是
+  分块 NZ，若种子的空间未定，它会带着原始 row-major view，与跨 split-K 循环与之做循环
+  携带的 `tile.matmul_acc` 结果不一致。
+- **需求需要跨越循环携带。** split-K 累加器在循环外分配，以 `IterArg` 的身份到达
+  `tile.matmul_acc`，因此 `ConsumerSpaceCollector` 用 `AsVarLike` 匹配操作数
+  （`IterArg` 有自己的 `ObjectKind`），并为每个 `IterArg` 记录一条指向其种子值的传播边。
+
+对齐后的累加器会声明为 **compact**。`mad` 以 `ceil(validRow/16)*16` 的 pitch 写出乘积
+（100 行的乘积即 112），而非 compact 的读取方是按物理行数推导 stride 的 —— 而分形对齐
+已把它取整为 112，或在 32 行对齐时取整为 128。compact 让所有读取方重新计算 `mad` 实际
+使用的 pitch；不声明它则会被 `AccCompactValid` 直接拒绝（issue #2470）。
+
+作用范围，以及刻意排除的情况：
+
+| 情况 | 是否对齐 | 原因 |
+| ---- | -------- | ---- |
+| 2-D `tensor.matmul` 左操作数 | 是，按行 | 其行轴即 M，块高在所有 dtype 下都是 16 |
+| 2-D `tensor.matmul_acc` 的左操作数与累加器 | 是，按行 | 同一条轴、同一条规则 —— 且该 op 要求二者物理 M 一致，因此必须一同对齐 |
+| `a_trans` 左操作数，以及与之配对的累加器 | 是，按列 | 自然加载的行轴是 K，M 是列尺寸；累加器经 `m_align_from_arg` 采用该操作数的列粒度 |
+| 右操作数 | 否 | 其行是 `K`，即归约轴 —— 除非硬件按 valid col 做掩码（尚未验证），补齐会把未初始化的 L1 数据带入求和 |
+| 输出的 `N` | 否 | 与 `K` 同属尚未解决的问题；[`AutoTileMatmulL0`](16-auto_tile_matmul_l0.md) 的 `PH-AT-007` 出于同样原因不予处理 |
+| rank >= 3 的操作数 | 否 | 它下沉为 `tile.batch_matmul`，其行被 [`FlattenTileNdTo2D`](13-flatten_tile_nd_to_2d.md) 打包成单个 `[B*M, N]` tile —— 分形规则约束的是打包后的尺寸，而非该维度 |
+| M 尺寸为动态值 | 否 | 没有编译期常量可供对齐 |
+
+本 pass 不处理的每一种情况，最终仍由 PyPTO 而非 ptoas 报错：
+[PTO codegen](../codegen/00-pto_codegen.md) 会校验它发射的每一条 `pto.alloc_tile`
+的分块网格。
 
 ## Transpose 下沉
 
@@ -242,7 +379,7 @@ for aiv_id in pl.split_aiv(2, mode=pl.SplitMode.UP_DOWN):
 oi = pl.matmul(full, v, out_dtype=pl.FP32)               # Tensor，位于区域外
 ```
 
-本 pass 将两者**各自 1:1**下降为对应的 tile 算子（`tensor.aiv_shard` → `tile.aiv_shard`,`tensor.aic_gather` → `tile.aic_gather`）；此后 IR 与 AUTO `pl.split` 路径经 [`LowerAutoVectorSplit`](20-lower_auto_vector_split.md)（pass 20）产出的结果逐字节一致。随后 `ExpandMixedKernel`（pass 21）将两者折叠进跨核 `tpush`/`tpop` 机制。
+本 pass 将两者**各自 1:1**下降为对应的 tile 算子（`tensor.aiv_shard` → `tile.aiv_shard`,`tensor.aic_gather` → `tile.aic_gather`）；此后 IR 与 AUTO `pl.split` 路径经 [`LowerAutoVectorSplit`](21-lower_auto_vector_split.md)（pass 20）产出的结果逐字节一致。随后 `ExpandMixedKernel`（pass 21）将两者折叠进跨核 `tpush`/`tpop` 机制。
 
 **约束**（由张量级类型推导器与 DSL 解析器施加,而非本 pass）：
 
@@ -305,6 +442,34 @@ class After:
 - InCore 函数新增 `Out` 参数 `ret0_out`
 - 编排函数调用点插入 `tensor.create`
 
+## 循环携带值的 valid_shape 修复
+
+`tensor.matmul` 会丢弃操作数的 `valid_shape`，因此只有当本 pass 把它变成作用于被收窄左
+操作数的 `tile.matmul` 之后，累加器才会比它所携带的种子更窄：
+
+```python
+acc = pl.create_tensor([M, N], dtype=pl.INT32)          # 完整盒
+for k0 in pl.pipeline(0, K, K_TILE, stage=2):
+    xk = pl.slice(x, [M, K_TILE], [m0, k0], valid_shape=[v, K_TILE])   # 运行期 v
+    acc = pl.matmul_acc(acc, xk, wk, b_trans=True)      # 收窄且 compact 的结果
+```
+
+循环携带值**只按其初值定型**——`ConvertToSSA` 用种子铸出 `IterArg`，本 pass 再用转换后的
+种子重铸一次，两者都会把循环的 `return_var` 拉回同一类型——于是收窄在循环边界上消失。
+`mad` 以 `ceil(v/16)*16` 的 N-fractal 步长写 L0C，而相信完整盒高的读者按物理行步长遍历，
+第一个之后的每个 N-fractal 都会被打乱（issue #2470）。
+
+因此本 pass 在返回前会对每个函数调用 `narrow_loop_carry::NarrowAccCarries`：由
+`tile.create` 播种的 Acc 携带值会按 yield 可证明的范围重新声明——`tile.create(compact=True)`
+加 `tile.set_validshape`——并让循环体的 def-use 闭包经由算子自身的 deducer 重新定型。在制造
+问题的 pass 里就地修复，才能保持流水线可验证；否则产出的携带值会被 `TypeCheck` 诊断与
+`AccCompactValid` 属性验证器拒绝。`FlattenTileNdTo2D` 调用同一个 helper，用于 ND 种子——
+它的收窄要等到 `tile.batch_matmul` 展开成 2D matmul 时才出现。
+
+两种情况下携带值保持原样：一是缓冲区的两种读法本来就不会分歧——单 fractal 块的 `[16, N]`
+累加器无论有效行是多少都按物理行打包；二是收窄用的表达式只在循环体内计算，重新声明的种子
+在那之前根本命名不到它。
+
 ## 实现
 
 **头文件**：`include/pypto/ir/transforms/passes.h`
@@ -313,15 +478,17 @@ class After:
 
 **Python 绑定**：`python/bindings/modules/passes.cpp`
 
-**测试**：`tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py`
+**测试**：`tests/ut/ir/transforms/test_convert_tensor_to_tile_ops.py`、`tests/ut/ir/transforms/test_narrow_loop_carry_valid_shape.py`（携带值修复）
 
 ## Pass 属性
 
 | 属性 | 值 |
 | ---- | -- |
 | Required | SSAForm, SplitIncoreOrch, NormalizedStmtStructure |
-| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure |
-| Invalidated | — |
+| Produced | SSAForm, IncoreTileOps, NormalizedStmtStructure, AivSplitValid |
+| Invalidated | AivSplitValid |
+
+`AivSplitValid` 同时被失效并重新产生，从而在此处强制对 split 区域再验证一次。`OutlineIncoreScopes` 建立该属性时，AIV split 边界还是 `tensor.aiv_shard` / `tensor.aic_gather`；TensorType 不携带 memory space，因此验证器的边界内存契约检查在那里必然被跳过。本 Pass 把这些算子改写为 tile 形式并附上声明的边界内存，而这正是该项检查所要检视的内容。
 
 ## 关键组件
 

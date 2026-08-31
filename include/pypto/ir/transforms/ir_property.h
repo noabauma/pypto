@@ -64,9 +64,12 @@ enum class IRProperty : uint64_t {
   CommDomainScopesMaterialized,     ///< Host_orch bodies are wrapped in CommDomainScopeStmts (one per
                                     ///< inferred comm domain) and pld.tensor.window result types carry
                                     ///< DistributedTensorType.window_buffer_ back-references
+  DistTensorCtxMaterialized,        ///< No pld.system.get_comm_ctx survives outside host orchestration;
+                                    ///< every chip-orchestration / device communication context is an
+                                    ///< explicit CommCtxType SSA value traceable to a parameter
   RuntimeScopesMaterialized,        ///< Orchestration functions carry explicit RuntimeScopeStmt nodes for the
                                     ///< function body and for/if bodies; codegen no longer emits implicit
-                                    ///< PTO2_SCOPE() wrappers
+                                    ///< SIMPLER_SCOPE() wrappers
   AssignTypeSymmetry,               ///< Every AssignStmt has structural_equal(var->GetType(),
                                     ///< value->GetType()) — covers dtype, shape, tile_view/tensor_view, and
                                     ///< TileType memory_space (memref excluded as an allocation detail;
@@ -101,6 +104,19 @@ enum class IRProperty : uint64_t {
                                     ///< store pipe can combine (BackendHandler::SupportsBf16AtomicAdd).
                                     ///< Decidable on the user's own IR, so it is a structural property
                                     ///< verified at pipeline input
+  AccCompactValid,                  ///< Every tile.matmul_acc / tile.matmul_mx_acc whose lhs valid rows
+                                    ///< make mad's pitch differ from the accumulator's physical row
+                                    ///< count accumulates into a CompactMode::normal buffer, and no tile
+                                    ///< outside the fractal spaces (Left/Right/Acc) carries a compact
+                                    ///< mode at all. `mad` lays L0C out at ceil(validRow/16)*16 taken
+                                    ///< from the L0A operand, and only a compact tile makes a reader
+                                    ///< recompute that pitch instead of using the physical row count.
+                                    ///< Verifiable once InferTileMemorySpace has resolved memory spaces
+  GraphBoundaryLegalized,           ///< Every FunctionType::Graph function satisfies the
+                                    ///< host_build_graph boundary contract: its derived boundary
+                                    ///< scalars have been hoisted to the call sites, its signature
+                                    ///< fits the runtime's tensor/direction/return limits, and no
+                                    ///< call site launches it in a form the runtime cannot cache
   kCount                            ///< Sentinel (must be last)
 };
 
@@ -233,7 +249,11 @@ enum class VerificationLevel {
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
  * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
- * AivSplitValid} — lightweight checks that catch the most common IR errors.
+ * AivSplitValid, TileMemoryInferred, HardSyncallOccupancyValid,
+ * IterArgCarryClassified, RuntimeScopesMaterialized,
+ * DistTensorCtxMaterialized, GraphBoundaryLegalized, AccToGmStoreValid,
+ * AccCompactValid, AtomicAddDtypeValid} —
+ * lightweight checks that catch the most common IR errors.
  */
 const IRPropertySet& GetVerifiedProperties();
 
@@ -243,7 +263,8 @@ const IRPropertySet& GetVerifiedProperties();
  * These are verified automatically at pipeline start and never declared
  * in per-pass PassProperties. Returns {TypeChecked, BreakContinueValid,
  * NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore,
- * InOutUseValid, PipelineLoopValid, ArrayNotEscaped, ManualDepsOnSubmitOnly}.
+ * InOutUseValid, PipelineLoopValid, ArrayNotEscaped, ManualDepsOnSubmitOnly,
+ * AtomicAddDtypeValid}.
  */
 const IRPropertySet& GetStructuralProperties();
 
@@ -251,7 +272,8 @@ const IRPropertySet& GetStructuralProperties();
  * @brief Default property set for explicit verification
  *
  * Returns {SSAForm, TypeChecked, NoNestedCalls, BreakContinueValid,
- * NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore} — the properties checked by
+ * NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore,
+ * TileTypeCoherence, ArrayNotEscaped} — the properties checked by
  * run_verifier() when no explicit set is given.
  */
 const IRPropertySet& GetDefaultVerifyProperties();

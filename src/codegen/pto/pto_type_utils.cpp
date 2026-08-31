@@ -12,16 +12,22 @@
 #include "pypto/codegen/pto/pto_type_utils.h"
 
 #include <cstdint>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
+#include "pypto/ir/storage_size.h"
 #include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -155,6 +161,90 @@ std::string FormatMultiTileBufTypeString(const std::string& slot_type_str, uint6
   std::ostringstream oss;
   oss << "!pto.multi_tile_buf<" << slot_type_str << ", count=" << count << ">";
   return oss.str();
+}
+
+namespace {
+
+/// Bytes a boxed fractal row is aligned to, mirroring PTOAS' `kAlignedBytes`.
+constexpr int64_t kBoxAlignedBytes = 32;
+
+/// Box granularity PTOAS derives for @p fractal / @p slayout, or nullopt when
+/// the layout is one this rule does not cover (see `CheckBoxedTileExtents`).
+std::optional<std::pair<int64_t, int64_t>> BoxGranularity(uint64_t fractal, ir::TileLayout slayout,
+                                                          int64_t elem_bytes) {
+  if (fractal == ir::tile_view_semantics::kAccFractal) {
+    return std::pair<int64_t, int64_t>{16, 16};
+  }
+  if (fractal != 512 || elem_bytes <= 0 || kBoxAlignedBytes % elem_bytes != 0) {
+    // The MX-scale fractal carries its own contract, and a carrier wider than
+    // the alignment has no whole-box grid; PTOAS diagnoses both itself.
+    return std::nullopt;
+  }
+  const int64_t packed = kBoxAlignedBytes / elem_bytes;
+  if (slayout == ir::TileLayout::row_major) return std::pair<int64_t, int64_t>{16, packed};
+  if (slayout == ir::TileLayout::col_major) return std::pair<int64_t, int64_t>{packed, 16};
+  return std::nullopt;
+}
+
+}  // namespace
+
+void CheckBoxedTileExtents(const ir::TileType& tile_type, const TileTypeComponents& components,
+                           const ir::Span* span) {
+  // A non-boxed tile is addressed as a flat run of bytes; the box rule is not
+  // about it. (PTOAS checks a byte-size alignment there instead.)
+  if (components.slayout == ir::TileLayout::none_box) return;
+
+  const DataType& dtype = tile_type.dtype_;
+  const auto space = tile_type.GetMemorySpace();
+
+  // `ExtractTileTypeInfo` falls back to its struct default for a dimension that
+  // is not a `ConstInt`, so a dynamic physical extent would be checked -- and
+  // emitted -- as that placeholder instead of as itself. `InitMemRef` (pass 32)
+  // already refuses a dynamic `TileType::shape_`, so reaching codegen with one
+  // is a pass bug, not user input.
+  for (const auto& dim : tile_type.shape_) {
+    INTERNAL_CHECK(As<ir::ConstInt>(dim))
+        << "Internal error: a boxed tile reached codegen with a dynamic physical extent ("
+        << ir::PythonPrint(dim)
+        << "); InitMemRef requires a static TileType::shape_, with any runtime extent in TileView";
+  }
+
+  const int64_t bits = static_cast<int64_t>(ir::storage_size::GetStorageBitWidth(dtype));
+  if (bits <= 0 || bits % 8 != 0) return;  // sub-byte carrier: not this rule
+  auto box = BoxGranularity(components.fractal, components.slayout, bits / 8);
+  if (!box) return;
+  // Plain locals rather than a structured binding: the lambda below captures
+  // them, which C++17 does not allow for binding names.
+  const int64_t inner_rows = box->first;
+  const int64_t inner_cols = box->second;
+
+  const std::string where = space.has_value() ? ir::MemorySpaceToString(*space) : std::string("unresolved");
+  auto report = [&](const char* axis, int64_t extent, int64_t inner) {
+    const int64_t padded = (extent + inner - 1) / inner * inner;
+    // The span is optional: some allocations are hoisted out of any single
+    // statement, and a location-less message still names the tile.
+    CHECK_SPAN(false, span != nullptr ? *span : ir::Span("", 0, 0))
+        << "a " << where << " tile of physical shape [" << components.rows << ", " << components.cols
+        << "] and dtype " << dtype.ToString() << " must be a whole number of " << inner_rows << "x"
+        << inner_cols << " fractal boxes, but its " << axis << " extent " << extent
+        << " is not a multiple of " << inner
+        << ". PTO addresses a boxed tile one box at a time, so a partial box has no address. The "
+           "*logical* extent is free -- allocate "
+        << padded << " on that axis and declare " << extent
+        << " as the tile's valid_shape (`valid_shape=` on pl.load / pl.tile.create + "
+           "pl.set_validshape), which moves and computes only the real data. A tensor-level "
+           "pl.matmul / pl.matmul_acc does this for its M axis automatically.";
+  };
+
+  // PTOAS exempts the row axis for Vec (unboxed rows) and for a single-row tile
+  // (the NZ map degenerates); the column rule always applies.
+  const bool row_exempt = (space.has_value() && *space == ir::MemorySpace::Vec) || components.rows == 1;
+  if (!row_exempt && inner_rows > 0 && components.rows % inner_rows != 0) {
+    report("row", components.rows, inner_rows);
+  }
+  if (inner_cols > 0 && components.cols % inner_cols != 0) {
+    report("column", components.cols, inner_cols);
+  }
 }
 
 TileTypeComponents ExtractTileTypeInfo(const ir::TileType& tile_type, const std::string& dtype_str_override) {

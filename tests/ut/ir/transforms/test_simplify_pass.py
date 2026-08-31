@@ -26,6 +26,8 @@ import pypto.language.distributed as pld
 import pytest
 from pypto import ir, passes
 
+_OP_PLD_TENSOR_ALLREDUCE = ir.get_op("pld.tensor.allreduce").name
+
 # ============================================================================
 # Pass metadata
 # ============================================================================
@@ -494,6 +496,173 @@ class TestControlFlow:
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
+
+    def test_while_iter_arg_stays_one_node_when_its_init_folds(self):
+        """A WhileStmt IterArg must not split into a header node + orphan uses.
+
+        An ``IterArg`` *use* is the same node as its declaration and carries
+        ``initValue_``, so ``IRMutator::VisitExpr_(IterArgPtr)`` mints a fresh
+        IterArg at the first use whose init the analyzer rewrote. Here
+        ``i = 0`` is a top-level constant, so ``VisitStmt_(AssignStmtPtr)``
+        full-binds it and the init folds ``i -> 0``.
+
+        ``ForStmt`` rebuilds ``iter_args_`` before its body so every reference
+        resolves to the header's new node. ``WhileStmt`` did not: the header
+        kept the stale IterArg while all four body/condition uses pointed at an
+        undefined clone, which ``UseAfterDef`` reported four times.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, out: pl.Tensor[[8], pl.INDEX]):
+                i: pl.Scalar[pl.INDEX] = 0
+                for (i_it,) in pl.while_(init_values=(i,)):
+                    pl.cond(i_it < 4)
+                    y: pl.Scalar[pl.INDEX] = i_it * 2
+                    pl.tensor.write(out, [i_it], y)
+                    nxt: pl.Scalar[pl.INDEX] = i_it + 1
+                    i_end: pl.Scalar[pl.INDEX] = pl.yield_(nxt)
+                # Reading the return_var after the loop keeps the carry live and
+                # exercises the return_vars_ rebuild alongside the iter_args_ one.
+                pl.tensor.write(out, [7], i_end)
+
+        after = passes.simplify()(Before)
+
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.UseAfterDef)
+        diagnostics = passes.PropertyVerifierRegistry.verify(props, after)
+        errors = [d for d in diagnostics if d.severity == passes.DiagnosticSeverity.Error]
+        assert not errors, f"UseAfterDef errors after Simplify: {[d.message for d in errors]}"
+
+        # `i = 0` folds into the iter_arg and is then DCE'd, so the body may be
+        # the bare WhileStmt rather than a SeqStmts.
+        func = next(iter(after.functions.values()))
+        body = func.body
+        stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+        while_stmt = next(s for s in stmts if isinstance(s, ir.WhileStmt))
+        iter_arg = while_stmt.iter_args[0]
+
+        # The fold did happen — otherwise the test would pass vacuously.
+        assert isinstance(iter_arg.initValue, ir.ConstInt)
+        assert iter_arg.initValue.value == 0
+
+        # ... and the condition reads that same node, not a clone of it.
+        condition = while_stmt.condition
+        assert isinstance(condition, ir.Lt)
+        assert condition.left.same_as(iter_arg)
+
+    def test_while_body_fold_does_not_leak_var_remap_past_the_loop(self):
+        """A fold inside a while body must not rewrite uses after the loop.
+
+        ``VisitScopedBody`` unbinds scalars but not ``var_remap_``. A nested fold
+        records ``outer_var -> body-local value``: the single-trip inner
+        ``pl.range(0, 1)`` fires Fold B, which binds ``acc_next -> acc + 1`` with
+        ``acc`` substituted by its init ``i``.
+
+        Leaking that past the loop rewrote the post-loop ``acc_next`` into
+        ``i + 1`` — silently *wrong*, not merely dangling: ``acc_next`` holds what
+        the last iteration computed, which equals the post-loop ``i``, so ``i + 1``
+        is off by one, and ``i`` being in scope means no verifier flags it.
+
+        The same program with a ``for`` as the outer loop is checked alongside it:
+        ``ForStmt`` has snapshotted ``var_remap_`` around its body all along, so
+        the two loop kinds must agree here.
+
+        Pre-SSA on purpose — leak-mode bodies only exist before SSA conversion,
+        and this pass runs at pipeline position 5 and again at 46.
+
+        Verification stays on: ``LiftBodyToReturnVars`` materialises
+        ``AssignStmt(acc_next, ...)`` inside the loop body for a return var whose
+        uses outlive the enclosing ``var_remap_`` restore, so the post-loop
+        reference keeps a definition. See
+        ``test_fold_materializes_escaping_return_var``.
+        """
+
+        @pl.program
+        class WhileOuter:
+            @pl.function
+            def main(self, out: pl.Tensor[[8], pl.INDEX]):
+                i: pl.Scalar[pl.INDEX] = 0
+                acc_next: pl.Scalar[pl.INDEX] = 0
+                while i < 4:
+                    for j, (acc,) in pl.range(0, 1, init_values=(i,)):
+                        acc_next = pl.yield_(acc + 1)
+                    i = i + 1
+                pl.tensor.write(out, [0], acc_next)
+
+        @pl.program
+        class ForOuter:
+            @pl.function
+            def main(self, out: pl.Tensor[[8], pl.INDEX]):
+                acc_next: pl.Scalar[pl.INDEX] = 0
+                for k in pl.range(4):
+                    for j, (acc,) in pl.range(0, 1, init_values=(k,)):
+                        acc_next = pl.yield_(acc + 1)
+                pl.tensor.write(out, [0], acc_next)
+
+        def post_loop_operand(program):
+            after = passes.simplify()(program)
+            func = next(iter(after.functions.values()))
+            body = func.body
+            stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+            call = next(s.expr for s in stmts if isinstance(s, ir.EvalStmt) and isinstance(s.expr, ir.Call))
+            assert isinstance(call, ir.Call)
+            return call.args[-1]
+
+        for label, program in (("while", WhileOuter), ("for", ForOuter)):
+            operand = post_loop_operand(program)
+            # Before the fix the `while` case produced an `Add` here — the
+            # loop-private `i + 1` substituted into a use outside the loop.
+            assert isinstance(operand, ir.Var), (
+                f"{label}: post-loop use was rewritten to {operand.as_python()}"
+            )
+            assert operand.name_hint.startswith("acc_next"), label
+
+    def test_fold_materializes_escaping_return_var(self):
+        """A folded loop's return var read after the loop gets a real definition.
+
+        Fold B lifts a single-trip body by recording ``return_var -> yielded``
+        in ``var_remap_``; the enclosing loop then rebases that map, so a
+        leak-mode read *after* the loop would keep a Var the fold just stripped
+        the only definition of — ``UseAfterDef``. ``ReturnVarEscapeIndex`` spots
+        the escaping use, and the lift emits ``AssignStmt`` instead.
+
+        The assignment must land inside the loop body: its RHS names the loop
+        variable, so it cannot be hoisted past the loop — and the last iteration
+        writing last is exactly the value a leak-mode post-loop read expects.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, out: pl.Tensor[[8], pl.INDEX]):
+                acc_next: pl.Scalar[pl.INDEX] = 0
+                for k in pl.range(4):
+                    for j, (acc,) in pl.range(0, 1, init_values=(k,)):
+                        acc_next = pl.yield_(acc + 1)
+                pl.tensor.write(out, [0], acc_next)
+
+        # Verification is on by default — the point of the test is that the
+        # folded IR passes UseAfterDef.
+        after = passes.simplify()(Before)
+        func = next(iter(after.functions.values()))
+        assert isinstance(func.body, ir.SeqStmts)
+        stmts = func.body.stmts
+
+        for_stmt = next(s for s in stmts if isinstance(s, ir.ForStmt))
+        body = for_stmt.body
+        body_stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+        assign = next(s for s in body_stmts if isinstance(s, ir.AssignStmt))
+        assert assign.var.name_hint.startswith("acc_next")
+        # RHS is the yielded `acc + 1` with `acc` substituted by its init `k`.
+        assert assign.value.as_python() == "k + 1", assign.value.as_python()
+
+        # The post-loop read still names that same Var — not a substituted copy
+        # of a loop-private expression.
+        call = next(s.expr for s in stmts if isinstance(s, ir.EvalStmt) and isinstance(s.expr, ir.Call))
+        assert isinstance(call.args[-1], ir.Var)
+        assert call.args[-1].name_hint == assign.var.name_hint
 
     def test_sequential_stmts(self):
         """Multiple statements should all be simplified."""
@@ -1104,14 +1273,42 @@ class TestConstantIfCollapse:
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
 
-    def test_symbolic_index_scalar_keeps_nonneg_default_bound(self):
-        """A symbolic INDEX scalar must keep its non-negative default bound.
+    def test_leaf_index_parameter_keeps_its_guard(self):
+        """A leaf INDEX *parameter* is not non-negative, so its guard survives.
 
-        `idx = a - b` (a, b INDEX) has an unknown [-inf, +inf] range, but
-        `idx` is INDEX-typed and therefore non-negative. BindScalarBound must
-        intersect the RHS range with the dtype default rather than overwrite
-        it — otherwise the uninformative RHS range erases the non-negativity
-        and `if idx < 0` (statically false for an INDEX scalar) stops folding.
+        Nothing here proves `a >= 0`. `a` is a runtime scalar the caller
+        supplies, `INDEX` is a signed type — codegen emits `arith.cmpi slt` for
+        it — and being unassigned only means the analyzer never saw a value, not
+        that the value is non-negative. Folding `if a < 0` away would silently
+        change what the kernel computes for `a = -1`: the program writes `b`,
+        the folded one writes `a`.
+
+        Non-negativity has to come from somewhere real — an explicit binding, a
+        loop's constant start, or the extent rule the shape proofs opt into —
+        never from the dtype.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, a: pl.Scalar[pl.INDEX], b: pl.Scalar[pl.INDEX], out: pl.Tensor[[1], pl.INDEX]):
+                if a < 0:
+                    pl.tensor.write(out, [0], b)
+                else:
+                    pl.tensor.write(out, [0], a)
+
+        after = passes.simplify()(Before)
+        # Unchanged: both arms, and the guard between them, are still reachable.
+        ir.assert_structural_equal(after, Before)
+
+    def test_derived_index_scalar_keeps_negative_range_guard(self):
+        """A *derived* INDEX scalar takes its range from its RHS, not the dtype default.
+
+        `idx = a - b` is negative whenever `b > a`, so `if idx < 0` is a live
+        guard. `BindScalarBound` must record the derived range instead of
+        intersecting it with the INDEX default `[0, +inf)` — that intersection
+        deletes a reachable negative range and folds the guard away as
+        statically false (issue #2500).
         """
 
         @pl.program
@@ -1124,15 +1321,37 @@ class TestConstantIfCollapse:
                 else:
                     pl.tensor.write(out, [0], idx)
 
-        # `idx < 0` is statically false (INDEX ≥ 0), so the then branch drops.
-        # `idx` is bound for analysis only, not substituted, so the surviving
-        # write still references it.
+        after = passes.simplify()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_nested_guard_on_derived_index_scalar_is_preserved(self):
+        """Nested `if pos >= 0: if pos < N:` keeps both guards (issue #2500).
+
+        The outer guard is the only thing keeping a negative offset out of the
+        inner body. Proving it statically true left the upper-bound check
+        standing alone, which a negative `pos` passes — the read then went
+        ahead against a clamped offset and the kernel silently returned wrong
+        data. Both `IfStmt`s must survive.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, base: pl.Scalar[pl.INDEX], out: pl.Tensor[[1], pl.INDEX]):
+                pos: pl.Scalar[pl.INDEX] = base - 1
+                if pos >= 0:
+                    if pos < 8:
+                        pl.tensor.write(out, [0], pos)
+
+        # Both guards survive; the outer one is only canonicalized `Ge` -> `Le`.
         @pl.program
         class Expected:
             @pl.function
-            def main(self, a: pl.Scalar[pl.INDEX], b: pl.Scalar[pl.INDEX], out: pl.Tensor[[1], pl.INDEX]):  # noqa: ARG002
-                idx: pl.Scalar[pl.INDEX] = a - b
-                pl.tensor.write(out, [0], idx)
+            def main(self, base: pl.Scalar[pl.INDEX], out: pl.Tensor[[1], pl.INDEX]):
+                pos: pl.Scalar[pl.INDEX] = base - 1
+                if 0 <= pos:
+                    if pos < 8:
+                        pl.tensor.write(out, [0], pos)
 
         after = passes.simplify()(Before)
         ir.assert_structural_equal(after, Expected)
@@ -1673,6 +1892,92 @@ class TestDeadIfReturnVarsDCE:
 
         assert has_tensor_write(then_stmts), "tensor.write side-effect in then branch must survive phi-prune"
         assert has_tensor_write(else_stmts), "tensor.write side-effect in else branch must survive phi-prune"
+
+
+class TestDistributedWindowBufferRemap:
+    def test_window_buffer_remapped_in_lockstep_with_scope_slot(self):
+        """Simplify folding a synthesized signal's window-buffer size
+        (``world_size * 1 * 4`` → ``world_size * 4``) must remap the
+        ``DistributedTensorType.window_buffer_`` back-reference in lockstep
+        with the ``CommDomainScopeStmt`` slot — both must point at the SAME
+        post-fold ``WindowBuffer``. Regression: the type rebuild left
+        ``window_buffer_`` on the pre-fold object, so
+        ``DistributedCodegen::ScopeForWindowBuffer``'s pointer-identity scan
+        failed with "not a slot of any open CommDomainScopeStmt".
+        """
+
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+                return data
+
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self):
+                data_buf = pld.alloc_window_buffer(256 * pl.FP32.get_byte())
+                data = pld.window(data_buf, [256], dtype=pl.FP32)
+                for r in pl.range(pld.world_size()):
+                    self.chip_orch(data, device=r)
+                data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+                return data
+
+        # NOTE: run under a BEFORE_AND_AFTER-only context (no print/parse
+        # roundtrip) — the materialize pass's output wraps the body in
+        # CommDomainScopeStmt and stamps window_buffer_ back-references on
+        # view Vars, neither of which the printer/parser pair roundtrips
+        # (same override the materialize test file applies to all its passes).
+        # The in-memory structural check below is the point of this test.
+        instruments: list[passes.PassInstrument] = [
+            passes.VerificationInstrument(passes.VerificationMode.BEFORE_AND_AFTER)
+        ]
+        with passes.PassContext(instruments):
+            materialized = passes.materialize_comm_domain_scopes()(passes.synthesize_allreduce_signals()(P))
+            simplified = passes.simplify()(materialized)
+        host = next(f for f in simplified.functions.values() if f.name == "host_orch")
+
+        # `ir.flatten_to_stmts` does not descend into CommDomainScopeStmt
+        # bodies, so walk recursively (the materialize test file uses the same
+        # shape for the same reason).
+        def walk(stmt):
+            out = [stmt]
+            if isinstance(stmt, ir.SeqStmts):
+                for child in stmt.stmts:
+                    out.extend(walk(child))
+            if isinstance(stmt, ir.ScopeStmt):
+                out.extend(walk(stmt.body))
+            if isinstance(stmt, ir.ForStmt):
+                out.extend(walk(stmt.body))
+            if isinstance(stmt, ir.WhileStmt):
+                out.extend(walk(stmt.body))
+            return out
+
+        stmts = walk(host.body)
+
+        scopes = [s for s in stmts if isinstance(s, ir.CommDomainScopeStmt)]
+        assert len(scopes) == 1
+        signal_slots = [
+            slot for slot in scopes[0].slots if slot.base.name_hint.startswith("__allreduce_signal_buf_")
+        ]
+        assert len(signal_slots) == 1
+
+        allreduce_assigns = [
+            s
+            for s in stmts
+            if isinstance(s, ir.AssignStmt)
+            and isinstance(s.value, ir.Call)
+            and s.value.op.name == _OP_PLD_TENSOR_ALLREDUCE
+        ]
+        assert len(allreduce_assigns) == 1
+        allreduce_call = allreduce_assigns[0].value
+        assert isinstance(allreduce_call, ir.Call)
+        signal_var = allreduce_call.args[1]
+        assert isinstance(signal_var, ir.Var)
+        signal_type = signal_var.type
+        assert isinstance(signal_type, ir.DistributedTensorType)
+
+        # The view Var's window_buffer back-reference must be the SAME object
+        # as the scope slot (both post-fold).
+        assert signal_type.window_buffer is signal_slots[0]
 
 
 if __name__ == "__main__":

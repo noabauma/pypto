@@ -25,7 +25,6 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
-#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -35,6 +34,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/op_conversion_registry.h"
@@ -42,7 +42,10 @@
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
+#include "pypto/ir/transforms/utils/buffer_root_collector.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
+#include "pypto/ir/transforms/utils/narrow_loop_carry.h"
+#include "pypto/ir/transforms/utils/result_alias_utils.h"
 #include "pypto/ir/transforms/utils/tile_conversion_utils.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
@@ -78,8 +81,213 @@ CallPtr MarkCompilerMatBridge(const CallPtr& call, MemorySpace space) {
   return marked;
 }
 
+/// Physical extent a cube tile must allocate on the matmul's M axis.
+///
+/// PTO-ISA keeps two independent notions of size for a cube operand, and only
+/// one of them is constrained.  The *logical* extent is essentially free:
+/// ``pto.mad`` derives ``%m`` from the operand's valid extent, bounds it at
+/// ``[1, 4095]``, and documents ``%m == 1`` as a first-class case.  The
+/// *physical* extent must be a whole number of NZ fractal boxes — ptoas
+/// enforces exactly that (``'pto.alloc_tile' op expects result boxed tile rows
+/// to be a multiple of innerRows (16)``), and pto-isa's ``TExtract`` repeats it
+/// as a static assertion on the Mat source it reads.  So the allocation is
+/// rounded up to the box and the tensor's true extent rides in ``valid_shape``,
+/// which the hardware already addresses through compact mode.
+///
+/// The padding is free on both axes of the cost model: a load moves only the
+/// valid extent, so no extra DMA; and the MAD cost is ``ceil(M/16)`` passes,
+/// which rounding M up to a multiple of 16 leaves unchanged.
+///
+/// @p axis is the axis of @p shape that carries M (1 for a transposed operand,
+/// whose natural load puts K on rows), and @p align the extent every cube tile
+/// of the call shares (see ``ResolveCubeMAlignment``).  Returns @p shape
+/// unchanged — leaving the emitted tile byte-identical to its historical form —
+/// when no padding applies, when the extent is dynamic (nothing to round at
+/// compile time), or when the tile is not rank 2 (a rank >= 3 operand lowers to
+/// ``tile.batch_matmul``, whose rows ``FlattenTileNdTo2D`` row-packs into one
+/// ``[B*M, N]`` tile; the box rule binds that packed extent, not this one).
+std::vector<ExprPtr> BoxCubeMAxis(const std::vector<ExprPtr>& shape, int64_t align, size_t axis,
+                                  const Span& span) {
+  if (align <= 1 || shape.size() != 2 || axis >= shape.size()) return shape;
+  auto extent = As<ConstInt>(shape[axis]);
+  if (!extent || extent->value_ <= 0) return shape;
+
+  const int64_t remainder = extent->value_ % align;
+  if (remainder == 0) return shape;
+  auto boxed = shape;
+  boxed[axis] = std::make_shared<ConstInt>(extent->value_ + align - remainder, DataType::INDEX, span);
+  return boxed;
+}
+
+/// Whether @p call reads the operand @p req describes transposed, which moves
+/// that operand's M from its row axis to its column axis.
+bool ReadsOperandTransposed(const CallPtr& call, const InputSpaceReq& req) {
+  return req.trans_kwarg && call->GetKwarg<bool>(*req.trans_kwarg, false);
+}
+
+/// Axis of the operand @p req describes that carries the matmul's M.
+size_t CubeMAxis(const CallPtr& call, const InputSpaceReq& req) {
+  return ReadsOperandTransposed(call, req) ? 1 : 0;
+}
+
+/// The physical M alignment every cube tile of @p call must share, or 0 when M
+/// cannot be boxed at compile time.
+///
+/// The granularity differs per tile even though the extent must not.  An Acc
+/// box is 16 rows for every dtype; a Mat operand's row box is also 16, but its
+/// *column* box is ``32 / sizeof(dtype)`` — 8 for FP32, 32 for INT8 — and a
+/// transposed left operand has its M on exactly that column axis.  So the
+/// alignment is the lcm of the deciding operand's own box and the accumulator's
+/// 16 rows; every granularity involved is a power of two, so the lcm is the max.
+///
+/// @p decider_idx names the operand whose layout decides (the left operand, see
+/// ``InputSpaceReq::m_align_from_arg``).  Returns 0 when that operand is not a
+/// statically boxed rank-2 tile, which is what keeps rank >= 3 and unresolved
+/// layouts on their historical unboxed path.
+int64_t ResolveCubeMAlignment(const CallPtr& call,
+                              const std::unordered_map<size_t, InputSpaceReq>& input_reqs,
+                              size_t decider_idx) {
+  auto req_it = input_reqs.find(decider_idx);
+  if (req_it == input_reqs.end() || decider_idx >= call->args_.size()) return 0;
+  const auto& decider = req_it->second;
+
+  const auto& arg_type = call->args_[decider_idx]->GetType();
+  std::vector<ExprPtr> shape;
+  DataType dtype = DataType::FP32;
+  if (auto tensor_type = As<TensorType>(arg_type)) {
+    shape = tensor_type->shape_;
+    dtype = tensor_type->dtype_;
+  } else if (auto tile_type = As<TileType>(arg_type)) {
+    shape = tile_type->shape_;
+    dtype = tile_type->dtype_;
+  } else {
+    return 0;
+  }
+  if (shape.size() != 2) return 0;
+
+  const auto view = tile_view_semantics::GetImplicitTileView(shape, decider.space);
+  const auto box = tile_view_semantics::GetBoxedTileAlignment(view, dtype);
+  if (!box) return 0;
+  const int64_t own = ReadsOperandTransposed(call, decider) ? box->cols : box->rows;
+  if (own <= 1) return 0;
+  return std::max<int64_t>(own, kAccFractalRows);
+}
+
 bool IsPassthroughTensorOp(const CallPtr& call) {
   return IsOp(call, "tensor.dim") || IsOp(call, "tensor.view");
+}
+
+/// Declared GM cache policy per source tensor, keyed by the param Var the
+/// declaration resolved to. ``CachePolicy`` stored as ``int``, the type the
+/// ``tile.load`` ``cache`` kwarg is registered with.
+using CachePolicyByParam = std::unordered_map<const Var*, int>;
+
+/**
+ * @brief Resolve an InCore function's ``cache_policy`` attr to its param Vars.
+ *
+ * ``OutlineIncoreScopes`` (pass 8) records ``pl.set_cache_policy`` declarations
+ * as (param index, policy) pairs, because at that point the param Vars are
+ * freshly minted. Here the indices are turned back into Var identities — the
+ * form every load site below matches its source arg against — and the attr is
+ * erased on the way out (see ``EraseCachePolicyAttr``): param indices are only
+ * valid across passes 8..10, since later passes both append to and prepend onto
+ * param lists.
+ */
+CachePolicyByParam BuildCachePolicyByParam(const FunctionPtr& func) {
+  CachePolicyByParam policies;
+  auto indices = func->GetAttr<std::vector<std::pair<int32_t, int>>>(kAttrCachePolicyParams);
+  policies.reserve(indices.size());
+  for (const auto& [idx, policy] : indices) {
+    INTERNAL_CHECK_SPAN(idx >= 0 && static_cast<size_t>(idx) < func->params_.size(), func->span_)
+        << "Internal error: cache_policy param index " << idx << " out of range for function '" << func->name_
+        << "' with " << func->params_.size() << " param(s)";
+    // insert_or_assign, not emplace: a tensor declared twice takes its last
+    // declaration, deterministically (the attr is sorted by index).
+    policies.insert_or_assign(func->params_[static_cast<size_t>(idx)].get(), policy);
+  }
+  return policies;
+}
+
+/// Drop the consumed ``cache_policy`` attr. Nothing downstream may see it —
+/// its param indices go stale the moment a later pass grows the param list.
+std::vector<std::pair<std::string, std::any>> EraseCachePolicyAttr(
+    const std::vector<std::pair<std::string, std::any>>& attrs) {
+  std::vector<std::pair<std::string, std::any>> kept;
+  kept.reserve(attrs.size());
+  for (const auto& kv : attrs) {
+    if (kv.first == kAttrCachePolicyParams) continue;
+    kept.push_back(kv);
+  }
+  return kept;
+}
+
+/// Longest ``IterArg`` init chain followed when resolving a load source. Loop
+/// nesting is the real bound (single digits); this only stops malformed IR from
+/// spinning.
+constexpr int kMaxIterArgInitChain = 64;
+
+/**
+ * @brief Resolve a load source to the function parameter it ultimately reads.
+ *
+ * A loop-carried tensor reaches its load as an ``IterArg``, not as the param
+ * ``Var`` the declaration named -- ``IterArg`` is its own ``ObjectKind``, so
+ * ``AsVarLike`` hands it back as itself and a param-keyed lookup misses. Follow
+ * ``initValue_`` back to the root first, mirroring how
+ * ``PTOCodegen::TryGetTensorView`` resolves the same shape. Returns the
+ * innermost resolvable Var-like, which for a non-carried source is the source
+ * itself.
+ */
+VarPtr ResolveToRootParam(const ExprPtr& src) {
+  auto var = AsVarLike(src);
+  for (int depth = 0; var && depth < kMaxIterArgInitChain; ++depth) {
+    auto iter_arg = As<IterArg>(var);
+    if (!iter_arg) return var;
+    auto init = AsVarLike(iter_arg->initValue_);
+    if (!init) return var;
+    var = init;
+  }
+  return var;
+}
+
+/**
+ * @brief Add the declared ``cache`` kwarg for a synthesised ``tile.load``.
+ *
+ * No-op unless ``src`` is a param carrying a declaration. An explicit
+ * ``cache=`` already in ``kwargs`` always wins (precedence: per-access kwarg,
+ * then the scope declaration, then ``CachePolicy::kDefault``).
+ */
+void AppendCachePolicyKwarg(const ExprPtr& src, const CachePolicyByParam& policies,
+                            std::vector<std::pair<std::string, std::any>>* kwargs) {
+  if (policies.empty()) return;
+  auto var = ResolveToRootParam(src);
+  if (!var) return;
+  auto it = policies.find(var.get());
+  if (it == policies.end()) return;
+  const bool stated_explicitly =
+      std::any_of(kwargs->begin(), kwargs->end(), [](const auto& kv) { return kv.first == "cache"; });
+  if (stated_explicitly) return;
+  kwargs->emplace_back("cache", it->second);
+}
+
+/**
+ * @brief Stamp the declared policy onto a ``tile.load`` already in the body.
+ *
+ * A hand-written (or earlier-pass) load of a declared tensor must honour the
+ * declaration exactly as a synthesised one does, unless it states its own
+ * ``cache=``. Returns nullptr when nothing changes, so callers keep their
+ * copy-on-write short-circuit. Only ``Call`` is considered: a ``Submit``
+ * launches a task through a ``GlobalVar`` callee and can never carry a tile op.
+ */
+CallPtr StampCachePolicyOnLoad(const CallPtr& call, const CachePolicyByParam& policies) {
+  if (policies.empty() || !IsOp(call, "tile.load") || call->args_.empty()) return nullptr;
+  auto kwargs = call->kwargs_;
+  AppendCachePolicyKwarg(call->args_[0], policies, &kwargs);
+  // Unchanged when the source carries no declaration, or when the load already
+  // states its own ``cache=``.
+  if (kwargs.size() == call->kwargs_.size()) return nullptr;
+  auto stamped = MutableCopy(call);
+  stamped->kwargs_ = std::move(kwargs);
+  return stamped;
 }
 
 void CheckReinterpretViewIncoreLayout(const CallPtr& call) {
@@ -244,7 +452,41 @@ struct ConsumerSpaceReq {
   MemorySpace space;  ///< Required memory space. The consumer-driven load is always
                       ///< natural; a transposed (b_trans/a_trans) operand is realised
                       ///< by a zero-copy tile.transpose_view in BridgeInputSpaces.
+  /// Resolved form of ``InputSpaceReq::cube_m_axis``, so a load-like producer
+  /// that answers the demand directly boxes exactly what ``BridgeInputSpaces``
+  /// would have: ``cube_m_align`` is the extent every cube tile of the consuming
+  /// call shares (0 when M cannot be boxed), and ``cube_m_axis`` names the axis
+  /// of *this* operand that carries M — 1 when the consumer reads it
+  /// transposed, whose natural load puts K on rows.
+  int64_t cube_m_align = 0;
+  size_t cube_m_axis = 0;
 };
+
+/// Fold @p incoming into @p existing, the requirement already recorded for a
+/// shared producer.
+///
+/// Two rules, and both paths that record a demand -- a direct operand use and
+/// the backward sweep over inherit-input / alias / loop-carry edges -- have to
+/// apply them identically, or which demand a producer sees depends on the order
+/// its consumers happen to be visited in.
+///
+///   * A specialized space (Mat/Left/Right/Acc/Bias) beats the default Vec, so
+///     a load-like producer can emit that space directly.
+///   * The M boxing survives only where every consumer agrees on it. A differing
+///     axis or alignment means one of them reads the tile at its declared
+///     physical shape, and one buffer cannot carry two physical extents; the
+///     padding is dropped so the mismatch is reported against the shape the
+///     author actually wrote, the same way whichever consumer is visited first.
+void MergeConsumerReq(ConsumerSpaceReq* existing, const ConsumerSpaceReq& incoming) {
+  if (existing->space == MemorySpace::Vec && incoming.space != MemorySpace::Vec) {
+    *existing = incoming;
+    return;
+  }
+  if (existing->space != incoming.space) return;
+  if (existing->cube_m_axis != incoming.cube_m_axis || existing->cube_m_align != incoming.cube_m_align) {
+    existing->cube_m_align = 0;
+  }
+}
 
 /**
  * @brief Visitor that collects consumer memory space requirements for variables.
@@ -281,13 +523,29 @@ class ConsumerSpaceCollector : public IRVisitor {
       if (out_it == consumer_reqs_.end()) continue;
       const auto& req = out_it->second;
       auto [ins_it, inserted] = consumer_reqs_.try_emplace(src, req);
-      if (!inserted && ins_it->second.space == MemorySpace::Vec && req.space != MemorySpace::Vec) {
-        ins_it->second = req;
-      }
+      // Same reconciliation as a direct use: a source reached both directly and
+      // through an alias must not keep whichever demand this sweep happened to
+      // reach first (see MergeConsumerReq).
+      if (!inserted) MergeConsumerReq(&ins_it->second, req);
     }
   }
 
  protected:
+  /// A loop carry's demand is equally a demand on the value that seeds it: the
+  /// two share one buffer for the whole loop, so an accumulator allocated
+  /// before the loop must be built the way the body's `tile.matmul_acc` reads
+  /// it. The edge flows strictly backward (the seed is defined before the
+  /// loop), so the reverse sweep in PropagateThroughInheritInputOps resolves it
+  /// in the same single pass as the others.
+  void VisitExpr_(const IterArgPtr& op) override {
+    if (op && op->initValue_) {
+      if (auto seed = AsVarLike(op->initValue_)) {
+        propagation_edges_.emplace_back(op.get(), seed.get());
+      }
+    }
+    IRVisitor::VisitExpr_(op);
+  }
+
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (!op) return;
     auto is_shaped = [](const TypePtr& t) { return As<TensorType>(t) || As<TileType>(t); };
@@ -332,14 +590,22 @@ class ConsumerSpaceCollector : public IRVisitor {
     // supplies the transpose. (No more transpose-at-load baking.)
     for (const auto& [idx, req] : entry->input_reqs) {
       if (idx >= call->args_.size()) continue;
-      if (auto var = As<Var>(call->args_[idx])) {
-        // Prioritize non-Vec spaces: if an existing requirement is the default Vec but this
-        // consumer needs a specialized space (Mat/Left/Right/Acc/Bias), override it so the
-        // load-like producer can emit the specialized space directly.
-        auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), ConsumerSpaceReq{req.space});
-        if (!inserted && it->second.space == MemorySpace::Vec && req.space != MemorySpace::Vec) {
-          it->second = ConsumerSpaceReq{req.space};
-        }
+      // `AsVarLike`, not `As<Var>`: a loop-carried operand is an `IterArg`,
+      // which carries its own ObjectKind and would otherwise record no demand
+      // at all (see `ir-kind-traits.md`). A split-K accumulator reaches its
+      // `tile.matmul_acc` exactly that way.
+      if (auto var = AsVarLike(call->args_[idx])) {
+        // A transposed use moves this operand's M to its column axis, and the
+        // alignment is the one the whole call shares (see ConsumerSpaceReq).
+        const int64_t align = req.cube_m_axis ? ResolveCubeMAlignment(call, entry->input_reqs,
+                                                                      req.m_align_from_arg.value_or(idx))
+                                              : 0;
+        const ConsumerSpaceReq resolved{req.space, align, CubeMAxis(call, req)};
+        // Several consumers can share one producer (a sliced KV feeding two
+        // matmuls, an accumulator seed read by two accumulations); MergeConsumerReq
+        // is the single rule for reconciling them.
+        auto [it, inserted] = consumer_reqs_.try_emplace(var.get(), resolved);
+        if (!inserted) MergeConsumerReq(&it->second, resolved);
       }
     }
     IRVisitor::VisitStmt_(op);
@@ -542,10 +808,27 @@ class TypePropagatingMutator : public IRMutator {
 class TensorToTileMutator : public TypePropagatingMutator {
  public:
   TensorToTileMutator(const OpConversionRegistry& conv_registry, const OpRegistry& op_registry,
-                      const ConsumerSpaceCollector& consumer_collector)
-      : conv_registry_(conv_registry), op_registry_(op_registry), consumer_collector_(consumer_collector) {}
+                      const ConsumerSpaceCollector& consumer_collector, CachePolicyByParam cache_policies)
+      : conv_registry_(conv_registry),
+        op_registry_(op_registry),
+        consumer_collector_(consumer_collector),
+        cache_policies_(std::move(cache_policies)) {}
 
  protected:
+  /// Honour a ``pl.set_cache_policy`` declaration on a ``tile.load`` that was
+  /// already in the body (user-written, or produced by an earlier pass) rather
+  /// than synthesised here. Hooked on the generic Call visit so the loads a
+  /// converter emits in its own prologue are covered too.
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    // Qualified with IRMutator: TypePropagatingMutator declares only the
+    // IterArg overload, which hides the base Call one from name lookup.
+    auto visited = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(visited);
+    if (!call) return visited;
+    auto stamped = StampCachePolicyOnLoad(call, cache_policies_);
+    return stamped ? ExprPtr(stamped) : visited;
+  }
+
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     // Pin this Var's address for the pass so a freed-then-reused address cannot
     // alias a stale var_remap_ entry (see TypePropagatingMutator::RetainVar).
@@ -588,6 +871,18 @@ class TensorToTileMutator : public TypePropagatingMutator {
       if (consumer_req) {
         auto override_load = HandleConsumerDrivenLoad(op, call, *consumer_req);
         if (override_load) return override_load;
+      }
+    }
+
+    // Consumer-driven row boxing for an allocation that feeds a cube
+    // accumulator. Unlike an operand, an accumulator is never loaded from GM, so
+    // its create site is the only place its physical row count can still be
+    // rounded up to the box.
+    if (IsOp(call, "tensor.create")) {
+      auto consumer_req = consumer_collector_.GetConsumerReq(op->var_.get());
+      if (consumer_req && consumer_req->cube_m_align > 0) {
+        auto boxed_create = HandleBoxedAccCreate(op, call, *consumer_req);
+        if (boxed_create) return boxed_create;
       }
     }
 
@@ -653,9 +948,81 @@ class TensorToTileMutator : public TypePropagatingMutator {
   }
 
  private:
+  /// Handle a `tensor.create` that seeds a cube accumulator: allocate whole NZ
+  /// fractal boxes on the row axis and declare the requested rectangle as
+  /// `valid_shape`.
+  ///
+  /// `tile.matmul_acc` requires the accumulator and the matrix product to agree
+  /// on *physical* M, so the accumulator has to be boxed by exactly the rule
+  /// `BoxCubeMAxis` applies to the left operand (see its comment for why the box
+  /// binds the physical extent and not the logical one). The operand reaches
+  /// that rule through its bridge load; an accumulator is never loaded — there
+  /// is no data path into Acc — so its allocation is the only site left.
+  ///
+  /// The narrowing rides on a separate `tile.set_validshape` because
+  /// `tile.create` takes no valid extent. It is metadata-only, so the pair costs
+  /// nothing. Returns nullptr when no padding applies, leaving the historical
+  /// single-`tile.create` lowering byte-identical.
+  StmtPtr HandleBoxedAccCreate(const AssignStmtPtr& op, const CallPtr& call, const ConsumerSpaceReq& req) {
+    if (call->args_.size() != 1) return nullptr;
+    auto shape_tuple = As<MakeTuple>(call->args_[0]);
+    if (!shape_tuple || shape_tuple->elements_.size() != 2) return nullptr;
+    const auto& shape = shape_tuple->elements_;
+
+    auto boxed = BoxCubeMAxis(shape, req.cube_m_align, req.cube_m_axis, call->span_);
+    if (AreExprVectorsEqual(boxed, shape)) return nullptr;
+
+    // Route the boxed allocation through the registered converter so it keeps
+    // the capacity check and the kwarg filtering `tensor.create` performs.
+    const auto* entry = conv_registry_.Lookup("tensor.create");
+    INTERNAL_CHECK_SPAN(entry, call->span_)
+        << "Internal error: tensor.create has no registered tile conversion";
+    auto converted =
+        As<Call>(entry->func({MakeShapeTuple(boxed, call->span_)}, call->kwargs_, call->span_).result);
+    INTERNAL_CHECK_SPAN(converted, call->span_)
+        << "Internal error: the tensor.create conversion must produce a Call";
+
+    // ... then stamp the space. The converter deliberately leaves `tensor.create`
+    // unresolved because it has no consumer context to derive a space from; here
+    // there is one, and it is the same demand that asked for the boxing. Stating
+    // it matters beyond saving InferTileMemorySpace the work: an Acc tile's
+    // implicit view is boxed NZ, so a seed left unresolved would carry the raw
+    // row-major view and disagree with the `tile.matmul_acc` result it is
+    // carried against across a loop.
+    auto create_kwargs = converted->kwargs_;
+    create_kwargs.emplace_back("target_memory", req.space);
+    // Compact, because the padding is what makes the two readings of an L0C
+    // stride disagree. `mad` lays the product out at a pitch of
+    // ceil(validRow/16)*16 -- 112 for a 100-row product -- while a non-compact
+    // reader derives its stride from the physical row count, which the box
+    // rounded to 112 or, at a 32-row alignment (a transposed INT8 operand), to
+    // 128. Compact makes every reader recompute the pitch `mad` actually used.
+    // Reaching here means padding applies, so the two never coincide by
+    // accident; `AccCompactValid` rejects the unstamped form outright.
+    if (req.space == MemorySpace::Acc) create_kwargs.emplace_back("compact", true);
+    auto storage = op_registry_.Create("tile.create", converted->args_, create_kwargs, call->span_);
+
+    auto storage_var = std::make_shared<Var>(MakeTileValueName(op->var_->name_hint_) + "_storage",
+                                             storage->GetType(), op->var_->span_);
+    auto narrowed =
+        op_registry_.Create("tile.set_validshape", {storage_var, shape[0], shape[1]}, call->span_);
+    auto tile_var =
+        std::make_shared<Var>(MakeTileValueName(op->var_->name_hint_), narrowed->GetType(), op->var_->span_);
+    var_remap_[op->var_.get()] = tile_var;
+
+    std::vector<StmtPtr> stmts = {
+        std::make_shared<AssignStmt>(storage_var, storage, op->span_),
+        std::make_shared<AssignStmt>(tile_var, narrowed, op->span_),
+    };
+    return SeqStmts::Flatten(std::move(stmts), op->span_);
+  }
+
   /// Handle tensor.slice whose consumer needs a specific memory space — produce tile.load with that space.
   StmtPtr HandleConsumerDrivenLoad(const AssignStmtPtr& op, const CallPtr& call,
                                    const ConsumerSpaceReq& req) {
+    // Acc is not a load target (see BridgeInputSpaces): nothing but the matrix
+    // unit writes L0C.
+    if (req.space == MemorySpace::Acc) return nullptr;
     const auto& input = call->args_[0];
     auto tensor_type = AsTensorTypeLike(input->GetType());
     if (!tensor_type) return nullptr;
@@ -685,13 +1052,27 @@ class TensorToTileMutator : public TypePropagatingMutator {
         << "tensor.slice conversion does not support rank-0 tiles; keep one unit axis or use tensor.read "
            "for a scalar result";
 
+    // A cube operand answered here rather than in BridgeInputSpaces must get the
+    // same row boxing, or a sliced left operand keeps its unaligned physical row
+    // count all the way to ptoas. `valid_shape` already names the slice window,
+    // so only the allocation grows. Skipped when the slice drops a dimension:
+    // the result is then not the rank-2 tile the M-axis rule is about.
+    ExprPtr physical_shape_arg = shape_arg;
+    if (req.cube_m_align > 0 && drop_dims.empty()) {
+      auto boxed = BoxCubeMAxis(full_shape, req.cube_m_align, req.cube_m_axis, call->span_);
+      if (!AreExprVectorsEqual(boxed, full_shape)) {
+        physical_shape_arg = MakeShapeTuple(boxed, call->span_);
+      }
+    }
+
     // The consumer-driven load is always natural; a transposed (b_trans/a_trans)
     // operand gets a zero-copy tile.transpose_view at the matmul site instead.
     std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", req.space}};
-    auto load_call =
-        MarkCompilerMatBridge(op_registry_.Create("tile.load", {input, offset_arg, shape_arg, valid_shape},
-                                                  load_kwargs, call->span_),
-                              req.space);
+    AppendCachePolicyKwarg(input, cache_policies_, &load_kwargs);
+    auto load_call = MarkCompilerMatBridge(
+        op_registry_.Create("tile.load", {input, offset_arg, physical_shape_arg, valid_shape}, load_kwargs,
+                            call->span_),
+        req.space);
 
     auto tile_name = MakeTileValueName(op->var_->name_hint_);
     if (drop_dims.empty()) {
@@ -735,13 +1116,24 @@ class TensorToTileMutator : public TypePropagatingMutator {
     // Emit a `tile.load` of `arg` (TensorType) into `space`, append its AssignStmt,
     // and return the bound load Var. The load is always natural; a transposed
     // operand is realised by a zero-copy tile.transpose_view on the result.
-    auto emit_load = [&](const ExprPtr& arg, const TensorTypePtr& tensor_type, MemorySpace space,
-                         size_t idx) -> VarPtr {
+    //
+    // `m_align` / `m_axis` mark a cube operand (see InputSpaceReq::cube_m_axis):
+    // the load then allocates a whole number of NZ fractal boxes on the axis that
+    // carries M and declares the tensor's true extent as valid_shape.
+    // `BoxCubeMAxis` returns the physical shape; it equals `tensor_type->shape_`
+    // whenever no padding applies, so a fractal-sized operand keeps its
+    // historical byte-identical load.
+    auto emit_load = [&](const ExprPtr& arg, const TensorTypePtr& tensor_type, MemorySpace space, size_t idx,
+                         int64_t m_align, size_t m_axis) -> VarPtr {
       auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), call->span_);
-      auto shapes = MakeShapeTuple(tensor_type->shape_, call->span_);
+      auto valid = MakeShapeTuple(tensor_type->shape_, call->span_);
+      auto boxed = BoxCubeMAxis(tensor_type->shape_, m_align, m_axis, call->span_);
+      auto shapes =
+          AreExprVectorsEqual(boxed, tensor_type->shape_) ? valid : MakeShapeTuple(boxed, call->span_);
       std::vector<std::pair<std::string, std::any>> load_kw = {{"target_memory", space}};
+      AppendCachePolicyKwarg(arg, cache_policies_, &load_kw);
       auto load = MarkCompilerMatBridge(
-          op_registry_.Create("tile.load", {arg, offsets, shapes, shapes}, load_kw, call->span_), space);
+          op_registry_.Create("tile.load", {arg, offsets, shapes, valid}, load_kw, call->span_), space);
       std::string var_name;
       if (auto var = As<Var>(arg)) {
         auto space_str = MemorySpaceToString(space);
@@ -787,13 +1179,24 @@ class TensorToTileMutator : public TypePropagatingMutator {
     for (size_t idx : sorted_indices) {
       const auto& req = input_reqs.at(idx);
       if (idx >= args.size()) continue;
+      // Acc is never a bridge target: only the matrix unit writes L0C, so no
+      // load can put a GM tensor there. An Acc req exists to carry the cube
+      // row-box demand back to the operand's producer (HandleBoxedAccCreate);
+      // leaving the operand alone here keeps InferTileMemorySpace's "no data
+      // path into Acc memory" diagnostic, which names the real limitation.
+      if (req.space == MemorySpace::Acc) continue;
       const bool use_view = req.trans_kwarg ? call->GetKwarg<bool>(*req.trans_kwarg, false) : false;
       auto tensor_type = As<TensorType>(args[idx]->GetType());
 
       if (tensor_type) {
         // GM operand: load NATURAL (2D and ND alike), then reinterpret as its
         // transpose with a zero-copy view when b_trans/a_trans.
-        auto loaded = emit_load(args[idx], tensor_type, req.space, idx);
+        // A transposed operand is boxed on its *column* axis: the
+        // tile.transpose_view below reinterprets the row axis as the matmul's K,
+        // so M is the column extent the natural load allocates.
+        const int64_t m_align =
+            req.cube_m_axis ? ResolveCubeMAlignment(call, input_reqs, req.m_align_from_arg.value_or(idx)) : 0;
+        auto loaded = emit_load(args[idx], tensor_type, req.space, idx, m_align, CubeMAxis(call, req));
         args[idx] = use_view ? emit_view(loaded) : loaded;
         continue;
       }
@@ -818,6 +1221,9 @@ class TensorToTileMutator : public TypePropagatingMutator {
   const OpConversionRegistry& conv_registry_;
   const OpRegistry& op_registry_;
   const ConsumerSpaceCollector& consumer_collector_;
+  /// Declared GM cache policies of this function's params (empty when the
+  /// function carries no ``pl.set_cache_policy`` declaration).
+  const CachePolicyByParam cache_policies_;
 };
 
 bool ExprUsesVar(const ExprPtr& expr, const Var* target) {
@@ -1249,99 +1655,23 @@ ParamOrigins LookupOrigins(const Var* var, const AliasOriginMap& origin_map) {
 
 ParamOrigins CollectReferencedOrigins(const ExprPtr& expr, const AliasOriginMap& origin_map);
 
-ExprPtr GetCallKwargExpr(const CallPtr& call, const std::string& key) {
-  if (!call || !call->HasKwarg(key)) return nullptr;
-  return call->GetKwarg<ExprPtr>(key, ExprPtr{});
-}
-
-ExprPtr GetWriteTargetExpr(const CallPtr& call) {
-  if (!call) return nullptr;
-
-  if (IsOp(call, "tensor.write") && !call->args_.empty()) {
-    return call->args_[0];
-  }
-  if (IsOp(call, "tile.store")) {
-    if (call->args_.size() >= 3) {
-      return call->args_[2];
-    }
-    return GetCallKwargExpr(call, "output_tensor");
-  }
-  if (IsOp(call, "tensor.assemble") && !call->args_.empty()) {
-    return call->args_[0];
-  }
-  // pld.tile.remote_store(src_tile, target, peer, offsets): the cross-rank write
-  // lands in `target` (args_[1]). Recognising it here lets the enclosing window
-  // param be upgraded from In to Out/InOut so a later reader gets a RAW edge.
-  if (IsOp(call, "pld.tile.remote_store") && call->args_.size() >= 2) {
-    return call->args_[1];
-  }
-  // pld.tile.put(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
-  //   the HCCL TPUT writes through `dst` (args_[0]).
-  // pld.tile.get(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
-  //   the HCCL TGET writes the pulled bytes into local `dst` (args_[0]).
-  // Both mirror the remote_store handling above so the enclosing window
-  // param is upgraded from In to Out/InOut and a later reader gets a RAW edge.
-  if ((IsOp(call, "pld.tile.put") || IsOp(call, "pld.tile.get")) && !call->args_.empty()) {
-    return call->args_[0];
-  }
-  // pld.system.notify(target, peer, offsets, value, *, op): the TNOTIFY
-  // deposits `value` into the peer rank's slot of `target` (args_[0]), so the
-  // enclosing window param must be upgraded from In to Out/InOut — otherwise a
-  // later reader of the same signal gets no RAW edge. The op is side-effect-only
-  // (UnknownType result), so this entry only ever feeds AnalyzeCallAccess, never
-  // the result-aliasing path in GetAliasOrigins.
-  if (IsOp(call, "pld.system.notify") && !call->args_.empty()) {
-    return call->args_[0];
-  }
-  // pld.tensor.allreduce(target, signal, *, op): the composite collective
-  // writes the reduced value back into `target` (args_[0]) — the in-place
-  // rebind idiom shared with `pl.store`. `signal` (args_[1]) is also
-  // written (ready and per-chunk notify), but the marker below for
-  // ``pld.tensor.allreduce`` already records both args as InOut; this
-  // entry just identifies the primary data target for any downstream
-  // consumer that walks GetWriteTargetExpr.
-  if (IsOp(call, "pld.tensor.allreduce") && !call->args_.empty()) {
-    return call->args_[0];
-  }
-  // pld.tensor.allgather unified 3-arg API (see DeduceTensorAllGatherType):
-  //   arg[1] (target) is the result window for both HOST and InCore paths.
-  //   local_data (arg[0]) is read-only; signal (arg[2]) is barrier only.
-  if (IsOp(call, "pld.tensor.allgather")) {
-    if (call->args_.size() >= 3) {
-      return call->args_[1];  // target is the write target (window-as-result)
-    }
-  }
-  // pld.tensor.reduce_scatter(target, signal, *, op): writes the reduced
-  // chunk back into target (Phase 4 store).  target (args_[0]) is the
-  // primary write target — same as allreduce.
-  if (IsOp(call, "pld.tensor.reduce_scatter") && !call->args_.empty()) {
-    return call->args_[0];
-  }
-  // pld.tensor.barrier(signal): returns a rebind of signal — the result
-  // aliases signal so that ``sig2 = barrier(sig1)`` propagates origins
-  // through GetAliasOrigins().  The AnalyzeCallAccess handler separately
-  // marks signal read+write for param-direction inference.
-  if (IsOp(call, "pld.tensor.barrier") && !call->args_.empty()) {
-    return call->args_[0];
-  }
-  // pld.tensor.broadcast(target, signal, *, root): writes root's data into
-  // target on every rank via pld.tile.get.  target (args_[0]) is
-  // the primary write target.
-  if (IsOp(call, "pld.tensor.broadcast") && !call->args_.empty()) {
-    return call->args_[0];
-  }
-  // pld.tensor.all_to_all(input, target, signal): 3-arg push-based
-  // window-as-result.  target (args_[1]) receives peers' writes via TPUT.
-  if (IsOp(call, "pld.tensor.all_to_all") && call->args_.size() >= 2) {
-    return call->args_[1];
-  }
-  // pld.tensor.all_to_all_v(input, target, signal, send_counts, recv_counts):
-  // 5-arg variable-size push-based window-as-result.  target (args_[1]) receives
-  // peers' writes; recv_counts (args_[4]) receives per-source valid-row counts;
-  // send_counts is read-only.
-  if (IsOp(call, "pld.tensor.all_to_all_v") && call->args_.size() >= 2) {
-    return call->args_[1];
-  }
+/// The argument whose buffer this call's SSA result names, or null when the
+/// result is a fresh value.
+///
+/// This is the destination-rebind idiom — `c2 = tile.store(t, off, c)`, where
+/// reading `c2` reads `c` — and it is a *narrower* question than "which argument
+/// does this operator write", which the registry now answers (`set_arg_effect`).
+/// The two differ: `tile.mgather` clobbers a GM scratch operand yet returns a
+/// fresh tile, so it writes an argument it does not alias.
+///
+/// An operator declaring `set_output_reuses_input(N)` states exactly this
+/// relation, so that declaration is consulted first. The remaining entries are
+/// the tensor-level and cross-rank operators whose result rebinds a destination
+/// without reusing an on-chip MemRef; unifying them onto one declaration is
+/// follow-up work, and the two sources are kept consistent by the write-effect
+/// check below.
+ExprPtr ResultAliasedDestination(const CallPtr& call) {
+  if (auto index = ResultAliasedArgIndex(call)) return call->args_[*index];
   return nullptr;
 }
 
@@ -1372,7 +1702,7 @@ ParamOrigins GetAliasOrigins(const ExprPtr& expr, const AliasOriginMap& origin_m
   auto call = As<Call>(expr);
   if (!call) return {};
 
-  if (auto write_target = GetWriteTargetExpr(call)) {
+  if (auto write_target = ResultAliasedDestination(call)) {
     return GetAliasOrigins(write_target, origin_map);
   }
   if ((IsOp(call, "tensor.slice") || IsOp(call, "tensor.view")) && !call->args_.empty()) {
@@ -1415,226 +1745,46 @@ ParamOrigins CollectReferencedOrigins(const ExprPtr& expr, const AliasOriginMap&
   return origins;
 }
 
+/// Mark the parameter origins each argument of @p call reads and writes.
+///
+/// Which argument a call writes is a property of the operator, declared once on
+/// the registry (`set_arg_effect`) and read here — this pass used to carry its
+/// own table of twenty operators, whose default arm counted every argument of an
+/// operator it did not recognise as a read. That default is why a GM tensor
+/// written only by `tile.mscatter` kept direction `In`.
+///
+/// Reads resolve through `CollectReferencedOrigins`, since an operand may merely
+/// *mention* a buffer (an offsets tuple built from `tensor.dim`). Writes resolve
+/// through `GetAliasOrigins`, since a destination operand names the buffer
+/// itself. A pure `Write` argument is not marked as a read: a store that lands
+/// on a sub-region never reads the untouched remainder.
 void AnalyzeCallAccess(const CallPtr& call, const AliasOriginMap& origin_map, std::vector<bool>& has_read,
                        std::vector<bool>& has_write, std::vector<std::optional<Span>>& dma_store_spans,
                        std::vector<std::optional<Span>>& scalar_store_spans) {
   if (!call) return;
 
-  if (IsOp(call, "tile.load") || IsOp(call, "tensor.read")) {
-    if (!call->args_.empty()) {
-      MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_read);
-    }
-    for (size_t i = 1; i < call->args_.size(); ++i) {
+  // A call to a user function reaches here with a GlobalVar callee and no
+  // registry entry. Its writes are propagated separately, from the callee's
+  // declared param directions; every operand counts as a read here.
+  const auto* entry = LookupOpEntry(call->op_);
+
+  for (size_t i = 0; i < call->args_.size(); ++i) {
+    const auto effect = entry ? entry->GetArgEffect(i, call->kwargs_) : ArgEffect::Read;
+
+    if (ArgEffectReads(effect)) {
       MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
     }
-    return;
-  }
+    if (!ArgEffectWrites(effect)) continue;
 
-  if (IsOp(call, "tile.store")) {
-    if (!call->args_.empty()) {
-      MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
+    auto origins = GetAliasOrigins(call->args_[i], origin_map);
+    MarkAccess(origins, has_write);
+    // Only a GM store participates in the mixed-channel diagnostic below; an
+    // operator that writes a tile, an array or a signal slot declares no
+    // channel and is skipped.
+    if (auto channel = entry->GetWriteChannel()) {
+      RecordFirstStoreSpan(origins, *channel == WriteChannel::Scalar ? scalar_store_spans : dma_store_spans,
+                           call->span_);
     }
-    for (size_t i = 1; i + 1 < call->args_.size(); ++i) {
-      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
-    }
-    if (call->args_.size() < 3) {
-      MarkAccess(CollectReferencedOrigins(GetCallKwargExpr(call, "offsets"), origin_map), has_read);
-    }
-    if (auto write_target = GetWriteTargetExpr(call)) {
-      auto origins = GetAliasOrigins(write_target, origin_map);
-      MarkAccess(origins, has_write);
-      RecordFirstStoreSpan(origins, dma_store_spans, call->span_);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.tile.remote_store")) {
-    // remote_store(src_tile, target, peer, offsets): src_tile/peer/offsets read,
-    // target (args_[1]) written. Mirrors the tile.store handling above.
-    if (!call->args_.empty()) {
-      MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
-    }
-    for (size_t i = 2; i < call->args_.size(); ++i) {
-      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
-    }
-    if (auto write_target = GetWriteTargetExpr(call)) {
-      MarkAccess(GetAliasOrigins(write_target, origin_map), has_write);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.tile.put") || IsOp(call, "pld.tile.get")) {
-    // pld.tile.put(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
-    //   dst (args_[0]) is the cross-rank write target; peer/src/stage and any
-    //   subregion offsets are all read.
-    // pld.tile.get(dst, peer, src, stage[, dst_offsets, src_offsets, shape]):
-    //   dst (args_[0]) is the local write target (HCCL TGET lands bytes into
-    //   the local window slot); peer/src/stage and any subregion offsets are
-    //   all read.
-    // Mirrors the pld.tile.remote_store handling above.
-    for (size_t i = 1; i < call->args_.size(); ++i) {
-      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
-    }
-    if (auto write_target = GetWriteTargetExpr(call)) {
-      MarkAccess(GetAliasOrigins(write_target, origin_map), has_write);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.system.notify")) {
-    // pld.system.notify(target, peer, offsets, value, *, op): target (args_[0])
-    // is always written; peer/offsets/value are reads. NotifyOp::kAtomicAdd is
-    // additionally a read-modify-write of the target slot, so its distributed
-    // target dependency must be preserved even when the slot belongs to a peer
-    // rank. NotifyOp::kSet remains write-only.
-    for (size_t i = 1; i < call->args_.size(); ++i) {
-      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
-    }
-    if (auto write_target = GetWriteTargetExpr(call)) {
-      auto origins = GetAliasOrigins(write_target, origin_map);
-      const auto notify_op =
-          static_cast<NotifyOp>(call->GetKwarg<int>("op", static_cast<int>(NotifyOp::kAtomicAdd)));
-      if (notify_op == NotifyOp::kAtomicAdd) {
-        MarkAccess(origins, has_read);
-      }
-      MarkAccess(origins, has_write);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.tensor.allreduce")) {
-    // pld.tensor.allreduce(target, signal, *, op): both target (args_[0])
-    // and signal (args_[1]) are InOut — read AND written across the
-    // ready-plus-per-chunk decomposition (target read and written per chunk;
-    // signal written by notify and read by wait at both barriers).
-    // Marking both args on both sides makes the enclosing window params
-    // surface as InOut without needing LowerCompositeOps to have run yet
-    // (this pass is upstream of LowerCompositeOps).
-    for (size_t i = 0; i < std::min<size_t>(2, call->args_.size()); ++i) {
-      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
-      MarkAccess(origins, has_read);
-      MarkAccess(origins, has_write);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.tensor.allgather")) {
-    // Unified 3-arg InCore (AnalyzeCallAccess only fires for InCore functions).
-    //   arg[0] = local_data — Tensor [1, SIZE] (In, read-only)
-    //   arg[1] = target     — DistributedTensor window (InOut, push target + result)
-    //   arg[2] = signal     — DistributedTensor INT32 barrier (InOut)
-    if (call->args_.size() >= 1) {
-      MarkAccess(CollectReferencedOrigins(call->args_[0], origin_map), has_read);
-    }
-    for (size_t i = 1; i < call->args_.size(); ++i) {
-      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
-      MarkAccess(origins, has_read);
-      MarkAccess(origins, has_write);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.tensor.reduce_scatter")) {
-    // pld.tensor.reduce_scatter(target, signal, *, op): same 5-phase
-    // pattern as allreduce — both target and signal are InOut.
-    for (size_t i = 0; i < std::min<size_t>(2, call->args_.size()); ++i) {
-      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
-      MarkAccess(origins, has_read);
-      MarkAccess(origins, has_write);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.tensor.barrier")) {
-    // pld.tensor.barrier(signal): signal (args_[0]) is InOut.
-    // Written in Phase 1 (notify), read in Phase 2 (wait).
-    if (!call->args_.empty()) {
-      auto origins = CollectReferencedOrigins(call->args_[0], origin_map);
-      MarkAccess(origins, has_read);
-      MarkAccess(origins, has_write);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.tensor.broadcast")) {
-    // pld.tensor.broadcast(target, signal, *, root): target (args_[0]) and
-    // signal (args_[1]) are both InOut.  Target is read via pld.tile.get
-    // (non-root reads root's slice), written via pld.tile.get into local
-    // slot.  Signal is written (Phase 2a notify) and read (Phase 2b wait).
-    for (size_t i = 0; i < std::min<size_t>(2, call->args_.size()); ++i) {
-      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
-      MarkAccess(origins, has_read);
-      MarkAccess(origins, has_write);
-    }
-    return;
-  }
-
-  if (IsOp(call, "pld.tensor.all_to_all") || IsOp(call, "pld.tensor.all_to_all_v")) {
-    // Push-based window-as-result: input (arg[0]) is read-only (Tensor or
-    // DistributedTensor); target (arg[1]) receives peer writes via TPUT and
-    // is returned in-place; signal (arg[2]) is read+written by notify/wait.
-    // all_to_all_v carries two more operands — send_counts (arg[3], read-only
-    // via ``tensor.read``) and recv_counts (arg[4], written by peer count
-    // notify) — so only arg[3] stays read-only among the trailing operands.
-    for (size_t i = 0; i < call->args_.size(); ++i) {
-      auto origins = CollectReferencedOrigins(call->args_[i], origin_map);
-      MarkAccess(origins, has_read);
-      const bool is_write_target = (i == 1 || i == 2 || (IsOp(call, "pld.tensor.all_to_all_v") && i == 4));
-      if (is_write_target) {
-        MarkAccess(origins, has_write);
-      }
-    }
-    return;
-  }
-
-  if (IsOp(call, "tensor.write")) {
-    for (size_t i = 1; i < call->args_.size(); ++i) {
-      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
-    }
-    if (auto write_target = GetWriteTargetExpr(call)) {
-      auto origins = GetAliasOrigins(write_target, origin_map);
-      MarkAccess(origins, has_write);
-      RecordFirstStoreSpan(origins, scalar_store_spans, call->span_);
-    }
-    return;
-  }
-
-  if (IsOp(call, "tensor.assemble")) {
-    for (size_t i = 1; i < call->args_.size(); ++i) {
-      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
-    }
-    if (!call->args_.empty()) {
-      auto origins = GetAliasOrigins(call->args_[0], origin_map);
-      MarkAccess(origins, has_write);
-      RecordFirstStoreSpan(origins, dma_store_spans, call->span_);
-    }
-    return;
-  }
-
-  if (IsOp(call, "tensor.slice") || IsOp(call, "tensor.create") || IsOp(call, "tensor.full")) {
-    for (size_t i = 1; i < call->args_.size(); ++i) {
-      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
-    }
-    return;
-  }
-
-  if (IsOp(call, "system.syncall") && call->GetKwarg<std::string>("mode", "hard") == "soft") {
-    // Soft form: each core writes its arrival counter into gm_workspace
-    // (args_[0]) and polls it, so the workspace is read AND written. The
-    // optional used_cores operand is a read. Marking the write lets dependency
-    // analysis order barriers that reuse one workspace.
-    INTERNAL_CHECK_SPAN(!call->args_.empty(), call->span_)
-        << "Internal error: soft system.syncall is missing gm_workspace";
-    MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_read);
-    MarkAccess(GetAliasOrigins(call->args_[0], origin_map), has_write);
-    for (size_t i = 1; i < call->args_.size(); ++i) {
-      MarkAccess(CollectReferencedOrigins(call->args_[i], origin_map), has_read);
-    }
-    return;
-  }
-
-  for (const auto& arg : call->args_) {
-    MarkAccess(CollectReferencedOrigins(arg, origin_map), has_read);
   }
 }
 
@@ -2044,8 +2194,14 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   consumer_collector.VisitStmt(canonical_body);
   consumer_collector.PropagateThroughInheritInputOps();
 
+  // Resolve the scope-declared GM cache policies onto this function's params.
+  // Every load this pass synthesises below, and every load already in the body,
+  // carries the declaration onward as a ``cache`` kwarg; the function attr is
+  // erased when the transformed function is rebuilt.
+  auto cache_policies = BuildCachePolicyByParam(func);
+
   // Create the body mutator
-  TensorToTileMutator mutator(conv_registry, op_registry, consumer_collector);
+  TensorToTileMutator mutator(conv_registry, op_registry, consumer_collector, cache_policies);
 
   // New body statements (prefix tile.loads + mutated body)
   std::vector<StmtPtr> new_stmts;
@@ -2053,7 +2209,7 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   // Phase 1: Insert tile.load for each TensorType parameter that is directly consumed
   // by a converted tensor op.  Parameters that are only referenced by non-converted ops
   // (e.g. tile.load, tile.move) already manage their own tile representation and must
-  // NOT get an additional Vec-space load inserted here.
+  // NOT get an additional load inserted here.
   TensorArgsInConvertedOpsCollector collector(conv_registry);
   collector.VisitStmt(canonical_body);
   collector.TraceIterArgInitValues();
@@ -2068,9 +2224,44 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
     // Attribute the entry load to the parameter declaration it loads, not to `def`.
     const auto& load_span = var->span_;
     auto offsets = MakeZeroOffsets(tensor_type->shape_.size(), load_span);
-    auto shapes = MakeShapeTuple(tensor_type->shape_, load_span);
-    std::vector<std::pair<std::string, std::any>> load_kwargs = {{"target_memory", MemorySpace::Vec}};
-    auto load_call = op_registry.Create("tile.load", {var, offsets, shapes, shapes}, load_kwargs, load_span);
+    auto valid = MakeShapeTuple(tensor_type->shape_, load_span);
+
+    // Honour the same consumer demand the mutator honours for the loads it
+    // creates (see BridgeInputSpaces): a parameter feeding a matmul goes
+    // straight to Mat rather than landing in Vec and being moved out again.
+    //
+    // With no demand recorded, leave `target_memory` *absent*. It used to be
+    // hard-coded to Vec, which is a guess this pass is not equipped to make --
+    // it sees only the ops it converts, while InferTileMemorySpace (pass 17)
+    // sees the whole function and places the tile from actual consumer demand.
+    // An unset space is the IR's "not decided yet", so stating Vec here would
+    // overwrite a real answer with a default and make pass 17 honour it (it
+    // never overrides a present kwarg).
+    auto entry_req = consumer_collector.GetConsumerReq(var.get());
+    // An Acc demand is not a load target either (see BridgeInputSpaces): a
+    // parameter cannot be loaded into L0C, so the entry load stays natural and
+    // the accumulator constraint is reported where it actually holds.
+    if (entry_req.has_value() && entry_req->space == MemorySpace::Acc) entry_req.reset();
+    std::vector<std::pair<std::string, std::any>> load_kwargs;
+    if (entry_req.has_value()) {
+      load_kwargs.emplace_back("target_memory", entry_req->space);
+    }
+    AppendCachePolicyKwarg(var, cache_policies, &load_kwargs);
+    // A parameter that reaches a matmul directly, or through an inherit-input
+    // chain such as tensor.set_validshape, is loaded here rather than by
+    // BridgeInputSpaces / HandleConsumerDrivenLoad -- so the same row boxing has
+    // to apply, or the cube operand keeps its unaligned physical row count.
+    ExprPtr shapes = valid;
+    if (entry_req.has_value() && entry_req->cube_m_align > 0) {
+      auto boxed =
+          BoxCubeMAxis(tensor_type->shape_, entry_req->cube_m_align, entry_req->cube_m_axis, load_span);
+      if (!AreExprVectorsEqual(boxed, tensor_type->shape_)) {
+        shapes = MakeShapeTuple(boxed, load_span);
+      }
+    }
+    auto load_call = MarkCompilerMatBridge(
+        op_registry.Create("tile.load", {var, offsets, shapes, valid}, load_kwargs, load_span),
+        entry_req.has_value() ? entry_req->space : MemorySpace::Vec);
 
     std::string tile_name = MakeTileValueName(var->name_hint_);
     auto tile_var = std::make_shared<Var>(tile_name, load_call->GetType(), load_span);
@@ -2177,9 +2368,9 @@ IncoreTransformResult TransformIncoreFunction(const FunctionPtr& func) {
   UpgradeWrittenTensorParamDirections(new_stmts, new_params, new_param_directions);
 
   auto new_body = SeqStmts::Flatten(std::move(new_stmts), span);
-  auto new_func =
-      std::make_shared<Function>(func->name_, new_params, new_param_directions, new_return_types, new_body,
-                                 span, FunctionType::InCore, func->level_, func->role_, func->attrs_);
+  auto new_func = std::make_shared<Function>(func->name_, new_params, new_param_directions, new_return_types,
+                                             new_body, span, FunctionType::InCore, func->level_, func->role_,
+                                             EraseCachePolicyAttr(func->attrs_));
 
   return {new_func, num_added_outputs};
 }
@@ -2642,48 +2833,139 @@ Pass ConvertTensorToTileOps() {
         func_map[func->name_] = func;
       }
 
+      // Everything derived from a *body* is computed once, before the fixed
+      // point. The loop below only rewrites `param_directions_` — it replaces a
+      // function with a `MutableCopy` whose body is the same node — so the
+      // parameter index, the buffer lineage and the call list are all invariant
+      // across rounds. Rebuilding them per round made the added analysis cost
+      // O(rounds x program), over the O(N log N) bound
+      // `.claude/rules/pass-complexity.md` sets; hoisting leaves the loop
+      // proportional to the call arguments it actually re-reads.
+      struct CallerFacts {
+        std::unordered_map<const Var*, size_t> param_idx;
+        std::vector<CallPtr> calls;
+        std::unordered_map<const Var*, const Var*> buffer_roots;
+        std::unordered_map<const Var*, std::vector<const Var*>> candidates;
+      };
+      std::unordered_map<std::string, CallerFacts> facts_by_name;
+      for (const auto& func : functions_phase2b) {
+        if (func->func_type_ == FunctionType::InCore) continue;
+
+        CallerFacts f;
+        for (size_t i = 0; i < func->params_.size(); ++i) {
+          f.param_idx[func->params_[i].get()] = i;
+        }
+
+        // An argument rarely *is* the parameter. `for acc in ...: acc =
+        // kernel(x, acc)` forwards a loop-carried `IterArg` whose value is the
+        // parameter's buffer, and looking the IterArg up in `param_idx` finds
+        // nothing — so the enclosing signature kept declaring `In` for a buffer
+        // the call chain writes. Resolving the argument to its owning buffer
+        // first is what makes the propagation reach through a carry, and it is
+        // the same resolution the InParamWritten warning uses to decide which
+        // parameter a write lands on.
+        buffer_root::BufferRootCollector roots(program, buffer_root::AmbiguousRootPolicy::kSkip);
+        roots.Initialize(func->params_);
+        roots.VisitStmt(func->body_);
+        f.buffer_roots = roots.buffer_roots;
+        // An ambiguous var is exactly the case the single-root map cannot
+        // answer, so keep the candidates it does have.
+        for (const Var* var : roots.ambiguous_buffer_vars) {
+          f.candidates[var] = roots.RootCandidatesOf(var);
+        }
+
+        class CallScanner : public IRVisitor {
+         public:
+          std::vector<CallPtr> calls;
+          void VisitExpr_(const CallPtr& call) override {
+            Record(call);
+            IRVisitor::VisitExpr_(call);
+          }
+
+          /// A task launch forwards its arguments exactly as a plain call does,
+          /// and the base visitor does not route `Submit` through the `Call`
+          /// handler (`.claude/rules/pass-submit-awareness.md`). Without this a
+          /// parameter handed to an `Out` callee through `pl.submit` never
+          /// reached the propagation below, so an orchestration function that
+          /// only ever submits kept declaring `In` for a buffer its tasks write.
+          /// The view is transient — the loop reads only `op_` and `args_` — and
+          /// `args_` is a positional prefix of the callee's params, which the
+          /// loop's dual bound already respects.
+          void VisitExpr_(const SubmitPtr& submit) override {
+            Record(SubmitToCallView(submit));
+            IRVisitor::VisitExpr_(submit);
+          }
+
+         private:
+          void Record(const CallPtr& call) {
+            if (std::dynamic_pointer_cast<const GlobalVar>(call->op_)) {
+              calls.push_back(call);
+            }
+          }
+        };
+        CallScanner scanner;
+        scanner.VisitStmt(func->body_);
+        f.calls = std::move(scanner.calls);
+
+        facts_by_name[func->name_] = std::move(f);
+      }
+
       bool changed = true;
       while (changed) {
         changed = false;
         for (auto& func : functions_phase2b) {
           if (func->func_type_ == FunctionType::InCore) continue;
-
-          std::unordered_map<const Var*, size_t> param_idx;
-          for (size_t i = 0; i < func->params_.size(); ++i) {
-            param_idx[func->params_[i].get()] = i;
-          }
-
-          class CallScanner : public IRVisitor {
-           public:
-            std::vector<CallPtr> calls;
-            void VisitExpr_(const CallPtr& call) override {
-              if (std::dynamic_pointer_cast<const GlobalVar>(call->op_)) {
-                calls.push_back(call);
-              }
-              IRVisitor::VisitExpr_(call);
-            }
-          };
-          CallScanner scanner;
-          scanner.VisitStmt(func->body_);
+          auto facts_it = facts_by_name.find(func->name_);
+          if (facts_it == facts_by_name.end()) continue;
+          const CallerFacts& facts = facts_it->second;
 
           auto new_dirs = func->param_directions_;
-          for (const auto& call : scanner.calls) {
+          for (const auto& call : facts.calls) {
             auto gv = std::dynamic_pointer_cast<const GlobalVar>(call->op_);
             if (!gv) continue;
             auto callee_it = func_map.find(gv->name_);
             if (callee_it == func_map.end()) continue;
             const auto& callee = callee_it->second;
             for (size_t ai = 0; ai < call->args_.size() && ai < callee->param_directions_.size(); ++ai) {
-              auto arg_var = As<Var>(call->args_[ai]);
+              // AsVarLike, not As<Var>: an IterArg has its own ObjectKind and
+              // does not match As<Var> (.claude/rules/ir-kind-traits.md).
+              auto arg_var = AsVarLike(call->args_[ai]);
               if (!arg_var) continue;
-              auto pi = param_idx.find(arg_var.get());
-              if (pi == param_idx.end()) continue;
-              ParamDirection callee_dir = callee->param_directions_[ai];
-              ParamDirection& caller_dir = new_dirs[pi->second];
-              if (callee_dir == ParamDirection::Out && caller_dir == ParamDirection::In) {
-                caller_dir = ParamDirection::Out;
-              } else if (callee_dir == ParamDirection::InOut && caller_dir != ParamDirection::InOut) {
-                caller_dir = ParamDirection::InOut;
+              const ParamDirection callee_dir = callee->param_directions_[ai];
+              if (callee_dir != ParamDirection::Out && callee_dir != ParamDirection::InOut) continue;
+
+              // Control flow can leave a value naming more than one buffer:
+              //
+              //     t = a if cond else b
+              //     self.writer(src, t)      # writer declares its slot Out
+              //
+              // The callee writes whichever `t` turned out to be, so *both* `a`
+              // and `b` may be written and both must be upgraded. Skipping the
+              // ambiguous var — which is what this did — drops the dependency
+              // for every candidate at once, and that is the direction that
+              // fails silently: an under-declared `In` loses the RAW edge and
+              // races on device, where an over-declared `Out` only over-orders.
+              // Under `kSkip` such a var has no `buffer_roots` entry by
+              // construction, so the candidate list is the only place the answer
+              // exists.
+              auto cand_it = facts.candidates.find(arg_var.get());
+              std::vector<const Var*> arg_roots;
+              if (cand_it != facts.candidates.end()) {
+                arg_roots = cand_it->second;
+              } else {
+                auto root_it = facts.buffer_roots.find(arg_var.get());
+                arg_roots.push_back(root_it == facts.buffer_roots.end() ? arg_var.get() : root_it->second);
+              }
+
+              for (const Var* arg_root : arg_roots) {
+                auto pi = facts.param_idx.find(arg_root);
+                if (pi == facts.param_idx.end()) continue;
+                ParamDirection& caller_dir = new_dirs[pi->second];
+                if (callee_dir == ParamDirection::Out && caller_dir == ParamDirection::In) {
+                  caller_dir = ParamDirection::Out;
+                } else if (callee_dir == ParamDirection::InOut && caller_dir != ParamDirection::InOut) {
+                  caller_dir = ParamDirection::InOut;
+                }
               }
             }
           }
@@ -2697,6 +2979,15 @@ Pass ConvertTensorToTileOps() {
           }
         }
       }
+    }
+
+    // A `tensor.matmul` drops its operands' valid_shape, so an accumulator only
+    // becomes narrower than the seed it is carried from once this pass turns it into
+    // a `tile.matmul` -- which re-types the yields but not the carry those yields
+    // flow through. Repair it here rather than leave a carry the TypeCheck and
+    // AccCompactValid verifiers reject (issue #2470).
+    for (auto& func : functions_phase2b) {
+      func = narrow_loop_carry::NarrowAccCarries(func);
     }
 
     return std::make_shared<Program>(functions_phase2b, program->name_, program->span_);

@@ -449,6 +449,170 @@ def test_tile_matmul_acc():
     assert "acc + torch.matmul(a, b).float()" in code
 
 
+def test_tile_matmul_acc_runtime_init_cond_overwrites():
+    """A runtime init_cond must overwrite the accumulator, not accumulate into it."""
+
+    @pl.program
+    class SplitKFromNonZeroAcc:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            seed: pl.Tensor[[16, 16], pl.FP32],
+            lhs: pl.Tensor[[16, 32], pl.FP32],
+            rhs: pl.Tensor[[32, 16], pl.FP32],
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            # A *non-zero* accumulator is what separates overwrite from
+            # accumulate; the tile.create zero seed the compiler emits today
+            # makes the two coincide. Seeding it with a matmul both keeps the
+            # accumulator in Acc and gives it a value the k0 == 0 step must drop.
+            seed_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                seed, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+            )
+            head: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+            )
+            acc_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(seed_tile, head)
+            for k0 in pl.range(0, 32, 16):
+                a: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    lhs, [0, k0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                b: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    rhs, [k0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                acc_tile = pl.matmul_acc(acc_tile, a, b, init_cond=(k0 == 0))
+            return pl.store(acc_tile, [0, 0], output)
+
+    code = torch_codegen(SplitKFromNonZeroAcc)
+    assert "_acc_init(acc_tile, torch.matmul(a, b).float(), (k0 == 0))" in code
+
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102
+    seed = torch.full((16, 16), 3.0)
+    lhs = torch.ones(16, 32)
+    rhs = torch.ones(32, 16)
+    out = torch.zeros(16, 16)
+    ns["kernel"](seed, lhs, rhs, out)
+
+    # k0 == 0 overwrites the seeded accumulator; k0 == 16 accumulates into it.
+    overwrite = lhs[:, :16] @ rhs[:16, :] + lhs[:, 16:] @ rhs[16:, :]
+    assert torch.allclose(out, overwrite)
+    # Dropping the predicate would fold the seed product in instead.
+    assert not torch.allclose(out, seed @ lhs[:, :16] + overwrite)
+
+
+def test_tile_matmul_acc_literal_init_cond_folds():
+    """A literal init_cond picks one arm outright, mirroring the pto backend."""
+
+    @pl.program
+    class MatmulAccInitTrue:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            lhs: pl.Tensor[[16, 16], pl.FP32],
+            rhs: pl.Tensor[[16, 16], pl.FP32],
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            a: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            acc: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(a, b)
+            out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(acc, a, b, init_cond=True)
+            return pl.store(out_tile, [0, 0], output)
+
+    @pl.program
+    class MatmulAccInitFalse:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            lhs: pl.Tensor[[16, 16], pl.FP32],
+            rhs: pl.Tensor[[16, 16], pl.FP32],
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            a: pl.Tile[[16, 16], pl.FP32] = pl.load(lhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            b: pl.Tile[[16, 16], pl.FP32] = pl.load(rhs, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+            acc: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Acc] = pl.matmul(a, b)
+            out_tile: pl.Tile[[16, 16], pl.FP32] = pl.tile.matmul_acc(acc, a, b, init_cond=False)
+            return pl.store(out_tile, [0, 0], output)
+
+    # True selects the overwrite arm outright -- the accumulator drops out.
+    assert "out_tile = torch.matmul(a, b).float()" in torch_codegen(MatmulAccInitTrue)
+    # False selects the accumulating arm, identical to carrying no predicate.
+    assert "out_tile = (acc + torch.matmul(a, b).float())" in torch_codegen(MatmulAccInitFalse)
+
+
+def test_tile_gemv_acc_runtime_init_cond_overwrites():
+    """GEMV carries the same predicate as matmul, so the reference must honour it.
+
+    ``tile.gemv_acc`` shares the ``_tile_matmul_acc`` handler -- GEMV is a matmul
+    whose M is 1 on the same cube MAD. This pins that the shared handler reads
+    the predicate for GEMV too, rather than modelling an overwrite as an
+    accumulate.
+    """
+
+    @pl.program
+    class GemvSplitKFromNonZeroAcc:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            seed: pl.Tensor[[1, 32], pl.FP32],
+            seed_rhs: pl.Tensor[[32, 16], pl.FP32],
+            lhs: pl.Tensor[[1, 64], pl.FP32],
+            rhs: pl.Tensor[[64, 16], pl.FP32],
+            output: pl.Out[pl.Tensor[[1, 16], pl.FP32]],
+        ) -> pl.Tensor[[1, 16], pl.FP32]:
+            # Seed with a plain gemv so the accumulator is both Acc-resident and
+            # non-zero -- a zero seed would make overwrite and accumulate agree.
+            seed_tile = pl.load(seed, [0, 0], [1, 32], target_memory=pl.MemorySpace.Mat)
+            seed_rhs_tile = pl.load(seed_rhs, [0, 0], [32, 16], target_memory=pl.MemorySpace.Mat)
+            acc_tile = pl.tile.gemv(seed_tile, seed_rhs_tile)
+            for k0 in pl.range(0, 64, 32):
+                a = pl.load(lhs, [0, k0], [1, 32], target_memory=pl.MemorySpace.Mat)
+                b = pl.load(rhs, [k0, 0], [32, 16], target_memory=pl.MemorySpace.Mat)
+                acc_tile = pl.tile.gemv_acc(acc_tile, a, b, init_cond=(k0 == 0))
+            return pl.store(acc_tile, [0, 0], output)
+
+    code = torch_codegen(GemvSplitKFromNonZeroAcc)
+    assert "_acc_init(acc_tile, torch.matmul(a, b).float(), (k0 == 0))" in code
+
+    ns: dict = {}
+    exec(code, ns)  # noqa: S102
+    seed = torch.full((1, 32), 3.0)
+    seed_rhs = torch.full((32, 16), 2.0)
+    lhs = torch.ones(1, 64)
+    rhs = torch.ones(64, 16)
+    out = torch.zeros(1, 16)
+    ns["kernel"](seed, seed_rhs, lhs, rhs, out)
+
+    # k0 == 0 overwrites the seeded accumulator; k0 == 32 accumulates into it.
+    overwrite = lhs[:, :32] @ rhs[:32, :] + lhs[:, 32:] @ rhs[32:, :]
+    assert torch.allclose(out, overwrite)
+    # Dropping the predicate would fold the seed product in instead.
+    assert not torch.allclose(out, seed @ seed_rhs + overwrite)
+
+
+def test_tensor_matmul_acc_init_cond_with_transpose():
+    """tensor.matmul_acc must honour init_cond alongside a_trans/b_trans."""
+
+    @pl.program
+    class TensorSplitK:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            acc: pl.Tensor[[16, 16], pl.FP32],
+            # a_trans=True, so lhs is [K=32, M=16] and the product is [16, 16].
+            lhs: pl.Tensor[[32, 16], pl.FP32],
+            rhs: pl.Tensor[[32, 16], pl.FP32],
+            output: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            result: pl.Tensor[[16, 16], pl.FP32] = acc
+            for k0 in pl.range(0, 2):
+                result = pl.matmul_acc(result, lhs, rhs, a_trans=True, init_cond=(k0 == 0))
+            return pl.assemble(output, result, [0, 0])
+
+    code = torch_codegen(TensorSplitK)
+    assert "_acc_init(result, torch.matmul(lhs.mT, rhs), (k0 == 0))" in code
+
+
 def test_tile_cmp():
     """tile.cmp should emit correct comparison operator."""
     a = _tile_var("a", [64])
@@ -837,6 +1001,69 @@ def test_cross_core_split_merge_preserves_region_attrs():
     assert tuple(merged.shape) == (2, 4)
     assert getattr(merged, "_pypto_valid_shape", None) == (2, 3)
     assert getattr(merged, "_pypto_full_shape", None) == (2, 4)
+
+
+def test_cross_core_rebalanced_split_slices_at_the_box_but_starts_at_the_stride():
+    """`lane_stride` moves lane 1's START; the slice WIDTH stays the physical box.
+
+    A ragged boundary rebalanced onto its valid region (16-row box, 13 valid,
+    stride 7) gives both lanes the compiler's 8-row box — lane 0 rows 0-7 and
+    lane 1 rows 7-14 — with per-lane valid extents 7 and 6. Cutting at the
+    stride instead would hand the lanes 7- and 9-row payloads that no longer
+    match the tile types the IR carries.
+    """
+    ns: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, ns)  # noqa: S102
+
+    rt = ns["_cross_core_rt"]
+    set_lane = ns["_set_subblock_idx"]
+
+    tile = torch.arange(16 * 2, dtype=torch.float32).reshape(16, 2)
+    setattr(tile, "_pypto_valid_shape", (13, 2))
+    setattr(tile, "_pypto_full_shape", (16, 2))
+
+    rt.push_to_aiv(tile, 3, 7)
+    set_lane(0)
+    lane0 = rt.pop_from_aic(3)
+    set_lane(1)
+    lane1 = rt.pop_from_aic(3)
+
+    assert tuple(lane0.shape) == (8, 2)
+    assert tuple(lane1.shape) == (8, 2)
+    # Lane 1 begins at the stride, not at the box half.
+    assert torch.equal(lane0, tile[0:8])
+    assert torch.equal(lane1, tile[7:15])
+    # clamp(13 - lane * 7, 0, 7) -> 7 and 6.
+    assert getattr(lane0, "_pypto_valid_shape", None) == (7, 2)
+    assert getattr(lane1, "_pypto_valid_shape", None) == (6, 2)
+
+
+def test_cross_core_odd_split_rejects_lanes_that_are_not_one_apart():
+    """The _ODD codes exist to say "lane 1 is one cell shorter" — enforce it."""
+    ns: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, ns)  # noqa: S102
+
+    rt = ns["_cross_core_rt"]
+    tile = torch.zeros(16, 2, dtype=torch.float32)
+    setattr(tile, "_pypto_valid_shape", (13, 2))
+
+    # Box partition (stride 8) over 13 valid rows gives 8 and 5.
+    with pytest.raises(ValueError, match="lanes one cell apart"):
+        rt.push_to_aiv(tile, 3)
+
+
+def test_cross_core_vector_to_cube_rejects_the_odd_codes():
+    """pto-isa has no odd Vector -> Cube transport, so the runtime refuses it."""
+    ns: dict[str, Any] = {}
+    exec(torch_codegen_module._PREAMBLE, ns)  # noqa: S102
+
+    rt = ns["_cross_core_rt"]
+    tile = torch.zeros(8, 2, dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="Unsupported odd split mode for push_to_aic"):
+        rt.push_to_aic(tile, 3)
+    with pytest.raises(ValueError, match="Unsupported odd split mode for pop_from_aiv"):
+        rt.pop_from_aiv(4)
 
 
 def test_cross_core_no_split_dual_dispatch_runtime_pipe_pairing():

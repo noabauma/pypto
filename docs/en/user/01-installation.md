@@ -107,8 +107,24 @@ ran. A traceback here is the real signal — the exact wording of the line is no
 | C++ compiler | C++17 | GCC or Clang. `CMAKE_CXX_STANDARD 17` is required, not merely preferred |
 | numpy | ≥ 2.0 | Installed automatically |
 | torch | ≥ 2.0 | Installed automatically, but install the CPU wheel first (see below) |
-| nanobind | ≥ 2.0 | Build-time only; fetched automatically |
+| nanobind | ≥ 2.0, < 3 | Build-time only; fetched automatically |
 | scikit-build-core | ≥ 0.10 | Build backend; fetched automatically |
+
+The ranges above are what pypto is compatible with. The exact versions CI
+builds against are pinned in `build-constraints.txt` at the repository root. To
+reproduce a CI build locally, point pip at it:
+
+```bash
+PIP_BUILD_CONSTRAINT=$PWD/build-constraints.txt \
+PIP_CONSTRAINT=$PWD/build-constraints.txt \
+    pip install -e .
+```
+
+Both variables, because they cover different pip versions:
+`PIP_BUILD_CONSTRAINT` is the one pip applies to build dependencies from 26.2
+on, and `PIP_CONSTRAINT` is what earlier pip honours there. With only the
+latter, a recent pip resolves `[build-system] requires` freely again and the
+build is no longer the one CI validated.
 
 **Install the CPU torch wheel before PyPTO.** `pip install -e .` resolves `torch>=2.0.0`
 to the default wheel, which carries the full CUDA stack — around 2 GB that a PyPTO
@@ -134,6 +150,18 @@ through the environment:
 
 ```bash
 CMAKE_BUILD_TYPE=Release pip install .
+```
+
+`RelWithDebInfo` carries full debug info, which is what a debugger needs — and also most
+of the artifact: the extension is 304 MiB, of which 292 MiB is DWARF. Set
+`PYPTO_DEBUG_INFO_LEVEL=1` to keep only what backtraces read, the function descriptions
+and line-number tables. The extension drops to 62 MiB and its wheel to 18 MiB, the
+compile is about a third faster, and the `C++ Traceback` in an error message is
+unchanged. What goes is local variables and types, so keep the default whenever you
+plan to attach a debugger:
+
+```bash
+SKBUILD_CMAKE_DEFINE=PYPTO_DEBUG_INFO_LEVEL=1 pip install .
 ```
 
 `ccache` is detected and used automatically when present, which makes repeated builds

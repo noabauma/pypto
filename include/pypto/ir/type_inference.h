@@ -33,6 +33,8 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
+#include "pypto/ir/kind_traits.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/printer.h"  // NOLINT(misc-include-cleaner) -- needed for operator<< on ExprPtr
@@ -182,6 +184,37 @@ enum class ProofResult {
  * by the arithmetic analyzer.
  */
 ProofResult ProveValidExtentEqual(const ExprPtr& lhs, const ExprPtr& rhs);
+
+/**
+ * @brief Enforce what a Cube <-> Vector boundary can carry in its valid_shape.
+ *
+ * The FIFO slot is written by the producer at its PHYSICAL column pitch and read
+ * back by each lane with pto-isa's own geometry, which it derives from the
+ * POPPED tile's runtime valid extents (``popVecTileFromGMFiFo``):
+ * ``gmStrideR = validCol`` (doubled for the left-right codes) and
+ * ``subAIVOffset = subBlockId * validRow * validCol`` (``* validCol`` for
+ * left-right). Both only reconstruct the producer's rectangle when the COLUMN
+ * extent is the full physical box, which is why a narrowed column extent has no
+ * carrier across this boundary at all -- on LEFT_RIGHT it is additionally the
+ * split axis, so it would have to be per-lane, which nothing can express.
+ *
+ * Called from the boundary op's own deduction (``tile.aiv_shard`` /
+ * ``tile.aic_gather``) AND from the transport code choice
+ * (``split_axis::ShardSplitCode``), so a hand-written
+ * ``tile.tpush_to_aiv`` / ``tile.tpop_from_aic`` pair is held to the same
+ * contract as a compiler-generated boundary.
+ *
+ * @param op_name Op name for diagnostics.
+ * @param shape The tile's PHYSICAL shape (rank 2; other ranks return).
+ * @param valid The tile's valid_shape.
+ * @param split_axis 0 (UP_DOWN), 1 (LEFT_RIGHT), or -1 for a split=0 crossing.
+ * @param halve Whether this boundary actually splits (a gather passes false).
+ * @param span Span for diagnostics.
+ * @throws pypto::ValueError naming the shapes that would work.
+ */
+void CheckSplitBoundaryCarriesValid(const std::string& op_name, const std::vector<ExprPtr>& shape,
+                                    const std::vector<ExprPtr>& valid, int split_axis, bool halve,
+                                    const Span& span);
 
 /**
  * @brief Prove whether one valid-extent expression is less than or equal to another
@@ -639,6 +672,73 @@ inline void InheritTileViewLayout(TileView& dst, const std::shared_ptr<const Til
   dst.slayout = eff.slayout;
   dst.pad = eff.pad;
   dst.compact = eff.compact;
+}
+
+/// L0C's fractal row block. `mad` rounds its M up to this, and a compact reader recomputes the
+/// N-fractal stride as `ceil(validRow/16)*16`.
+constexpr int64_t kAccFractalRows = 16;
+
+/**
+ * @brief Would the compact and non-compact readings of an Acc tile use the same N-fractal pitch?
+ *
+ * `StampCompactForNarrowedAccRows` stamps whenever equality is not *proven*, which is the safe
+ * direction for a stamper: a compact tile whose valid rows fill the box recomputes the stride it
+ * would have read from `Rows` anyway. Checks need the other direction — they may only reject a tile
+ * whose two readings genuinely differ, or they fail legal IR. The readings differ unless
+ * `ceil(validRow/16)*16 == Rows`, which holds when the valid rows fill the box and, for a
+ * single-fractal-block box, for *every* extent it can hold: a `[16, N]` gemv accumulator valid to
+ * one row still packs to 16.
+ *
+ * @param valid_rows Valid row extent (may be dynamic)
+ * @param physical_rows Physical row extent
+ * @return true when the two pitches provably coincide, so the compact flag cannot change a reader
+ */
+inline bool AccPitchesCoincide(const ExprPtr& valid_rows, const ExprPtr& physical_rows) {
+  if (ProveValidExtentEqual(valid_rows, physical_rows) == ProofResult::kTrue) {
+    return true;
+  }
+  auto physical_const = As<ConstInt>(physical_rows);
+  if (!physical_const) {
+    return false;
+  }
+  if (auto valid_const = As<ConstInt>(valid_rows)) {
+    const int64_t packed = (valid_const->value_ + kAccFractalRows - 1) / kAccFractalRows * kAccFractalRows;
+    return packed == physical_const->value_;
+  }
+  return physical_const->value_ == kAccFractalRows;
+}
+
+/**
+ * @brief Stamp PTO's compact mode on an L0C view whose valid rows may be narrower than its
+ *        physical rows
+ *
+ * `mad` lays a matrix product out in L0C with an N-fractal stride of ceil(M/16)*16, where M is
+ * the *valid* row count of the L0A operand (pto-isa `TMatmul.hpp`:
+ * `uint16_t m = aMatrix.GetValidRow()`). Every Acc reader instead derives its stride from the
+ * tile's compile-time physical `Rows` unless the tile is compact, in which case it recomputes
+ * ceil(validRow/16)*16 — exactly the stride `mad` wrote at (`tstore_common.hpp`,
+ * `TStoreAccNz2nd` and siblings). A narrowed accumulator that is not compact is therefore read
+ * back at a different pitch than it was written at, silently scrambling every N-fractal above
+ * the first (issue #2470). This mirrors the L0A/L0B stamping `tile.extract` gained for #2232.
+ *
+ * Only the row extent decides this: every Acc stride the ISA derives is a function of `validRow`
+ * alone, so a narrowed *column* extent leaves writer and reader in agreement and keeps the
+ * historical non-compact form.
+ *
+ * Stamps whenever equality is not *proven*, so an undecidable symbolic extent is treated as
+ * narrowed. That is the safe direction: a compact tile whose valid rows happen to fill the box
+ * recomputes the same stride it would have read from `Rows`.
+ *
+ * @param dst Accumulator TileView to stamp (valid_shape must already be set)
+ * @param physical_shape The accumulator's physical shape
+ */
+inline void StampCompactForNarrowedAccRows(TileView& dst, const std::vector<ExprPtr>& physical_shape) {
+  if (dst.valid_shape.empty() || physical_shape.empty()) {
+    return;
+  }
+  if (ProveValidExtentEqual(dst.valid_shape[0], physical_shape[0]) != ProofResult::kTrue) {
+    dst.compact = CompactMode::normal;
+  }
 }
 
 namespace detail {

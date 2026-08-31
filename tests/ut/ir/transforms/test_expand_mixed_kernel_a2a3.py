@@ -119,6 +119,29 @@ def test_forged_waiter_marker_without_task_level_call_site_is_rejected():
         _run_pipeline(Program)
 
 
+def test_deferred_waiter_dispatched_from_a_graph_body_is_accepted():
+    """The caller check asks "is this a task-level orchestration body".
+
+    A Graph body is one — its call sites are task launches like any other
+    orchestration body's. Requiring strictly `Orchestration` rejects a legal
+    Graph that dispatches a deferred waiter, with a message telling the author
+    to do what they already did.
+    """
+
+    @pl.program
+    class Program:
+        @pl.function(type=pl.FunctionType.InCore)
+        def waiter(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            pl.func_attr({"deferred_completion_waiter": True})
+            pld.system.defer_wait(signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+        @pl.function(type=pl.FunctionType.Graph)
+        def layer(self, signal: pld.DistributedTensor[[1, 1], pl.INT32]):
+            self.waiter(signal)
+
+    _run_pipeline(Program)
+
+
 def test_forged_waiter_plain_call_early_resolve_fails_closed():
     """A plain GlobalVar call cannot smuggle an unsafe early-resolve attr."""
 
@@ -490,8 +513,8 @@ def test_explicit_sync_core_type_routes_each_event_to_one_lane():
             x: pl.Tensor[[16], pl.FP32],
         ) -> pl.Tensor[[16], pl.FP32]:
             pl.system.set_ffts(workspace)
-            pl.system.sync_set(4, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type="aiv")
-            pl.system.sync_wait(4, pipe=pl.PipeType.MTE2, core_type="aic")
+            pl.system.sync_set(4, pipe=pl.PipeType.MTE3, ffts_mode=2, core_type=pl.KernelType.AIV)
+            pl.system.sync_wait(4, pipe=pl.PipeType.MTE2, core_type=pl.KernelType.AIC)
             return x
 
     after = _run_pipeline(Before)
@@ -598,7 +621,7 @@ def test_v2c_boundary_uses_nz_layout_on_a2a3():
                 slot_size=4096,
                 slot_num=2,
             )
-            x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(x, [0, 0], [16, 128])
+            x_tile: pl.Tile[[16, 128], pl.BF16] = pl.load(x, [0, 0], [16, 128], target_memory=pl.Mem.Vec)
             pl.tpush_to_aic(x_tile, split=0)
             z_vec: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
             out_0_store: pl.Tensor[[16, 64], pl.FP32] = pl.store(z_vec, [0, 0], out_0)

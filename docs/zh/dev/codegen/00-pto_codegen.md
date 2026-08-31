@@ -14,7 +14,7 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 
 **原因：** 嵌入分析逻辑的代码生成会变得脆弱——它重复了 Pass 已有的逻辑，且更难以独立测试。保持代码生成为直接的转换，确保其可预测性和可维护性。
 
-**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/25-normalize_return_order.md) pass。
+**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/26-normalize_return_order.md) pass。
 
 ## 概述
 
@@ -186,7 +186,7 @@ tile 调用 `set_validshape`。
 | `system.reserve_buffer(...)` | `%name = pto.reserve_buffer {name = "N", size = S, location = #pto.address_space<loc>, auto = false, base = B} -> i32` | 预留缓冲区（`memory_planner=PTOAS` 下发射 `auto = true` 且省略 `base`） |
 | `system.import_peer_buffer(...)` | `%name = pto.import_reserved_buffer {name = "N", peer_func = @F} -> i32` | 导入对等缓冲区 |
 | `system.syncall(core_type=C)` | `pto.syncall() mode = #pto.sync_all_mode<hard>, core_type = #pto.sync_core_type<C>` | 跨核全员屏障（hard/FFTS 形态） |
-| `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_pview[, %used] : !pto.partition_tensor_view<...xi32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | 当前 PTO-ISA 的 soft/GM 轮询屏障（部分占用即可；GM workspace 至少 64 字节；显式 `N=0` 时从设备启动寄存器推导并省略 `%used`） |
+| `system.syncall(mode="soft", core_type=C, gm_workspace=ws, used_cores=N)` | `pto.syncall(%gm_ptr[, %used] : !pto.ptr<i32>[, i32]) mode = #pto.sync_all_mode<soft>, core_type = #pto.sync_core_type<C>` | 当前 PTO-ISA 的 soft/GM 轮询屏障（部分占用即可；GM workspace 至少 64 字节；显式 `N=0` 时从设备启动寄存器推导并省略 `%used`） |
 
 **说明：**
 
@@ -196,19 +196,52 @@ tile 调用 `set_validshape`。
   `tile.set_validshape` 更新，`tpush` 会发射已经更新运行时 valid shape 的同一个
   tile handle。对于 split `tpush`，codegen 会临时使用完整物理传输 box，随后恢复
   producer tile 的逻辑 valid shape。
-- Cube-to-Vector FIFO 在**任意** split 下都按物理 box stride 搬运：ISA 用被弹出
-  tile 的编译期 rows/cols 以及 producer 的 box 行间距构造 GM 槽位视图，再用该 tile
-  的*运行时* `valid_col` 去 stride 这个视图。因此 TPOP 上的部分 valid shape 会让 GM
-  行间隙塌缩为 0，消费侧读到的是一段连续数据而不是每次一行 box——这会静默破坏
-  *有效*区域的数据，因为 ISA 中对应的断言在 release 构建里被编译掉了。所以部分有效的
-  Acc-to-Vec 传输在无切分以及 `split = 1` / `split = 2` 下，TPUSH 和 TPOP 都使用完整
-  物理 box，并在传输两侧立即恢复逻辑 valid shape——消费侧通过纯元数据的
-  `pto.treshape` 恢复（前端 tpop 结果不是 PTOAS 的本地绑定 tile，`pto.set_validshape`
-  无法就地修改它）。
+- `split` 就是 pto-isa 的 `TileSplitAxis`，原样打印。`0` = 不切分，`1` / `2` = 上下 /
+  左右，`3` / `4` = 同样两个轴、但 extent 为**奇数**：
+
+  | Code | pto-isa | Lane 0 | Lane 1 | Lane 1 的数据段起点 |
+  | ---- | ------- | ------ | ------ | ------------------- |
+  | 0 | `TILE_NO_SPLIT` | 整块 tile | （单一读者） | — |
+  | 1 / 2 | `TILE_UP_DOWN` / `TILE_LEFT_RIGHT` | `e0` | `e1` | `e1 * pitch` |
+  | 3 / 4 | `TILE_UP_DOWN_ODD` / `TILE_LEFT_RIGHT_ODD` | `e0` | `e1` | `(e1 + 1) * pitch` |
+
+  `eL` 是 lane `L` 在切分轴上的**运行时** valid extent——ISA 直接从被弹出的 tile 上读取
+  （`popVecTileFromGMFiFo`），因此偶数 code 要求 `e0 == e1`，奇数 code 要求
+  `e0 == e1 + 1`。这些 extent 由
+  [LowerAutoVectorSplit](../passes/21-lower_auto_vector_split.md) 物化，
+  [ExpandMixedKernel](../passes/22-expand_mixed_kernel.md) 选择匹配的 code。
+- Cube-to-Vector FIFO 搬运的是紧凑矩形：producer 以 `valid_col` 为行间距写入
+  `valid_row` x `valid_col` 数据块，每个消费 lane 再以相同间距读回自己的数据段
+  （`gmStrideR = valid_col`，左右切分的 code 下加倍）。因此若传输两侧的 valid shape
+  不一致，pop 的 stride 就会错位——这会静默破坏*有效*区域的数据，因为 ISA 中对应的
+  断言在 release 构建里被编译掉了。所以部分有效的 Acc-to-Vec 传输无论是否切分，
+  TPOP 以及 TPUSH 的**列**维度都使用完整物理 box，并在传输两侧立即恢复逻辑 valid
+  shape——消费侧通过纯元数据的 `pto.treshape` 恢复（前端 tpop 结果不是 PTOAS 的本地
+  绑定 tile，`pto.set_validshape` 无法就地修改它）。第一个例外是切分轴上的 extent：它必须保持
+  逐 lane 的值并留在 TPOP 操作数上，因为 ISA 正是靠它定位 lane 1 的数据段起点——也正因如此，
+  编译期无法核验的逐 lane extent 绝不能到达那里。`pl.split_aiv` 区域中切分轴 extent 为运行期
+  值的边界，会让被弹出的 tile 保留完整 box（`split_axis::WithFullSplitAxisValid`），使偶数
+  code 的数据段落在 box 的一半处，而把 lane 自身的 extent 交给消费者携带。
+- 第二个例外是**非切分** Acc-to-Vec TPUSH 的**行**维度：它必须保持 producer 写入时
+  的值。TPUSH 执行的是 L0C 上的 `TStoreAccNz2nd`，其源 pitch 对 compact tile 为
+  `ceil(validRow/16)*16`，否则为 `TileData::Rows`；而 `mad` 是按 L0A 操作数的**有效**
+  行数所隐含的 pitch 写出乘积的。在 push 之前把 `validRow` 撑大到物理 box，会让该
+  pitch 改按 box 推导，于是 fix-pipe 以 `mad` 从未写入过的 stride 遍历 L0C——64 行的
+  box 只有 16 行有效时，fractal `j` 会读到 `4j`（issue #2510）。超出 `validRow` 的行
+  会在 slot 中保留旧数据，这正是窄化 `valid_shape` 对其无效区域给出的承诺，同时传输
+  量也从整个 box 降到 `validRow` 行。
+- **切分**的 Acc-to-Vec 传输走不了这条路：lane 1 从 box 一半处开始读自己的数据段，而
+  该数据段只有在 producer 写满整个 box 时才存在——但写满 box 就意味着按物理 pitch 读
+  L0C，而那并不是 `mad` 使用的 pitch。二者互斥，因此行窄化的 compact 累加器跨
+  `pl.split` / `pl.split_aiv` 边界时会被**拒绝**，并给出指明两种 DSL 替代写法的报错
+  （窄化结果而非操作数，或让累加器经 GM 中转），而不是下降成静默错位的数据——在加入该
+  拒绝之前，设备上实测 8192 个元素中有 1808 个是错的。该拒绝以 pitch 确实不同为前提，
+  因此单个 fractal 行块的累加器（`ceil(validRow/16)*16 == Rows`）仍可照常跨越。
 - 当 tpop 结果的 `TileView.valid_shape` 与物理 tile shape 不一致时，PTO codegen 会生成 PTOAS 前端操作数：`%buf = pto.tpop_from_*(%valid_row, %valid_col) {[id = I, ]split = N} -> !pto.tile_buf<..., v_row=?, v_col=?, ...>`。这同时覆盖动态表达式和 `[0, 0]` 这类静态非满形状；operand 携带后续计算和 store 使用的逻辑范围。对于静态形状、非空的部分 pop，上述 Cube-to-Vector 完整 box 传输优先，因为 `pto.treshape` 不带 valid-row/valid-col operand，只能恢复*静态*逻辑范围。
-- 对于 split consumer，`SplitVectorKernel` 会按 subblock 本地化这些动态
+- 对于手写 pop 的 split consumer，`SplitVectorKernel` 会按 subblock 本地化这些动态
   tpop valid-shape operand（例如 `[16, 16]` tile 做上下切分时，全局
-  `[8, 16]` 会变成 `[8, 16]` 和 `[0, 16]`）。
+  `[8, 16]` 会变成 `[8, 16]` 和 `[0, 16]`）。奇数切分轴走同一条路径——`[17, 128]`
+  的 tile 在 `split = 3` 下，lane 0 弹出 `[9, 128]`，lane 1 弹出 `[8, 128]`。
 - `system.tfree_*` 的 `split` 来自其 tile 参数，因此前端必须释放由 `tile.tpop_*` 产生的那个确切 SSA 值，即使 PTO 指令本身并不显式接收该 tile 作为操作数
 - `ExpandMixedKernel` 现在会在 split 生成的消费侧 `tile.tpop_*` 之后自动补 `system.tfree_*`，保持 `tpop -> direct users -> tfree -> next tpop`
 - `reserve_buffer` 和 `import_reserved_buffer` 返回 `i32` SSA 值；`initialize_pipe` 以操作数引用这些值
@@ -466,6 +499,44 @@ pto.tmul ins(%tile_a_buf : !pto.tile_buf<...>,
 输出与不带位置的形式逐字节一致; 由于 ptoas 独立于 PyPTO 发布, 这是应对某个
 ptoas 版本解析器拒绝尾随位置时的应急开关。
 
+## 分块 Tile 尺寸校验
+
+PyPTO 发射的每一条 `pto.alloc_tile` 都会按 PTOAS 将要检查的分块网格先行校验。
+PTO 以「块」为单位寻址分块 tile，因此*物理*尺寸不是整数个块的 tile 根本没有地址。
+
+该规则与 PTOAS 的 `verifyBoxedTileLayout` 完全一致：
+
+| 布局 | 块尺寸（行 x 列） |
+| ---- | ----------------- |
+| fractal 1024（`Acc`） | 16 x 16 |
+| fractal 512，`slayout = row_major`（`Mat` / `Left`） | 16 x (32 / sizeof(dtype)) |
+| fractal 512，`slayout = col_major`（`Right`，转置对偶） | (32 / sizeof(dtype)) x 16 |
+| `slayout = none_box` | 非分块，无此约束 |
+
+并保留 PTOAS 自身的豁免：*行*方向的规则对 `Vec` 以及单行 tile（此时 NZ 映射退化）
+跳过，而列方向的规则始终生效。MX scale fractal 与亚字节载体交由 PTOAS 自行诊断。
+
+**为什么放在这里而不是交给 PTOAS。** PTOAS 会拒绝同样的形状，但它的报错只提及自身内部
+概念，也不给出修复方式：
+
+```text
+'pto.alloc_tile' op expects result boxed tile rows to be a multiple of innerRows (16), but got 100
+```
+
+在发射点报错则能同时给出 tile、出问题的轴、需要达到的尺寸，以及达到它的方式：
+
+```text
+a Mat tile of physical shape [100, 128] and dtype fp16 must be a whole number of
+16x16 fractal boxes, but its row extent 100 is not a multiple of 16. ...
+allocate 112 on that axis and declare 100 as the tile's valid_shape ...
+```
+
+`ComputeAllocTileFields` 是所有分配的唯一收口——逐变量声明、被提升出来的
+`extra_alloc_tiles`、以及控制流路径都经过它——因此校验看到的正是最终发射的内容，不会与之
+漂移。张量层的 `pl.matmul` / `pl.matmul_acc` 不会因 *M 轴*触发它：M 轴已由
+[`ConvertTensorToTileOps`](../passes/10-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing)
+自动对齐；仍需用户自行保证的是 `K` 与 `N`。
+
 ## 完整示例
 
 ### 输入: PyPTO 程序
@@ -637,8 +708,41 @@ tile_c = pl.mul(tile_a, tile_b)
 | `compact` | `TileView::compact` | `null(0)`, `normal(1)` | `null(0)` |
 
 当 MemRef 没有关联 TileView 时，代码生成器使用上表中的默认值。默认的 null
-`compact` 属性不会输出。进入 L0A/L0B 的部分 `tile.extract` 会自动设置
-`normal(1)`，使 TEXTRACT 仅传输逻辑 `valid_shape`，而不会把 box 对齐填充当作数据。
+`compact` 属性不会输出。有两条路径会自动设置 `normal(1)`：
+
+- 进入 L0A/L0B 的部分 `tile.extract`，使 TEXTRACT 仅传输逻辑 `valid_shape`，
+  而不会把 box 对齐填充当作数据。
+- **有效行数无法证明等于物理行数的 Acc (L0C) tile**，由 `tile.matmul`、
+  `tile.matmul_bias`、`tile.matmul_mx` 的类型推导产生。`mad` 始终以
+  `ceil(validRow/16)*16` 的 N-fractal stride 写出乘积，其中 `validRow` 取自 **lhs**
+  的有效行数；而所有 Acc 读取方在 tile 非 compact 时都按编译期物理 `Rows` 推导
+  stride。缺少该标记时，运行期窄化的累加器读回时使用的 pitch 与写入时不同。只有
+  **行** 维度决定这一点 —— ISA 推导的每个 Acc stride 都只是 `validRow` 的函数，
+  因此仅窄化列维度时保持非 compact 形式。
+
+  compact 只在**确立累加器布局的那一处**盖章，绝不在它的别名上重新推导。
+  `tile.matmul_acc`（以及 `matmul_mx_acc`）**继承**累加器操作数的模式，因为该 op
+  原地复用那块 buffer，而 codegen 只有在两者完整 tile 配置一致时才会做别名。
+  `tile.set_validshape` 同样是继承：它只改元数据，且可能在 buffer **写入之后**才
+  执行，因此读取方必须使用的仍是 `mad` 当初写入时的 pitch —— 若按窄化后的行数重新
+  推导，就会以从未重排过的方式重新解释这些字节。
+
+  buffer 也可以在创建时**声明**该模式：`tile.create(..., target_memory=Acc,
+  compact=True)`。新建的 L0C buffer 没有既有字节可供重新解释，因此这不是别名上的重新
+  推导——`AutoTileMatmulL0` 在切分 K 时正是这样声明它合成的累加器种子：
+  `tile.matmul_acc` 会继承该种子的模式，种子若非 compact，就会把整条累加链以及循环之后
+  的读取方一起拖回物理 pitch。声明也是唯一能存活的形式：pass 盖在 call 上的类型，会在
+  任何后续 pass 重新推导时被丢弃（`InferTileMemorySpace` 就会），而 kwarg 每次都会被
+  重新读取。
+
+  `AccCompactValid`（见 [Verifier](../passes/99-verifier.md)）会校验该契约的两半：当 `mad`
+  的 pitch 与累加器物理行数不同时，每个 `tile.matmul_acc` 都必须累加进 compact 的 buffer；
+  且 Left/Right/Acc 之外的任何 tile 都不得携带 compact 模式。
+
+注意：在 a2a3 与 a5 上，PTO-ISA 的 Acc → L1 读取方（`TExtractAccToMat`、
+`TMovCcToCb`）都没有 `CompactMode` 分支，因此运行期窄化的累加器若经
+`tile.extract` / `tile.move` 进入 L1，仍会按物理 `Rows` pitch 读取。该缺口需要
+PTO-ISA 侧配套修改。
 
 ## 内核包装器生成 (PTO 后端)
 
@@ -670,14 +774,14 @@ output_dir/
 ├── kernels/aiv/
 │   └── <func_name>.cpp              # Final wrapper
 ├── orchestration/
-│   └── <orch_func_name>.cpp         # PTO2 runtime orchestration code
+│   └── <orch_func_name>.cpp         # simpler runtime orchestration code
 └── kernel_config.py                 # Runtime/orchestration/kernel config
 ```
 
 仅当使用 `ir.compile(..., dump_ptoas_passes=True)` 或
 `RunConfig(dump_ptoas_passes=True)` 时才会生成 `ptoas_passes/`。
 
-编排代码生成使用 PTO2 运行时 API (`rt_submit_task`, `make_tensor_external` 等) 生成编排 C++ 代码。
+编排代码生成使用 simpler 运行时 API (`rt_submit_task`, `make_tensor_external` 等) 生成编排 C++ 代码。
 
 ### 运行时配置 (`kernel_config.py`)
 

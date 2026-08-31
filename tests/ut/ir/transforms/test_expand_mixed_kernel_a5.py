@@ -299,7 +299,7 @@ def _make_cube_bias_expected(cube_op: str):
                 bias: pl.Tensor[[1, 128], pl.FP32],
                 out_0: pl.Out[pl.Tensor[[1, 128], pl.FP32]],
             ) -> pl.Tensor[[1, 128], pl.FP32]:
-                bias_tile = pl.load(bias, [0, 0], [1, 128])
+                bias_tile = pl.load(bias, [0, 0], [1, 128], target_memory=pl.Mem.Vec)
                 bias_tile_nz = pl.move(
                     bias_tile,
                     target_memory=pl.MemorySpace.Vec,
@@ -356,7 +356,7 @@ def _make_cube_bias_expected(cube_op: str):
                 bias: pl.Tensor[[1, 128], pl.FP32],
                 out_0: pl.Out[pl.Tensor[[1, 128], pl.FP32]],
             ) -> pl.Tensor[[1, 128], pl.FP32]:
-                bias_tile = pl.load(bias, [0, 0], [1, 128])
+                bias_tile = pl.load(bias, [0, 0], [1, 128], target_memory=pl.Mem.Vec)
                 bias_tile_nz = pl.move(
                     bias_tile,
                     target_memory=pl.MemorySpace.Vec,
@@ -831,7 +831,7 @@ def _make_v2c_boundary_program(vec_op: str):
                 y: pl.Tensor[[128, 64], pl.BF16],
                 out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
             ) -> pl.Tensor[[16, 64], pl.FP32]:
-                x_tile = pl.load(x, [0, 0], [16, 128])
+                x_tile = pl.load(x, [0, 0], [16, 128], target_memory=pl.Mem.Vec)
                 x_sum = pl.add(x_tile, x_tile)
                 x_sum_nz = pl.move(
                     x_sum,
@@ -919,7 +919,7 @@ def _make_v2c_boundary_program(vec_op: str):
                 y: pl.Tensor[[128, 64], pl.BF16],
                 out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
             ) -> pl.Tensor[[16, 64], pl.FP32]:
-                x_tile = pl.load(x, [0, 0], [16, 128])
+                x_tile = pl.load(x, [0, 0], [16, 128], target_memory=pl.Mem.Vec)
                 x_sub = pl.sub(x_tile, x_tile)
                 x_sub_nz = pl.move(
                     x_sub,
@@ -987,7 +987,7 @@ class TestPassthrough:
                 x: pl.Tensor[[64], pl.FP32],
                 out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x_tile = pl.load(x, [0], [64])
+                x_tile = pl.load(x, [0], [64], target_memory=pl.Mem.Vec)
                 y_tile = pl.add(x_tile, x_tile)
                 out_0_store = pl.store(y_tile, [0], out_0)
                 return out_0_store
@@ -1076,7 +1076,7 @@ class TestPassthrough:
                 out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
                 for i in pl.range(4):
-                    x_tile = pl.load(x, [0], [64])
+                    x_tile = pl.load(x, [0], [64], target_memory=pl.Mem.Vec)
                     y_tile = pl.add(x_tile, x_tile)
                     out_0 = pl.store(y_tile, [0], out_0)
                 return out_0
@@ -1349,7 +1349,7 @@ class TestCrossCoreBoundaries:
                 y: pl.Tensor[[128, 64], pl.BF16],
                 out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
             ) -> pl.Tensor[[16, 64], pl.FP32]:
-                x_tile = pl.load(x, [0, 0], [16, 128])
+                x_tile = pl.load(x, [0, 0], [16, 128], target_memory=pl.Mem.Vec)
                 x_tile_nz = pl.move(
                     x_tile,
                     target_memory=pl.MemorySpace.Vec,
@@ -1440,7 +1440,7 @@ class TestCrossCoreBoundaries:
                 y: pl.Tensor[[128, 64], pl.BF16],
                 out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
             ) -> pl.Tensor[[16, 64], pl.FP32]:
-                y_tile = pl.load(y, [0, 0], [128, 64])
+                y_tile = pl.load(y, [0, 0], [128, 64], target_memory=pl.Mem.Vec)
                 y_tile_nz = pl.move(
                     y_tile,
                     target_memory=pl.MemorySpace.Vec,
@@ -1832,7 +1832,7 @@ class TestMultipleInCore:
                 x: pl.Tensor[[64], pl.FP32],
                 out_0: pl.Out[pl.Tensor[[64], pl.FP32]],
             ) -> pl.Tensor[[64], pl.FP32]:
-                x_tile = pl.load(x, [0], [64])
+                x_tile = pl.load(x, [0], [64], target_memory=pl.Mem.Vec)
                 y_tile = pl.add(x_tile, x_tile)
                 out_0_store = pl.store(y_tile, [0], out_0)
                 return out_0_store
@@ -2219,7 +2219,7 @@ class TestAutoPipeSetup:
                 )
                 c2v = pl.reserve_buffer(name="main_incore_0_c2v_slot_buffer", size=16384)
                 pl.aiv_initialize_pipe(c2v, v2c, dir_mask=3, slot_size=8192, slot_num=2)
-                x_tile = pl.load(x, [0, 0], [16, 128])
+                x_tile = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
                 x_sum = pl.add(x_tile, x_tile)
                 x_sum_nz: pl.Tile[
                     [16, 128],
@@ -2420,7 +2420,13 @@ class TestAutoPipeSetup:
         _assert_function_equal(After, Expected, "main_incore_0_aiv")
 
     def test_alias_tfree_preserves_explicit_pipe_id(self):
-        """Canonicalizing a tfree alias must keep its original pipe id kwarg."""
+        """Canonicalizing a tfree alias must keep its original pipe id kwarg.
+
+        ``pl.tfree_to_aiv(alias, id=0)`` is canonicalized onto the tpop result
+        the alias names; ``Expected`` pins that the rewrite retargets the
+        argument *without* rewriting the explicit ``id=0`` to the tpop's own
+        ``id=1``.
+        """
 
         @pl.program
         class Before:
@@ -2435,31 +2441,53 @@ class TestAutoPipeSetup:
                 vector_tile: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.tpop_from_aic(split=0)
                 pl.tfree_to_aic(vector_tile)
 
-        After = _expand_raw(Before)
-        aic_func = After.get_function("main_incore_0_aic")
-        assert aic_func is not None
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIC)
+            def main_incore_0_aic(self):
+                main_incore_0_v2c_slot_buffer: pl.Scalar[pl.INT32] = pl.reserve_buffer(
+                    name="main_incore_0_v2c_slot_buffer", size=2048, base=pl.AUTO
+                )
+                main_incore_0_c2v_slot_buffer_import: pl.Scalar[pl.INT32] = pl.import_peer_buffer(
+                    name="main_incore_0_c2v_slot_buffer", peer_func="main_incore_0_aiv"
+                )
+                pl.aic_initialize_pipe(
+                    main_incore_0_c2v_slot_buffer_import,
+                    main_incore_0_v2c_slot_buffer,
+                    dir_mask=3,
+                    slot_size=1024,
+                    slot_num=2,
+                )
+                received: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = pl.tpop_from_aiv(split=0, id=1)
+                # The alias binding survives the split; only its tfree use is retargeted.
+                alias: pl.Tile[[16, 16], pl.FP16, pl.Mem.Mat] = received  # noqa: F841
+                # Retargeted onto `received`, and still `id=0`, not the tpop's `id=1`.
+                pl.tfree_to_aiv(received, id=0)
 
-        tpop_var = None
-        tfree_call = None
-        for stmt in ir.flatten_to_stmts(aic_func.body):
-            if isinstance(stmt, ir.AssignStmt):
-                call = stmt.value
-            elif isinstance(stmt, ir.EvalStmt):
-                call = stmt.expr
-            else:
-                call = None
-            if not isinstance(call, ir.Call):
-                continue
-            if call.op.name == ir.get_op("tile.tpop_from_aiv").name:
-                assert isinstance(stmt, ir.AssignStmt)
-                tpop_var = stmt.var
-            elif call.op.name == ir.get_op("system.tfree_to_aiv").name:
-                tfree_call = call
+            @pl.function(type=pl.FunctionType.AIV)
+            def main_incore_0_aiv(self):
+                main_incore_0_v2c_slot_buffer_import: pl.Scalar[pl.INT32] = pl.import_peer_buffer(
+                    name="main_incore_0_v2c_slot_buffer", peer_func="main_incore_0_aic"
+                )
+                main_incore_0_c2v_slot_buffer: pl.Scalar[pl.INT32] = pl.reserve_buffer(
+                    name="main_incore_0_c2v_slot_buffer", size=2048, base=pl.AUTO
+                )
+                pl.aiv_initialize_pipe(
+                    main_incore_0_c2v_slot_buffer,
+                    main_incore_0_v2c_slot_buffer_import,
+                    dir_mask=3,
+                    slot_size=1024,
+                    slot_num=2,
+                )
+                vector_tile: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tpop_from_aic(split=0)
+                pl.tfree_to_aic(vector_tile)
 
-        assert tpop_var is not None
-        assert tfree_call is not None
-        assert tfree_call.args == [tpop_var]
-        assert tfree_call.kwargs["id"] == 0
+            @pl.function(type=pl.FunctionType.Group)
+            def main_incore_0(self):
+                self.main_incore_0_aic()
+                self.main_incore_0_aiv()
+
+        ir.assert_structural_equal(_expand_raw(Before), Expected)
 
     def test_auto_tfree_does_not_hoist_user_before_if_defined_tile(self):
         """A later tpop user must stay after an if-defined tile result."""
@@ -2738,7 +2766,7 @@ class TestNestedStructures:
                 out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
             ) -> pl.Tensor[[16, 64], pl.FP32]:
                 for i in pl.range(4):
-                    x_tile = pl.load(x, [0, 0], [16, 128])
+                    x_tile = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
                     x_sum = pl.add(x_tile, x_tile)
                     x_sum_nz = pl.move(
                         x_sum,
@@ -2992,7 +3020,7 @@ class TestDCERegression:
                 y: pl.Tensor[[128, 128], pl.BF16],
                 out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
             ) -> pl.Tensor[[16, 128], pl.FP32]:
-                x_tile = pl.load(x, [0, 0], [16, 128])
+                x_tile = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Vec)
                 x_fp32 = pl.tile.cast(x_tile, target_type=pl.FP32, mode="round")
                 out_0_store = pl.store(x_fp32, [0, 0], out_0)
                 return out_0_store
@@ -3160,7 +3188,7 @@ class TestDCERegression:
                 acc_0 = pl.tile.create([16, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
                 acc_1 = pl.tile.muls(acc_0, 0.0)
                 for i, (acc_iter,) in pl.range(4, init_values=(acc_1,)):
-                    x_tile = pl.load(x, [0, 0], [16, 128])
+                    x_tile = pl.load(x, [0, 0], [16, 128], target_memory=pl.Mem.Vec)
                     x_sum = pl.add(x_tile, x_tile)
                     x_sum_nz = pl.move(
                         x_sum,
@@ -3252,7 +3280,7 @@ class TestDCERegression:
                 _z_vec: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
                     split=0
                 )
-                x_tile = pl.load(x, [0, 0], [16, 128])
+                x_tile = pl.load(x, [0, 0], [16, 128], target_memory=pl.Mem.Vec)
                 x_fp32 = pl.tile.cast(x_tile, target_type=pl.FP32, mode="round")
                 out_0_store = pl.store(x_fp32, [0, 0], out_0)
                 return out_0_store
@@ -3983,23 +4011,32 @@ class TestDCERegression:
 
         _assert_function_equal(After, ExpectedAIC, "main_incore_0_aic")
 
-    def test_nested_loop_vector_init_value_pulled_into_aic(self):
-        """Regression for issue #977: VECTOR init-value defined inside an outer
-        loop must be pulled back into the AIC body for a surviving iter_arg.
+    def test_nested_loop_acc_init_value_reaches_aic_body(self):
+        """Regression for issue #977: an init-value defined inside an outer loop must
+        reach the split AIC body ahead of the inner loop that carries it.
 
-        This is the actual Qwen3Scope1 failure pattern: tile.full creates a
-        Vec-typed zero accumulator inside an outer loop, then an inner loop
-        uses it as init_values for matmul_acc.  BuildCoreBody drops the VECTOR
-        tile.full from AIC, and FixupIterArgInitValues must pull its definition
-        chain from original_def_map -- which requires BuildDefMap to recurse
-        into nested loop bodies.
+        This is the Qwen3Scope1 shape: an outer loop allocates an accumulator,
+        an inner loop takes it through ``init_values`` and accumulates with
+        ``matmul_acc``. If the allocation does not land in the AIC body before the
+        inner loop, the split function references an undefined init value.
 
-        FixupIterArgInitValues rewrites the ``tile.full`` call's deduced type
-        from Vec to Acc so the init value matches the Acc-typed iter_arg. While
-        ``pl.tile.full`` has no ``target_memory`` parameter, the rewritten
-        Acc-typed result is reproducible in the DSL via an explicit
-        ``pl.Tile[..., pl.MemorySpace.Acc]`` annotation, so the full split
-        program is verified structurally.
+        The accumulator was originally a ``pl.tile.full``, i.e. VECTOR-classified:
+        BuildCoreBody dropped it from AIC and ``FixupIterArgInitValues`` pulled its
+        definition chain back out of ``original_def_map`` -- the reason BuildDefMap
+        recurses into nested loop bodies. That shape is no longer constructible:
+        ``tile.full`` has a fixed Vec output space, and no target has a data path
+        into Acc, so a Vec tile can never be a ``matmul_acc`` accumulator. The
+        accumulator is therefore allocated unset and placed in Acc by
+        InferTileMemorySpace. ``tile.create`` is SHARED, so the cube filter now keeps
+        the definition in place instead of dropping it; the nested-loop init-value
+        structure is still verified end to end, but the pull path itself is no longer
+        reachable from the DSL.
+
+        Note this fixture is structural only. ``tile.create`` allocates without
+        initializing, so the accumulator is not zeroed the way the old ``tile.full``
+        one was; a kernel that needs a defined starting value passes
+        ``init_cond=(kb == 0)`` to overwrite on the first step. Nothing here executes
+        the arithmetic -- the assertion compares IR structure.
         """
 
         @pl.program
@@ -4012,7 +4049,7 @@ class TestDCERegression:
                 out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
             ) -> pl.Tensor[[16, 64], pl.FP32]:
                 for ob in pl.range(2):
-                    acc_init = pl.tile.full([16, 64], dtype=pl.FP32, value=0.0)
+                    acc_init = pl.tile.create([16, 64], dtype=pl.FP32)
                     for kb, (acc_iter,) in pl.range(2, init_values=(acc_init,)):
                         x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
                         x_left = pl.move(x_mat, target_memory=pl.MemorySpace.Left)
@@ -4041,8 +4078,8 @@ class TestDCERegression:
                 out_0: pl.Out[pl.Tensor[[16, 64], pl.FP32]],
             ):
                 for ob in pl.range(2):
-                    acc_init: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Acc] = pl.tile.full(
-                        [16, 64], dtype=pl.FP32, value=0.0
+                    acc_init: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Acc] = pl.tile.create(
+                        [16, 64], dtype=pl.FP32, target_memory=pl.MemorySpace.Acc
                     )
                     for kb, (acc_iter,) in pl.range(2, init_values=(acc_init,)):
                         x_mat = pl.load(x, [0, 0], [16, 128], target_memory=pl.MemorySpace.Mat)
@@ -4148,6 +4185,377 @@ class TestDCERegression:
 
         # End-to-end safety net: the property verifier rejects free-var refs.
         passes.run_verifier()(After)
+
+
+class TestManualPipeVtoCFractalAdapt:
+    """A hand-written pl.tpush_to_aic gets the same V->C fractal adapter.
+
+    The push is staged into an NZ Vec tile exactly as the boundary-move path
+    stages the pipes this pass builds itself, and the original call's kwargs
+    ride along -- an `id` reset to the CreateTpush default would collapse a
+    multi-pipe program onto one FIFO, and the Expected programs below pin it.
+
+    The other half of the contract -- that no adapter appears on a backend
+    where RequiresVtoCFractalAdapt() is false -- is held by
+    test_expand_mixed_kernel_a2a3.py::test_v2c_boundary_uses_nz_layout_on_a2a3,
+    which fails as soon as the gate stops being consulted.
+    """
+
+    def test_push_in_a_hand_written_aiv_function_is_adapted(self):
+        """The author already typed the function AIV, so the pass only adapts."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def manual_aic(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                v2c = pl.reserve_buffer(name="v2c_slot_buffer", size=8192, base=pl.AUTO)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c, dir_mask=2, slot_size=1024, id=1)
+                lhs_mat: pl.Tile[[16, 16], pl.FP32, pl.Mem.Mat] = pl.tpop_from_aiv(split=0, id=1)
+                lhs_left = pl.move(lhs_mat, target_memory=pl.MemorySpace.Left)
+                rhs_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                rhs_right = pl.move(rhs_mat, target_memory=pl.MemorySpace.Right)
+                acc = pl.matmul(lhs_left, rhs_right)
+                pl.tfree_to_aiv(lhs_mat, id=1)
+                out_0_store = pl.store(acc, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def manual_aiv(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="manual_aic")
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
+                a_tile = pl.load(a, [0, 0], [16, 16])
+                doubled = pl.add(a_tile, a_tile)
+                pl.tpush_to_aic(doubled, split=0, id=1)
+
+            @pl.function(type=pl.FunctionType.Group)
+            def manual_group(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result = self.manual_aic(a, out_0)
+                self.manual_aiv(a, out_0)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIC)
+            def manual_aic(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                v2c = pl.reserve_buffer(name="v2c_slot_buffer", size=8192, base=pl.AUTO)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c, dir_mask=2, slot_size=1024, id=1)
+                lhs_mat: pl.Tile[[16, 16], pl.FP32, pl.Mem.Mat] = pl.tpop_from_aiv(split=0, id=1)
+                lhs_left = pl.move(lhs_mat, target_memory=pl.MemorySpace.Left)
+                rhs_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                rhs_right = pl.move(rhs_mat, target_memory=pl.MemorySpace.Right)
+                acc = pl.matmul(lhs_left, rhs_right)
+                pl.tfree_to_aiv(lhs_mat, id=1)
+                out_0_store = pl.store(acc, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def manual_aiv(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="manual_aic")
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
+                a_tile = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+                doubled = pl.add(a_tile, a_tile)
+                doubled_nz = pl.move(
+                    doubled,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                pl.tpush_to_aic(doubled_nz, split=0, id=1)
+
+            @pl.function(type=pl.FunctionType.Group)
+            def manual_group(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result = self.manual_aic(a, out_0)
+                self.manual_aiv(a, out_0)
+                return result
+
+        ir.assert_structural_equal(_expand_raw(Before), Expected)
+
+    def test_push_authored_in_an_incore_body_is_adapted(self):
+        """`tile.tpush_to_aic` is VECTOR-affine, so authoring one in an InCore body is legal.
+
+        Such a body only becomes an AIV function inside this pass, after the
+        per-function loop, so the adapter has to sweep what the pass emits
+        rather than what it was handed.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def manual_aic(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                v2c = pl.reserve_buffer(name="v2c_slot_buffer", size=8192, base=pl.AUTO)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c, dir_mask=2, slot_size=1024, id=1)
+                lhs_mat: pl.Tile[[16, 16], pl.FP32, pl.Mem.Mat] = pl.tpop_from_aiv(split=0, id=1)
+                lhs_left = pl.move(lhs_mat, target_memory=pl.MemorySpace.Left)
+                rhs_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                rhs_right = pl.move(rhs_mat, target_memory=pl.MemorySpace.Right)
+                acc = pl.matmul(lhs_left, rhs_right)
+                pl.tfree_to_aiv(lhs_mat, id=1)
+                out_0_store = pl.store(acc, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def manual_incore(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="manual_aic")
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
+                a_tile = pl.load(a, [0, 0], [16, 16])
+                doubled = pl.add(a_tile, a_tile)
+                pl.tpush_to_aic(doubled, split=0, id=1)
+
+            @pl.function(type=pl.FunctionType.Group)
+            def manual_group(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result = self.manual_aic(a, out_0)
+                self.manual_incore(a, out_0)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIC)
+            def manual_aic(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                v2c = pl.reserve_buffer(name="v2c_slot_buffer", size=8192, base=pl.AUTO)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c, dir_mask=2, slot_size=1024, id=1)
+                lhs_mat: pl.Tile[[16, 16], pl.FP32, pl.Mem.Mat] = pl.tpop_from_aiv(split=0, id=1)
+                lhs_left = pl.move(lhs_mat, target_memory=pl.MemorySpace.Left)
+                rhs_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                rhs_right = pl.move(rhs_mat, target_memory=pl.MemorySpace.Right)
+                acc = pl.matmul(lhs_left, rhs_right)
+                pl.tfree_to_aiv(lhs_mat, id=1)
+                out_0_store = pl.store(acc, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def manual_incore(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="manual_aic")
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
+                a_tile = pl.load(a, [0, 0], [16, 16], target_memory=pl.Mem.Vec)
+                doubled = pl.add(a_tile, a_tile)
+                doubled_nz = pl.move(
+                    doubled,
+                    target_memory=pl.MemorySpace.Vec,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                pl.tpush_to_aic(doubled_nz, split=0, id=1)
+
+            @pl.function(type=pl.FunctionType.Group)
+            def manual_group(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result = self.manual_aic(a, out_0)
+                self.manual_incore(a, out_0)
+                return result
+
+        ir.assert_structural_equal(_expand_raw(Before), Expected)
+
+    def test_push_keeps_its_attrs(self):
+        """The rewrite replaces the pushed tile and nothing else.
+
+        ``Call.attrs`` carries compiler metadata an earlier pass or a caller may
+        have attached to the op. Rebuilding the push must not quietly drop it,
+        the same way rebuilding through CreateTpush would drop the kwargs.
+        ``Expected`` pins the marker riding through onto the adapted push, and
+        — being a whole-program comparison — that the fractal ``tile.move`` the
+        adapter inserts is the only other change.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def manual_aic(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                v2c = pl.reserve_buffer(name="v2c_slot_buffer", size=8192, base=pl.AUTO)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c, dir_mask=2, slot_size=1024, id=1)
+                lhs_mat: pl.Tile[[16, 16], pl.FP32, pl.Mem.Mat] = pl.tpop_from_aiv(split=0, id=1)
+                lhs_left = pl.move(lhs_mat, target_memory=pl.MemorySpace.Left)
+                rhs_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                rhs_right = pl.move(rhs_mat, target_memory=pl.MemorySpace.Right)
+                acc = pl.matmul(lhs_left, rhs_right)
+                pl.tfree_to_aiv(lhs_mat, id=1)
+                out_0_store = pl.store(acc, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def manual_aiv(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="manual_aic")
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
+                a_tile = pl.load(a, [0, 0], [16, 16])
+                doubled = pl.add(a_tile, a_tile)
+                pl.tpush_to_aic(doubled, split=0, id=1, attrs={"test_push_marker": 4471})
+
+            @pl.function(type=pl.FunctionType.Group)
+            def manual_group(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result = self.manual_aic(a, out_0)
+                self.manual_aiv(a, out_0)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.AIC)
+            def manual_aic(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                v2c: pl.Scalar[pl.INT32] = pl.reserve_buffer(name="v2c_slot_buffer", size=8192, base=pl.AUTO)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c, dir_mask=2, slot_size=1024, id=1)
+                lhs_mat: pl.Tile[[16, 16], pl.FP32, pl.Mem.Mat] = pl.tpop_from_aiv(split=0, id=1)
+                lhs_left: pl.Tile[[16, 16], pl.FP32, pl.Mem.Left] = pl.tile.move(
+                    lhs_mat, target_memory=pl.Mem.Left
+                )
+                rhs_mat: pl.Tile[[16, 16], pl.FP32, pl.Mem.Mat] = pl.tile.load(
+                    a, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Mat
+                )
+                rhs_right: pl.Tile[[16, 16], pl.FP32, pl.Mem.Right] = pl.tile.move(
+                    rhs_mat, target_memory=pl.Mem.Right
+                )
+                acc: pl.Tile[[16, 16], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(lhs_left, rhs_right)
+                pl.tfree_to_aiv(lhs_mat, id=1)
+                out_0_store: pl.Tensor[[16, 16], pl.FP32] = pl.tile.store(acc, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def manual_aiv(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                v2c_peer: pl.Scalar[pl.INT32] = pl.import_peer_buffer(
+                    name="v2c_slot_buffer", peer_func="manual_aic"
+                )
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
+                a_tile: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tile.load(
+                    a, [0, 0], [16, 16], [16, 16], target_memory=pl.Mem.Vec
+                )
+                doubled: pl.Tile[[16, 16], pl.FP32, pl.Mem.Vec] = pl.tile.add(a_tile, a_tile)
+                # The fractal adapter's inserted NZ move — the only change the
+                # rewrite makes besides re-pointing the push at its result.
+                doubled_nz: pl.Tile[
+                    [16, 16],
+                    pl.FP32,
+                    pl.Mem.Vec,
+                    pl.TileView(blayout=pl.TileLayout.col_major, slayout=pl.TileLayout.row_major),
+                ] = pl.tile.move(
+                    doubled,
+                    target_memory=pl.Mem.Vec,
+                    blayout=pl.TileLayout.col_major,
+                    slayout=pl.TileLayout.row_major,
+                )
+                pl.tpush_to_aic(doubled_nz, split=0, id=1, attrs={"test_push_marker": 4471})
+
+            @pl.function(type=pl.FunctionType.Group)
+            def manual_group(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result = self.manual_aic(a, out_0)
+                self.manual_aiv(a, out_0)
+                return result
+
+        ir.assert_structural_equal(_expand_raw(Before), Expected)
+
+    def test_adapting_is_idempotent(self):
+        """A push already carrying the boundary view is left alone on a second run."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIC)
+            def manual_aic(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                v2c = pl.reserve_buffer(name="v2c_slot_buffer", size=8192, base=pl.AUTO)
+                pl.aic_initialize_pipe(pl.const(0, pl.INT32), v2c, dir_mask=2, slot_size=1024, id=1)
+                lhs_mat: pl.Tile[[16, 16], pl.FP32, pl.Mem.Mat] = pl.tpop_from_aiv(split=0, id=1)
+                lhs_left = pl.move(lhs_mat, target_memory=pl.MemorySpace.Left)
+                rhs_mat = pl.load(a, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                rhs_right = pl.move(rhs_mat, target_memory=pl.MemorySpace.Right)
+                acc = pl.matmul(lhs_left, rhs_right)
+                pl.tfree_to_aiv(lhs_mat, id=1)
+                out_0_store = pl.store(acc, [0, 0], out_0)
+                return out_0_store
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def manual_aiv(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                v2c_peer = pl.import_peer_buffer(name="v2c_slot_buffer", peer_func="manual_aic")
+                pl.aiv_initialize_pipe(pl.const(0, pl.INT32), v2c_peer, dir_mask=2, slot_size=1024, id=1)
+                a_tile = pl.load(a, [0, 0], [16, 16])
+                doubled = pl.add(a_tile, a_tile)
+                pl.tpush_to_aic(doubled, split=0, id=1)
+
+            @pl.function(type=pl.FunctionType.Group)
+            def manual_group(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                result = self.manual_aic(a, out_0)
+                self.manual_aiv(a, out_0)
+                return result
+
+        Once = _expand_raw(Before)
+        ir.assert_structural_equal(passes.expand_mixed_kernel()(Once), Once)
 
 
 if __name__ == "__main__":

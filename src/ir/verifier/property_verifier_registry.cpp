@@ -69,15 +69,18 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::CallDirectionsResolved, CreateCallDirectionsResolvedPropertyVerifier);
   Register(IRProperty::TileTypeCoherence, CreateTileTypeCoherencePropertyVerifier);
   Register(IRProperty::AccToGmStoreValid, CreateAccToGmStoreValidPropertyVerifier);
+  Register(IRProperty::AccCompactValid, CreateAccCompactValidPropertyVerifier);
   // AtomicAddDtypeValid: an atomic-add into a bf16 GM destination is A2/A3-only
   // (BackendHandler::SupportsBf16AtomicAdd). Decidable on the user's own IR, so
   // it sits in GetStructuralProperties() and fires at pipeline input rather than
   // after a particular pass.
   Register(IRProperty::AtomicAddDtypeValid, CreateAtomicAddDtypeValidPropertyVerifier);
+
   Register(IRProperty::InlineFunctionsEliminated, CreateInlineFunctionsEliminatedPropertyVerifier);
   Register(IRProperty::OrchestrationReferencesResolved,
            CreateOrchestrationReferencesResolvedPropertyVerifier);
   Register(IRProperty::RuntimeScopesMaterialized, CreateRuntimeScopesMaterializedPropertyVerifier);
+  Register(IRProperty::GraphBoundaryLegalized, CreateGraphBoundaryLegalizedPropertyVerifier);
   // TensorViewCanonical (RFC #1300 §2.4): strict mode — every TensorView
   // reaching the codegen-entry boundary must carry explicit stride. The
   // registry default fires immediately after ``MaterializeTensorStrides``
@@ -90,6 +93,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::TensorViewCanonical,
            []() { return CreateTensorViewCanonicalPropertyVerifier(/*require_materialized=*/true); });
   Register(IRProperty::CommDomainScopesMaterialized, CreateCommDomainScopesMaterializedPropertyVerifier);
+  Register(IRProperty::DistTensorCtxMaterialized, CreateDistTensorCtxMaterializedPropertyVerifier);
   // AssignTypeSymmetry (#1285): every AssignStmt(var, value) must satisfy
   // structural_equal(var->GetType(), value->GetType()). Registered so callers
   // can run it on demand via PropertyVerifierRegistry::verify; not yet promoted

@@ -665,14 +665,82 @@ class TestOutlineIncoreScopes:
         After = passes.outline_incore_scopes()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    @staticmethod
+    def _outlined_directions(program, callee="main_incore_0"):
+        """Map the outlined callee's parameter names to their derived directions.
+
+        Keys drop the ``__ssa_vN`` suffix ``ConvertToSSA`` appends, so a test can
+        name the parameter as it was written in the source.
+        """
+        after = passes.outline_incore_scopes()(passes.convert_to_ssa()(program))
+        func = after.get_function(callee)
+        assert func is not None, f"{callee} was not outlined"
+        return {p.name_hint.split("__ssa_v")[0]: d for p, d in zip(func.params, func.param_directions)}
+
+    def test_outline_scalar_write_dest_becomes_out(self):
+        """``tensor.write`` writes its destination, so a captured tensor written
+        only through it becomes ``Out``.
+
+        The outliner used to recognise exactly two writers, ``tile.store`` and
+        ``tensor.assemble``. Every other write operator — ``tensor.write`` here
+        — left the captured tensor looking untouched, so the parameter stayed
+        ``In`` and the caller got no dependency on the write. The operator now
+        declares which argument it writes and the outliner reads that.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, dst: pl.Tensor[[64], pl.FP32], value: pl.Scalar[pl.FP32]
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    updated: pl.Tensor[[64], pl.FP32] = pl.write(dst, [0], value)
+                return updated
+
+        assert self._outlined_directions(Before)["dst"] == ir.ParamDirection.Out
+
+    def test_outline_expand_clone_target_becomes_out(self):
+        """``tensor.expand_clone`` stores into its ``target`` on every lowering
+        branch, so a captured target is written, not read."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, src: pl.Tensor[[1, 1, 32], pl.FP32], dst: pl.Tensor[[1, 8, 32], pl.FP32]
+            ) -> pl.Tensor[[1, 8, 32], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    expanded: pl.Tensor[[1, 8, 32], pl.FP32] = pl.expand_clone(src, dst)
+                return expanded
+
+        directions = self._outlined_directions(Before)
+        assert directions["dst"] == ir.ParamDirection.Out
+        assert directions["src"] == ir.ParamDirection.In
+
+    def test_outline_read_then_write_dest_is_inout(self):
+        """A captured tensor the scope reads *and* writes stays ``InOut``. The
+        write widens the direction; it does not replace the read."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, dst: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    first: pl.Scalar[pl.FP32] = pl.read(dst, [0])
+                    updated: pl.Tensor[[64], pl.FP32] = pl.write(dst, [1], first)
+                return updated
+
+        assert self._outlined_directions(Before)["dst"] == ir.ParamDirection.InOut
+
     def test_outline_write_only_assemble_dest_becomes_out(self):
         """``tensor.assemble`` destination captured by a scope becomes an Out param.
 
         ``tensor.assemble`` is SSA-pure (returns a fresh Tensor), but its first
         argument is a destination the result aliases in place. When the
         destination is a captured outer variable, the outlined function writes
-        the caller's backing buffer, so ``InferParamDirections`` Step 2
-        (``AssembleDestUpgrader``) lifts that parameter off ``In``. Here the body
+        the caller's backing buffer, so ``InferParamDirections`` lifts that
+        parameter off ``In`` from the operator's declared write. Here the body
         never reads ``dst`` — the assemble destination slot is the only use — so
         the direction is ``Out``, not ``InOut`` (issue #2415: a false ``InOut``
         reaches ``DistributedCodegen`` and manufactures a cross-rank edge). The
@@ -884,6 +952,48 @@ class TestOutlineIncoreScopes:
         assert outlined.param_directions[out_idx] == ir.ParamDirection.Out, (
             f"expected Out at outlined callee param {out_idx}, got {list(outlined.param_directions)}"
         )
+
+    def test_outline_mgather_scratch_stays_out(self):
+        """Writing an argument does not make the result name it.
+
+        ``tile.mgather`` stages a Mat *elem* gather through the GM ``scratch``
+        operand — its only written argument — but returns a **fresh** tile.
+        Inferring the result alias from "the one write slot" registered the
+        gathered tile as a second name for ``scratch``, so reading the tile
+        marked a write-only ``scratch`` as read and promoted it to ``InOut``.
+        That is the false read of issue #2415, on a capture whose contents the
+        scope never needs staged in.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                mem: pl.Tensor[[512], pl.FP32],
+                idx: pl.Tensor[[16, 32], pl.INT32],
+                scratch: pl.Out[pl.Tensor[[512], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    gathered: pl.Tile[[16, 32], pl.FP32] = pl.tile.mgather(
+                        mem, idx, coalesce="elem", target_memory=pl.MemorySpace.Mat, scratch=scratch
+                    )
+                    # Reading the gathered tile must not read `scratch`.
+                    vec: pl.Tile[[16, 32], pl.FP32] = pl.move(gathered, target_memory=pl.MemorySpace.Vec)
+                    out = pl.store(vec, [0, 0], out)
+                return out
+
+        After = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+
+        outlined = next(f for gv, f in After.functions.items() if gv.name != "main")
+        directions = {
+            p.name_hint.split("__ssa_v")[0]: d for p, d in zip(outlined.params, outlined.param_directions)
+        }
+        assert directions["scratch"] == ir.ParamDirection.Out, (
+            f"mgather scratch is written, never read; got {directions}"
+        )
+        assert directions["out"] == ir.ParamDirection.Out, f"expected Out for out, got {directions}"
 
     def test_outline_spmd_assemble_keeps_out_param_out(self):
         """Regression for issue #2415: a ``pl.Out`` formal stays ``Out``.
@@ -1163,13 +1273,21 @@ class TestOutlineSubmitTaskId:
         assert tail.dtype == DataType.TASK_ID
 
     def test_deferred_wait_does_not_order_later_notify_behind_waiter(self):
-        """Signal control ops stay Input; notify has no waiter dependency.
+        """Notify writes its signal, and still carries no waiter dependency.
 
         The deferred waiter is logically live after its AIV kernel returns, so
         a spurious waiter -> notifier edge would recreate the physical-core
-        saturation deadlock.  ``defer_wait`` and ``notify`` are side-effect ops
-        with no memory-write specification, hence both outlined signal params
-        derive as Input and a MANUAL scope leaves the later notifier unordered.
+        saturation deadlock. That edge is what this test guards, and a MANUAL
+        scope leaves the later notifier unordered regardless of direction.
+
+        The directions themselves are not symmetric. ``pld.system.wait`` /
+        ``defer_wait`` poll a signal they never write, so the waiter's parameter
+        is ``Input``. ``pld.system.notify`` deposits a value into the peer's
+        slot — that is the write whose absence dropped the RAW edge a waiter
+        needs and deadlocked the communication card, so the notifier's parameter
+        is ``Out`` and its call site ``OutputExisting``. The operator declares
+        both facts on the registry, so the outliner and ``ConvertTensorToTileOps``
+        read the same answer instead of disagreeing about the same call.
         """
 
         @pl.program
@@ -1223,7 +1341,10 @@ class TestOutlineSubmitTaskId:
         assert isinstance(waiter, ir.Submit)
         assert list(waiter.arg_directions) == [ir.ArgDirection.Input]
         assert isinstance(notifier, ir.Call)
-        assert list(notifier.arg_directions) == [ir.ArgDirection.Input, ir.ArgDirection.Scalar]
+        assert list(notifier.arg_directions) == [
+            ir.ArgDirection.OutputExisting,
+            ir.ArgDirection.Scalar,
+        ]
         assert "manual_dep_edges" not in notifier.attrs
         assert "compiler_manual_dep_edges" not in notifier.attrs
         assert isinstance(consumer, ir.Submit)
@@ -1365,7 +1486,14 @@ class TestOutlineSubmitTaskId:
             passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
 
     def test_deferred_wait_accepts_static_conditional_registration_loop(self):
-        """The MoE waiter is bounded and consumers use ordinary deps unchanged."""
+        """The MoE waiter is bounded and consumers use ordinary deps unchanged.
+
+        ``Expected`` (after both outlining passes) pins the whole shape at once:
+        the waiter is outlined carrying ``deferred_completion_waiter``, the
+        gather body carries no ``system.cacheinvalid``, and ``main`` ends up
+        with two launches where the second takes the waiter's TaskId as its
+        single dep.
+        """
 
         @pl.program
         class Before:
@@ -1400,36 +1528,69 @@ class TestOutlineSubmitTaskId:
                     out = pl.store(value, [offset], out)
                 return out
 
-        after = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
-        waiter = after.get_function("dispatch_wait")
-        consumer = after.get_function("dispatch_gather")
-        assert waiter is not None
-        assert waiter.attrs["deferred_completion_waiter"] is True
-        assert consumer is not None
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore, strict_ssa=True)
+            def dispatch_gather(
+                self,
+                payload: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                block: pl.Scalar[pl.INDEX] = pl.tile.get_block_idx()
+                offset: pl.Scalar[pl.INDEX] = block * 16
+                value: pl.Tile[[16], pl.FP32] = pl.tile.load(payload, [offset], [16], [16])
+                out_1: pl.Tensor[[64], pl.FP32] = pl.tile.store(value, [offset], out)
+                out_store: pl.Tensor[[64], pl.FP32] = out_1
+                return out
 
-        calls: list[ir.Call] = []
+            @pl.function(type=pl.FunctionType.Spmd, strict_ssa=True)
+            def dispatch_gather_spmd(
+                self,
+                payload: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                out_2: pl.Tensor[[64], pl.FP32] = self.dispatch_gather(payload, out)
+                return out
 
-        class _CallCollector(ir.IRVisitor):
-            def visit_call(self, op):
-                calls.append(op)
-                super().visit_call(op)
+            @pl.function(type=pl.FunctionType.InCore, strict_ssa=True)
+            def dispatch_wait(
+                self,
+                indices: pl.Tensor[[1, 1], pl.INT32],
+                my_rank: pl.Scalar[pl.INT32],
+                signal: pld.DistributedTensor[[8, 1], pl.INT32],
+                epoch: pl.Scalar[pl.INT32],
+            ):
+                pl.func_attr({"deferred_completion_waiter": True})
+                idx_anchor: pl.Scalar[pl.INT32] = pl.tensor.read(indices, [0, 0])
+                for src in pl.range(8):
+                    if src != pl.cast(my_rank, pl.INDEX):
+                        pld.system.defer_wait(signal, [src, 0], epoch, cmp=pld.WaitCmp.Ge)
 
-        _CallCollector().visit_stmt(consumer.body)
-        assert all(call.op.name != ir.get_op("system.cacheinvalid").name for call in calls)
+            @pl.function(type=pl.FunctionType.Orchestration, strict_ssa=True)
+            def main(
+                self,
+                signal: pld.DistributedTensor[[8, 1], pl.INT32],
+                indices: pl.Tensor[[1, 1], pl.INT32],
+                payload: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+                my_rank: pl.Scalar[pl.INT32],
+                epoch: pl.Scalar[pl.INT32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                wait_ret: pl.Tuple[pl.Scalar[pl.TASK_ID]] = pl.submit(
+                    self.dispatch_wait, indices, my_rank, signal, epoch
+                )
+                wait_tid: pl.Scalar[pl.TASK_ID] = wait_ret[0]
+                gather_ret: pl.Tuple[pl.Tensor[[64], pl.FP32], pl.Scalar[pl.TASK_ID]] = pl.spmd_submit(
+                    self.dispatch_gather_spmd, payload, out, deps=[wait_tid], core_num=4
+                )
+                out_2: pl.Tensor[[64], pl.FP32] = gather_ret[0]
+                gather_tid: pl.Scalar[pl.TASK_ID] = gather_ret[1]
+                return out_2
 
-        after = passes.outline_cluster_scopes()(after)
-        main = after.get_function("main")
-        assert main is not None
-        submits: list[ir.Submit] = []
-
-        class _SubmitCollector(ir.IRVisitor):
-            def visit_submit(self, op):
-                submits.append(op)
-                super().visit_submit(op)
-
-        _SubmitCollector().visit_stmt(main.body)
-        assert len(submits) == 2
-        assert len(submits[1].deps) == 1
+        after = passes.outline_cluster_scopes()(
+            passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+        )
+        ir.assert_structural_equal(after, Expected)
 
     def test_deferred_wait_accepts_pure_scalar_temporary_in_registration_loop(self):
         """Hoisting pure expected-value arithmetic must not change legality."""
@@ -3125,6 +3286,573 @@ class TestGraphFunctionTypeIsPreserved:
         main = self._outline(Before).get_function("main")
         assert main is not None
         assert main.func_type == ir.FunctionType.Orchestration
+
+
+class TestOutlineCachePolicy:
+    """``pl.set_cache_policy(t, policy)`` lowering: ``ScopeStmt.attrs['cache_policy_vars']``
+    holds the captured Vars the declaration names, and the outliner translates
+    them into positional indices into the outlined function's params, re-emitted
+    as the function attr ``cache_policy``.
+
+    The Var form is *consumed* here — it must not survive onto the synthesised
+    call or onto either function. Param indices are a carrier with a deliberately
+    short life: they stay valid only until ConvertTensorToTileOps (pass 10) turns
+    them into per-``tile.load`` ``cache`` kwargs, because passes after that both
+    append to param lists (InjectGMPipeBuffer, MaterializeDistTensorCtx) and
+    prepend onto them (MaterializeValidShapeSymbols).
+
+    The two rejections below are author errors rather than compiler bugs — a
+    declaration naming a tensor the scope never reads, and a bypassing read of
+    bytes the same kernel writes — so they surface as ``ValueError`` from
+    ``CHECK_SPAN``, not as an internal error.
+    """
+
+    @staticmethod
+    def _outline(program: ir.Program) -> ir.Program:
+        return passes.outline_incore_scopes()(passes.convert_to_ssa()(program))
+
+    @staticmethod
+    def _kernel(program: ir.Program, name: str) -> ir.Function:
+        func = program.get_function(name)
+        assert func is not None, f"outlined kernel '{name}' not found"
+        return func
+
+    def test_declaration_becomes_a_param_index_on_the_outlined_kernel(self):
+        """The declared Var is resolved to its slot in the outlined signature."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
+                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                    c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
+                    out = pl.assemble(out, c, [0, 0])
+                return out
+
+        mm = self._kernel(self._outline(Before), "mm")
+        # Capture order is a, b, out — so b's declaration lands at index 1,
+        # paired with CachePolicy.BYPASS's underlying int (the form the
+        # ``tile.load`` ``cache`` kwarg is registered with).
+        assert dict(mm.attrs)["cache_policy"] == [(1, int(pl.CachePolicy.BYPASS))]
+        assert mm.params[1].name_hint.startswith("b"), "index 1 must be the declared tensor's slot"
+
+    def test_scope_attr_is_consumed_by_outlining(self):
+        """The Var-keyed scope attr is translated, never propagated."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
+                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                    c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
+                    out = pl.assemble(out, c, [0, 0])
+                return out
+
+        After = self._outline(Before)
+
+        # Not on the synthesised dispatch: the declaration is a property of the
+        # callee's parameters, and nothing at the call site consumes it.
+        call = TestOutlineNoDepArgs._outlined_user_call(After)
+        assert "cache_policy_vars" not in call.attrs
+        assert "cache_policy" not in call.attrs
+        # Not on the orchestrator either — only the outlined kernel carries it.
+        main = self._kernel(After, "main")
+        assert "cache_policy_vars" not in dict(main.attrs)
+        assert "cache_policy" not in dict(main.attrs)
+        # And the Var form is gone from the kernel: indices replaced it.
+        assert "cache_policy_vars" not in dict(self._kernel(After, "mm").attrs)
+
+    def test_declarations_are_recorded_in_param_index_order(self):
+        """Declaration order is irrelevant; the attr is sorted by param index.
+
+        The declaration set is order-independent, so two spellings that differ
+        only in the order the author wrote them must produce structurally equal
+        IR (and identical dumps).
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
+                    # Written b-then-a; a is captured first, so the attr must
+                    # come back a-then-b.
+                    pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+                    pl.set_cache_policy(a, pl.CachePolicy.BYPASS)
+                    c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
+                    out = pl.assemble(out, c, [0, 0])
+                return out
+
+        mm = self._kernel(self._outline(Before), "mm")
+        bypass = int(pl.CachePolicy.BYPASS)
+        assert dict(mm.attrs)["cache_policy"] == [(0, bypass), (1, bypass)]
+
+    def test_default_policy_is_allowed_on_a_written_tensor(self):
+        """Only BYPASS carries the no-concurrent-write promise, so only BYPASS
+        is restricted to ``In`` params. DEFAULT states nothing and is legal
+        anywhere the tensor is captured."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
+                    pl.set_cache_policy(out, pl.CachePolicy.DEFAULT)
+                    c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
+                    out = pl.assemble(out, c, [0, 0])
+                return out
+
+        mm = self._kernel(self._outline(Before), "mm")
+        assert dict(mm.attrs)["cache_policy"] == [(2, int(pl.CachePolicy.DEFAULT))]
+
+    def test_declaration_on_an_uncaptured_tensor_is_rejected(self):
+        """A tensor the scope body never reads has no parameter to resolve to."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                w: pl.Tensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    pl.set_cache_policy(w, pl.CachePolicy.BYPASS)
+                    y: pl.Tensor[[64], pl.FP32] = pl.add(x, x)
+                return y
+
+        with pytest.raises(ValueError, match="not captured by the scope body"):
+            self._outline(Before)
+
+    def test_bypass_on_an_out_param_is_rejected(self):
+        """BYPASS promises nothing writes those bytes while the kernel runs; a
+        tensor the scope itself writes breaks that promise by construction."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                b: pl.Tensor[[128, 256], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 256], pl.FP32]],
+            ) -> pl.Tensor[[256, 256], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
+                    pl.set_cache_policy(out, pl.CachePolicy.BYPASS)
+                    c: pl.Tensor[[256, 256], pl.FP32] = pl.matmul(a, b, out_dtype=pl.FP32)
+                    out = pl.assemble(out, c, [0, 0])
+                return out
+
+        with pytest.raises(ValueError, match=r"not allowed on a tensor this scope writes \(Out\)"):
+            self._outline(Before)
+
+    def test_bypass_on_an_inout_param_is_rejected(self):
+        """Same rejection for a captured tensor that is both read and updated."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64, 64], pl.FP32],
+                k: pl.Tensor[[64, 64], pl.FP32],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="kk"):
+                    pl.set_cache_policy(k, pl.CachePolicy.BYPASS)
+                    t: pl.Tensor[[64, 64], pl.FP32] = pl.add(k, x)
+                    k = pl.assemble(k, t, [0, 0])
+                return k
+
+        with pytest.raises(ValueError, match=r"not allowed on a tensor this scope writes \(InOut\)"):
+            self._outline(Before)
+
+
+class TestOutlineScopeInControlFlow:
+    """A scope inside a loop or an ``if`` must not leak its store-target rename.
+
+    Outlining a scope that writes a captured tensor binds the call result to a
+    *fresh* SSA name. When the scope sits inside a control-flow body that name is
+    bound inside the body, so anything after the statement that still resolves the
+    store target to it reads a Var that is out of scope. ``ScopeOutliner`` threads
+    the rename out as a real carry instead: the value on entry seeds an
+    ``IterArg``, the body yields the fresh Var, and a new ``return_var`` is what
+    the following statements see.
+
+    Nothing miscompiled before the fix — every SSA version of an orchestration
+    tensor denotes the same GM buffer — so these tests assert on the *def-use
+    graph*: SSAForm and UseAfterDef, plus the shape of the resulting carry.
+    """
+
+    @staticmethod
+    def _outline(program) -> ir.Program:
+        return passes.outline_incore_scopes()(passes.convert_to_ssa()(program))
+
+    @staticmethod
+    def _structural_errors(program: ir.Program) -> list[str]:
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.SSAForm)
+        props.insert(passes.IRProperty.UseAfterDef)
+        return [
+            d.message
+            for d in passes.PropertyVerifierRegistry.verify(props, program)
+            if d.severity == passes.DiagnosticSeverity.Error
+        ]
+
+    @staticmethod
+    def _stmts(node) -> list[ir.Stmt]:
+        body = node.body
+        assert isinstance(body, ir.SeqStmts), f"expected a SeqStmts body, got {type(body).__name__}"
+        return list(body.stmts)
+
+    @staticmethod
+    def _loop(stmt: ir.Stmt) -> ir.ForStmt:
+        assert isinstance(stmt, ir.ForStmt), f"expected a ForStmt, got {type(stmt).__name__}"
+        return stmt
+
+    @staticmethod
+    def _name(expr) -> str:
+        assert isinstance(expr, ir.Var), f"expected a Var, got {type(expr).__name__}"
+        return expr.name_hint
+
+    @classmethod
+    def _bound_name(cls, stmt: ir.Stmt) -> str:
+        assert isinstance(stmt, ir.AssignStmt), f"expected an AssignStmt, got {type(stmt).__name__}"
+        return stmt.var.name_hint
+
+    @classmethod
+    def _call_args(cls, stmt: ir.Stmt) -> list:
+        assert isinstance(stmt, ir.AssignStmt), f"expected an AssignStmt, got {type(stmt).__name__}"
+        value = stmt.value
+        assert isinstance(value, ir.Call), f"expected a Call value, got {type(value).__name__}"
+        return list(value.args)
+
+    def test_loop_local_store_target_stays_local(self):
+        """A tensor created in the loop body is not a carry of that loop."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                for i in pl.range(4):
+                    scratch = pl.create_tensor([256, 128], pl.FP32)
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [0, 0], scratch)
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t2 = pl.load(scratch, [0, 0], [64, 128])
+                        pl.store(t2, [i * 64, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        loop = self._loop(stmts[0])
+        # `scratch` is recreated on every iteration. Only caller-owned `out`
+        # crosses the loop boundary.
+        assert len(loop.iter_args) == 1
+        assert len(loop.return_vars) == 1
+        assert loop.iter_args[0].name_hint.startswith("out")
+
+        body = self._stmts(loop)
+        scratch_after_store = self._bound_name(body[1])
+        assert any(
+            isinstance(arg, ir.Var) and arg.name_hint == scratch_after_store
+            for arg in self._call_args(body[2])
+        )
+        ret = stmts[1]
+        assert isinstance(ret, ir.ReturnStmt)
+        assert self._name(ret.value[0]) == loop.return_vars[0].name_hint
+
+    def test_child_loop_return_var_is_local_to_parent_branch(self):
+        """A child loop result used as a store target is local to its parent branch."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[64, 128], pl.FP32],
+                flag: pl.Scalar[pl.INT32],
+                out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                if flag > 0:
+                    scratch = pl.create_tensor([64, 128], pl.FP32)
+                    for _j, (scratch_iter,) in pl.range(1, init_values=(scratch,)):
+                        scratch_rv = pl.yield_(scratch_iter)
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t = pl.load(a, [0, 0], [64, 128])
+                        pl.store(t, [0, 0], scratch_rv)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        if_stmt = self._stmts(After.get_function("main"))[0]
+        assert isinstance(if_stmt, ir.IfStmt), f"expected an IfStmt, got {type(if_stmt).__name__}"
+        assert not if_stmt.return_vars
+        assert isinstance(if_stmt.then_body, ir.SeqStmts)
+        inner = self._loop(list(if_stmt.then_body.stmts)[1])
+        assert len(inner.iter_args) == 1
+        assert len(inner.return_vars) == 1
+
+    def test_loop_writer_read_after_the_loop_is_threaded_as_a_carry(self):
+        """The canonical shape: written by an in-loop scope, read by a later one."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                for i in pl.range(4):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [i * 64, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        loop = self._loop(stmts[1])
+        # The loop carried nothing before; it now carries `scratch` alone.
+        assert len(loop.iter_args) == 1
+        assert len(loop.return_vars) == 1
+        assert self._name(loop.iter_args[0].initValue) == self._bound_name(stmts[0])
+        # ...and the consumer after the loop reads the return var, not a body-local.
+        assert self._name(self._call_args(stmts[2])[0]) == loop.return_vars[0].name_hint
+
+    def test_loop_writer_read_by_the_return_stmt_is_threaded_as_a_carry(self):
+        """The other consumer route: a plain post-loop reference."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                for i in pl.range(4):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [i * 64, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        loop = self._loop(stmts[0])
+        assert len(loop.iter_args) == 1
+        ret = stmts[1]
+        assert isinstance(ret, ir.ReturnStmt)
+        assert self._name(ret.value[0]) == loop.return_vars[0].name_hint
+
+    def test_carry_is_appended_after_an_existing_one(self):
+        """An existing carry keeps its slot; the store target is appended after it.
+
+        Also the ``manual_dep`` / ``deps=`` shape from the dependency guide: the
+        TaskId array is what puts the loop in SSA mode, so before the fix this
+        was the variant ``UseAfterDef`` could see.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32, manual_dep=True)
+                writers = pl.array.create(4, pl.TASK_ID)
+                for i in pl.range(4):
+                    with pl.at(level=pl.Level.CORE_GROUP) as tid:
+                        t = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [i * 64, 0], scratch)
+                    writers[i] = tid
+                with pl.at(level=pl.Level.CORE_GROUP, deps=[writers]):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        loop = self._loop(self._stmts(After.get_function("main"))[2])
+        # `writers` was already carried; `scratch` is appended after it.
+        assert len(loop.iter_args) == 2
+        assert len(loop.return_vars) == 2
+        assert loop.iter_args[0].name_hint.startswith("writers")
+        assert loop.iter_args[1].name_hint.startswith("scratch")
+        # The submit inside the body now reads the carry, not the pre-loop value.
+        assert loop.iter_args[1].name_hint in python_print(loop.body)
+
+    def test_nested_loops_thread_the_carry_out_of_both(self):
+        """An inner-loop carry re-emerges as the outer loop's carry."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                for i in pl.range(2):
+                    for j in pl.range(2):
+                        with pl.at(level=pl.Level.CORE_GROUP):
+                            t = pl.load(a, [(i * 2 + j) * 64, 0], [64, 128])
+                            pl.store(pl.mul(t, 2.0), [(i * 2 + j) * 64, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        outer = self._loop(stmts[1])
+        inner = self._loop(self._stmts(outer)[0])
+        assert len(outer.iter_args) == 1
+        assert len(inner.iter_args) == 1
+        # The inner carry is seeded from the outer one, which is seeded from the
+        # tensor as it was before either loop.
+        assert self._name(inner.iter_args[0].initValue) == outer.iter_args[0].name_hint
+        assert self._name(outer.iter_args[0].initValue) == self._bound_name(stmts[0])
+
+    def test_two_sibling_scopes_in_one_loop_share_one_carry(self):
+        """N scopes writing the same target in one body still add a single slot."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                for i in pl.range(2):
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t0 = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t0, 2.0), [i * 64, 0], scratch)
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t1 = pl.load(a, [i * 64, 0], [64, 128])
+                        pl.store(pl.mul(t1, 3.0), [i * 64, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        loop = self._loop(self._stmts(After.get_function("main"))[1])
+        assert len(loop.iter_args) == 1
+        assert len(loop.return_vars) == 1
+
+    def test_if_branch_writer_yields_and_the_else_yields_the_incoming_value(self):
+        """A conditional write must not escape its branch.
+
+        Worse than the loop case before the fix: the fresh Var existed only on the
+        taken path, yet the read after the ``if`` was unconditional.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                flag: pl.Scalar[pl.INT32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                if flag > 0:
+                    with pl.at(level=pl.Level.CORE_GROUP):
+                        t = pl.load(a, [0, 0], [64, 128])
+                        pl.store(pl.mul(t, 2.0), [0, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        if_stmt = stmts[1]
+        assert isinstance(if_stmt, ir.IfStmt), f"expected an IfStmt, got {type(if_stmt).__name__}"
+        assert len(if_stmt.return_vars) == 1
+        # The source had no `else`; one is synthesised so the untaken path still
+        # produces a value — the tensor as it was before the `if`.
+        else_body = if_stmt.else_body
+        assert else_body is not None
+        assert self._bound_name(stmts[0]) in python_print(else_body)
+        assert self._name(self._call_args(stmts[2])[0]) == if_stmt.return_vars[0].name_hint
+
+    def test_scope_outside_control_flow_is_unchanged(self):
+        """The top-level case must keep resolving to the plain renamed Var."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[256, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[256, 128], pl.FP32]],
+            ) -> pl.Tensor[[256, 128], pl.FP32]:
+                scratch = pl.create_tensor([256, 128], pl.FP32)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t = pl.load(a, [0, 0], [64, 128])
+                    pl.store(pl.mul(t, 2.0), [0, 0], scratch)
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    t2 = pl.load(scratch, [0, 0], [64, 128])
+                    pl.store(t2, [0, 0], out)
+                return out
+
+        After = self._outline(Before)
+        assert not self._structural_errors(After)
+
+        stmts = self._stmts(After.get_function("main"))
+        assert self._name(self._call_args(stmts[2])[0]) == self._bound_name(stmts[1])
 
 
 if __name__ == "__main__":

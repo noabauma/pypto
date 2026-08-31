@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -267,6 +268,13 @@ class LoweringBuilder {
     return var;
   }
 
+  /// Append a side-effecting expression without manufacturing an unused SSA
+  /// result. This is used by destination-passing ops whose output buffers are
+  /// explicit operands.
+  void EmitEval(const ExprPtr& expr, const Span& span) {
+    stmts_.push_back(std::make_shared<EvalStmt>(expr, span));
+  }
+
   // Primitive op builders -- type deduction is delegated to OpRegistry so the
   // result preserves the input TileType's shape/layout/dtype.
   ExprPtr Muls(const ExprPtr& x, float c, const Span& span) {
@@ -322,6 +330,10 @@ class LoweringBuilder {
   //      output.
   ExprPtr NotEq(const ExprPtr& left, const ExprPtr& right, const Span& span) {
     return MakeNe(left, right, span);
+  }
+
+  ExprPtr Gt(const ExprPtr& left, const ExprPtr& right, const Span& span) {
+    return MakeGt(left, right, span);
   }
 
   // ---- Collective-op helpers (DRY extraction for barrier/broadcast/allgather/
@@ -822,6 +834,167 @@ ExprPtr LowerCosRule(const CallPtr& call, const std::vector<ExprPtr>& args, Lowe
 }
 
 // ============================================================================
+// ``tile.tquant_mx`` lowering — grouped TQUANT + exponent X-to-ZZ.
+//
+// Public group_axis=1 is the A-side [M,K] path. group_axis=0 is the B-side
+// [N,K] path: transpose to [K,N] first, then PTOAS axis0. Axis0 X-to-ZZ follows
+// pto-isa TMovDnTo2Zz (pin be5ccb76): DN [M̂,N] -> ZZ [N,M̂] row/row, then a
+// zero-copy tile.transpose_view yields the public [M̂,N] col/col scale. Same-
+// InCore mix with matmul_mx is not supported yet; stage through GM between AIV
+// and AIC (follow-up).
+ExprPtr LowerTileTQuantMxRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
+  const auto& span = call->span_;
+  auto& reg = OpRegistry::GetInstance();
+  auto src = args[0];
+  const int group_axis = call->GetKwarg<int>("group_axis");
+  INTERNAL_CHECK_SPAN(group_axis == 0 || group_axis == 1, span)
+      << "Internal error: tile.tquant_mx group_axis must be 0 or 1";
+  const bool packed_b = group_axis == 0;
+
+  if (packed_b) {
+    auto axis0 = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+    auto axis1 = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+    src = b.Bind("tq_src_kn", reg.Create("tile.transpose", {src, axis0, axis1}, {}, span), span);
+  }
+
+  auto src_tile = As<TileType>(src->GetType());
+  INTERNAL_CHECK_SPAN(src_tile && src_tile->shape_.size() == 2, span)
+      << "Internal error: tile.tquant_mx lowering requires a 2D source tile";
+  auto rows_const = As<ConstInt>(src_tile->shape_[0]);
+  auto cols_const = As<ConstInt>(src_tile->shape_[1]);
+  // PTOAS special requirement: TQUANT/X2ZZ need static physical+valid extents so
+  // EmitStaticValidTileView can emit a concrete treshape result type (not v_*=?).
+  INTERNAL_CHECK_SPAN(rows_const && cols_const, span)
+      << "Internal error: tile.tquant_mx lowering requires static source shapes";
+  const int64_t rows = rows_const->value_;
+  const int64_t cols = cols_const->value_;
+  // Positive dims / group-axis divisibility already enforced by DeduceTileTQuantMxType;
+  // re-check before `/ 32` so a broken invariant cannot silently truncate.
+  INTERNAL_CHECK_SPAN(rows > 0 && cols > 0, span)
+      << "Internal error: tile.tquant_mx lowering requires positive source dimensions";
+  INTERNAL_CHECK_SPAN((group_axis == 1 && cols % 32 == 0) || (group_axis == 0 && rows % 32 == 0), span)
+      << "Internal error: tile.tquant_mx source is not divisible by its group axis";
+  const int64_t group_rows = group_axis == 0 ? rows / 32 : rows;
+  const int64_t group_cols = group_axis == 0 ? cols : cols / 32;
+  INTERNAL_CHECK_SPAN(group_rows <= std::numeric_limits<int64_t>::max() / group_cols, span)
+      << "Internal error: tile.tquant_mx scale-group count overflows int64";
+  const int64_t groups = group_rows * group_cols;
+
+  auto make_dim = [&](int64_t value) { return std::make_shared<ConstInt>(value, DataType::INDEX, span); };
+  auto make_shape = [&](int64_t dim0, int64_t dim1) {
+    return std::make_shared<MakeTuple>(std::vector<ExprPtr>{make_dim(dim0), make_dim(dim1)}, span);
+  };
+  auto bind_typed_create = [&](const std::string& name, int64_t physical_rows, int64_t physical_cols,
+                               int64_t valid_rows, int64_t valid_cols, DataType dtype, TileLayout slayout,
+                               int64_t fractal = 512, TileLayout blayout = TileLayout::row_major) {
+    auto shape = make_shape(physical_rows, physical_cols);
+    std::vector<std::pair<std::string, std::any>> create_kwargs = {{"dtype", dtype},
+                                                                   {"target_memory", MemorySpace::Vec}};
+    auto created = As<Call>(reg.Create("tile.create", {shape}, create_kwargs, span));
+    INTERNAL_CHECK_SPAN(created, span) << "Internal error: tile.create did not produce a Call";
+    TileView view;
+    view.valid_shape = {make_dim(valid_rows), make_dim(valid_cols)};
+    view.blayout = blayout;
+    view.slayout = slayout;
+    view.fractal = fractal;
+    auto type =
+        std::make_shared<TileType>(std::vector<ExprPtr>{make_dim(physical_rows), make_dim(physical_cols)},
+                                   dtype, std::nullopt, view, MemorySpace::Vec);
+    auto typed_create =
+        std::make_shared<Call>(created->op_, created->args_, created->kwargs_, created->attrs_, type, span);
+    return b.Bind(name, typed_create, span);
+  };
+
+  // Axis1 uses the legacy-flat exponent branch so FP32, FP16, and BF16 all
+  // remain supported by the pinned PTO-ISA. Axis0 uses canonical [M/32,N].
+  const int64_t aux_rows = group_axis == 0 ? group_rows : 1;
+  const int64_t aux_cols = group_axis == 0 ? group_cols : groups;
+  auto max_tile = bind_typed_create("tq_max", aux_rows, aux_cols, aux_rows, aux_cols, src_tile->dtype_,
+                                    TileLayout::none_box);
+
+  int64_t scaling_physical_cols = aux_cols;
+  if (group_axis == 1) {
+    // PTOAS grouped-TQUANT scratch sizing and FP32 unroll thresholds.
+    constexpr int64_t kFp32ScaleAlignment = 64;
+    constexpr int64_t kFp16ScaleAlignment = 128;
+    constexpr int64_t kFp32UnrollMinElements = 1024;
+    constexpr int64_t kFp32UnrollMultiple = 256;
+    const int64_t align = src_tile->dtype_ == DataType::FP32 ? kFp32ScaleAlignment : kFp16ScaleAlignment;
+    int64_t scale_elements = groups;
+    INTERNAL_CHECK_SPAN(rows <= std::numeric_limits<int64_t>::max() / cols, span)
+        << "Internal error: tile.tquant_mx source element count overflows int64";
+    const int64_t source_elements = rows * cols;
+    const bool unroll = src_tile->dtype_ == DataType::FP32 && source_elements > kFp32UnrollMinElements &&
+                        source_elements % kFp32UnrollMultiple == 0;
+    INTERNAL_CHECK_SPAN(!unroll || scale_elements <= std::numeric_limits<int64_t>::max() / 2, span)
+        << "Internal error: tile.tquant_mx unrolled scale scratch size overflows int64";
+    if (unroll) scale_elements *= 2;
+    INTERNAL_CHECK_SPAN(scale_elements <= std::numeric_limits<int64_t>::max() - (align - 1), span)
+        << "Internal error: tile.tquant_mx aligned scale scratch size overflows int64";
+    scaling_physical_cols = (scale_elements + align - 1) / align * align;
+  }
+  auto scaling_tile = bind_typed_create("tq_scaling", aux_rows, scaling_physical_cols, aux_rows, aux_cols,
+                                        src_tile->dtype_, TileLayout::none_box);
+
+  auto public_types = As<TupleType>(call->GetType());
+  INTERNAL_CHECK_SPAN(public_types && public_types->types_.size() == 2, span)
+      << "Internal error: tile.tquant_mx must return exactly two tile types";
+  auto public_dst_type = As<TileType>(public_types->types_[0]);
+  INTERNAL_CHECK_SPAN(public_dst_type && public_dst_type->dtype_ == DataType::FP8E4M3FN, span)
+      << "Internal error: tile.tquant_mx public destination must be FP8E4M3FN";
+
+  // Value-returning TQUANT (gather_compare-style): Bind the TupleType result,
+  // then project dst/exp so InitMemRef + ResolveTupleResultElements see real
+  // TupleGetItem consumers. max/scaling remain write-only workspace inputs.
+  DataType dtype = call->GetKwarg<DataType>("dtype", DataType::FP8E4M3FN);
+  auto raw_tuple = b.Bind("tq_raw",
+                          reg.Create("tile.tquant_mx_raw", {src, max_tile, scaling_tile},
+                                     {{"dtype", dtype}, {"group_axis", group_axis}}, span),
+                          span);
+  auto raw_dst = b.Bind("tq_dst", std::make_shared<TupleGetItemExpr>(raw_tuple, 0, span), span);
+  auto raw_exp = b.Bind("tq_exp", std::make_shared<TupleGetItemExpr>(raw_tuple, 1, span), span);
+
+  // MXFP8 uses PTOAS's raw INT8 destination and exposes a zero-copy FP8 alias.
+  ExprPtr dst_tile =
+      b.Bind("tq_quant",
+             reg.Create("tile.reinterpret_view", {raw_dst}, {{"dtype", DataType::FP8E4M3FN}}, span), span);
+
+  // Axis1 X-to-ZZ tmp: 64 + ceil(rows/16)*cols bytes. Axis0 (TMovDnTo2Zz): ISA
+  // still requires a Vec tmp operand; use one 32-byte Vec pad unit.
+  constexpr int64_t kVecByteAlign = 32;
+  int64_t tmp_bytes = kVecByteAlign;
+  if (group_axis == 1) {
+    INTERNAL_CHECK_SPAN(group_rows <= std::numeric_limits<int64_t>::max() - 15, span)
+        << "Internal error: tile.tquant_mx padded exponent rows overflow int64";
+    const int64_t row_blocks = (group_rows + 15) / 16;
+    INTERNAL_CHECK_SPAN(row_blocks <= (std::numeric_limits<int64_t>::max() - 64) / group_cols, span)
+        << "Internal error: tile.tquant_mx exponent temporary size overflows int64";
+    tmp_bytes = 64 + row_blocks * group_cols;
+  }
+  INTERNAL_CHECK_SPAN(tmp_bytes <= std::numeric_limits<int64_t>::max() - (kVecByteAlign - 1), span)
+      << "Internal error: tile.tquant_mx aligned exponent temporary size overflows int64";
+  const int64_t tmp_physical_bytes = (tmp_bytes + kVecByteAlign - 1) / kVecByteAlign * kVecByteAlign;
+  auto x2zz_tmp = bind_typed_create("tq_x2zz_tmp", 1, tmp_physical_bytes, 1, tmp_physical_bytes,
+                                    DataType::UINT8, TileLayout::none_box);
+  // Value-returning X-to-ZZ: InitMemRef allocates ZZ dst from the deduced type.
+  // Axis1 needs dst_rows/dst_cols because TQUANT exp is legacy-flat [1,M*G].
+  std::vector<std::pair<std::string, std::any>> x2zz_kwargs = {{"group_axis", group_axis}};
+  if (group_axis == 1) {
+    x2zz_kwargs.emplace_back("dst_rows", static_cast<int>(group_rows));
+    x2zz_kwargs.emplace_back("dst_cols", static_cast<int>(group_cols));
+  }
+  auto zz_exp =
+      b.Bind("tq_exp_zz", reg.Create("tile.tmov_x2zz", {raw_exp, x2zz_tmp}, x2zz_kwargs, span), span);
+  ExprPtr exp_tile = b.Bind(
+      "tq_scale", reg.Create("tile.reinterpret_view", {zz_exp}, {{"dtype", DataType::FP8E8M0}}, span), span);
+  if (group_axis == 0) {
+    // ZZ [N,M̂] row/row <-> public MX_B [M̂,N] col/col over the same bytes.
+    exp_tile = b.Bind("tq_scale_nn", reg.Create("tile.transpose_view", {exp_tile}, {}, span), span);
+  }
+  return std::make_shared<MakeTuple>(std::vector<ExprPtr>{dst_tile, exp_tile}, span);
+}
+
+// ============================================================================
 // ``pld.tensor.allreduce`` lowering rule
 //
 // In-place all-reduce of a window-bound DistributedTensor across every rank
@@ -1269,6 +1442,18 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
   auto ring_target = b.Bind(
       "target_2d", CreateAllReduceTargetView(target, flat_shape, flat_valid_shape, partial_valid_shape, span),
       span);
+  // VEC staging tile for the TPUT push path (mirrors the allgather / all_to_all
+  // host-builtin recipe).  pto-isa TPUT streams the transfer through this tile,
+  // clamping the last chunk to the transfer extent, and the single-shot path
+  // reads exactly the tile's valid mask — so each pld.tile.put below narrows it
+  // to the subchunk's valid_cols via tile.set_validshape (the same mechanism as
+  // the host builtin's ColMaskInternal).  The stage is shared across all ring
+  // pushes; it is mutable per-use kernel state.
+  auto put_stage =
+      b.Bind("ring_put_stage",
+             reg.Create("tile.create", {chunk_shape},
+                        {{"dtype", target_type->dtype_}, {"target_memory", MemorySpace::Vec}}, span),
+             span);
   // Value-producing IfExpr branches must agree on a fixed TileType. For an
   // inactive logical segment, read one in-bounds element and pad it to the
   // physical chunk shape. Using tile.create here would survive the default
@@ -1291,23 +1476,6 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
   auto segment_end = [&](const ExprPtr& segment_idx) {
     return segment_boundary(MakeAdd(segment_idx, one_idx, span));
   };
-  std::vector<std::pair<std::string, std::any>> remote_load_kwargs;
-  if (target_type->dtype_ == DataType::FP16) {
-    remote_load_kwargs.emplace_back("allow_physical_tail_padding", true);
-  }
-  auto remote_valid_cols = [&](const ExprPtr& logical_valid_cols) {
-    if (target_type->dtype_ != DataType::FP16) return logical_valid_cols;
-    return MakeMul(MakeFloorDiv(MakeAdd(logical_valid_cols, alignment_minus_one_idx, span),
-                                alignment_elements_idx, span),
-                   alignment_elements_idx, span);
-  };
-  auto restore_remote_valid_shape = [&](LoweringBuilder& body, const ExprPtr& loaded,
-                                        const ExprPtr& logical_valid_cols,
-                                        const std::string& name) -> ExprPtr {
-    if (target_type->dtype_ != DataType::FP16) return loaded;
-    return body.Bind(name, reg.Create("tile.set_validshape", {loaded, one_idx, logical_valid_cols}, {}, span),
-                     span);
-  };
   auto emit_barrier = [&](LoweringBuilder& body, const ExprPtr& round, const ExprPtr& expected,
                           const std::string& suffix) {
     body.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, round, NotifyOp::kAtomicAdd, one_i32, suffix,
@@ -1319,78 +1487,172 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
   auto nr_minus_one = b.Bind("nr_minus_one", MakeSub(comm.nranks_idx, one_idx, span), span);
 
   // ------------------------------------------------------------------
-  // Phase 1: Reduce-Scatter — P−1 ring steps
+  // Phase 1: Reduce-Scatter — P−1 ring steps (TPUT push + local reduce)
   // ------------------------------------------------------------------
+  //
+  // Push-model schedule (non-atomic TPUT + local reduce — preserves
+  // Sum/Max/Min/Prod; the ReduceOp trade-off is an explicit design choice,
+  // NOT a silent Sum-only regression):
+  //
+  //   * recv_idx = (my_rank − step − 1 + NR) % NR is the chunk this rank
+  //     receives from the left neighbour; send_idx = (my_rank − step + NR) % NR
+  //     is the chunk this rank pushes to the right neighbour.
+  //   * Each rank first reads its OWN value of slot recv_idx into a register
+  //     tile (the slot is stable — own value only — until the left neighbour's
+  //     push lands).
+  //   * Ready barrier (generation 2k+1): all ranks' own-value reads are done
+  //     and no push has landed — this is what makes the own-read race-free.
+  //   * Each rank then TPUTs (pld.tile.put, AtomicType::kNone) its current
+  //     partial of slot send_idx into the RIGHT neighbour's slot of the same
+  //     index.  The transfer extent is the exact (possibly ragged) valid_cols;
+  //     the staging tile is narrowed to it via tile.set_validshape so the TPUT
+  //     single-shot path reads exactly the transfer width (PTOAS >= v0.55
+  //     accepts dynamic partition-view shapes — issue #1069).
+  //   * Push-done barrier (generation 2k+2): all pushes have landed.
+  //   * Each rank reads its own slot recv_idx again (now holding the left
+  //     neighbour's partial), reduces it with the saved own value, and stores
+  //     the result back.  The push is a plain copy into the receiver's own
+  //     window — no remote read, so the only cross-rank visibility needed is
+  //     the TPUT→notify ordering the credit-barrier protocol provides
+  //     (pld.tile.put codegen emits pipe_barrier(PIPE_ALL) around the TPUT and
+  //     the comm-fence pass orders it ahead of the notify).
   b.EmitFor(
       "rs_step", zero_idx, nr_minus_one, one_idx,
       [&](LoweringBuilder& body, const VarPtr& rs_step_var) {
         auto step = body.Bind("step", MakeAdd(rs_step_var, one_idx, span), span);
 
-        // recv_add_idx = (my_rank − step − 1 + NR) % NR
+        // recv_idx = (my_rank − step − 1 + NR) % NR
         auto r1 = MakeSub(my_rank_idx, step, span);
         auto r2 = MakeSub(r1, one_idx, span);
         auto r3 = MakeAdd(r2, comm.nranks_idx, span);
-        // recv_add_idx and send_idx are the same chunk index in this
-        // reduce-scatter formulation — bind once and reuse.
-        auto recv_add_idx = body.Bind("recv_add_idx", MakeFloorMod(r3, comm.nranks_idx, span), span);
-        const auto& send_idx = recv_add_idx;
+        auto recv_idx = body.Bind("recv_idx", MakeFloorMod(r3, comm.nranks_idx, span), span);
 
-        // left = (my_rank − 1 + NR) % NR
-        auto l1 = MakeSub(my_rank_idx, one_idx, span);
-        auto l2 = MakeAdd(l1, comm.nranks_idx, span);
-        auto left_peer = body.Bind("left", MakeFloorMod(l2, comm.nranks_idx, span), span);
+        // send_idx = (my_rank − step + NR) % NR — one chunk ahead of recv_idx.
+        auto s1 = MakeSub(my_rank_idx, step, span);
+        auto s2 = MakeAdd(s1, comm.nranks_idx, span);
+        auto send_idx = body.Bind("send_idx", MakeFloorMod(s2, comm.nranks_idx, span), span);
 
-        auto segment_offset = body.Bind("rs_segment_begin", segment_begin(send_idx), span);
-        auto segment_limit = body.Bind("rs_segment_end", segment_end(send_idx), span);
-        auto segment_cols = body.Bind("rs_segment_cols", MakeSub(segment_limit, segment_offset, span), span);
+        // right = (my_rank + 1) % NR — the push destination.
+        auto rr1 = MakeAdd(my_rank_idx, one_idx, span);
+        auto right_peer = body.Bind("right", MakeFloorMod(rr1, comm.nranks_idx, span), span);
+
+        auto recv_segment_offset = body.Bind("rs_recv_segment_begin", segment_begin(recv_idx), span);
+        auto recv_segment_limit = body.Bind("rs_recv_segment_end", segment_end(recv_idx), span);
+        auto recv_segment_cols =
+            body.Bind("rs_recv_segment_cols", MakeSub(recv_segment_limit, recv_segment_offset, span), span);
+
+        auto send_segment_offset = body.Bind("rs_send_segment_begin", segment_begin(send_idx), span);
+        auto send_segment_limit = body.Bind("rs_send_segment_end", segment_end(send_idx), span);
+        auto send_segment_cols =
+            body.Bind("rs_send_segment_cols", MakeSub(send_segment_limit, send_segment_offset, span), span);
 
         body.EmitFor(
             "rs_col", zero_idx, max_segment_cols, chunk_cols,
             [&](LoweringBuilder& chunk_body, const VarPtr& subcol) {
-              auto active = MakeLt(subcol, segment_cols, span);
-              auto remaining = MakeSub(segment_cols, subcol, span);
-              auto valid_cols = MakeMin(chunk_cols, remaining, span);
+              // Receive-side extent (own-value read, pushed-partial read,
+              // reduce, store all operate on slot recv_idx).
+              auto recv_active = MakeLt(subcol, recv_segment_cols, span);
+              auto recv_remaining = MakeSub(recv_segment_cols, subcol, span);
+              auto recv_valid_cols = MakeMin(chunk_cols, recv_remaining, span);
               // Keep the value-producing IfExpr branch metadata identical.
               // Inactive ranks use one safe element, while active ranks retain
               // the exact logical tail extent.
-              auto load_valid_cols = MakeMax(one_idx, valid_cols, span);
+              auto load_valid_cols = MakeMax(one_idx, recv_valid_cols, span);
               auto load_valid_shape = tile_conversion_utils::MakeShapeTuple({one_idx, load_valid_cols}, span);
-              auto remote_load_valid_shape =
-                  tile_conversion_utils::MakeShapeTuple({one_idx, remote_valid_cols(load_valid_cols)}, span);
-              auto offsets = tile_conversion_utils::MakeShapeTuple(
-                  {zero_idx, MakeAdd(segment_offset, subcol, span)}, span);
+              auto recv_offsets = tile_conversion_utils::MakeShapeTuple(
+                  {zero_idx, MakeAdd(recv_segment_offset, subcol, span)}, span);
+
+              // Send-side extent (TPUT source = slot send_idx).
+              auto send_active = MakeLt(subcol, send_segment_cols, span);
+              auto send_remaining = MakeSub(send_segment_cols, subcol, span);
+              auto send_valid_cols = MakeMin(chunk_cols, send_remaining, span);
+              auto send_valid_shape = tile_conversion_utils::MakeShapeTuple({one_idx, send_valid_cols}, span);
+              auto send_offsets = tile_conversion_utils::MakeShapeTuple(
+                  {zero_idx, MakeAdd(send_segment_offset, subcol, span)}, span);
 
               auto chunk_id = MakeFloorDiv(subcol, chunk_cols, span);
+
+              // ---- Own-value read: BEFORE the ready barrier, so no push has
+              // landed in slot recv_idx yet (the slot is stable — own value).
+              auto acc_own = chunk_body.EmitIfExpr(
+                  recv_active,
+                  [&](LoweringBuilder& then_body) {
+                    auto acc_loaded = then_body.Bind(
+                        "acc_rs_own_loaded",
+                        reg.Create("tile.load", {ring_target, recv_offsets, chunk_shape, load_valid_shape},
+                                   {{"target_memory", MemorySpace::Vec}}, span),
+                        span);
+                    return then_body.Bind("acc_rs_own",
+                                          reg.Create("tile.fillpad_inplace", {acc_loaded},
+                                                     {{"pad_value", PadValue::zero}}, span),
+                                          span);
+                  },
+                  [&](LoweringBuilder& else_body) {
+                    auto placeholder_loaded = else_body.Bind(
+                        "acc_rs_own_placeholder_loaded",
+                        reg.Create("tile.load",
+                                   {ring_target, placeholder_offsets, chunk_shape, load_valid_shape},
+                                   {{"target_memory", MemorySpace::Vec}}, span),
+                        span);
+                    return else_body.Bind("acc_rs_own_placeholder",
+                                          reg.Create("tile.fillpad_inplace", {placeholder_loaded},
+                                                     {{"pad_value", PadValue::zero}}, span),
+                                          span);
+                  },
+                  span);
+
+              // ---- Ready barrier: all ranks' own-value reads are done; no
+              // push can land before this barrier completes.
               auto ready_epoch_idx = MakeAdd(MakeMul(chunk_id, two_idx, span), one_idx, span);
               auto ready_epoch = chunk_body.Bind(
                   "rs_ready_epoch", std::make_shared<ir::Cast>(ready_epoch_idx, DataType::INT32, span), span);
               emit_barrier(chunk_body, rs_step_var, ready_epoch, "_rs_ready");
 
+              // ---- Push phase: TPUT slot send_idx into the right neighbour's
+              // slot of the same index (plain copy; the receiver reduces
+              // locally after the push-done barrier).  The staging tile is
+              // narrowed to the transfer width so the TPUT single-shot path
+              // reads exactly send_valid_cols.
+              chunk_body.EmitIf(
+                  send_active,
+                  [&](LoweringBuilder& push_body) {
+                    auto rs_stage_valid = push_body.Bind(
+                        "rs_stage_valid",
+                        reg.Create("tile.set_validshape", {put_stage, one_idx, send_valid_cols}, {}, span),
+                        span);
+                    push_body.Bind("push_rs",
+                                   reg.Create("pld.tile.put",
+                                              {ring_target, right_peer, ring_target, rs_stage_valid,
+                                               send_offsets, send_offsets, send_valid_shape},
+                                              {{"atomic", static_cast<int>(AtomicType::kNone)}}, span),
+                                   span);
+                  },
+                  /*else_fn=*/nullptr, span);
+
+              // ---- Push-done barrier: all pushes have landed — slot recv_idx
+              // now holds the left neighbour's partial.
+              auto read_epoch_idx = MakeAdd(ready_epoch_idx, one_idx, span);
+              auto read_epoch = chunk_body.Bind(
+                  "rs_read_epoch", std::make_shared<ir::Cast>(read_epoch_idx, DataType::INT32, span), span);
+              emit_barrier(chunk_body, rs_step_var, read_epoch, "_rs_read");
+
+              // ---- Local reduce + store: read the pushed partial (own slot
+              // recv_idx, now = left's partial), combine with the saved own
+              // value, store back.
               auto acc_full = chunk_body.EmitIfExpr(
-                  active,
+                  recv_active,
                   [&](LoweringBuilder& then_body) {
                     auto recv_loaded = then_body.Bind(
                         "recv_rs_loaded",
-                        reg.Create("pld.tile.remote_load",
-                                   {ring_target, left_peer, offsets, chunk_shape, remote_load_valid_shape},
-                                   remote_load_kwargs, span),
-                        span);
-                    auto recv_tail =
-                        restore_remote_valid_shape(then_body, recv_loaded, load_valid_cols, "recv_rs_tail");
-                    auto recv = then_body.Bind("recv_rs",
-                                               reg.Create("tile.fillpad_inplace", {recv_tail},
-                                                          {{"pad_value", PadValue::zero}}, span),
-                                               span);
-                    auto acc_loaded = then_body.Bind(
-                        "acc_rs_loaded",
-                        reg.Create("tile.load", {ring_target, offsets, chunk_shape, load_valid_shape},
+                        reg.Create("tile.load", {ring_target, recv_offsets, chunk_shape, load_valid_shape},
                                    {{"target_memory", MemorySpace::Vec}}, span),
                         span);
-                    auto acc = then_body.Bind("acc_rs",
-                                              reg.Create("tile.fillpad_inplace", {acc_loaded},
-                                                         {{"pad_value", PadValue::zero}}, span),
-                                              span);
-                    return then_body.Bind("acc_rs_next", then_body.Reduce(reduce_op, acc, recv, span), span);
+                    auto recv = then_body.Bind("recv_rs",
+                                               reg.Create("tile.fillpad_inplace", {recv_loaded},
+                                                          {{"pad_value", PadValue::zero}}, span),
+                                               span);
+                    return then_body.Bind("acc_rs_next", then_body.Reduce(reduce_op, acc_own, recv, span),
+                                          span);
                   },
                   [&](LoweringBuilder& else_body) {
                     auto placeholder_loaded = else_body.Bind(
@@ -1406,22 +1668,17 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
                   },
                   span);
 
-              auto read_epoch_idx = MakeAdd(ready_epoch_idx, one_idx, span);
-              auto read_epoch = chunk_body.Bind(
-                  "rs_read_epoch", std::make_shared<ir::Cast>(read_epoch_idx, DataType::INT32, span), span);
-              emit_barrier(chunk_body, rs_step_var, read_epoch, "_rs_read");
-
               chunk_body.EmitIf(
-                  active,
+                  recv_active,
                   [&](LoweringBuilder& store_body) {
                     // Encode the active-branch bounds in the store operands so
                     // valid-region inference can prove this write stays inside
                     // the flattened logical extent without relying on control
                     // flow predicates.
-                    auto raw_store_col = MakeAdd(segment_offset, subcol, span);
+                    auto raw_store_col = MakeAdd(recv_segment_offset, subcol, span);
                     auto store_col = MakeSub(
                         size_expr, MakeMax(zero_idx, MakeSub(size_expr, raw_store_col, span), span), span);
-                    auto raw_store_end = MakeAdd(store_col, valid_cols, span);
+                    auto raw_store_end = MakeAdd(store_col, recv_valid_cols, span);
                     auto store_end = MakeSub(
                         size_expr, MakeMax(zero_idx, MakeSub(size_expr, raw_store_end, span), span), span);
                     auto store_valid_cols = MakeSub(store_end, store_col, span);
@@ -1441,27 +1698,40 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
       span);
 
   // ------------------------------------------------------------------
-  // Phase 2: AllGather — P−1 ring steps
+  // Phase 2: AllGather — P−1 ring steps (TPUT push, non-atomic copy)
   // ------------------------------------------------------------------
+  //
+  // Each rank TPUTs its finalized chunk send_idx = (my_rank − step + 1 + NR)
+  // % NR into the RIGHT neighbour's slot of the same index — a plain copy,
+  // since the chunk value is already fully reduced.  The receiver does
+  // nothing locally; the push performs the store.  The transfer extent is the
+  // exact (possibly ragged) valid_cols with the staging tile narrowed to it
+  // (PTOAS >= v0.55 dynamic partition-view shapes).  The ready barrier
+  // (generation 2k+1) guarantees the slot being forwarded holds valid data —
+  // not because the counters carry credit across rounds (each round uses its
+  // own signal row, so row k starts at zero), but because every rank must pass
+  // the previous round's push-done barrier before it enters round k.  The
+  // push-done barrier (generation 2k+2) then guarantees the copy is visible
+  // before any rank reads it at the next step.
   b.EmitFor(
       "ag_step", zero_idx, nr_minus_one, one_idx,
       [&](LoweringBuilder& body, const VarPtr& ag_step_var) {
         auto step = body.Bind("ag_step_val", MakeAdd(ag_step_var, one_idx, span), span);
         auto ag_round = body.Bind("ag_round", MakeAdd(ag_step_var, nr_minus_one, span), span);
 
+        // send_idx = (my_rank − step + 1 + NR) % NR — the fully-reduced chunk
+        // this rank forwards to the right neighbour.
         auto r1 = MakeSub(my_rank_idx, step, span);
-        auto r2 = MakeAdd(r1, comm.nranks_idx, span);
-        auto segment_idx = body.Bind("ag_segment_idx", MakeFloorMod(r2, comm.nranks_idx, span), span);
+        auto r2 = MakeAdd(r1, one_idx, span);
+        auto r3 = MakeAdd(r2, comm.nranks_idx, span);
+        auto send_idx = body.Bind("ag_send_idx", MakeFloorMod(r3, comm.nranks_idx, span), span);
 
-        // left = (my_rank - 1 + NR) % NR is the peer that already owns this
-        // step's segment.
-        auto l1 = MakeSub(my_rank_idx, one_idx, span);
-        auto l2 = MakeAdd(l1, comm.nranks_idx, span);
-        auto left_val = MakeFloorMod(l2, comm.nranks_idx, span);
-        auto left_peer = body.Bind("ag_left", left_val, span);
+        // right = (my_rank + 1) % NR — the push destination.
+        auto rr1 = MakeAdd(my_rank_idx, one_idx, span);
+        auto right_peer = body.Bind("ag_right", MakeFloorMod(rr1, comm.nranks_idx, span), span);
 
-        auto segment_offset = body.Bind("ag_segment_begin", segment_begin(segment_idx), span);
-        auto segment_limit = body.Bind("ag_segment_end", segment_end(segment_idx), span);
+        auto segment_offset = body.Bind("ag_segment_begin", segment_begin(send_idx), span);
+        auto segment_limit = body.Bind("ag_segment_end", segment_end(send_idx), span);
         auto segment_cols = body.Bind("ag_segment_cols", MakeSub(segment_limit, segment_offset, span), span);
 
         body.EmitFor(
@@ -1470,77 +1740,47 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
               auto active = MakeLt(subcol, segment_cols, span);
               auto remaining = MakeSub(segment_cols, subcol, span);
               auto valid_cols = MakeMin(chunk_cols, remaining, span);
-              auto load_valid_cols = MakeMax(one_idx, valid_cols, span);
-              auto load_valid_shape = tile_conversion_utils::MakeShapeTuple({one_idx, load_valid_cols}, span);
-              auto remote_load_valid_shape =
-                  tile_conversion_utils::MakeShapeTuple({one_idx, remote_valid_cols(load_valid_cols)}, span);
+              auto valid_shape = tile_conversion_utils::MakeShapeTuple({one_idx, valid_cols}, span);
               auto offsets = tile_conversion_utils::MakeShapeTuple(
                   {zero_idx, MakeAdd(segment_offset, subcol, span)}, span);
 
               auto chunk_id = MakeFloorDiv(subcol, chunk_cols, span);
+
+              // ---- Ready barrier: every rank passes the previous round's
+              // push-done barrier before entering this round, so the round-k-1
+              // push into the slot being forwarded has landed and is visible —
+              // the slot holds valid data.  (Counters are per-round: row k
+              // starts at zero and carries no credit from row k-1.)
               auto ready_epoch_idx = MakeAdd(MakeMul(chunk_id, two_idx, span), one_idx, span);
               auto ready_epoch = chunk_body.Bind(
                   "ag_ready_epoch", std::make_shared<ir::Cast>(ready_epoch_idx, DataType::INT32, span), span);
               emit_barrier(chunk_body, ag_round, ready_epoch, "_ag_ready");
 
-              auto recv_full = chunk_body.EmitIfExpr(
+              // ---- Push phase: TPUT slot send_idx into the right neighbour's
+              // slot of the same index (plain copy).  The staging tile is
+              // narrowed to the transfer width so the TPUT single-shot path
+              // reads exactly valid_cols.
+              chunk_body.EmitIf(
                   active,
-                  [&](LoweringBuilder& then_body) {
-                    auto recv_loaded = then_body.Bind(
-                        "recv_ag_loaded",
-                        reg.Create("pld.tile.remote_load",
-                                   {ring_target, left_peer, offsets, chunk_shape, remote_load_valid_shape},
-                                   remote_load_kwargs, span),
-                        span);
-                    auto recv_tail =
-                        restore_remote_valid_shape(then_body, recv_loaded, load_valid_cols, "recv_ag_tail");
-                    return then_body.Bind("recv_ag",
-                                          reg.Create("tile.fillpad_inplace", {recv_tail},
-                                                     {{"pad_value", PadValue::zero}}, span),
-                                          span);
+                  [&](LoweringBuilder& push_body) {
+                    auto ag_stage_valid = push_body.Bind(
+                        "ag_stage_valid",
+                        reg.Create("tile.set_validshape", {put_stage, one_idx, valid_cols}, {}, span), span);
+                    push_body.Bind("push_ag",
+                                   reg.Create("pld.tile.put",
+                                              {ring_target, right_peer, ring_target, ag_stage_valid, offsets,
+                                               offsets, valid_shape},
+                                              {{"atomic", static_cast<int>(AtomicType::kNone)}}, span),
+                                   span);
                   },
-                  [&](LoweringBuilder& else_body) {
-                    auto placeholder_loaded = else_body.Bind(
-                        "recv_ag_placeholder_loaded",
-                        reg.Create("tile.load",
-                                   {ring_target, placeholder_offsets, chunk_shape, load_valid_shape},
-                                   {{"target_memory", MemorySpace::Vec}}, span),
-                        span);
-                    return else_body.Bind("recv_ag_placeholder",
-                                          reg.Create("tile.fillpad_inplace", {placeholder_loaded},
-                                                     {{"pad_value", PadValue::zero}}, span),
-                                          span);
-                  },
-                  span);
+                  /*else_fn=*/nullptr, span);
 
+              // ---- Push-done barrier: all pushes have landed — every rank's
+              // forwarded slot is visible before the next step reads it.
               auto read_epoch_idx = MakeAdd(ready_epoch_idx, one_idx, span);
               auto read_epoch = chunk_body.Bind(
                   "ag_read_epoch", std::make_shared<ir::Cast>(read_epoch_idx, DataType::INT32, span), span);
               emit_barrier(chunk_body, ag_round, read_epoch, "_ag_read");
-
-              chunk_body.EmitIf(
-                  active,
-                  [&](LoweringBuilder& store_body) {
-                    // See the reduce-scatter store above: these clamped
-                    // expressions are no-ops for active chunks and make both
-                    // the offset and far edge statically bounded by size_expr.
-                    auto raw_store_col = MakeAdd(segment_offset, subcol, span);
-                    auto store_col = MakeSub(
-                        size_expr, MakeMax(zero_idx, MakeSub(size_expr, raw_store_col, span), span), span);
-                    auto raw_store_end = MakeAdd(store_col, valid_cols, span);
-                    auto store_end = MakeSub(
-                        size_expr, MakeMax(zero_idx, MakeSub(size_expr, raw_store_end, span), span), span);
-                    auto store_valid_cols = MakeSub(store_end, store_col, span);
-                    auto store_offsets = tile_conversion_utils::MakeShapeTuple({zero_idx, store_col}, span);
-                    auto narrowed = store_body.Bind(
-                        "recv_ag_valid",
-                        reg.Create("tile.set_validshape", {recv_full, one_idx, store_valid_cols}, {}, span),
-                        span);
-                    store_body.Bind(
-                        "store_ag",
-                        reg.Create("tile.store", {narrowed, store_offsets, ring_target}, {}, span), span);
-                  },
-                  /*else_fn=*/nullptr, span);
             },
             span);
       },
@@ -1995,25 +2235,24 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
 // send_counts, recv_counts) extends the symmetric all_to_all's
 // window-as-result pattern: the intrinsic returns target, and the caller
 // reads back from the window with tile.load.  During the push phase each
-// rank also publishes the *clamped* ``min(send_counts[dest], MAX_RECV)``
+// rank also publishes the *clamped* ``clamp(send_counts[dest], 0, MAX_RECV)``
 // into peer ``dest``'s ``recv_counts[my_rank, 0]`` via ``pld.system.notify``
 // (Set) — MPI_Alltoallv recvcounts — so after the barrier the receiver knows
-// how many of the physically-transferred rows at the tail of each source's
-// MAX_RECV slot are logically valid. Notify writes a scalar INT32 cell (same
-// path as the barrier signal), so ``recv_counts`` stays ``[NR, 1]`` and no
-// post-convert ``tensor.create`` scratch is needed (ConvertTensorToTileOps
-// already ran before this pass).
+// which rows of each source's MAX_RECV slot are logically valid. Notify
+// writes a scalar INT32 cell (same path as the barrier signal), so
+// ``recv_counts`` stays ``[NR, 1]`` and no post-convert ``tensor.create``
+// scratch is needed (ConvertTensorToTileOps already ran before this pass).
 //
 // 2-phase push-based decomposition:
 //
 //   Phase 1 (push):
 //     For each dest ∈ [0, NR):
-//       rows = min(send_counts[dest], MAX_RECV)        // runtime scalar read
+//       rows = clamp(send_counts[dest], 0, MAX_RECV)   // runtime scalar read
 //       notify(recv_counts, dest, [my_rank, 0], rows, Set)  // clamped count
-//       // Single pld.tile.put per destination: contiguous [MAX_RECV, SIZE]
-//       // block at input[dest*MAX_RECV, :] → target[my_rank*MAX_RECV, :].
-//       // Transfer shape is static [MAX_RECV, SIZE] (PTOAS requires static
-//       // partition-view dims for pto.comm.tput).  A [1, SIZE] staging tile
+//       // Single pld.tile.put per destination: contiguous [rows, SIZE] block
+//       // at input[dest*MAX_RECV, :] → target[my_rank*MAX_RECV, :]. The
+//       // transfer shape is the runtime [rows, SIZE] (PTOAS accepts dynamic
+//       // partition-view dims on pto.comm.tput).  A [1, SIZE] staging tile
 //       // feeds the TPUT engine, which 2-D-slides the transfer through it.
 //
 //   Phase 2: self-clearing credit barrier
@@ -2021,16 +2260,16 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
 //     EmitEpilogueReset(-1) — subtracts the credit back to zero after the call
 //
 // MAX_RECV = target.shape[0] / NR (both must be compile-time constants) is
-// both the per-peer *capacity* and the fixed transfer size: it fixes the flat
-// row-index arithmetic (dest*MAX_RECV+r) so a receiver can locate each
-// sender's block without knowing that sender's count, and it sizes every
-// pld.tile.put identically regardless of the runtime count.  Counts are
-// clamped to MAX_RECV so an out-of-range count cannot push past peer dest's
-// capacity slice.  Rows beyond a sender's actual count still physically cross
-// the wire, but are logically invalid — the receiver uses recv_counts[src]
-// (already clamped to MAX_RECV at publish time) to know how many leading rows
-// of source src's block to use, the same MPI_Alltoallv semantics applied to
-// the logical result rather than the wire transfer.
+// the per-peer *capacity*: it fixes the flat row-index arithmetic
+// (dest*MAX_RECV+r) so a receiver can locate each sender's block without
+// knowing that sender's count.  Counts are clamped to [0, MAX_RECV] so an
+// out-of-range (or negative) count cannot push past peer dest's capacity
+// slice or produce a negative extent.  The transfer moves exactly
+// clamp(send_counts[dest], 0, MAX_RECV) rows per destination — rows beyond
+// the runtime count never cross the wire, and the receiver uses
+// recv_counts[src] (the same clamped value, published at push time) to know
+// how many leading rows of source src's block are valid, the same
+// MPI_Alltoallv semantics applied to the logical result.
 // ============================================================================
 
 ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>& args, LoweringBuilder& b) {
@@ -2094,14 +2333,15 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
   auto max_recv_expr = std::make_shared<ConstInt>(max_recv_value, DataType::INDEX, span);
 
   // Per-destination staging tile: static [1, SIZE] — pto-isa auto-chunks the
-  // transfer through it.  The Transfer shape is static [MAX_RECV, SIZE]
-  // (PTOAS requires static partition-view dims for pto.comm.tput).
+  // transfer through it. The stage stays static (UB is allocated statically)
+  // even though the transfer extent is dynamic.
   auto stage_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{one_idx, size_expr}, span);
 
   // ---- Phase 1: push per-destination blocks to peer windows ----
   // One shared [1, SIZE] VEC staging tile reused across all destinations;
-  // a single pld.tile.put per destination transfers the full [MAX_RECV, SIZE]
-  // capacity per peer (static partition-view size, required by PTOAS).
+  // a single pld.tile.put per destination transfers [rows, SIZE], where rows is
+  // the runtime send count clamped to [0, MAX_RECV] — so only the payload
+  // crosses the wire, not the full capacity block.
   // Flat row-index arithmetic:
   // source[dest*MAX_RECV, :] → target[my_rank*MAX_RECV, :].
   auto put_stage =
@@ -2130,39 +2370,62 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
                       reg.Create("tensor.read",
                                  {send_counts, std::make_shared<MakeTuple>(count_indices, span)}, {}, span),
                       span);
-        auto rows = body.Bind(
-            "aav_rows", MakeMin(MakeCast(count_value, DataType::INDEX, span), max_recv_expr, span), span);
+        // Clamped on BOTH sides: above by MAX_RECV (a larger count would push
+        // into the next destination's slice of the peer window) and below by 0.
+        // The lower clamp matters because ``rows`` now sizes the transfer: a
+        // negative ``send_counts`` would otherwise yield a negative extent. The
+        // HOST builtin kernel applies the identical two-sided clamp, so the two
+        // rails stay bit-for-bit identical on the wire for every input,
+        // including negative counts.
+        auto rows =
+            body.Bind("aav_rows",
+                      MakeMax(MakeMin(MakeCast(count_value, DataType::INDEX, span), max_recv_expr, span),
+                              zero_idx, span),
+                      span);
 
         // Publish the *clamped* transfer count into peer dest's
         // recv_counts[my_rank, 0] via TNOTIFY Set — same scalar-cell path as
         // the barrier signal, including self (peer offset is 0 for self).
-        // The TPUT transfers the full MAX_RECV capacity; the published
-        // clamped value tells the receiver how many rows are valid.
+        // Emitted UNCONDITIONALLY, outside the rows > 0 guard below: a
+        // destination receiving zero rows still needs recv_counts = 0 published,
+        // or it would read a stale count from a previous invocation.
         auto count_i32 = body.Bind("aav_count_i32", MakeCast(rows, DataType::INT32, span), span);
         body.Bind("aav_count_notify",
                   reg.Create("pld.system.notify", {recv_counts, dest_var, my_recv_offsets, count_i32},
                              {{"op", static_cast<int>(NotifyOp::kSet)}}, span),
                   span);
 
-        // Single pld.tile.put per destination transferring the full
-        // [MAX_RECV, SIZE] capacity (static — required by PTOAS).
-        // The [1, SIZE] VEC staging tile feeds the TPUT engine, which
-        // 2-D-slides the larger transfer through it.
+        // Single pld.tile.put per destination transferring exactly the rows
+        // being sent. The [1, SIZE] VEC staging tile feeds the TPUT engine,
+        // which 2-D-slides the larger transfer through it.
         // 2D source offsets: input[dest * MAX_RECV, :]
         auto src_offsets = std::make_shared<MakeTuple>(
             std::vector<ExprPtr>{dest_base, std::make_shared<ConstInt>(0, DataType::INDEX, span)}, span);
         // 2D target offsets: target[my_rank * MAX_RECV, :]
         auto dst_offsets = std::make_shared<MakeTuple>(
             std::vector<ExprPtr>{my_base, std::make_shared<ConstInt>(0, DataType::INDEX, span)}, span);
-        // Static transfer shape: [MAX_RECV, SIZE] — required by PTOAS
-        // (pto.comm.tput partition-view dims must be static).
-        auto transfer_shape =
-            std::make_shared<MakeTuple>(std::vector<ExprPtr>{max_recv_expr, size_expr}, span);
-        body.Bind("aav_put",
+        // Dynamic transfer shape: [rows, SIZE] — only the rows actually being
+        // sent cross the interconnect, instead of the full MAX_RECV capacity.
+        // PTOAS accepts dynamic partition-view dims on pto.comm.tput
+        // (TPutOp::verify passes CommGlobalShapePolicy::AllowDynamicPartitionView),
+        // and pld.tile.put needs no chunk_rows attr: it takes an explicit
+        // [1, SIZE] staging tile, and ValidateStageFitsTransfer skips dynamic
+        // dims because the runtime extent bounds them.
+        auto transfer_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{rows, size_expr}, span);
+        // Skip the push entirely for a destination getting no rows — a
+        // zero-extent transfer has no defined TPUT behaviour. The count TNOTIFY
+        // above stays outside this guard on purpose.
+        body.EmitIf(
+            body.Gt(rows, zero_idx, span),
+            [&](LoweringBuilder& then_body) {
+              then_body.Bind(
+                  "aav_put",
                   reg.Create("pld.tile.put",
                              {target, dest_var, input, put_stage, dst_offsets, src_offsets, transfer_shape},
                              {{"atomic", static_cast<int>(AtomicType::kNone)}}, span),
                   span);
+            },
+            /*else_fn=*/nullptr, span);
       },
       span);
 
@@ -2195,10 +2458,10 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
 // total credit count it issued so the signal returns to all-zero after the
 // call.
 //
-// Today the rules are ``tile.sin`` / ``tile.cos`` and ``pld.tensor.*``
-// distributed collectives. Host-level allreduce is skipped here and lowered
-// later by LowerHostTensorCollectives. The pass is idempotent provided each
-// rule emits only ops not listed here.
+// Today the rules are ``tile.sin`` / ``tile.cos``, ``tile.tquant_mx``, and
+// ``pld.tensor.*`` distributed collectives. Host-level allreduce is skipped here
+// and lowered later by LowerHostTensorCollectives. The pass is idempotent
+// provided each rule emits only ops not listed here.
 //
 // When the table grows past a handful of entries — or a rule wants its own
 // translation unit — promote this back to a standalone registry under
@@ -2208,6 +2471,9 @@ CompositeLoweringFn LookupCompositeRule(const std::string& op_name) {
   static const std::unordered_map<std::string, CompositeLoweringFn> kRules = {
       {"tile.sin", &LowerSinRule},
       {"tile.cos", &LowerCosRule},
+      // tile.tquant_mx → tile.tquant_mx_raw + tile.tmov_x2zz (value-returning SSA).
+      // Scratch tiles are created with MemorySpace::Vec before InferTileMemorySpace.
+      {"tile.tquant_mx", &LowerTileTQuantMxRule},
       {"pld.tensor.allreduce", &LowerTensorAllReduceRule},
       {"pld.tensor.allgather", &LowerTensorAllGatherRule},
       {"pld.tensor.reduce_scatter", &LowerTensorReduceScatterRule},
@@ -2238,10 +2504,40 @@ class LowerCompositeOpsMutator : public IRMutator {
   explicit LowerCompositeOpsMutator(bool skip_host_collectives = false)
       : skip_host_collectives_(skip_host_collectives) {}
 
+  ExprPtr VisitExpr_(const TupleGetItemExprPtr& op) override {
+    auto tuple = VisitExpr(op->tuple_);
+    // Prefer composite-produced MakeTuples recorded privately — do not rely on
+    // global var_remap_ for arbitrary `v = (a, b)` assignments.
+    if (auto values = ResolveCompositeTuple(tuple)) {
+      INTERNAL_CHECK_SPAN(op->index_ >= 0 && static_cast<size_t>(op->index_) < values->elements_.size(),
+                          op->span_)
+          << "Tuple index out of range: " << op->index_;
+      return values->elements_[static_cast<size_t>(op->index_)];
+    }
+    if (tuple.get() != op->tuple_.get()) {
+      return std::make_shared<TupleGetItemExpr>(tuple, op->index_, op->span_);
+    }
+    return IRMutator::VisitExpr_(op);
+  }
+
   StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
     auto call = As<Call>(op->value_);
     if (!call) {
-      return IRMutator::VisitStmt_(op);
+      auto visited = IRMutator::VisitStmt_(op);
+      auto assign = As<AssignStmt>(visited);
+      // Propagate aliases of composite-produced tuples (e.g. alias = pair).
+      // Prefer composite_tuples_; if VisitExpr already expanded the RHS to a
+      // MakeTuple via var_remap_, also seed var_remap_ for the alias Var so
+      // later projections and ConvertToSSA see a concrete tuple.
+      if (assign) {
+        if (auto mt = ResolveCompositeTuple(assign->value_)) {
+          composite_tuples_[op->var_.get()] = mt;
+          if (As<MakeTuple>(assign->value_)) {
+            var_remap_[op->var_.get()] = assign->value_;
+          }
+        }
+      }
+      return visited;
     }
     CompositeLoweringFn rule = LookupRule(call);
     if (!rule) {
@@ -2254,6 +2550,13 @@ class LowerCompositeOpsMutator : public IRMutator {
 
     LoweringBuilder builder(op->var_->name_hint_, temp_counter_);
     ExprPtr result = rule(call, visited_args, builder);
+    if (auto mt = As<MakeTuple>(result)) {
+      // Record privately for TupleGetItem folding, and also seed var_remap_ so
+      // SSA aliases (`alias = pair`) expand through VisitExpr_(Var) without
+      // needing a global "any MakeTuple" remap.
+      composite_tuples_[op->var_.get()] = mt;
+      var_remap_[op->var_.get()] = result;
+    }
 
     auto stmts = builder.TakeStmts();
     // Bind the final result to the original target Var (preserves uses
@@ -2372,8 +2675,22 @@ class LowerCompositeOpsMutator : public IRMutator {
     return out;
   }
 
+  /// Resolve an expression to a MakeTuple produced by this pass (including
+  /// aliases recorded in composite_tuples_). Returns nullptr if not found.
+  MakeTuplePtr ResolveCompositeTuple(const ExprPtr& expr) const {
+    if (auto mt = As<MakeTuple>(expr)) return mt;
+    if (auto var = AsVarLike(expr)) {
+      auto it = composite_tuples_.find(var.get());
+      if (it != composite_tuples_.end()) return it->second;
+    }
+    return nullptr;
+  }
+
   std::size_t temp_counter_ = 0;
   bool skip_host_collectives_{false};
+  /// MakeTuples produced by composite lowering rules (and their SSA aliases).
+  /// Used only to fold TupleGetItem projections; does not affect global var_remap_.
+  std::unordered_map<const Expr*, MakeTuplePtr> composite_tuples_;
 };
 
 FunctionPtr TransformLowerCompositeOps(const FunctionPtr& func) {

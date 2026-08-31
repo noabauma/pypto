@@ -11,6 +11,7 @@
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,7 +26,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
-#include "pypto/ir/tile_view_semantics.h"
+#include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
@@ -41,8 +42,14 @@ TypePtr DeduceUnknownType(const std::vector<ExprPtr>& args,
 }
 
 // Read the required "split" int attr shared by the split-axis reshape ops
-// (reuses the tpush/tpop encoding: 0 = NONE/no split axis, 1 = UP_DOWN/axis0,
-// 2 = LEFT_RIGHT/axis1).
+// (0 = NONE/no split axis, 1 = UP_DOWN/axis0, 2 = LEFT_RIGHT/axis1).
+//
+// These two ops carry the AUTHORED MODE, not the pto-isa split code: the odd
+// codes (kSplitUpDownOdd / kSplitLeftRightOdd, see include/pypto/ir/stmt.h)
+// describe how the two lanes' RUNTIME extents relate, which is a property of
+// the transport rather than of the author's choice of axis. ExpandMixedKernel
+// derives the code from this mode plus the boundary tile's extents when it
+// mints the tpush / tpop pair (split_axis::ShardSplitCode).
 //
 // 0 is the task-parallel (``mode=pl.SplitMode.NONE``) region: both AIV lanes run
 // the full body, so there is no axis to halve — the op still marks the AIC/AIV
@@ -60,10 +67,33 @@ int ReadSplitAttr(const std::vector<std::pair<std::string, std::any>>& kwargs, c
       << op_name << " requires a 'split' attr (0 = NONE/no split axis, 1 = UP_DOWN/axis0, "
       << "2 = LEFT_RIGHT/axis1)";
   const int split = *split_opt;
-  CHECK_SPAN(split == 0 || split == 1 || split == 2, span)
+  CHECK_SPAN(split == kSplitNone || split == kSplitUpDown || split == kSplitLeftRight, span)
       << op_name << " split must be 0 (NONE/no split axis), 1 (UP_DOWN/axis0) or 2 (LEFT_RIGHT/axis1), "
       << "but got " << split;
   return split;
+}
+
+// The optional "lane_stride" attr: how far apart the two AIV lanes' data sits on
+// the split axis. Absent (the common case) means the default box partition,
+// where the stride is the tile's own physical half. LowerAutoVectorSplit stamps
+// it when it rebalances a ragged boundary across the lanes, and ExpandMixedKernel
+// reads it back to pick the transport's pto-isa split code — so it is the
+// compiler's own bookkeeping, never something an author writes.
+void CheckLaneStrideAttr(const std::vector<std::pair<std::string, std::any>>& kwargs,
+                         const ExprPtr& split_axis_extent, const std::string& op_name, const Span& span) {
+  for (const auto& [key, value] : kwargs) {
+    if (key != "lane_stride") continue;
+    const int stride = AnyCast<int>(value, "kwarg key: lane_stride");
+    CHECK_SPAN(stride > 0, span) << op_name << ": 'lane_stride' must be a positive partition stride, but got "
+                                 << stride;
+    if (auto extent = As<ConstInt>(split_axis_extent)) {
+      const int64_t box_half = (extent->value_ + 1) / 2;
+      CHECK_SPAN(stride <= box_half, span)
+          << op_name << ": 'lane_stride' " << stride << " exceeds the per-lane physical half " << box_half
+          << " of a " << extent->value_ << "-wide split axis";
+    }
+    return;
+  }
 }
 
 // Shared split-axis reshape core for both the tile ops (tile.aiv_shard /
@@ -71,18 +101,21 @@ int ReadSplitAttr(const std::vector<std::pair<std::string, std::any>>& kwargs, c
 // Halves (shard, `halve` = true) or doubles (gather, `halve` = false) the
 // split-axis extent of `shape` and `valid`.
 //
-// Static (ConstInt) extents are halved/doubled directly; for the halving
-// direction a static split-axis extent must be even. Dynamic (non-ConstInt)
-// extents are reshaped symbolically (floordiv(dim, 2) on shard, dim * 2 on
-// gather) so the result type reflects the shard/gather along the split axis
-// rather than an identity reshape.
+// The physical half is the CEIL half, which is what makes an ODD split axis
+// representable: 2k+1 gives BOTH lanes a (k+1)-cell box, and the raggedness is
+// carried by the per-lane valid extent that LowerAutoVectorSplit materializes
+// once the lane index is in scope (lane 0 fills k+1, lane 1 fills k). That is
+// pto-isa's TILE_UP_DOWN_ODD / TILE_LEFT_RIGHT_ODD contract, which
+// ExpandMixedKernel selects when it mints the transport ops
+// (split_axis::ShardSplitCode). An even extent is unaffected: ceil(2k/2) == k.
 //
-// The even-extent requirement applies to the PHYSICAL split-axis extent only;
-// the per-lane valid_shape is reshaped with ceil-div on halve (floordiv(dim + 1,
-// 2), keeping valid <= physical) since the true per-lane valid region is
-// localized later at lowering time, which knows the subblock (lane) index. This
-// avoids rejecting an input whose physical extent is even but whose partial
-// valid_shape happens to be odd.
+// Dynamic (non-ConstInt) extents are reshaped symbolically (floordiv(dim, 2) on
+// shard, dim * 2 on gather) so the result type reflects the shard/gather along
+// the split axis rather than an identity reshape.
+//
+// The per-lane valid_shape is reshaped with ceil-div on halve (floordiv(dim + 1,
+// 2), keeping valid <= physical), since the true per-lane valid region is
+// localized later at lowering time.
 struct SplitReshaped {
   std::vector<ExprPtr> shape;
   std::vector<ExprPtr> valid;
@@ -91,16 +124,12 @@ struct SplitReshaped {
 SplitReshaped ReshapeSplitAxis(std::vector<ExprPtr> shape, std::vector<ExprPtr> valid, size_t axis,
                                bool halve, const std::string& op_name, const Span& span) {
   if (auto c = As<ConstInt>(shape[axis])) {
-    if (halve) {
-      CHECK_SPAN(c->value_ % 2 == 0, span)
-          << op_name << ": split-axis static extent " << c->value_ << " must be even to shard in half";
-      shape[axis] = std::make_shared<ConstInt>(c->value_ / 2, c->dtype(), shape[axis]->span_);
-    } else {
-      shape[axis] = std::make_shared<ConstInt>(c->value_ * 2, c->dtype(), shape[axis]->span_);
-    }
+    // Ceil half: exact for an even extent, lane 1's spare cell for an odd one.
+    const int64_t reshaped = halve ? (c->value_ + 1) / 2 : c->value_ * 2;
+    shape[axis] = std::make_shared<ConstInt>(reshaped, c->dtype(), shape[axis]->span_);
   } else {
-    // Dynamic split-axis extent: symbolic half / double. Per-lane evenness is
-    // resolved at lowering time, which knows the subblock index.
+    // Dynamic split-axis extent: symbolic half / double. The per-lane extents
+    // are resolved at lowering time, which knows the subblock index.
     auto two = std::make_shared<ConstInt>(2, GetScalarDtype(shape[axis]), shape[axis]->span_);
     shape[axis] = halve ? MakeFloorDiv(shape[axis], two, shape[axis]->span_)
                         : MakeMul(shape[axis], two, shape[axis]->span_);
@@ -179,7 +208,7 @@ SplitReshaped ReshapeSplitAxis(std::vector<ExprPtr> shape, std::vector<ExprPtr> 
 // compiler's own localized clamp and is left alone.
 //
 // Docs: docs/en/dev/codegen/00-pto_codegen.md,
-//       docs/en/dev/passes/20-lower_auto_vector_split.md
+//       docs/en/dev/passes/21-lower_auto_vector_split.md
 bool IsFullExtent(const ExprPtr& valid_dim, const ExprPtr& dim) {
   return ProveValidExtentEqual(valid_dim, dim) == ProofResult::kTrue;
 }
@@ -187,6 +216,134 @@ bool IsFullExtent(const ExprPtr& valid_dim, const ExprPtr& dim) {
 std::string DescribeExtent(const ExprPtr& valid_dim, const ExprPtr& dim) {
   return PythonPrint(valid_dim) + " of " + PythonPrint(dim);
 }
+
+// Deducer for the tile-level split-axis reshape ops tile.aiv_shard (full ->
+// half) and tile.aic_gather (half -> full). The single positional tile argument
+// is reshaped along the split axis selected by the "split" int attr.
+//
+// SHAPE-PRESERVING AT split=0. A task-parallel (``mode=pl.SplitMode.NONE``)
+// region has no split axis: both AIV lanes run the full body, so nothing is
+// halved and nothing is re-joined. There the op still means "this value crosses
+// the AIC/AIV boundary" — that is the whole of its meaning in manual mode — and
+// the crossing does not change the value's shape. So split=0 reshapes nothing
+// and the rank-2 requirement is dropped with it: rank 2 exists only to make
+// UP_DOWN / LEFT_RIGHT unambiguous, and neither applies.
+TypePtr DeduceSplitReshape(const std::vector<ExprPtr>& args,
+                           const std::vector<std::pair<std::string, std::any>>& kwargs,
+                           const std::string& op_name, bool halve) {
+  CHECK(args.size() == 1) << "The operator " << op_name << " requires exactly 1 tile argument, but got "
+                          << args.size();
+
+  auto tile_type = As<TileType>(args[0]->GetType());
+  CHECK(tile_type) << "The operator " << op_name << " requires argument to be a TileType, but got "
+                   << args[0]->GetType()->TypeName();
+
+  const int split = ReadSplitAttr(kwargs, op_name, args[0]->span_);
+  if (split == 0) {
+    // No split axis: preserve shape and valid_shape exactly. The type is still
+    // rebuilt (rather than returned as-is) so the boundary result keeps the same
+    // "fresh tile, no inherited layout / memref" shape the halving path produces
+    // — the memory space comes from set_output_memory, and the layout is
+    // re-attached downstream.
+    TileView no_split_view;
+    no_split_view.valid_shape = GetValidShape(tile_type);
+    // No split axis, but the column field is still pinned by the FIFO transport.
+    CheckSplitBoundaryCarriesValid(op_name, tile_type->shape_, no_split_view.valid_shape,
+                                   /*split_axis=*/-1, halve, args[0]->span_);
+    return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt,
+                                      std::move(no_split_view));
+  }
+
+  CHECK_SPAN(tile_type->shape_.size() == 2, args[0]->span_)
+      << op_name << " requires a 2D tile, but got rank " << tile_type->shape_.size();
+
+  const size_t axis = static_cast<size_t>(SplitAxisFromSplitCode(split));
+  CheckLaneStrideAttr(kwargs, tile_type->shape_[axis], op_name, args[0]->span_);
+  CheckSplitBoundaryCarriesValid(op_name, tile_type->shape_, GetValidShape(tile_type), static_cast<int>(axis),
+                                 halve, args[0]->span_);
+  auto reshaped =
+      ReshapeSplitAxis(tile_type->shape_, GetValidShape(tile_type), axis, halve, op_name, args[0]->span_);
+
+  // The result is a fresh per-lane (shard) / re-joined (gather) tile along the
+  // split axis. Only the halved/doubled valid_shape is carried; the source's
+  // explicit blayout/slayout is intentionally NOT inherited. Inheriting a
+  // non-implicit layout (e.g. an Acc operand's col_major) makes the result type
+  // diverge from the deduction fixpoint that downstream elementwise consumers
+  // (which re-derive layout from their inputs) and a print->parse round-trip
+  // reconstruct — the boundary's true memory layout is re-attached by the
+  // lowering pass (ReshapeTypeWithMemory) and normalized downstream.
+  TileView tile_view;
+  tile_view.valid_shape = std::move(reshaped.valid);
+  return std::make_shared<TileType>(std::move(reshaped.shape), tile_type->dtype_, std::nullopt,
+                                    std::move(tile_view));
+}
+
+// Tensor-level counterpart of DeduceSplitReshape for tensor.aiv_shard /
+// tensor.aic_gather — the @pl.jit / pl.spmd author-facing form, where producers
+// (pl.matmul, elementwise) return Tensor. Mirrors the tile deducer exactly but
+// over a TensorType, and enforces rank-2: UP_DOWN / LEFT_RIGHT are only
+// well-defined on the 2D physical tile view. An N-D tensor flattens to
+// [product(leading), last] (FlattenTileNdTo2D), so a pre-flatten row-axis split
+// would not match the contiguous half the lowering physically takes — reject
+// with a reshape hint rather than silently miscompiling.
+TypePtr DeduceSplitReshapeTensor(const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>& kwargs,
+                                 const std::string& op_name, bool halve) {
+  CHECK(args.size() == 1) << "The operator " << op_name << " requires exactly 1 tensor argument, but got "
+                          << args.size();
+
+  // Exact TensorType match: rejects TileType (the tile op's domain) AND
+  // DistributedTensorType (out of scope for AIV/AIC split).
+  auto tensor_type = As<TensorType>(args[0]->GetType());
+  CHECK(tensor_type) << "The operator " << op_name
+                     << " requires argument to be a (non-distributed) TensorType, but got "
+                     << args[0]->GetType()->TypeName();
+
+  const int split = ReadSplitAttr(kwargs, op_name, args[0]->span_);
+  if (split == 0) {
+    // Task-parallel (NONE) region: the op marks the crossing and preserves the
+    // shape (see DeduceSplitReshape). The operand's type is returned unchanged
+    // rather than rebuilt: a TensorType carries no memory space or tile layout
+    // to strip (which is why the tile deducer rebuilds and this one does not),
+    // and its view was already canonicalized at construction, so a rebuild
+    // would yield a structurally identical type.
+    return args[0]->GetType();
+  }
+
+  CHECK_SPAN(tensor_type->shape_.size() == 2, args[0]->span_)
+      << op_name << " requires a 2D tensor, but got rank " << tensor_type->shape_.size()
+      << ". Reshape the operand to 2D (pl.reshape) before the shard / gather so the "
+         "UP_DOWN / LEFT_RIGHT split axis is unambiguous.";
+
+  const size_t axis = static_cast<size_t>(SplitAxisFromSplitCode(split));
+
+  // Valid shape: TensorView::valid_shape if set, otherwise the static shape
+  // (mirrors GetValidShape for tiles).
+  std::vector<ExprPtr> valid = (tensor_type->tensor_view_ && !tensor_type->tensor_view_->valid_shape.empty())
+                                   ? tensor_type->tensor_view_->valid_shape
+                                   : tensor_type->shape_;
+  // Same boundary contract as the tile form this lowers to (pass 10), checked
+  // here so the diagnostic carries the author's own @pl.jit span.
+  CheckSplitBoundaryCarriesValid(op_name, tensor_type->shape_, valid, static_cast<int>(axis), halve,
+                                 args[0]->span_);
+  auto reshaped =
+      ReshapeSplitAxis(tensor_type->shape_, std::move(valid), axis, halve, op_name, args[0]->span_);
+
+  // Fresh per-lane (shard) / re-joined (gather) tensor along the split axis; only
+  // the halved/doubled valid_shape is carried (no layout inheritance — same
+  // rationale as the tile deducer). Memory space is a tile-level concept and is
+  // re-attached when ConvertTensorToTileOps lowers this to tile.aiv_shard.
+  //
+  // A redundant view needs no guard here: TensorType's constructor canonicalizes
+  // it away, clearing a valid_shape equal to the shape and then resetting the
+  // otherwise-default view to nullopt (CanonicalizeTensorViewInPlace). Same as
+  // the tile deducer above, which hands TileType an unconditional TileView.
+  TensorView tensor_view({}, TensorLayout::ND, std::move(reshaped.valid));
+  return std::make_shared<TensorType>(std::move(reshaped.shape), tensor_type->dtype_, std::nullopt,
+                                      std::make_optional(std::move(tensor_view)));
+}
+
+}  // namespace
 
 // `split_axis` is 0 (UP_DOWN), 1 (LEFT_RIGHT), or -1 for the shape-preserving
 // split=0 crossing, which has no split axis and therefore no per-lane extent.
@@ -274,138 +431,6 @@ void CheckSplitBoundaryCarriesValid(const std::string& op_name, const std::vecto
       << "    and store the full column box; the padded columns are don't-care.";
 }
 
-// Deducer for the tile-level split-axis reshape ops tile.aiv_shard (full ->
-// half) and tile.aic_gather (half -> full). The single positional tile argument
-// is reshaped along the split axis selected by the "split" int attr.
-//
-// SHAPE-PRESERVING AT split=0. A task-parallel (``mode=pl.SplitMode.NONE``)
-// region has no split axis: both AIV lanes run the full body, so nothing is
-// halved and nothing is re-joined. There the op still means "this value crosses
-// the AIC/AIV boundary" — that is the whole of its meaning in manual mode — and
-// the crossing does not change the value's shape. So split=0 reshapes nothing
-// and the rank-2 requirement is dropped with it: rank 2 exists only to make
-// UP_DOWN / LEFT_RIGHT unambiguous, and neither applies.
-TypePtr DeduceSplitReshape(const std::vector<ExprPtr>& args,
-                           const std::vector<std::pair<std::string, std::any>>& kwargs,
-                           const std::string& op_name, bool halve) {
-  CHECK(args.size() == 1) << "The operator " << op_name << " requires exactly 1 tile argument, but got "
-                          << args.size();
-
-  auto tile_type = As<TileType>(args[0]->GetType());
-  CHECK(tile_type) << "The operator " << op_name << " requires argument to be a TileType, but got "
-                   << args[0]->GetType()->TypeName();
-
-  const int split = ReadSplitAttr(kwargs, op_name, args[0]->span_);
-  if (split == 0) {
-    // No split axis: preserve shape and valid_shape exactly. The type is still
-    // rebuilt (rather than returned as-is) so the boundary result keeps the same
-    // "fresh tile, no inherited layout / memref" shape the halving path produces
-    // — the memory space comes from set_output_memory, and the layout is
-    // re-attached downstream.
-    TileView no_split_view;
-    no_split_view.valid_shape = GetValidShape(tile_type);
-    // No split axis, but the column field is still pinned by the FIFO transport.
-    CheckSplitBoundaryCarriesValid(op_name, tile_type->shape_, no_split_view.valid_shape,
-                                   /*split_axis=*/-1, halve, args[0]->span_);
-    return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt,
-                                      std::move(no_split_view));
-  }
-
-  CHECK_SPAN(tile_type->shape_.size() == 2, args[0]->span_)
-      << op_name << " requires a 2D tile, but got rank " << tile_type->shape_.size();
-
-  const size_t axis = (split == 1) ? 0 : 1;
-  CheckSplitBoundaryCarriesValid(op_name, tile_type->shape_, GetValidShape(tile_type), static_cast<int>(axis),
-                                 halve, args[0]->span_);
-  auto reshaped =
-      ReshapeSplitAxis(tile_type->shape_, GetValidShape(tile_type), axis, halve, op_name, args[0]->span_);
-
-  // The result is a fresh per-lane (shard) / re-joined (gather) tile along the
-  // split axis. Only the halved/doubled valid_shape is carried; the source's
-  // explicit blayout/slayout is intentionally NOT inherited. Inheriting a
-  // non-implicit layout (e.g. an Acc operand's col_major) makes the result type
-  // diverge from the deduction fixpoint that downstream elementwise consumers
-  // (which re-derive layout from their inputs) and a print->parse round-trip
-  // reconstruct — the boundary's true memory layout is re-attached by the
-  // lowering pass (ReshapeTypeWithMemory) and normalized downstream.
-  TileView tile_view;
-  tile_view.valid_shape = std::move(reshaped.valid);
-  return std::make_shared<TileType>(std::move(reshaped.shape), tile_type->dtype_, std::nullopt,
-                                    std::move(tile_view));
-}
-
-// Tensor-level counterpart of DeduceSplitReshape for tensor.aiv_shard /
-// tensor.aic_gather — the @pl.jit / pl.spmd author-facing form, where producers
-// (pl.matmul, elementwise) return Tensor. Mirrors the tile deducer exactly but
-// over a TensorType, and enforces rank-2: UP_DOWN / LEFT_RIGHT are only
-// well-defined on the 2D physical tile view. An N-D tensor flattens to
-// [product(leading), last] (FlattenTileNdTo2D), so a pre-flatten row-axis split
-// would not match the contiguous half the lowering physically takes — reject
-// with a reshape hint rather than silently miscompiling.
-TypePtr DeduceSplitReshapeTensor(const std::vector<ExprPtr>& args,
-                                 const std::vector<std::pair<std::string, std::any>>& kwargs,
-                                 const std::string& op_name, bool halve) {
-  CHECK(args.size() == 1) << "The operator " << op_name << " requires exactly 1 tensor argument, but got "
-                          << args.size();
-
-  // Exact TensorType match: rejects TileType (the tile op's domain) AND
-  // DistributedTensorType (out of scope for AIV/AIC split).
-  auto tensor_type = As<TensorType>(args[0]->GetType());
-  CHECK(tensor_type) << "The operator " << op_name
-                     << " requires argument to be a (non-distributed) TensorType, but got "
-                     << args[0]->GetType()->TypeName();
-
-  const int split = ReadSplitAttr(kwargs, op_name, args[0]->span_);
-  if (split == 0) {
-    // Task-parallel (NONE) region: the op marks the crossing and preserves the
-    // shape (see DeduceSplitReshape). Return the operand's type unchanged — its
-    // view is already canonical, so re-wrapping it could only break the
-    // print -> parse round-trip the halving path has to work around below.
-    return args[0]->GetType();
-  }
-
-  CHECK_SPAN(tensor_type->shape_.size() == 2, args[0]->span_)
-      << op_name << " requires a 2D tensor, but got rank " << tensor_type->shape_.size()
-      << ". Reshape the operand to 2D (pl.reshape) before the shard / gather so the "
-         "UP_DOWN / LEFT_RIGHT split axis is unambiguous.";
-
-  const size_t axis = (split == 1) ? 0 : 1;
-
-  // Valid shape: TensorView::valid_shape if set, otherwise the static shape
-  // (mirrors GetValidShape for tiles).
-  std::vector<ExprPtr> valid = (tensor_type->tensor_view_ && !tensor_type->tensor_view_->valid_shape.empty())
-                                   ? tensor_type->tensor_view_->valid_shape
-                                   : tensor_type->shape_;
-  // Same boundary contract as the tile form this lowers to (pass 10), checked
-  // here so the diagnostic carries the author's own @pl.jit span.
-  CheckSplitBoundaryCarriesValid(op_name, tensor_type->shape_, valid, static_cast<int>(axis), halve,
-                                 args[0]->span_);
-  auto reshaped =
-      ReshapeSplitAxis(tensor_type->shape_, std::move(valid), axis, halve, op_name, args[0]->span_);
-
-  // Fresh per-lane (shard) / re-joined (gather) tensor along the split axis; only
-  // the halved/doubled valid_shape is carried (no layout inheritance — same
-  // rationale as the tile deducer). Memory space is a tile-level concept and is
-  // re-attached when ConvertTensorToTileOps lowers this to tile.aiv_shard.
-  //
-  // Canonicalize a redundant view away, mirroring the tile path: TileType's
-  // constructor drops a tile_view whose valid_shape matches the shape (the
-  // implicit view), but TensorType performs no such canonicalization. So only
-  // attach a tensor_view when the reshaped valid_shape is a genuine partial
-  // (differs from the reshaped shape). A redundant valid_shape == shape view
-  // otherwise breaks the print -> parse round-trip: the printer collapses it to
-  // a bare ``pl.TensorView()`` presence marker that reparses to an empty
-  // valid_shape (structurally != the shape-sized valid_shape).
-  if (tile_view_semantics::ShapeExprListsEquivalent(reshaped.valid, reshaped.shape)) {
-    return std::make_shared<TensorType>(std::move(reshaped.shape), tensor_type->dtype_, std::nullopt);
-  }
-  TensorView tensor_view({}, TensorLayout::ND, std::move(reshaped.valid));
-  return std::make_shared<TensorType>(std::move(reshaped.shape), tensor_type->dtype_, std::nullopt,
-                                      std::make_optional(std::move(tensor_view)));
-}
-
-}  // namespace
-
 // ============================================================================
 // Cross-Core Tile Transfer Operations (tpush / tpop)
 // ============================================================================
@@ -418,6 +443,9 @@ REGISTER_OP("tile.tpush_to_aiv")
     .set_cross_core_role(core_affinity::CrossCoreRole::TPush)
     .add_argument("tile", "Tile data to transfer")
     .set_attr<int>("split")
+    // Optional partition stride (see tile.aiv_shard); consumed by the torch
+    // reference runtime, ignored by PTO codegen.
+    .set_attr<int>("lane_stride")
     .set_attr<int>("id")
     .no_memory_spec()
     .f_deduce_type(DeduceUnknownType);
@@ -442,6 +470,9 @@ REGISTER_OP("tile.tpop_from_aic")
     .set_cross_core_role(core_affinity::CrossCoreRole::TPop)
     .no_argument()
     .set_attr<int>("split")
+    // Optional partition stride (see tile.aiv_shard); consumed by the torch
+    // reference runtime, ignored by PTO codegen.
+    .set_attr<int>("lane_stride")
     .set_attr<int>("id")
     .no_memory_spec()
     .f_deduce_type(DeduceUnknownType);
@@ -498,6 +529,9 @@ REGISTER_OP("tile.aiv_shard")
         "shape (split=0)")
     .add_argument("tile", "Tile data to shard (TileType, 2D)")
     .set_attr<int>("split")
+    // Optional; stamped by LowerAutoVectorSplit when it balances a ragged
+    // boundary across the two lanes (see CheckLaneStrideAttr).
+    .set_attr<int>("lane_stride")
     .set_output_memory(MemorySpace::Vec)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {

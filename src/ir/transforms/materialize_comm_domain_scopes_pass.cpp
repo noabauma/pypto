@@ -24,6 +24,7 @@
 
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -137,7 +138,7 @@ struct CollectiveConsumer {
 class AllocAndWindowCollector : public IRVisitor {
  public:
   void VisitStmt_(const AssignStmtPtr& op) override {
-    auto var = As<Var>(op->var_);
+    auto var = AsVarLike(op->var_);
     auto call = As<Call>(op->value_);
     if (var && call && call->op_) {
       if (IsOp(call, "pld.tensor.alloc_window_buffer")) {
@@ -152,7 +153,9 @@ class AllocAndWindowCollector : public IRVisitor {
         ptr_to_alloc[var.get()] = rec.get();
         allocs.push_back(std::move(rec));
       } else if (IsOp(call, "pld.tensor.window") && !call->args_.empty()) {
-        auto ptr_arg_var = As<Var>(call->args_[0]);
+        // AsVarLike (not As<Var>): the windowed buffer may be an SSA loop carry
+        // (IterArg) — record it so ResolveWindowRecord can follow it.
+        auto ptr_arg_var = AsVarLike(call->args_[0]);
         if (ptr_arg_var) {
           auto it = ptr_to_alloc.find(ptr_arg_var.get());
           if (it != ptr_to_alloc.end()) {
@@ -161,14 +164,30 @@ class AllocAndWindowCollector : public IRVisitor {
             windows.push_back(wr);
           }
         }
+      } else if (IsTensorAllReduce(call) && !call->args_.empty()) {
+        // An allreduce result aliases its data window: record (result, data)
+        // so the substitution below can re-type the result with the same
+        // WindowBuffer (loop-carried results must keep window identity).
+        collective_results.emplace_back(var, AsVarLike(call->args_[0]));
       }
     }
     // Record the AssignStmt def for every Var so ResolveDeviceDescriptor can
     // follow ``for r in pl.range(<var>)`` back to ``<var> = pld.system.world_size()``
     // (CSE / NormalizeStmtStructure hoists such calls out into a temp).
-    if (auto var = As<Var>(op->var_)) {
+    // AsVarLike (not As<Var>): an SSA loop-carry LHS is an IterArg.
+    if (auto var = AsVarLike(op->var_)) {
       var_defs[var.get()] = op->value_;
     }
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    if (!op->iter_args_.empty()) loops.push_back(op);
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    if (!op->iter_args_.empty()) whiles.push_back(op);
     IRVisitor::VisitStmt_(op);
   }
 
@@ -176,6 +195,9 @@ class AllocAndWindowCollector : public IRVisitor {
   std::unordered_map<const Var*, AllocRecord*> ptr_to_alloc;
   std::unordered_map<const Var*, WindowRecord> view_to_window;
   std::vector<WindowRecord> windows;
+  std::vector<std::pair<VarPtr, VarPtr>> collective_results;  ///< {allreduce result, data arg}
+  std::vector<ForStmtPtr> loops;                              ///< loops carrying values (iter_args non-empty)
+  std::vector<WhileStmtPtr> whiles;
   std::unordered_map<const Var*, ExprPtr> var_defs;
 };
 
@@ -309,7 +331,7 @@ class DispatchAnalyzer : public IRVisitor {
     if (!device) return;
     DeviceDescriptor desc = ResolveDeviceDescriptor(device, for_stack_, var_defs_, op->span_);
     for (const auto& arg : op->args_) {
-      auto arg_var = As<Var>(arg);
+      auto arg_var = AsVarLike(arg);
       if (!arg_var) continue;
       auto window = ResolveWindowRecord(arg_var);
       if (window) {
@@ -320,7 +342,9 @@ class DispatchAnalyzer : public IRVisitor {
 
   [[nodiscard]] AllocRecord* ResolveWindowAlloc(const ExprPtr& expr, const std::string& op_name,
                                                 const char* role) {
-    auto view_var = As<Var>(expr);
+    // AsVarLike (not As<Var>): a loop-carried data/signal arg is an IterArg
+    // (ConvertToSSA runs first); ResolveWindowRecord follows its init value.
+    auto view_var = AsVarLike(expr);
     INTERNAL_CHECK_SPAN(view_var, expr->span_)
         << "MaterializeCommDomainScopes: " << op_name << " " << role << " must be a window view Var";
     auto window = ResolveWindowRecord(view_var);
@@ -443,23 +467,31 @@ class DispatchAnalyzer : public IRVisitor {
     auto direct = view_to_window_.find(var.get());
     if (direct != view_to_window_.end()) return &direct->second;
 
+    // An SSA loop carry is an IterArg with no AssignStmt RHS: resolve through
+    // its init value (AsVarLike + initValue_, mirroring InferTileMemorySpace
+    // #2547 — see .claude/rules/ir-kind-traits.md).
+    if (var->GetKind() == ObjectKind::IterArg) {
+      auto init = static_cast<const IterArg*>(var.get())->initValue_;
+      return init ? ResolveWindowRecord(AsVarLike(init), visited) : nullptr;
+    }
+
     auto def_it = var_defs_.find(var.get());
     if (def_it == var_defs_.end() || !def_it->second) return nullptr;
-    if (auto alias = As<Var>(def_it->second)) {
+    if (auto alias = AsVarLike(def_it->second)) {
       return ResolveWindowRecord(alias, visited);
     }
     auto call = As<Call>(def_it->second);
     if (call && IsTensorAllReduce(call) && !call->args_.empty()) {
-      return ResolveWindowRecord(As<Var>(call->args_[0]), visited);
+      return ResolveWindowRecord(AsVarLike(call->args_[0]), visited);
     }
     if (call && IsTensorAllToAll(call) && call->args_.size() > 1) {
-      return ResolveWindowRecord(As<Var>(call->args_[1]), visited);
+      return ResolveWindowRecord(AsVarLike(call->args_[1]), visited);
     }
     if (call && IsTensorAllGather(call) && call->args_.size() > 1) {
-      return ResolveWindowRecord(As<Var>(call->args_[1]), visited);
+      return ResolveWindowRecord(AsVarLike(call->args_[1]), visited);
     }
     if (call && IsTensorAllToAllV(call) && call->args_.size() > 1) {
-      return ResolveWindowRecord(As<Var>(call->args_[1]), visited);
+      return ResolveWindowRecord(AsVarLike(call->args_[1]), visited);
     }
     return nullptr;
   }
@@ -507,6 +539,67 @@ class DispatchAnalyzer : public IRVisitor {
   auto new_type = std::make_shared<const DistributedTensorType>(dt->shape_, dt->dtype_, dt->memref_,
                                                                 dt->tensor_view_, std::make_optional(wb));
   return std::make_shared<Var>(old_var->name_hint_, new_type, old_var->span_);
+}
+
+/// Build a fresh IterArg with an updated DistributedTensorType whose
+/// ``window_buffer_`` points to ``wb`` — a loop carry that views a window must
+/// share the window-buffer object with its init value / yield / return var
+/// (the typecheck verifier compares those by pointer identity).
+[[nodiscard]] IterArgPtr MintIterArgWithWb(const IterArgPtr& iter_arg, const WindowBufferPtr& wb) {
+  auto dt = As<DistributedTensorType>(iter_arg->GetType());
+  INTERNAL_CHECK_SPAN(dt, iter_arg->span_)
+      << "MaterializeCommDomainScopes: loop iter_arg should have DistributedTensorType";
+  auto new_type = std::make_shared<const DistributedTensorType>(dt->shape_, dt->dtype_, dt->memref_,
+                                                                dt->tensor_view_, std::make_optional(wb));
+  return std::make_shared<IterArg>(iter_arg->name_hint_, new_type, iter_arg->initValue_, iter_arg->span_);
+}
+
+/// Follow a Var's def chain (through window / allreduce / all_to_all / allgather /
+/// all_to_all_v aliases and loop-carry init values) to the alloc-window-buffer it
+/// views, returning that alloc's ``WindowBuffer`` (the SAME object the scope slot
+/// holds). Mirrors DispatchAnalyzer::ResolveWindowRecord; used to extend the view
+/// substitution to collective results and loop carries so every DistributedTensorType
+/// denoting the same window shares one WindowBuffer object.
+[[nodiscard]] const WindowBufferPtr* ResolveWindowBufferPtr(const VarPtr& var,
+                                                            const AllocAndWindowCollector& c) {
+  std::unordered_set<const Var*> visited;
+  VarPtr cur = var;
+  while (cur && visited.insert(cur.get()).second) {
+    auto it = c.view_to_window.find(cur.get());
+    if (it != c.view_to_window.end()) return &it->second.alloc->wb;
+    if (cur->GetKind() == ObjectKind::IterArg) {
+      auto init = static_cast<const IterArg*>(cur.get())->initValue_;
+      cur = init ? AsVarLike(init) : nullptr;
+      continue;
+    }
+    auto def_it = c.var_defs.find(cur.get());
+    if (def_it == c.var_defs.end() || !def_it->second) return nullptr;
+    const ExprPtr& def = def_it->second;
+    if (auto alias = AsVarLike(def)) {
+      cur = alias;
+      continue;
+    }
+    auto call = As<Call>(def);
+    if (call && IsOp(call, "pld.tensor.window") && !call->args_.empty()) {
+      cur = AsVarLike(call->args_[0]);
+      continue;
+    }
+    if (call && IsTensorAllReduce(call) && !call->args_.empty()) {
+      cur = AsVarLike(call->args_[0]);
+      continue;
+    }
+    if (call && (IsOp(call, "pld.tensor.all_to_all") || IsOp(call, "pld.tensor.allgather")) &&
+        call->args_.size() > 1) {
+      cur = AsVarLike(call->args_[1]);
+      continue;
+    }
+    if (call && IsOp(call, "pld.tensor.all_to_all_v") && call->args_.size() > 1) {
+      cur = AsVarLike(call->args_[1]);
+      continue;
+    }
+    return nullptr;
+  }
+  return nullptr;
 }
 
 /// Process one host_orch function: identify allocs/windows/dispatches,
@@ -586,11 +679,42 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
                                                    /*store_to_host=*/false, rec->span);
   }
 
-  // Phase 5: build var substitution map for every pld.tensor.window result Var.
+  // Phase 5: build var substitution map for every pld.tensor.window result Var,
+  // every allreduce result Var (aliases its data window), and every loop carry
+  // (iter_arg / return_var) whose lineage is a window. The typecheck verifier
+  // compares loop-carry types (initValue / iter_arg / yield / return_var) by
+  // WindowBuffer pointer identity, so all DistributedTensorTypes denoting the
+  // same window must share one WindowBuffer object after substitution.
   std::unordered_map<const Var*, VarPtr> view_subst;
   for (const auto& w : collector.windows) {
     view_subst[w.old_view_var.get()] = MintViewVar(w.old_view_var, w.alloc->wb);
   }
+  for (const auto& [result_var, data_var] : collector.collective_results) {
+    if (!result_var || !data_var) continue;
+    if (const auto* wb = ResolveWindowBufferPtr(data_var, collector)) {
+      if (view_subst.find(result_var.get()) == view_subst.end()) {
+        view_subst[result_var.get()] = MintViewVar(result_var, *wb);
+      }
+    }
+  }
+  auto sync_loop_carries = [&collector, &view_subst](const std::vector<IterArgPtr>& iter_args,
+                                                     const std::vector<VarPtr>& return_vars) {
+    for (size_t i = 0; i < iter_args.size(); ++i) {
+      const auto& ia = iter_args[i];
+      if (!ia || !ia->initValue_) continue;
+      const auto* wb = ResolveWindowBufferPtr(AsVarLike(ia->initValue_), collector);
+      if (!wb) continue;
+      if (view_subst.find(ia.get()) == view_subst.end()) {
+        view_subst[ia.get()] = MintIterArgWithWb(ia, *wb);
+      }
+      if (i < return_vars.size() && return_vars[i] &&
+          view_subst.find(return_vars[i].get()) == view_subst.end()) {
+        view_subst[return_vars[i].get()] = MintViewVar(return_vars[i], *wb);
+      }
+    }
+  };
+  for (const auto& fs : collector.loops) sync_loop_carries(fs->iter_args_, fs->return_vars_);
+  for (const auto& ws : collector.whiles) sync_loop_carries(ws->iter_args_, ws->return_vars_);
 
   // Phase 6: cluster allocs into pending domain entries by merged descriptor
   // (alloc-order within a domain). Use a vector for deterministic order: scan

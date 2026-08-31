@@ -22,6 +22,7 @@ __all__ = [
     "create",
     "no_dep",
     "dump_tag",
+    "set_cache_policy",
     "read",
     "write",
     "dim",
@@ -127,9 +128,9 @@ from pypto.ir.op import tensor_ops as _ir_ops
 from pypto.ir.utils import _normalize_expr, caller_warning_stacklevel, has_partial_valid_region
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import AtomicType, Expr, MemorySpace, PadValue, PtrType, TensorLayout
+from pypto.pypto_core.ir import AtomicType, CachePolicy, Expr, MemorySpace, PadValue, TensorLayout
 
-from ..typing import BoolLike, IntLike, Scalar, Tensor, predicate_to_expr
+from ..typing import BoolLike, IntLike, Ptr, Scalar, Tensor, predicate_to_expr
 
 # Bound TypeVar lets slice / assemble propagate the caller's concrete tensor
 # class (Tensor or its DistributedTensor subclass) through to the return type.
@@ -174,13 +175,12 @@ def create(
         shape: List of dimension sizes (int or Expr)
         dtype: Data type of tensor elements
         layout: Tensor layout (default: ND)
-        init_value: If given, the runtime pre-fills the freshly allocated
-            buffer with this scalar on the AICPU (before any kernel writes it).
-            ``init_value=0`` zeroes the buffer and works for every dtype.
-            Non-zero values work for integer and 32/64-bit float dtypes;
-            non-zero fills of fp16/bf16 are rejected at codegen. The fill only
-            applies to this runtime-allocated buffer and is cheaper than
-            ``pl.full`` (which materializes a constant tensor via a kernel).
+        init_value: **Removed.** Passing anything but ``None`` raises
+            ``ValueError``. The runtime dropped its create-info fill, so a
+            runtime-allocated buffer can no longer be pre-filled from
+            orchestration. Seed it with a kernel — ``pl.full`` materializes a
+            constant tensor, or write the buffer from your own kernel — and
+            order every reader after that kernel with an explicit dependency.
         manual_dep: Opt this tensor out of OverlapMap auto-dep tracking for
             its **entire lifetime**. When True, every task that reads or
             writes this tensor skips OverlapMap lookup and insert, so the
@@ -355,6 +355,68 @@ def dump_tag(tensor: Tensor) -> Tensor:
         The tensor unchanged. The marker is consumed at parse time.
     """
     return tensor
+
+
+def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
+    """Declare the GM cache-access policy for every read of ``tensor`` in this scope.
+
+    The scope-level surface of the cache policy, for tensor programming — where
+    the GM reads are implicit and there is no ``pl.load`` call to annotate. The
+    per-access counterpart is the ``cache=`` kwarg on
+    [`pl.load`][pypto.language.tile.load], which names one read instead of all
+    of them. ``pl.slice`` deliberately takes no ``cache=``: a slice computes an
+    address descriptor, it moves no data.
+
+    Write it as a **standalone statement directly inside** a ``pl.at(...)`` /
+    ``pl.spmd(...)`` scope body. Anywhere else — nested in an ``if`` / ``for``
+    inside the scope, or outside a scope altogether — the parser rejects it,
+    because the declaration attaches to the scope, and a conditionally-executed
+    declaration would be a promise the compiler cannot check.
+
+    Semantics:
+
+    * **A contract, not a hint.** ``CachePolicy.BYPASS`` asserts two things
+      about ``tensor``: that the kernel streams it with no reuse worth caching,
+      and that **nothing writes those bytes while the kernel runs**. Mixing a
+      cached write and a bypassing read of the same bytes is a coherency bug
+      the compiler cannot detect, so coherency is the author's contract. This
+      is why the policy is never a default and never inferred. Declaring
+      BYPASS on a tensor the scope itself writes is rejected at outlining.
+    * **Tracked by Var identity, never by name.** The declaration names the
+      binding live at the scope, so rebinding the name afterwards
+      (``b = self.foo(b)``) yields a new value the declaration does not cover.
+    * **Consumed at parse time.** It emits no IR statement of its own: the
+      parser records it on the enclosing scope, the scope outliner resolves it
+      to the outlined kernel's parameters, and ``ConvertTensorToTileOps`` turns
+      it into a ``cache`` kwarg on each ``tile.load`` that reads a declared
+      parameter.
+    * **Explicit wins.** An explicit ``pl.load(..., cache=...)`` overrides the
+      scope declaration for that one access, in both directions — so
+      ``cache=pl.CachePolicy.DEFAULT`` opts a single read back into the cache
+      inside a bypassing scope.
+
+    Current status: PTOAS has no L2-bypass path yet
+    (https://github.com/hw-native-sys/PTOAS/issues/1356). The declaration is
+    carried all the way to codegen, but codegen emits a warning and compiles it
+    as an ordinary cached access, so generated code is unchanged today. Writing
+    the declaration now is what makes the kernel pick the bypass up for free
+    once that lands.
+
+    Args:
+        tensor: The tensor whose reads the policy applies to. Must be a
+            ``Tensor`` value bound outside the scope and read inside it.
+        policy: ``CachePolicy.BYPASS`` to declare a streaming, non-cached read;
+            ``CachePolicy.DEFAULT`` for an ordinary cached read.
+
+    Returns:
+        Nothing. The marker is consumed at parse time and produces no value.
+
+    Example:
+        >>> with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
+        ...     pl.set_cache_policy(b, pl.CachePolicy.BYPASS)
+        ...     c = pl.matmul(a, b, out_dtype=pl.FP32)
+        ...     out = pl.assemble(out, c, [0, 0])
+    """
 
 
 def read(tensor: Tensor, indices: IntLike | Sequence[IntLike]) -> Scalar:
@@ -582,6 +644,10 @@ def ci(
 
     Equivalent to ``numpy.arange`` / ``torch.arange``. Lowers to ``tile.ci`` → ``pto.tci``.
 
+    Note:
+        ``pto.tci`` only populates the first row. Leading dimensions must be 1 —
+        prefer shapes of the form ``[1, N]``.
+
     Args:
         start: Starting integer (plain int or Scalar). Must match ``dtype``.
         shape: Destination tensor shape (innermost dim != 1).
@@ -647,6 +713,12 @@ def matmul(
 ) -> Tensor:
     """Matrix multiplication with optional transpose.
 
+    A transpose flag swaps its own operand's two trailing axes, so that operand must
+    be at least 2D: ``a_trans`` with a 1D ``lhs`` (or ``b_trans`` with a 1D ``rhs``)
+    raises rather than being ignored. On the mixed mat-vec / vec-mat forms the flag
+    applies to the matrix side, so a ``lhs`` stored ``[K, M]`` with ``a_trans=True``
+    against a ``[K]`` ``rhs`` deduces ``[M]``.
+
     Args:
         lhs: Left-hand side tensor
         rhs: Right-hand side tensor
@@ -679,7 +751,7 @@ def matmul_acc(
     accumulated into. This is the split-K idiom, and it removes the need to zero
     the accumulator or to peel the first K step::
 
-        for k0 in pl.pipeline(0, K, K_TILE):
+        for k0 in pl.pipeline(0, K, K_TILE, stage=2):
             acc[t0 : t0 + R, :] = pl.matmul_acc(
                 acc[t0 : t0 + R, :], x_k, w_k, b_trans=True, init_cond=(k0 == 0)
             )
@@ -904,7 +976,7 @@ def part_min(lhs: Tensor, rhs: Tensor) -> Tensor:
 
 
 def fmod(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
-    """Element-wise floating-point remainder of tensor and tensor or scalar.
+    """Element-wise truncating remainder of tensor and tensor or scalar.
 
     Automatically selects between tensor.fmod (tensor, tensor) and
     tensor.fmods (tensor, scalar) based on the rhs type. The result matches
@@ -923,7 +995,7 @@ def fmod(lhs: Tensor, rhs: int | float | Tensor | Scalar | Expr) -> Tensor:
 
 
 def fmods(lhs: Tensor, rhs: int | float | Expr | Scalar) -> Tensor:
-    """Element-wise floating-point remainder of tensor and scalar.
+    """Element-wise truncating remainder of tensor and scalar.
 
     Args:
         lhs: Left-hand side tensor
@@ -1378,6 +1450,9 @@ def row_expand(target: Tensor, row_vec: Tensor) -> Tensor:
 def row_expand_mul(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast multiplication: tensor[i,:] * row_vec[i,0].
 
+    Multiplies each row of the tensor by the corresponding row vector value,
+    for all ``i``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         row_vec: Row vector (TensorType [M, 1])
@@ -1393,6 +1468,9 @@ def row_expand_mul(tensor: Tensor, row_vec: Tensor) -> Tensor:
 
 def row_expand_div(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast division: tensor[i,:] / row_vec[i,0].
+
+    Divides each row of the tensor by the corresponding row vector value,
+    for all ``i``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1410,6 +1488,8 @@ def row_expand_div(tensor: Tensor, row_vec: Tensor) -> Tensor:
 def row_expand_add(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast addition: tensor[i,:] + row_vec[i,0].
 
+    Adds a row vector to each row of the tensor, for all ``i``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         row_vec: Row vector (TensorType [M, 1])
@@ -1425,6 +1505,8 @@ def row_expand_add(tensor: Tensor, row_vec: Tensor) -> Tensor:
 
 def row_expand_sub(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast subtraction: tensor[i,:] - row_vec[i,0].
+
+    Subtracts a row vector from each row of the tensor, for all ``i``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1442,6 +1524,9 @@ def row_expand_sub(tensor: Tensor, row_vec: Tensor) -> Tensor:
 def row_expand_max(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast maximum: max(tensor[i,:], row_vec[i,0]).
 
+    Takes the element-wise maximum of each row and the row vector value,
+    for all ``i``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         row_vec: Row vector (TensorType [M, 1])
@@ -1457,6 +1542,9 @@ def row_expand_max(tensor: Tensor, row_vec: Tensor) -> Tensor:
 
 def row_expand_min(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise broadcast minimum: min(tensor[i,:], row_vec[i,0]).
+
+    Takes the element-wise minimum of each row and the row vector value,
+    for all ``i``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1474,6 +1562,8 @@ def row_expand_min(tensor: Tensor, row_vec: Tensor) -> Tensor:
 def row_expand_expdif(tensor: Tensor, row_vec: Tensor) -> Tensor:
     """Row-wise exp-diff: exp(tensor[i,:] - row_vec[i,0]).
 
+    Computes the exponential of the per-row difference, for all ``i``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         row_vec: Row vector providing per-row scalar (TensorType [M, 1])
@@ -1489,6 +1579,9 @@ def row_expand_expdif(tensor: Tensor, row_vec: Tensor) -> Tensor:
 
 def col_expand_mul(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast multiplication: tensor[:,j] * col_vec[0,j].
+
+    Multiplies each column of the tensor by the corresponding column vector
+    value, for all ``j``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1522,6 +1615,8 @@ def col_expand(tensor: Tensor, col_vec: Tensor) -> Tensor:
 def col_expand_sub(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast subtraction: tensor[:,j] - col_vec[0,j].
 
+    Subtracts a column vector from each column of the tensor, for all ``j``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         col_vec: Column vector (TensorType [1, N])
@@ -1537,6 +1632,9 @@ def col_expand_sub(tensor: Tensor, col_vec: Tensor) -> Tensor:
 
 def col_expand_div(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast division: tensor[:,j] / col_vec[0,j].
+
+    Divides each column of the tensor by the corresponding column vector
+    value, for all ``j``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1554,6 +1652,8 @@ def col_expand_div(tensor: Tensor, col_vec: Tensor) -> Tensor:
 def col_expand_add(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast addition: tensor[:,j] + col_vec[0,j].
 
+    Adds a column vector to each column of the tensor, for all ``j``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         col_vec: Column vector (TensorType [1, N])
@@ -1569,6 +1669,9 @@ def col_expand_add(tensor: Tensor, col_vec: Tensor) -> Tensor:
 
 def col_expand_max(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast maximum: max(tensor[:,j], col_vec[0,j]).
+
+    Takes the element-wise maximum of each column and the column vector
+    value, for all ``j``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1586,6 +1689,9 @@ def col_expand_max(tensor: Tensor, col_vec: Tensor) -> Tensor:
 def col_expand_min(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise broadcast minimum: min(tensor[:,j], col_vec[0,j]).
 
+    Takes the element-wise minimum of each column and the column vector
+    value, for all ``j``.
+
     Args:
         tensor: Input tensor (TensorType [M, N])
         col_vec: Column vector (TensorType [1, N])
@@ -1601,6 +1707,8 @@ def col_expand_min(tensor: Tensor, col_vec: Tensor) -> Tensor:
 
 def col_expand_expdif(tensor: Tensor, col_vec: Tensor) -> Tensor:
     """Column-wise exp-diff: exp(tensor[:,j] - col_vec[0,j]).
+
+    Computes the exponential of the per-column difference, for all ``j``.
 
     Args:
         tensor: Input tensor (TensorType [M, N])
@@ -1928,11 +2036,10 @@ def view(
 ) -> _TensorT:
     """Reinterpret a tensor over the same physical memory.
 
-    At least one of ``shape`` or ``layout`` must be provided. The result is a
-    zero-copy tensor view with canonical strides derived by the IR type deducer.
-
-    See [`tensor.view`][pypto.language.tensor.view] for full details on validity
-    constraints, error conditions, and the product-preserving shape rule.
+    At least one of ``shape`` or ``layout`` must be provided: ``shape`` derives
+    canonical strides for the requested shape, ``layout`` derives the canonical
+    ND/DN layout view. The result is a zero-copy view over the same physical
+    memory, and its target shape must have rank at least 1.
 
     Args:
         tensor: Source tensor.
@@ -1943,9 +2050,10 @@ def view(
             collapse to ``[1, product(shape)]``. Required when either supported
             collapse reinterprets a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN); DN requires rank at least 2.
-            Layout changes combined with ``shape`` are supported in-core but not by orchestration
-            lowering. Orchestration shape reinterpret is limited to ND-layout
-            tensors.
+            Orchestration supports ND shape reinterprets and shaped
+            ND/MX_A_ZZ/MX_B_NN backing and consumer views for dynamic FP8E8M0
+            MX scales. Other layout-changing shape views are limited to in-core
+            lowering.
 
     Returns:
         Tensor wrapping the view operation.
@@ -1965,6 +2073,14 @@ def view(
 
 def scatter_update(input: Tensor, *args: Any, **kwargs: Any) -> Tensor:
     """Update input tensor rows at positions specified by 2D index with values from src.
+
+    Supports two rank variants:
+
+    - 2D: ``input [rows, d]``, ``src [b*s, d]``, ``index [b, s]``
+    - 4D: ``input [blockNum, blockSize, 1, d]``, ``src [b, s, 1, d]``, ``index [b, s]``
+
+    For each ``(i, j)``, row ``input[index[i*s + j]]`` receives row ``src[i*s + j]``
+    (linear layout).
 
     Accepts the same flexible call shapes as the IR builder
     ``pypto.ir.op.tensor.scatter_update``:
@@ -1989,8 +2105,8 @@ def sort32(src: Tensor, idx: Tensor) -> Tensor:
     """Sort fixed 32-element blocks with explicit index tensor (tensor-level).
 
     Tensor-level counterpart of ``pl.tile.sort32``. Sorts 32-element blocks in
-    src, permuting idx alongside. Returns sorted value-index pairs tensor with
-    doubled last dimension.
+    src, permuting idx alongside. Returns an 8-byte value-index-pair tensor;
+    its last dimension is 2x the input width for FP32 and 4x for FP16.
 
     For FP16 src: initialize idx with [0, 1, 2, ..., 31] per block.
     For FP32 src: initialize idx with [0, 2, 4, ..., 62] per block.
@@ -2000,7 +2116,7 @@ def sort32(src: Tensor, idx: Tensor) -> Tensor:
         idx: Input index tensor with sequential offsets
 
     Returns:
-        Tensor wrapping the sort32 operation (last dim doubled)
+        Tensor wrapping the dtype-dependent expanded sort32 output
     """
     call_expr = _ir_ops.sort32(src.unwrap(), idx.unwrap())
     return Tensor(expr=call_expr)
@@ -2434,7 +2550,7 @@ def scatter(
 def alloc(
     memory_space: MemorySpace,
     size: int,
-) -> PtrType:
+) -> Ptr:
     """Stub for the internal ``tensor.alloc`` IR operation.
 
     This function is never called in user-written DSL code. It is emitted
@@ -2452,7 +2568,7 @@ def alloc(
     Returns:
         A ``Ptr`` standing for the allocation, carrying no address of its own.
     """
-    return PtrType()
+    return Ptr()
 
 
 def get_block_idx() -> Scalar:

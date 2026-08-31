@@ -34,8 +34,14 @@ import pypto.language as pl
 import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
-from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy
+
+pytestmark = pytest.mark.skip(
+    reason=(
+        "PTOAS v0.57 (revert #2523 TMP) rejects tfillpad_expand static-shape mismatch; "
+        "re-enable when ptoas returns to v0.60"
+    ),
+)
 
 # =============================================================================
 # Programs — one explicit @pl.program per scenario (distinct names, literal
@@ -316,9 +322,6 @@ class _FillpadExpandCase(PTOTestCase):
 
     def get_strategy(self) -> OptimizationStrategy:
         return OptimizationStrategy.Default
-
-    def get_backend_type(self) -> BackendType:
-        return BackendType.Ascend910B
 
     def define_tensors(self) -> list[TensorSpec]:
         return [

@@ -115,6 +115,7 @@ TypePtr DeduceTileMatMulType(const std::vector<ExprPtr>& args,
   tile_view_semantics::SetTileLayout(
       tile_view, tile_view_semantics::GetImplicitTileLayout(geometry.physical_shape, MemorySpace::Acc));
   tile_view.valid_shape = geometry.valid_shape;
+  StampCompactForNarrowedAccRows(tile_view, geometry.physical_shape);
 
   return std::make_shared<TileType>(std::move(geometry.physical_shape), geometry.accumulator_dtype,
                                     std::nullopt, tile_view, MemorySpace::Acc);
@@ -198,6 +199,13 @@ TypePtr DeduceTileMatMulAccType(const std::vector<ExprPtr>& args,
   tile_view_semantics::SetTileLayout(
       tile_view, tile_view_semantics::GetImplicitTileLayout(output_shape, MemorySpace::Acc));
   tile_view.valid_shape = acc_valid;
+  // Inherit the accumulator's compact mode rather than re-deriving it. This op
+  // is `set_output_reuses_input(0)`: the result *is* the accumulator's buffer,
+  // and codegen only aliases the two when their `TileBufSignature` — compact
+  // included — matches, so inheriting keeps that alias legal by construction.
+  // `tile.matmul` is where the accumulator's stride is established, so it is
+  // the only place that derives compact from the valid rows (#2470).
+  tile_view.compact = tile_view_semantics::GetEffectiveTileView(*acc_type).compact;
 
   return std::make_shared<TileType>(output_shape, geometry.accumulator_dtype, std::nullopt, tile_view,
                                     MemorySpace::Acc);
@@ -266,6 +274,7 @@ TypePtr DeduceTileMatMulBiasType(const std::vector<ExprPtr>& args,
   tile_view_semantics::SetTileLayout(
       tile_view, tile_view_semantics::GetImplicitTileLayout(geometry.physical_shape, MemorySpace::Acc));
   tile_view.valid_shape = geometry.valid_shape;
+  StampCompactForNarrowedAccRows(tile_view, geometry.physical_shape);
   return std::make_shared<TileType>(std::move(geometry.physical_shape), geometry.accumulator_dtype,
                                     std::nullopt, tile_view, MemorySpace::Acc);
 }
@@ -339,8 +348,10 @@ TypePtr DeduceTileGemvAccType(const std::vector<ExprPtr>& args,
                               const std::vector<std::pair<std::string, std::any>>& kwargs,
                               const std::string& op_name) {
   ValidateGemvAccPhase(kwargs, op_name);
-  CHECK(args.size() == 3) << "The operator " << op_name << " requires exactly 3 arguments, but got "
-                          << args.size();
+  CHECK(args.size() == 3 || args.size() == 4)
+      << "The operator " << op_name << " requires 3 arguments (acc, lhs, rhs) or 4 with the optional "
+      << "init_cond predicate, but got " << args.size();
+  CheckMatmulInitCond(args, 3, op_name);
   auto acc_type = As<TileType>(args[0]->GetType());
   CHECK(acc_type) << "The operator " << op_name << " requires first argument (acc) to be a TileType, but got "
                   << args[0]->GetType()->TypeName();
@@ -430,6 +441,8 @@ REGISTER_OP("tile.matmul_acc")
     .set_input_memory(2, MemorySpace::Right)
     .set_output_memory(MemorySpace::Acc)
     .set_output_reuses_input(0)
+    // Accumulates into `acc`: C += A@B reads the running sum it adds to.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileMatMulAccType(args, kwargs, "tile.matmul_acc");
@@ -473,12 +486,17 @@ REGISTER_OP("tile.gemv_acc")
     .add_argument("acc", "Accumulator tile (TileType, 2D [1, N])")
     .add_argument("lhs", "Row vector tile (TileType, 2D [1, K])")
     .add_argument("rhs", "Right-hand side tile (TileType, 2D [K, N])")
+    .add_argument("init_cond",
+                  "Optional BOOL scalar; where it holds the accumulator is overwritten with "
+                  "lhs @ rhs instead of accumulated into (the split-K `k == 0` step)")
     .set_attr<std::string>("acc_phase")
     .set_input_memory(0, MemorySpace::Acc)
     .set_input_memory(1, MemorySpace::Left)
     .set_input_memory(2, MemorySpace::Right)
     .set_output_memory(MemorySpace::Acc)
     .set_output_reuses_input(0)
+    // Accumulates into `acc`, same as tile.matmul_acc.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileGemvAccType(args, kwargs, "tile.gemv_acc");

@@ -364,6 +364,79 @@ def _build_host_allreduce_signal_reuse():
     return HostTensorAllReduceSignalReuse
 
 
+def _build_host_allreduce_loop(rounds: int = 3):
+    """Host allreduce whose implicit-signal call sits INSIDE a ``for`` loop.
+
+    SynthesizeAllReduceSignals hoists ONE shared signal (keyed to the data
+    buffer's lineage) and rewrites the in-loop call to use it (previously
+    rejected as a single-use signal inside a repeating scope). Loop-carried
+    reuse is safe because the builtin kernels self-clear their barrier cells
+    after each call (self-clearing epilogue).
+    """
+
+    ROUNDS = rounds
+
+    @pl.program
+    class HostTensorAllReduceLoop:
+        @pl.function(type=pl.FunctionType.InCore)
+        def publish_step(
+            self,
+            inp: pl.Tensor[[1, SIZE], pl.FP32],
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            local = pl.load(inp, [0, 0], [1, SIZE])
+            return pl.store(local, [0, 0], data)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def publish_orch(
+            self,
+            inp: pl.Tensor[[1, SIZE], pl.FP32],
+            data: pl.InOut[pld.DistributedTensor[[1, SIZE], pl.FP32]],
+        ) -> pld.DistributedTensor[[1, SIZE], pl.FP32]:
+            return self.publish_step(inp, data)
+
+        @pl.function(type=pl.FunctionType.InCore)
+        def consume_step(
+            self,
+            data: pld.DistributedTensor[[1, SIZE], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, SIZE], pl.FP32]],
+        ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+            reduced = pl.load(data, [0, 0], [1, SIZE])
+            return pl.store(reduced, [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def consume_orch(
+            self,
+            data: pld.DistributedTensor[[1, SIZE], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, SIZE], pl.FP32]],
+        ) -> pl.Tensor[[1, SIZE], pl.FP32]:
+            return self.consume_step(data, out)
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(
+            self,
+            inputs: pl.Tensor[[ROUNDS, NR, 1, SIZE], pl.FP32],
+            outputs: pl.Out[pl.Tensor[[ROUNDS, NR, 1, SIZE], pl.FP32]],
+        ) -> pl.Tensor[[ROUNDS, NR, 1, SIZE], pl.FP32]:
+            data_buf = pld.alloc_window_buffer(SIZE * pl.FP32.get_byte())
+
+            # Every iteration's allreduce is implicit-signal; one shared signal
+            # is synthesized for this buffer's lineage and reused across
+            # iterations.
+            for it in pl.range(ROUNDS):
+                for r in pl.range(pld.world_size()):
+                    data = pld.window(data_buf, [1, SIZE], dtype=pl.FP32)
+                    self.publish_orch(inputs[it, r], data, device=r)
+                data = pld.window(data_buf, [1, SIZE], dtype=pl.FP32)
+                data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+                for r in pl.range(pld.world_size()):
+                    self.consume_orch(data, outputs[it, r], device=r)
+
+            return outputs
+
+    return HostTensorAllReduceLoop
+
+
 class TestL3HostTensorAllReduce:
     @pytest.mark.parametrize("n_ranks", [2, 4])
     def test_host_tensor_allreduce(self, test_config, device_ids, n_ranks):
@@ -426,6 +499,43 @@ class TestL3HostTensorAllReduce:
             expected = _expected_allreduce(inputs[rd])
             assert torch.allclose(outputs[rd], expected), (
                 f"host allreduce signal-reuse round {rd} P={n_ranks} mismatch: "
+                f"max diff = {(outputs[rd] - expected).abs().max().item()}"
+            )
+
+    @pytest.mark.parametrize("n_ranks", [2, 4])
+    def test_host_tensor_allreduce_loop(self, test_config, device_ids, n_ranks):
+        """Implicit-signal allreduce inside a ``for`` loop in host_orch.
+
+        SynthesizeAllReduceSignals must accept the call (previously rejected
+        inside a repeating scope), hoist ONE shared signal, and the loop must
+        reuse it round after round (safe via the self-clearing epilogue).
+        """
+        if len(device_ids) < n_ranks:
+            pytest.skip(f"host allreduce P={n_ranks} needs {n_ranks} devices, got {device_ids}")
+
+        rounds = 3
+        compiled = ir.compile(
+            _build_host_allreduce_loop(rounds),
+            platform=test_config.platform,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:n_ranks],
+                num_sub_workers=0,
+            ),
+        )
+        variant_dir = compiled.output_dir / "next_levels" / "builtin.tensor.allreduce__sum__fp32"
+        assert variant_dir.is_dir()
+
+        # Each round carries a distinct offset so a stale round-1 result in a
+        # later round (a missed epilogue reset on a reused signal) cannot match
+        # the round's golden.
+        inputs = torch.stack([_make_rank_inputs(n_ranks, round_offset=rd * 10000.0) for rd in range(rounds)])
+        outputs = torch.zeros_like(inputs)
+        compiled(inputs, outputs)
+
+        for rd in range(rounds):
+            expected = _expected_allreduce(inputs[rd])
+            assert torch.allclose(outputs[rd], expected), (
+                f"host allreduce loop round {rd} P={n_ranks} mismatch: "
                 f"max diff = {(outputs[rd] - expected).abs().max().item()}"
             )
 

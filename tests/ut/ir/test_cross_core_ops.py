@@ -147,7 +147,9 @@ def test_cross_core_sync_static_and_dynamic_event_ids():
     """Cross-core sync accepts either a user event id or a dynamic index operand."""
     span = ir.Span.unknown()
 
-    static_set = system_ops.sync_set(3, pipe=ir.PipeType.FIX, ffts_mode=1, core_type="aiv", span=span)
+    static_set = system_ops.sync_set(
+        3, pipe=ir.PipeType.FIX, ffts_mode=1, core_type=system_ops.KernelType.AIV, span=span
+    )
     assert isinstance(static_set.type, ir.UnknownType)
     assert static_set.args == []
     assert static_set.kwargs == {
@@ -158,18 +160,26 @@ def test_cross_core_sync_static_and_dynamic_event_ids():
     }
 
     event_id = ir.Var("event_id", ir.ScalarType(DataType.INDEX), span)
-    dynamic_wait = system_ops.sync_wait(event_id, pipe=ir.PipeType.MTE3, core_type="aic", span=span)
+    dynamic_wait = system_ops.sync_wait(
+        event_id, pipe=ir.PipeType.MTE3, core_type=system_ops.KernelType.AIC, span=span
+    )
     assert isinstance(dynamic_wait.type, ir.UnknownType)
     assert dynamic_wait.args == [event_id]
     assert "event_id" not in dynamic_wait.kwargs
     assert dynamic_wait.kwargs["core_type"] == "aic"
 
 
-@pytest.mark.parametrize("core_type", ["cube", "vector", "mix"])
-def test_cross_core_sync_rejects_invalid_core_type(core_type):
-    """Mixed kernels target explicit events with the public AIC/AIV names."""
-    with pytest.raises(ValueError, match="core_type"):
+@pytest.mark.parametrize("core_type", ["aic", "aiv", "aic_only", "mix", 0])
+def test_cross_core_sync_rejects_non_enum_core_type(core_type):
+    """``core_type`` is enum-only: the lowered attr spelling is not an input."""
+    with pytest.raises(TypeError, match="core_type must be a KernelType member"):
         system_ops.sync_set(0, pipe=ir.PipeType.FIX, core_type=core_type)
+
+
+def test_cross_core_sync_rejects_mix_kernel():
+    """An event pins one kernel; landing in both is spelled by omitting core_type."""
+    with pytest.raises(ValueError, match="Omit core_type"):
+        system_ops.sync_set(0, pipe=ir.PipeType.FIX, core_type=system_ops.KernelType.MIX)
 
 
 @pytest.mark.parametrize("event_id", [-1, 14])
@@ -330,7 +340,7 @@ def test_split_reshape_rejects_non_2d_tile():
 
 
 def test_split_reshape_rejects_bad_split_attr():
-    """split must be 0, 1 or 2 — anything else is rejected."""
+    """split names the authored MODE — 0, 1 or 2; the pto-isa codes live on tpush/tpop."""
     span = ir.Span.unknown()
     tile_var = ir.Var("t", ir.TileType([16, 128], DataType.FP32), span)
 
@@ -389,13 +399,20 @@ def test_split_reshape_at_split_zero_skips_even_extent_guard():
     assert result.shape == [15, 128]
 
 
-def test_aiv_shard_rejects_odd_split_axis():
-    """aiv_shard requires the static split-axis extent to be even."""
+def test_aiv_shard_shards_an_odd_split_axis_to_the_ceil_half():
+    """An odd split axis shards to the CEIL half — both lanes get the same box.
+
+    pto-isa's TILE_UP_DOWN_ODD gives lane 0 ``rows / 2 + 1`` and lane 1
+    ``rows / 2``. A type function does not know the lane, so the deduced box is
+    the ceil half for both and the raggedness is carried by the per-lane valid
+    extent that LowerAutoVectorSplit materializes.
+    """
     span = ir.Span.unknown()
     tile_var = ir.Var("t", ir.TileType([15, 128], DataType.FP32), span)
 
-    with pytest.raises(ValueError, match="must be even"):
-        ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    sharded = ir.create_op_call("tile.aiv_shard", [tile_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TileType)
+    assert sharded.type.shape == [8, 128]  # ceil(15 / 2)
 
 
 def test_aiv_shard_allows_even_physical_with_odd_valid_shape():
@@ -544,7 +561,7 @@ def test_tensor_split_reshape_rejects_distributed_tensor():
 
 
 def test_tensor_split_reshape_rejects_bad_split_attr():
-    """split must be 0, 1 or 2 — anything else is rejected."""
+    """split names the authored MODE — 0, 1 or 2; the pto-isa codes live on tpush/tpop."""
     span = ir.Span.unknown()
     tensor_var = ir.Var("t", ir.TensorType([16, 128], DataType.FP32), span)
 
@@ -585,13 +602,14 @@ def test_tensor_split_reshape_at_split_zero_allows_non_2d():
     assert result.shape == [2, 16, 128]
 
 
-def test_tensor_aiv_shard_rejects_odd_split_axis():
-    """tensor.aiv_shard requires the static split-axis extent to be even."""
+def test_tensor_aiv_shard_shards_an_odd_split_axis_to_the_ceil_half():
+    """Tensor mirror of the tile deducer: an odd axis shards to the ceil half."""
     span = ir.Span.unknown()
     tensor_var = ir.Var("t", ir.TensorType([15, 128], DataType.FP32), span)
 
-    with pytest.raises(ValueError, match="must be even"):
-        ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    sharded = ir.create_op_call("tensor.aiv_shard", [tensor_var], {"split": 1}, span)
+    assert isinstance(sharded.type, ir.TensorType)
+    assert sharded.type.shape == [8, 128]  # ceil(15 / 2)
 
 
 def test_tensor_aiv_shard_allows_even_physical_with_odd_valid_shape():

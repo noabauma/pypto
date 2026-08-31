@@ -30,11 +30,13 @@ directly via `DistributedWorker(compiled)`, importable from
 | `rt.submit(compiled, x, y, z)` | Bounded asynchronous dispatch — returns a `DistributedRunHandle`. |
 | `rt.alloc_tensor(shape, dtype, *, init=None)` | Allocate a worker-resident `DeviceTensor`. `init` copies from host (one-time H2D). |
 | `rt.free_tensor(tensor)` | Release a `DeviceTensor`. |
-| `rt.copy_to(dst_dev_ptr, src_host_ptr, nbytes, *, worker_id=0)` | Explicit staged H2D copy. A host `torch.Tensor` source only needs to be CPU-contiguous and may be created after `prepare()`. |
-| `rt.copy_from(dst_host_ptr, src_dev_ptr, nbytes, *, worker_id=0)` | Explicit staged D2H copy. A host `torch.Tensor` destination only needs to be CPU-contiguous and may be created after `prepare()`. |
+| `rt.copy_to(dst_dev_ptr, src_host_ptr, nbytes, *, dst_offset=0, src_offset=0, worker_id=0)` | Explicit staged H2D copy. `dst_offset` and `src_offset` address sub-ranges: copy from `src_host_ptr + src_offset` into `dst_dev_ptr + dst_offset`. `dst_offset + nbytes` must fit the device allocation. A host `torch.Tensor` source only needs to be CPU-contiguous and may be created after `prepare()`. |
+| `rt.copy_from(dst_host_ptr, src_dev_ptr, nbytes, *, dst_offset=0, src_offset=0, worker_id=0)` | Explicit staged D2H copy. `dst_offset` and `src_offset` address sub-ranges: copy from `src_dev_ptr + src_offset` into `dst_host_ptr + dst_offset`. `src_offset + nbytes` must fit the device allocation. A host `torch.Tensor` destination only needs to be CPU-contiguous and may be created after `prepare()`. |
 | `rt.alloc_stacked_tensor(host_w)` | Shard host_w along dim 0 — shard `i` uploaded to card `i`. Returns `StackedDeviceTensor`. |
 | `rt.free_stacked_tensor(stacked)` | Release all shards of a `StackedDeviceTensor`. |
 | `rt.copy_stacked_from(stacked, host_out)` | Staged D2H read-back of every shard into a CPU-contiguous `host_out`; it may be allocated after `prepare()`. |
+| `rt.committed_device_memory(worker_id=0)` | Device HBM (bytes) this worker's own allocator has committed on card `worker_id` — tensors, pooled arenas, runtime buffers. Sum across ids for a multi-chip total. |
+| `rt.device_memory_info(worker_id=0)` | `(free_bytes, total_bytes)` for the whole card `worker_id` runs on, as the driver sees it. Use this to size an allocation; anything else on the card moves `free_bytes` without moving the committed total. Raises on simulator backends rather than reporting zeros. |
 | `rt.release_inherited_host_tensor_refs()` | Drop compatibility lifetime references retained in the parent process. |
 | `rt.close()` | Release buffers, shut down chip workers. Called automatically as context manager. |
 
@@ -131,6 +133,83 @@ Explicit resident upload and copy-back through `rt.alloc_tensor(init=...)`,
 When a host endpoint is a `torch.Tensor`, it only needs to be CPU-contiguous;
 it may be an ordinary tensor allocated after `prepare()`. It does not need
 `.share_memory_()`, pre-fork allocation, or `inherited_host_tensors`.
+
+### Skipping the staging copy
+
+Staging costs one full host-side copy of the payload, which for a large resident weight
+is worth avoiding. A range registered through `inherited_host_tensors` is named in place
+instead — no staging buffer, no memcpy — because it predates the fork and every child
+holds it at the same address.
+
+**Listing a tensor is a guarantee you make.** By passing it in
+`inherited_host_tensors` you assert two things:
+
+- its backing is **visible across processes** — a `MAP_SHARED` mapping, whether torch's
+  own shared memory or an external file mapping; and
+- that mapping stays **valid for the worker's lifetime**.
+
+Passing a `MAP_PRIVATE` backing is **unsupported**. Copy-on-write leaves the child reading
+its pre-fork snapshot, so an upload may carry stale or incorrect data. Nothing detects
+this for you.
+
+PyPTO cannot verify the guarantee, and does not try. `torch.is_shared()` answers a
+different question — whether the storage is a torch shared-memory allocation — and a
+read-only `MAP_SHARED` file mapping wrapped with `mmap` + `numpy.frombuffer` +
+`torch.from_numpy` is genuinely shared while reporting `False`. Reading
+`/proc/self/maps` would answer correctly but only on Linux, and the simulator also runs
+on macOS. So `is_shared()` is kept as a one-way signal: `True` confirms a torch-managed
+shared backing, `False` is inconclusive, and for the tensors it cannot confirm PyPTO
+emits one `RuntimeWarning` at `prepare()` time and proceeds. It never rejects the tensor
+and never falls back to staging — falling back would silently reinstate the copy you
+asked it to skip.
+
+```python
+weights = map_readonly_shared(path)          # mmap-backed MAP_SHARED, is_shared() == False
+with compiled.prepare(
+    inherited_host_tensors=[weights],        # "visible in every child, for my lifetime"
+) as rt:
+    resident = rt.alloc_stacked_tensor(weights)
+```
+
+The guarantee is about visibility, so it holds in both directions: a listed range may be
+an upload source or a read-back destination. Anything not listed, or allocated after
+`prepare()`, keeps staging exactly as before.
+
+**One allocation, one Buffer.** A listed tensor names its whole *storage*, not the extent
+of the view you passed. Every view of one storage therefore collapses to a single runtime
+Buffer and reaches its own bytes by offset — list `w`, `w[:2]` and `w[2:]` and you still
+get one. This is what keeps the number of Buffers a property of the memory rather than of
+which views you happened to list; a per-view Buffer would name the same bytes twice, and
+one identity may name only one backing.
+
+### Read-only backings
+
+One Buffer carries one access mode, fixed when it is created, so a listed allocation is
+declared writable by default — that is what a read-back destination needs. Wrap an entry
+in `ReadOnlyHostTensor` when the backing is shared but **not** writable, typically a
+`MAP_SHARED` mapping of a read-only file descriptor:
+
+```python
+from pypto.runtime import ReadOnlyHostTensor
+
+with compiled.prepare(
+    inherited_host_tensors=[kv_cache, ReadOnlyHostTensor(weights)],
+) as rt:
+    ...
+```
+
+That allocation's Buffer is then declared `READ`, and a `copy_from` into it raises a
+`ValueError` instead of leaving the forked child to fault on the store. Writability cannot
+be inferred any more than visibility can — torch erases it, a write probe faults rather
+than raising, and `/proc/self/maps` is Linux-only — so marking is a caller guarantee, just
+like listing the tensor in the first place.
+
+Listing one allocation both read-only and writable raises `ValueError`: one allocation has
+one access mode, and neither narrowing nor widening it silently is recoverable.
+
+The marker governs the named-copy descriptor only. Dispatch arguments are named by the
+runtime's own path, which this does not reach, so marking a dispatch IO buffer read-only
+does not stop the child from writing it.
 
 ## One-Shot vs Persistent Worker
 

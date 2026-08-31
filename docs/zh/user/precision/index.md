@@ -2,7 +2,7 @@
 
 结果是**错**的，不是慢。本章讲的是怀疑对象的排查顺序。
 
-> **前置**：[教程](../tutorials/index.md) —— 具体说是 [第一个算子](../tutorials/00-elementwise.md) 里那个 `allclose` 对比，本章假定你已经有了。
+> **前置**：[执行](../execution/index.md) —— 编译、运行，以及本章要打开的那些 `RunConfig` 字段。另外还有[教程](../tutorials/index.md) —— 具体说是 [第一个算子](../tutorials/00-elementwise.md) 里那个 `allclose` 对比，本章假定你已经有了。
 
 ## 本章是什么
 
@@ -43,5 +43,5 @@
 ## 参见
 
 - [性能优化](../performance/index.md) —— 姊妹闭环，用于慢而不是错。
-- [LegalizeTileCast](../../dev/passes/14-legalize_tile_cast.md) —— cast 链何时精确、何时不精确。
+- [LegalizeTileCast](../../dev/passes/15-legalize_tile_cast.md) —— cast 链何时精确、何时不精确。
 - [规约与 softmax](../tutorials/01-reduction-softmax.md) —— 规约中的 padding，一个高频的静默错误来源。

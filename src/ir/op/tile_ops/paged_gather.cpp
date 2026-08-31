@@ -64,6 +64,8 @@ static TypePtr DeduceTileGatherRowType(const std::vector<ExprPtr>& args,
   auto src_type = As<TensorType>(args[1]->GetType());
   CHECK(src_type) << "The operator " << op_name << " requires src to be a TensorType (GM), but got "
                   << args[1]->GetType()->TypeName();
+  CHECK_SPAN(!src_type->tensor_view_ || !IsMxTensorLayout(src_type->tensor_view_->layout), args[1]->span_)
+      << "The operator " << op_name << " does not support MX-layout source tensors";
   CHECK(dst_type->dtype_ == src_type->dtype_)
       << "The operator " << op_name << " requires dst and src to share dtype, but got "
       << dst_type->dtype_.ToString() << " and " << src_type->dtype_.ToString();
@@ -93,6 +95,9 @@ REGISTER_OP("tile.gather_row")
                   "May be a runtime Scalar[INDEX]; defaults to shapes.")
     .set_attr<bool>("transpose")
     .set_output_reuses_input(0)
+    // DPS: loads one GM row into a sub-region of `dst`; the rest of the
+    // accumulator tile passes through, so the prior content is read.
+    .set_arg_effect(0, ArgEffect::ReadWrite)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileGatherRowType(args, kwargs, "tile.gather_row");

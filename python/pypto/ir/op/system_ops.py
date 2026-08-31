@@ -20,7 +20,8 @@ System operations handle hardware synchronization and cross-core communication:
 """
 
 from collections.abc import Sequence
-from typing import Any, Protocol, overload, runtime_checkable
+from enum import Enum, auto
+from typing import Any, Protocol, TypeVar, overload, runtime_checkable
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
@@ -40,6 +41,107 @@ class _UnwrapsToExpr(Protocol):
     """Language wrappers (e.g. ``pl.Scalar[dtype]``) that expose ``unwrap() -> Expr``."""
 
     def unwrap(self) -> Expr: ...
+
+
+class KernelType(Enum):
+    """Which generated kernel an op belongs to.
+
+    A mixed InCore function is expanded into an AIC kernel and an AIV kernel.
+    This says which of the two a cross-core sync op lands in; ``MIX`` means both
+    take part, which only a barrier can ask for.
+
+    Two neighbouring enums mean different things:
+
+    - ``FunctionType.AIC`` / ``.AIV`` classify *a function*, and this classifies
+      *an op inside one*. A function already declared ``FunctionType.AIV`` needs
+      no ``KernelType`` on its ops -- there is only one kernel to land in.
+    - ``ir.CoreType`` labels one physical core in the SoC inventory, which is
+      what ``Backend::GetCoreCount`` counts. That is hardware; this is not, and
+      ``MIX`` has no ``CoreType`` counterpart at all.
+
+    Members carry no wire value: each op spells the same kernel differently in
+    its IR attr (``system.syncall`` writes ``"aic_only"`` where
+    ``system.sync_set`` writes ``"aic"``), so the lowering tables are explicit.
+    """
+
+    AIC = auto()
+    AIV = auto()
+    MIX = auto()
+
+
+class SyncAllMode(Enum):
+    """Barrier implementation selected by ``system.syncall``.
+
+    - ``HARD``: FFTS barrier with no operands; requires full-core occupancy.
+    - ``SOFT``: GM-polling barrier; works at partial occupancy.
+    """
+
+    HARD = "hard"
+    SOFT = "soft"
+
+
+# Kernel -> IR attr spelling, per op. ``system.syncall`` names a participant set
+# and can rendezvous both kernels; the event ops pin one op to one kernel, so
+# they have no MIX spelling (omitting the kwarg is what leaves an event in both).
+_SYNCALL_CORE_TYPE: dict[KernelType, str] = {
+    KernelType.AIC: "aic_only",
+    KernelType.AIV: "aiv_only",
+    KernelType.MIX: "mix",
+}
+_SYNC_EVENT_CORE_TYPE: dict[KernelType, str] = {
+    KernelType.AIC: "aic",
+    KernelType.AIV: "aiv",
+}
+# Each table's keys are also the op's domain: what it accepts as ``core_type``.
+_SYNCALL_KERNELS: tuple[KernelType, ...] = tuple(_SYNCALL_CORE_TYPE)
+_SYNC_EVENT_KERNELS: tuple[KernelType, ...] = tuple(_SYNC_EVENT_CORE_TYPE)
+
+_SYNC_EVENT_MIX_HINT = ". Omit core_type to leave the event in both kernels"
+
+_EnumT = TypeVar("_EnumT", bound=Enum)
+
+
+def _check_enum(
+    value: Any,
+    enum_cls: type[_EnumT],
+    param: str,
+    op_name: str,
+    *,
+    allowed: tuple[_EnumT, ...] | None = None,
+    hint: str = "",
+) -> _EnumT:
+    """Validate that an op keyword is an enum member this op accepts.
+
+    ``allowed`` is the per-op domain: an op that takes only part of the enum
+    passes just those members, and one outside them is rejected. Omit it to
+    accept every member.
+
+    Args:
+        value: Value passed by the caller
+        enum_cls: Enum the keyword is typed as
+        param: Keyword name, for the messages
+        op_name: Operation name, for the messages
+        allowed: Members this op accepts; defaults to every member
+        hint: Appended to the rejection message, to point at the alternative
+
+    Returns:
+        ``value``, once confirmed to be a member this op accepts
+
+    Raises:
+        ValueError: If ``value`` is a member outside this op's domain
+        TypeError: If ``value`` is not an ``enum_cls`` member at all
+    """
+    accepted = allowed if allowed is not None else tuple(enum_cls)
+    valid = ", ".join(f"{enum_cls.__name__}.{member.name}" for member in accepted)
+    if not isinstance(value, enum_cls):
+        raise TypeError(
+            f"{op_name} {param} must be a {enum_cls.__name__} member, got {value!r}. Valid values: {valid}"
+        )
+    if value not in accepted:
+        raise ValueError(
+            f"{op_name} {param} must be one of {valid}, got {enum_cls.__name__}.{value.name}{hint}"
+        )
+    return value
 
 
 def _create_sync_op(
@@ -150,7 +252,7 @@ def _create_cross_core_sync_op(
     *,
     pipe: PipeType,
     ffts_mode: int | None,
-    core_type: str | None,
+    core_type: KernelType | None,
     span: Span | None,
 ) -> Call:
     """Create a PTO cross-core sync set/wait operation."""
@@ -166,9 +268,15 @@ def _create_cross_core_sync_op(
     if ffts_mode is not None:
         kwargs["ffts_mode"] = ffts_mode
     if core_type is not None:
-        if core_type not in ("aic", "aiv"):
-            raise ValueError(f"{op_name} core_type must be 'aic' or 'aiv', got {core_type!r}")
-        kwargs["core_type"] = core_type
+        _check_enum(
+            core_type,
+            KernelType,
+            "core_type",
+            op_name,
+            allowed=_SYNC_EVENT_KERNELS,
+            hint=_SYNC_EVENT_MIX_HINT,
+        )
+        kwargs["core_type"] = _SYNC_EVENT_CORE_TYPE[core_type]
 
     actual_span = _get_span_or_capture(span, frame_offset=2)
     return _ir_core.create_op_call(op_name, args, kwargs, actual_span)
@@ -179,13 +287,14 @@ def sync_set(
     *,
     pipe: PipeType,
     ffts_mode: int | None = None,
-    core_type: str | None = None,
+    core_type: KernelType | None = None,
     span: Span | None = None,
 ) -> Call:
     """Set an explicit Cube/Vector cross-core synchronization event.
 
-    ``core_type`` targets the operation to one lane when expanding a mixed
-    InCore kernel. It may be omitted in an explicitly typed AIC/AIV function.
+    ``core_type`` (``KernelType.AIC`` / ``KernelType.AIV``) targets the operation
+    to one kernel when expanding a mixed InCore function. Omit it to leave the
+    event in both, which is what an explicitly typed AIC/AIV function wants.
     """
     return _create_cross_core_sync_op(
         "system.sync_set", event_id, pipe=pipe, ffts_mode=ffts_mode, core_type=core_type, span=span
@@ -196,13 +305,14 @@ def sync_wait(
     event_id: int | Expr,
     *,
     pipe: PipeType,
-    core_type: str | None = None,
+    core_type: KernelType | None = None,
     span: Span | None = None,
 ) -> Call:
     """Wait for an explicit Cube/Vector cross-core synchronization event.
 
-    ``core_type`` targets the operation to one lane when expanding a mixed
-    InCore kernel. It may be omitted in an explicitly typed AIC/AIV function.
+    ``core_type`` (``KernelType.AIC`` / ``KernelType.AIV``) targets the operation
+    to one kernel when expanding a mixed InCore function. Omit it to leave the
+    wait in both, which is what an explicitly typed AIC/AIV function wants.
     """
     return _create_cross_core_sync_op(
         "system.sync_wait", event_id, pipe=pipe, ffts_mode=None, core_type=core_type, span=span
@@ -310,10 +420,7 @@ def cacheinvalid(
     )
 
 
-_SYNCALL_CORE_TYPES = ("aiv_only", "aic_only", "mix")
-
-
-def syncall(*, core_type: str = "mix", span: Span | None = None) -> Call:
+def syncall(*, core_type: KernelType = KernelType.MIX, span: Span | None = None) -> Call:
     """Cross-core all-participant barrier (``pto::SYNCALL``, hard/FFTS form).
 
     Every core in the participant set selected by ``core_type`` must execute
@@ -333,23 +440,25 @@ def syncall(*, core_type: str = "mix", span: Span | None = None) -> Call:
         time (``HardSyncallOccupancy`` verifier, issue #1935): a hard-mode
         ``syncall`` whose enclosing ``pl.spmd`` does not fill all physical cores
         of ``core_type`` is rejected. Use a full-core SPMD dispatch, or the soft
-        form (``mode="soft"``) for partial occupancy.
+        form (``mode=SyncAllMode.SOFT``) for partial occupancy.
 
     Args:
-        core_type: Participant set, one of "aiv_only", "aic_only", or "mix".
+        core_type: Participant set, a :class:`KernelType` member —
+            ``MIX`` rendezvouses both kernels.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for system.syncall
     """
-    if core_type not in _SYNCALL_CORE_TYPES:
-        raise ValueError(f"syncall core_type must be one of {_SYNCALL_CORE_TYPES}, got {core_type!r}")
+    _check_enum(core_type, KernelType, "core_type", "syncall", allowed=_SYNCALL_KERNELS)
     actual_span = _get_span_or_capture(span, frame_offset=1)
-    return _ir_core.create_op_call("system.syncall", [], {"core_type": core_type}, actual_span)
+    return _ir_core.create_op_call(
+        "system.syncall", [], {"core_type": _SYNCALL_CORE_TYPE[core_type]}, actual_span
+    )
 
 
 def syncall_soft(
-    core_type: str,
+    core_type: KernelType,
     gm_workspace: Expr,
     used_cores: Expr | None = None,
     *,
@@ -367,7 +476,8 @@ def syncall_soft(
     Cross-core GM handoff requires explicit cache maintenance and a GM fence.
 
     Args:
-        core_type: Participant set, one of "aiv_only", "aic_only", or "mix".
+        core_type: Participant set, a :class:`KernelType` member —
+            ``MIX`` rendezvouses both kernels.
         gm_workspace: Shared, zero-initialized GM INT32 workspace with at least
             16 elements (64 bytes).
         used_cores: Optional INT32 participant count. Omit to derive it from the
@@ -378,8 +488,7 @@ def syncall_soft(
     Returns:
         Call expression for the soft-mode system.syncall.
     """
-    if core_type not in _SYNCALL_CORE_TYPES:
-        raise ValueError(f"soft syncall core_type must be one of {_SYNCALL_CORE_TYPES}, got {core_type!r}")
+    _check_enum(core_type, KernelType, "core_type", "soft syncall", allowed=_SYNCALL_KERNELS)
     if used_cores is not None:
         used_type = used_cores.type
         if not isinstance(used_type, ScalarType) or used_type.dtype != DataType.INT32:
@@ -397,7 +506,10 @@ def syncall_soft(
     if used_cores is not None:
         args.append(used_cores)
     return _ir_core.create_op_call(
-        "system.syncall", args, {"core_type": core_type, "mode": "soft"}, actual_span
+        "system.syncall",
+        args,
+        {"core_type": _SYNCALL_CORE_TYPE[core_type], "mode": SyncAllMode.SOFT.value},
+        actual_span,
     )
 
 
@@ -607,10 +719,10 @@ def tfree_to_aiv(
 
 
 def task_invalid(*, span: Span | None = None) -> Call:
-    """Construct an invalid ``PTO2TaskId`` sentinel.
+    """Construct an invalid ``TaskId`` sentinel.
 
     Returns a ``Call`` of result type ``Scalar[TASK_ID]`` that codegen lowers
-    to ``PTO2TaskId::invalid()`` — the "no producer" sentinel that downstream
+    to ``TaskId::invalid()`` — the "no producer" sentinel that downstream
     ``set_dependencies`` calls skip via an ``is_valid()`` guard. Surfaced in
     the DSL as the Python literal ``None`` in TaskId-typed positions.
 

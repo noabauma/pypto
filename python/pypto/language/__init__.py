@@ -42,6 +42,7 @@ from pypto.jit import JITFunction, jit
 from pypto.pypto_core import DataType
 from pypto.pypto_core.ir import (
     AtomicType,
+    CachePolicy,
     CompactMode,
     ForKind,
     FunctionType,
@@ -49,7 +50,6 @@ from pypto.pypto_core.ir import (
     MemorySpace,
     PadValue,
     PipeType,
-    PtrType,
     Role,
     SplitMode,
     TensorLayout,
@@ -82,6 +82,8 @@ from .op import tensor_ops as tensor
 from .op import tile_ops as tile
 from .op.system_ops import (
     AUTO,
+    KernelType,
+    SyncAllMode,
     aic_initialize_pipe,
     aiv_initialize_pipe,
     import_peer_buffer,
@@ -115,6 +117,7 @@ from .op.tensor_ops import (
     paged_gather,
     random,
     scatter,
+    set_cache_policy,
 )
 from .op.tile_ops import (
     MemRefType,
@@ -153,6 +156,12 @@ from .op.tile_ops import (
 )
 from .op.tile_ops import (
     mscatter as mscatter,
+)
+from .op.tile_ops import (
+    quant_mx as quant_mx,
+)
+from .op.tile_ops import (
+    tmov_x2zz as tmov_x2zz,
 )
 from .op.unified_ops import (
     abs,
@@ -252,6 +261,7 @@ from .typing import (
     MemRef,
     Out,
     PrefetchAsyncContext,
+    Ptr,
     Scalar,
     Tensor,
     Tile,
@@ -261,9 +271,6 @@ from .typing import (
 
 # Short alias for MemorySpace (pl.Mem.Vec instead of pl.MemorySpace.Vec)
 Mem = MemorySpace
-
-# Alias for PtrType — used in printed IR as type annotation for alloc LHS
-Ptr = PtrType
 
 # Re-export TensorLayout constants for convenience
 ND = TensorLayout.ND
@@ -455,6 +462,9 @@ __all__ = [
     "sel",
     "sels",
     "tri",
+    # MX quantization
+    "quant_mx",
+    "tmov_x2zz",
     # Promoted system ops (cross-core)
     "AUTO",
     "tpush_to_aiv",
@@ -488,6 +498,7 @@ __all__ = [
     "spmd_submit",
     "no_dep",
     "dump_tag",
+    "set_cache_policy",
     "scatter",
     "arange",
     "gather",
@@ -500,6 +511,9 @@ __all__ = [
     "FunctionType",
     "ForKind",
     "AtomicType",
+    "CachePolicy",
+    "KernelType",
+    "SyncAllMode",
     "Level",
     "MemRef",
     "Role",
@@ -512,7 +526,6 @@ __all__ = [
     "PrefetchAsyncContext",
     "AsyncEvent",
     "AsyncSession",
-    "PtrType",
     "TensorLayout",
     "TensorView",
     "TileLayout",

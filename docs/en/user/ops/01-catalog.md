@@ -1,7 +1,8 @@
 # Catalog
 
-Every operator family, one line each. Signatures live in the docstrings — see
-[Operations](index.md) for why this page does not repeat them.
+Every operator family, one line each. Every name links into the
+[API Reference](../../api/index.md) for its signature — see [Operations](index.md) for why
+this page does not repeat them.
 
 > **Reading the tables:** the **Reach** column gives the shortest spelling that works.
 > `pl.` means the name is available unqualified; `pl.tile.` / `pl.tensor.` mean the
@@ -40,7 +41,7 @@ See [Memory and Data Movement](../language/03-memory.md) for which moves are leg
 | -------- | ----- | ------------ |
 | [`add`][pypto.language.add] [`sub`][pypto.language.sub] [`mul`][pypto.language.mul] [`div`][pypto.language.div] | `pl.` | Binary arithmetic; a Python number on the right selects the scalar-operand form |
 | [`neg`][pypto.language.neg] [`abs`][pypto.language.abs] [`recip`][pypto.language.recip] | `pl.` | Unary negate, absolute value, reciprocal. For FP16/FP32 reciprocal, `high_precision=True` selects the slower, higher-precision PTO path on A5 |
-| [`rem`][pypto.language.tile.rem] [`rems`][pypto.language.tile.rems] [`fmod`][pypto.language.fmod] [`fmods`][pypto.language.fmods] | `pl.` | Remainder and floating-point modulo, tensor and scalar forms |
+| [`rem`][pypto.language.tile.rem] [`rems`][pypto.language.tile.rems] [`fmod`][pypto.language.fmod] [`fmods`][pypto.language.fmods] | `pl.` | Floor (`rem*`) and truncating (`fmod*`) remainder. Tensor operands must match shape and dtype; tile-tile operands must match physical and valid shapes. A2/A3 supports FP32/INT32 for `rem*` and FP32 for `fmod*`; every A2/A3 INT32 `rem*` source/scalar value must be in the inclusive PTO-ISA domain `[-2^24, 2^24]`. A2/A3 scalar forms require provably positive valid extents. Tile `rem` / `rems` scratch must have provably sufficient physical and valid capacity (two / one rows and all source columns) and must not overlap a live source on A2/A3. A5 accepts the wider frontend dtype union. `high_precision=True` is FP32 tile-tile only (defined on A5, accepted but ignored on A2/A3) |
 | [`addc`][pypto.language.tile.addc] [`subc`][pypto.language.tile.subc] [`addsc`][pypto.language.tile.addsc] [`subsc`][pypto.language.tile.subsc] | `pl.` (t) | Three-input add / subtract with carry operand |
 | [`part_add`][pypto.language.part_add] [`part_mul`][pypto.language.part_mul] [`part_max`][pypto.language.part_max] [`part_min`][pypto.language.part_min] | `pl.` | Partial (segmented) arithmetic |
 
@@ -119,9 +120,16 @@ tile depend on the pad value; see
 | [`assemble`][pypto.language.tensor.assemble] | `pl.` | Write a sub-region back; also written `dst[i:i+16] = src` |
 | [`reinterpret_view`][pypto.language.reinterpret_view] | `pl.` | Reinterpret without moving data |
 | [`set_validshape`][pypto.language.set_validshape] | `pl.` | Declare the meaningful region of a tile |
-| [`cast`][pypto.language.cast] | `pl.` | Convert dtype — may expand to a multi-hop chain, see [LegalizeTileCast](../../dev/passes/14-legalize_tile_cast.md) |
+| [`cast`][pypto.language.cast] | `pl.` | Convert dtype — may expand to a multi-hop chain, see [LegalizeTileCast](../../dev/passes/15-legalize_tile_cast.md) |
 | [`dim`][pypto.language.tensor.dim] | `pl.` | A tensor's runtime dimension |
 | [`read`][pypto.language.read] [`write`][pypto.language.write] | `pl.` | Element access |
+
+## Quantization
+
+| Operator | Reach | What it does |
+| -------- | ----- | ------------ |
+| `quant_mx` | `pl.` (t) | Ascend950 MXFP8 block-32 dynamic quantization to FP8E4M3FN data plus FP8E8M0 scales (`group_axis` = PTOAS `grpAxis`). MXFP4 quant is out of scope for this release. Not yet combinable with `matmul_mx` in one InCore mixed task — stage through GM (see [types](../language/00-types.md)) |
+| `tmov_x2zz` | `pl.` (t) | Ascend950 exponent X-to-ZZ layout conversion (UINT8). Workspace `tmp` is write-only; axis1 needs `dst_rows`/`dst_cols` for ZZ `[M,G]` over flat TQUANT exp. Typically used via `quant_mx` lowering rather than directly |
 
 ## Linear algebra
 
@@ -170,7 +178,7 @@ The mixed-kernel surface — AIC and AIV cooperating inside one InCore function.
 Push and pop must be **paired**, and each pop must be matched by a `tfree`. The tutorial covering this is
 [Mixed kernels](../tutorials/03-mixed-kernel.md); the machine-level mechanics are in
 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md) and
-[ExpandMixedKernel](../../dev/passes/21-expand_mixed_kernel.md).
+[ExpandMixedKernel](../../dev/passes/22-expand_mixed_kernel.md).
 
 ## Tasks and dependencies
 

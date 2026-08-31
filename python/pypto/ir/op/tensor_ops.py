@@ -9,7 +9,6 @@
 
 """Tensor operations for PyPTO IR."""
 
-import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -53,14 +52,11 @@ def create(
         shape: List of dimension sizes (int or Expr), or a MakeTuple
         dtype: Data type of tensor elements
         layout: Tensor layout (default: ND)
-        init_value: If given, the runtime pre-fills the freshly allocated
-            buffer with this scalar on the AICPU (via the runtime's
-            ``TensorCreateInfo::set_initial_value``) before any kernel writes
-            it. ``init_value=0`` zeroes the buffer and is valid for every
-            dtype. Non-zero values are supported for integer and 32/64-bit
-            float dtypes; non-zero fills of sub-32-bit float dtypes
-            (fp16/bf16) are rejected at codegen because the orchestration
-            translation unit has no ``half``/``bfloat16`` type to pack them.
+        init_value: **Removed.** Passing anything but ``None`` raises
+            ``ValueError``. The runtime dropped
+            ``TensorCreateInfo::set_initial_value``, so orchestration can no
+            longer pre-fill a runtime-allocated buffer; seed it with a kernel
+            instead (see the error message for the migration).
         manual_dep: Opt this tensor out of OverlapMap auto-dep tracking
             for its **entire lifetime**. When True, codegen marks the
             ``tensor.create`` call so every task that reads or writes the
@@ -91,23 +87,18 @@ def create(
     if manual_dep:
         kwargs["manual_dep"] = True
     if init_value is not None:
-        # Store as float so the attr type is unambiguous (Python float -> C++
-        # double); codegen casts it back to the tensor dtype's C type. Because
-        # double only represents integers exactly up to 2**53, reject larger
-        # integer inputs instead of silently corrupting the fill value.
-        # NOTE: this module defines a ``abs`` tensor op that shadows the builtin,
-        # so use an explicit range comparison rather than ``abs(...)``.
-        if isinstance(init_value, int) and not (-(2**53) <= init_value <= 2**53):
-            raise ValueError(
-                f"create_tensor: integer init_value {init_value} exceeds the exactly-representable "
-                f"range (+/-2**53); large-magnitude integer fills are not supported. "
-                f"Use init_value=0 or a smaller value."
-            )
-        # Reject NaN/Inf here so they never reach the printer (which cannot
-        # round-trip them) or codegen (where they would emit invalid C++).
-        if not math.isfinite(init_value):
-            raise ValueError(f"create_tensor: init_value must be finite, got {init_value}.")
-        kwargs["init_value"] = float(init_value)
+        # The fill was lowered to TensorCreateInfo::set_initial_value(), which the
+        # runtime removed: its host orchestrator cannot store to the GM-heap device
+        # address, so both runtimes dropped the create-info fill. Nothing in
+        # orchestration can pre-fill a runtime-allocated buffer any more, and
+        # silently ignoring the request would hand the kernel uninitialized memory.
+        raise ValueError(
+            f"create_tensor: init_value is no longer supported (got {init_value}). The runtime "
+            f"removed TensorCreateInfo::set_initial_value, so orchestration can no longer "
+            f"pre-fill a runtime-allocated buffer. Seed the buffer with a kernel that writes "
+            f"it, then order every reader after that kernel with an explicit dependency "
+            f"(pl.submit(..., deps=[seed_tid]) or pl.at(..., deps=[seed_tid]))."
+        )
 
     return _ir_core.create_op_call("tensor.create", args, kwargs, actual_span)
 
@@ -727,7 +718,7 @@ def part_min(lhs: Expr, rhs: Expr, span: Span | None = None) -> Call:
 
 
 def fmod(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
-    """Element-wise floating-point remainder of tensor and tensor or scalar.
+    """Element-wise truncating remainder of tensor and tensor or scalar.
 
     Automatically selects between tensor.fmod (tensor, tensor) and
     tensor.fmods (tensor, scalar) based on the rhs type. The result matches
@@ -739,7 +730,7 @@ def fmod(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for element-wise floating-point remainder
+        Call expression for element-wise truncating remainder
     """
     actual_span = _get_span_or_capture(span)
     rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
@@ -752,7 +743,7 @@ def fmod(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
 
 
 def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
-    """Element-wise floating-point remainder of tensor and scalar.
+    """Element-wise truncating remainder of tensor and scalar.
 
     Args:
         lhs: Left-hand side tensor
@@ -760,7 +751,7 @@ def fmods(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for element-wise floating-point remainder with scalar
+        Call expression for element-wise truncating remainder with scalar
     """
     actual_span = _get_span_or_capture(span)
     rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span, fallback_int_dtype=DataType.FP32)
@@ -1883,9 +1874,11 @@ def view(
        2D or a contiguous-prefix linear collapse to ``[1, product(shape)]``;
        both require an explicit target ``valid_shape``.
     Combining ``shape`` with a layout change is valid for type deduction and
-    PTO in-core lowering. Orchestration lowering only supports shape
-    reinterpret for ND-layout tensors because the runtime ``ChipTensor::reshape``
-    cannot express an arbitrary-layout view.
+    PTO in-core lowering. Only orchestration lowering is restricted: it supports
+    ND shape reinterprets and shaped ND/MX_A_ZZ/MX_B_NN backing/consumer views
+    for FP8E8M0 MX scales; other layout-changing shape reinterprets are
+    unsupported because the runtime ``TaskTensor::reshape`` cannot express an
+    arbitrary-layout view.
 
     Args:
         tensor: Input tensor expression.
@@ -1900,9 +1893,9 @@ def view(
             collapse reinterprets a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN). Must not be ``NZ``.
             When provided without ``shape``, performs a layout-only flip.
-            When combined with ``shape``, layout changes are supported in-core
-            but not by orchestration lowering. Orchestration shape reinterpret
-            is limited to ND-layout tensors.
+            Orchestration also permits shaped ND/MX_A_ZZ/MX_B_NN backing and
+            consumer views for FP8E8M0 MX scales; other layout-changing shape
+            views remain limited to in-core lowering.
         span: Optional source span for debugging (auto-captured if not
             provided).
 
@@ -2033,8 +2026,8 @@ def sort32(src: Expr, idx: Expr, span: Span | None = None) -> Call:
     """Sort fixed 32-element blocks with explicit index tensor (tensor-level).
 
     Tensor-level counterpart of ``tile.sort32``. Sorts 32-element blocks in src
-    and permutes idx accordingly. Output tensor stores sorted value-index pairs
-    with the last dimension doubled.
+    and permutes idx accordingly. Output tensor stores 8-byte value-index pairs;
+    its last dimension is 2x the input width for FP32 and 4x for FP16.
 
     Args:
         src: Input value tensor (TensorType, FP16 or FP32)
@@ -2042,7 +2035,7 @@ def sort32(src: Expr, idx: Expr, span: Span | None = None) -> Call:
         span: Optional source span for debugging
 
     Returns:
-        Call expression returning sorted tensor with doubled last dimension
+        Call expression returning the dtype-dependent expanded sort output
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tensor.sort32", [src, idx], {}, actual_span)

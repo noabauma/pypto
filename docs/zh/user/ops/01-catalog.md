@@ -1,6 +1,6 @@
 # 算子目录
 
-每个算子家族一行。签名在 docstring 里 —— 本页为何不重复它们，见 [算子](index.md)。
+每个算子家族一行。每个名字都链到 [API 参考](../../api/index.md)看签名 —— 本页为何不重复它们，见 [算子](index.md)。
 
 > **怎么读这些表：** **可达**列给出能用的最短拼法。`pl.` 表示该名字不带限定即可访问；`pl.tile.` / `pl.tensor.` 表示该算子是分层级的。标 **(t)** 的名字是为方便而重新导出到顶层的 tile 专属算子 —— `pl.load` **就是** `pl.tile.load`，不是派发器。
 
@@ -36,7 +36,7 @@
 | ---- | ---- | ---- |
 | [`add`][pypto.language.add] [`sub`][pypto.language.sub] [`mul`][pypto.language.mul] [`div`][pypto.language.div] | `pl.` | 二元算术；右侧给 Python 数字会选中标量操作数形式 |
 | [`neg`][pypto.language.neg] [`abs`][pypto.language.abs] [`recip`][pypto.language.recip] | `pl.` | 取负、绝对值、倒数；FP16/FP32 倒数设置 `high_precision=True` 时会在 A5 上选择速度较慢、精度较高的 PTO 路径 |
-| [`rem`][pypto.language.tile.rem] [`rems`][pypto.language.tile.rems] [`fmod`][pypto.language.fmod] [`fmods`][pypto.language.fmods] | `pl.` | 求余与浮点取模，张量与标量形式 |
+| [`rem`][pypto.language.tile.rem] [`rems`][pypto.language.tile.rems] [`fmod`][pypto.language.fmod] [`fmods`][pypto.language.fmods] | `pl.` | floor 取余（`rem*`）与截断取余（`fmod*`）。Tensor 操作数的 shape 和 dtype 必须一致；tile-tile 操作数的物理 shape 与 valid shape 必须一致。A2/A3 的 `rem*` 支持 FP32/INT32，`fmod*` 仅支持 FP32；A2/A3 INT32 `rem*` 的每个 source/scalar 值必须位于 PTO-ISA 闭区间 `[-2^24, 2^24]`。A2/A3 scalar 形式的 valid extent 必须可证明为正。Tile `rem` / `rems` 的 scratch 物理容量和有效容量都必须可证明足够（分别为两行 / 一行并覆盖全部 source 列），且在 A2/A3 上不得与仍存活的 source 重叠。A5 接受更宽的前端 dtype 集合。`high_precision=True` 仅适用于 FP32 tile-tile（A5 定义，A2/A3 接受但忽略） |
 | [`addc`][pypto.language.tile.addc] [`subc`][pypto.language.tile.subc] [`addsc`][pypto.language.tile.addsc] [`subsc`][pypto.language.tile.subsc] | `pl.` (t) | 带进位操作数的三输入加 / 减 |
 | [`part_add`][pypto.language.part_add] [`part_mul`][pypto.language.part_mul] [`part_max`][pypto.language.part_max] [`part_min`][pypto.language.part_min] | `pl.` | 分段算术 |
 
@@ -111,9 +111,16 @@
 | [`assemble`][pypto.language.tensor.assemble] | `pl.` | 把子区域写回；也可写作 `dst[i:i+16] = src` |
 | [`reinterpret_view`][pypto.language.reinterpret_view] | `pl.` | 不搬数据的重新解释 |
 | [`set_validshape`][pypto.language.set_validshape] | `pl.` | 声明 tile 的有效区域 |
-| [`cast`][pypto.language.cast] | `pl.` | 转换 dtype —— 可能展开成多跳链，见 [LegalizeTileCast](../../dev/passes/14-legalize_tile_cast.md) |
+| [`cast`][pypto.language.cast] | `pl.` | 转换 dtype —— 可能展开成多跳链，见 [LegalizeTileCast](../../dev/passes/15-legalize_tile_cast.md) |
 | [`dim`][pypto.language.tensor.dim] | `pl.` | 张量的运行期维度 |
 | [`read`][pypto.language.read] [`write`][pypto.language.write] | `pl.` | 元素访问 |
+
+## 量化
+
+| 算子 | 可达 | 作用 |
+| ---- | ---- | ---- |
+| `quant_mx` | `pl.` (t) | Ascend950 MXFP8 block-32 动态量化，生成 FP8E4M3FN 数据及 FP8E8M0 scale（`group_axis` 对齐 PTOAS `grpAxis`）。本版本不含 MXFP4 quant。暂不支持与 `matmul_mx` 同 InCore mixed task — 请经 GM 分核（见 [类型](../language/00-types.md)） |
+| `tmov_x2zz` | `pl.` (t) | Ascend950 指数 X-to-ZZ 布局转换（UINT8）。`tmp` 为只写 workspace；axis1 需 `dst_rows`/`dst_cols` 指定 ZZ `[M,G]`（相对 TQUANT 扁平 exp）。通常由 `quant_mx` 降级使用，而非直接调用 |
 
 ## 线性代数
 
@@ -159,7 +166,7 @@
 | [`aiv_shard`][pypto.language.tile.aiv_shard] [`aic_gather`][pypto.language.tile.aic_gather] | `pl.` | 在 AIV lane 间分片 / 在 AIC 上聚回 |
 | `AUTO` | `pl.` | 由编译器选择管道参数的哨兵值 |
 
-push 与 pop 必须**配对**，且每次 pop 都必须有对应的 `tfree`。用法见 [混合 kernel 教程](../tutorials/03-mixed-kernel.md)；机制见 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md) 与 [ExpandMixedKernel](../../dev/passes/21-expand_mixed_kernel.md)。
+push 与 pop 必须**配对**，且每次 pop 都必须有对应的 `tfree`。用法见 [混合 kernel 教程](../tutorials/03-mixed-kernel.md)；机制见 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md) 与 [ExpandMixedKernel](../../dev/passes/22-expand_mixed_kernel.md)。
 
 ## 任务与依赖
 

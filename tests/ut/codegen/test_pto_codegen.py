@@ -96,7 +96,9 @@ def _get_dyn_expr_incore_func():
     with ib.function("dyn_expr_func", type=ir.FunctionType.InCore) as f:
         q = f.param("q", tensor_ty)
         out = f.param("out", tensor_ty)
-        q_tile = ib.let("q_tile", tile.load(q, [0, 0], [16, 128]))
+        # No pass pipeline runs here, so InferTileMemorySpace never places this tile —
+        # pin the space explicitly the way the pass would.
+        q_tile = ib.let("q_tile", tile.load(q, [0, 0], [16, 128], target_memory=ir.MemorySpace.Vec))
         ret = ib.let("ret", tile.store(q_tile, [0, 0], out))
         f.return_type(tensor_ty)
         ib.return_stmt(ret)
@@ -816,7 +818,7 @@ def test_pto_codegen_plain_tensor_alias_resolves_store_view():
     with ib.function("alias_store_func", type=ir.FunctionType.InCore) as f:
         a = f.param("a", ty)
         out = f.param("out", ty)
-        t = ib.let("t", tile.load(a, [0, 0], [16, 64]))
+        t = ib.let("t", tile.load(a, [0, 0], [16, 64], target_memory=ir.MemorySpace.Vec))
         # Plain tensor Var alias (no Call on the RHS) — the post-fold shape.
         out_alias = ib.let("out_alias", out)
         ret = ib.let("ret", tile.store(t, [0, 0], out_alias))
@@ -862,7 +864,7 @@ def test_pto_codegen_iter_arg_alias_resolves_store_view():
         with ib.for_loop(k, 0, 2, 1) as loop:
             out_iter = loop.iter_arg("out_iter", out)  # tensor IterArg, init = param `out`
             out_final = loop.return_var("out_final")
-            t = ib.let("t", tile.load(a, [0, 0], [64, 64]))
+            t = ib.let("t", tile.load(a, [0, 0], [64, 64], target_memory=ir.MemorySpace.Vec))
             # Plain alias whose RHS is the IterArg — the post-fold `__rv = __iter`.
             out_alias = ib.let("out_alias", out_iter)
             ib.let("ret", tile.store(t, [0, 0], out_alias))
@@ -897,7 +899,7 @@ def test_pto_codegen_lowered_mixed_store_keeps_ptr():
     with ib.function("mixed_store", type=ir.FunctionType.InCore) as f:
         out = f.param("out", tensor_type)
         f.return_type(tensor_type)
-        src = ib.let("src", tile.load(out, [0, 0], [32, 1]))
+        src = ib.let("src", tile.load(out, [0, 0], [32, 1], target_memory=ir.MemorySpace.Vec))
         stored = ib.let("stored", tile.store(src, [0, 0], out))
         val = ib.let("val", tensor_ops.read(out, [0, 0]))
         result = ib.let("result", tensor_ops.write(stored, [0, 0], val))
@@ -1236,16 +1238,35 @@ class TestPreprocessPtoasOutput:
         assert "ptoas_bitcast" in result
 
     def test_renames_only_standalone_ptoas_tensor_type(self):
-        source = "Tensor value; GlobalTensor<float> global; TensorView view; ChipTensor ready;\n"
+        source = "Tensor value; GlobalTensor<float> global; TensorView view; TaskTensor ready;\n"
 
         assert _preprocess_ptoas_output(source) == (
-            "ChipTensor value; GlobalTensor<float> global; TensorView view; ChipTensor ready;\n"
+            "TaskTensor value; GlobalTensor<float> global; TensorView view; TaskTensor ready;\n"
         )
 
     def test_mgather_preprocess_fast_path_preserves_unrelated_content(self):
         source = "AICORE void kernel() {\n  TSTORE(v3);\n}\n"
 
         assert _preprocess_ptoas_output(source) == "static __aicore__ void kernel() {\n  TSTORE(v3);\n}\n"
+
+    def test_preserves_grouped_mx_tquant_name_for_pinned_pto_isa(self):
+        source = (
+            "AICORE void kernel() {\n"
+            "  TQUANT<1, pto::MxQuantAlg::OcpMxFp8E4M3>(dst, src, exp, max, scaling);\n"
+            "  TQUANT<0, MxQuantAlg::OcpMxFp4E2M1>(dst4, src4, exp4, max4, scaling4);\n"
+            "}\n"
+        )
+
+        result = _preprocess_ptoas_output(source)
+
+        assert "TQUANT<1, pto::MxQuantAlg::OcpMxFp8E4M3>" in result
+        assert "TQUANT<0, MxQuantAlg::OcpMxFp4E2M1>" in result
+        assert "TQuant<" not in result
+
+    def test_preserves_legacy_non_mx_tquant_name(self):
+        source = "AICORE void kernel() {\n  TQUANT<QuantMode::F322F16>(dst, src, scale);\n}\n"
+
+        assert "TQUANT<QuantMode::F322F16>" in _preprocess_ptoas_output(source)
 
     def test_restores_mgather_wrapper_operands(self):
         result = _preprocess_ptoas_output(
@@ -1339,17 +1360,17 @@ class TestGenerateArgUnpacking:
     def test_tensor_only(self):
         func = _make_func("test_fn", [("a", "tensor"), ("b", "tensor"), ("out", "tensor")])
         code, names = _generate_arg_unpacking(func)
-        assert "reinterpret_cast<__gm__ ChipTensor*>(args[0])" in code
-        assert "reinterpret_cast<__gm__ ChipTensor*>(args[1])" in code
-        assert "reinterpret_cast<__gm__ ChipTensor*>(args[2])" in code
+        assert "reinterpret_cast<__gm__ TaskTensor*>(args[0])" in code
+        assert "reinterpret_cast<__gm__ TaskTensor*>(args[1])" in code
+        assert "reinterpret_cast<__gm__ TaskTensor*>(args[2])" in code
         assert names == ["a", "b", "out"]
 
     def test_mixed_tensor_scalar(self):
         func = _make_func("test_fn", [("input", "tensor"), ("scale", "scalar"), ("output", "tensor")])
         code, names = _generate_arg_unpacking(func)
         # Tensors-first: input=args[0], output=args[1], scale=args[2]
-        assert "reinterpret_cast<__gm__ ChipTensor*>(args[0])" in code
-        assert "reinterpret_cast<__gm__ ChipTensor*>(args[1])" in code
+        assert "reinterpret_cast<__gm__ TaskTensor*>(args[0])" in code
+        assert "reinterpret_cast<__gm__ TaskTensor*>(args[1])" in code
         assert "scale_conv.u64 = args[2];" in code
         assert "float scale = scale_conv.val;" in code
         assert names == ["input", "output", "scale"]
@@ -1653,9 +1674,9 @@ class TestGenerateKernelWrapper:
         assert func is not None
         wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
 
-        assert '#include "pto_async_kernel_api.h"' in wrapper
-        assert '#if !__has_include("pto_async_kernel_api.h")' in wrapper
-        assert "requires a Simpler runtime that provides pto_async_kernel_api.h" in wrapper
+        assert '#include "async_kernel_api.h"' in wrapper
+        assert '#if !__has_include("async_kernel_api.h")' in wrapper
+        assert "requires a Simpler runtime that provides async_kernel_api.h" in wrapper
         assert "static __aicore__ void pypto_register_counter_completion(" in wrapper
         assert "AsyncCtx ctx = get_async_ctx(raw_args);" in wrapper
         assert "if (!async_ctx_is_deferred(ctx))" in wrapper
@@ -1671,20 +1692,20 @@ class TestGenerateKernelWrapper:
             < wrapper.index("expected < 0 || expected > kMaxExpected")
         )
         assert wrapper.count("*ctx.completion_count = 0;") == 2
-        assert "*ctx.completion_error_code = PTO2_ERROR_ASYNC_COMPLETION_INVALID;" in wrapper
+        assert "*ctx.completion_error_code = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;" in wrapper
         assert "ctx.task_token.raw = 0;" in wrapper
         assert "__builtin_trap();" in wrapper and "trap();" in wrapper
         assert "expected < 0 || expected > kMaxExpected" in wrapper
         assert wrapper.index("expected < 0 || expected > kMaxExpected") < wrapper.index(
             "static_cast<uint32_t>(expected)"
         )
-        assert "PTO2_ERROR_ASYNC_COMPLETION_INVALID" in wrapper
+        assert "SIMPLER_ERROR_ASYNC_COMPLETION_INVALID" in wrapper
         # Registration + writeback delegates to the runtime's public helper
         # rather than restating its token fields. Its only failure is slab
         # overflow, which it records itself as ASYNC_WAIT_OVERFLOW, so the
         # adapter must not also publish REGISTRATION_FAILED.
         assert "save_expected_notification_counter(" in wrapper
-        assert "PTO2_ERROR_ASYNC_REGISTRATION_FAILED" not in wrapper
+        assert "SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED" not in wrapper
         # The only automatic detector for runtime capacity drift.
         assert "static_assert(MAX_COMPLETIONS_PER_TASK == 64," in wrapper
         assert "pto2::detail::defer_flush(ctx);" in wrapper
@@ -2991,7 +3012,7 @@ def test_pto_codegen_view_output_uses_physical_stride():
     a_param = ir.Var("a", a_type, span)
     out_param = ir.Var("out", view_tensor_type, span)
 
-    load_call = ir.op.tile.load(a_param, [0, 0], [32, 32])
+    load_call = ir.op.tile.load(a_param, [0, 0], [32, 32], target_memory=ir.MemorySpace.Vec)
     tile_var = ir.Var("t", load_call.type, span)
     store_call = ir.op.tile.store(tile_var, [0, 0], out_param)
     result_var = ir.Var("result", store_call.type, span)
@@ -3045,12 +3066,16 @@ def test_pto_codegen_make_tensor_view_accepts_dynamic_shape_expressions():
 
     inp = ir.Var("inp", dyn_tensor_type, span)
     out = ir.Var("out", dyn_tensor_type, span)
-    tile_type = ir.op.tile.load(inp, [0, 0], [8, 8]).type
+    tile_type = ir.op.tile.load(inp, [0, 0], [8, 8], target_memory=ir.MemorySpace.Vec).type
     tile_var = ir.Var("t", tile_type, span)
     result_var = ir.Var("result", dyn_tensor_type, span)
     body = ir.SeqStmts(
         [
-            ir.AssignStmt(tile_var, ir.op.tile.load(inp, [0, 0], [8, 8]), span),
+            ir.AssignStmt(
+                tile_var,
+                ir.op.tile.load(inp, [0, 0], [8, 8], target_memory=ir.MemorySpace.Vec),
+                span,
+            ),
             ir.AssignStmt(result_var, ir.op.tile.store(tile_var, [0, 0], out), span),
             ir.ReturnStmt([result_var], span),
         ],
@@ -3087,7 +3112,7 @@ def test_pto_codegen_tensor_view_aliases_input_base_ptr():
 
     view_call = ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
     view_var = ir.Var("src_dn", view_call.type, span)
-    tile_call = ir.op.tile.load(view_var, [0, 0], [16, 8])
+    tile_call = ir.op.tile.load(view_var, [0, 0], [16, 8], target_memory=ir.MemorySpace.Vec)
     tile_var = ir.Var("tile", tile_call.type, span)
     # The DN view transposes [8, 16] to [16, 8], so the tile is in DN coordinates.
     # tile.store does no layout conversion (RFC #1300 P7), so the destination is
@@ -3240,7 +3265,7 @@ def test_pto_codegen_tensor_view_shape_and_layout():
 
     view_call = ir.op.tensor.view(src, [4, 8], layout=ir.TensorLayout.DN)
     view_var = ir.Var("src_view", view_call.type, span)
-    tile_call = ir.op.tile.load(view_var, [0, 0], [4, 8])
+    tile_call = ir.op.tile.load(view_var, [0, 0], [4, 8], target_memory=ir.MemorySpace.Vec)
     tile_var = ir.Var("tile", tile_call.type, span)
     store_call = ir.op.tile.store(tile_var, [0, 0], out)
     result_var = ir.Var("result", store_call.type, span)

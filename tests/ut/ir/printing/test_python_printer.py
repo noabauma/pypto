@@ -125,6 +125,15 @@ def test_python_print_program():
     assert "def simple_func" in result
 
 
+def test_python_print_program_rejects_distributed_prefix():
+    """The main DSL alias must not shadow the reserved distributed alias."""
+    span = ir.Span.unknown()
+    program = ir.Program([], "test_program", span)
+
+    with pytest.raises(ValueError, match="prefix 'pld' is reserved"):
+        program.as_python(prefix="pld")
+
+
 def test_python_print_if_stmt_basic():
     """Test basic if statement printing."""
     span = ir.Span.unknown()
@@ -1732,6 +1741,68 @@ def test_reinterpret_view_public_api_print_parse_roundtrip():
     assert "pl.tensor.reinterpret_view(data, dtype=pl.INT16, shape=[4, 64])" in printed
     assert "pl.tile.reinterpret_view(data, dtype=pl.INT16)" in printed
     assert 'attrs={"pipeline_membership": "0:1"}' in printed
+
+    reparsed = pl.parse_program(printed)
+    ir.assert_structural_equal(program, reparsed)
+    assert python_print(reparsed, format=False) == printed
+
+
+def test_acc_init_cond_print_parse_roundtrip():
+    """The accumulate ops' predicate must print in the form its DSL signature takes.
+
+    The IR stores ``init_cond`` as the 4th positional operand, but two DSL
+    signatures already spend positional slot 4 on something else, so for those
+    the printer must emit it as a keyword argument:
+
+    - ``tensor.matmul_acc(acc, lhs, rhs, a_trans, b_trans, init_cond)`` --
+      ``a_trans`` owns the slot. Printed positionally the predicate re-parses as
+      a transpose flag, then collides with the printed ``a_trans=`` kwarg.
+    - ``tile.gemv_acc(acc, lhs, rhs, acc_phase, *, init_cond)`` -- ``acc_phase``
+      owns the slot, and is likewise also printed as a kwarg.
+
+    ``tile.matmul_acc`` takes the predicate positionally and must keep printing
+    it that way.
+    """
+    source = textwrap.dedent("""\
+        @pl.program
+        class PredicatedSplitK:
+            @pl.function(type=pl.FunctionType.InCore)
+            def tensor_acc(
+                self,
+                acc: pl.Tensor[[64, 64], pl.FP32],
+                lhs: pl.Tensor[[64, 32], pl.FP16],
+                rhs: pl.Tensor[[32, 64], pl.FP16],
+                k0: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                return pl.tensor.matmul_acc(acc, lhs, rhs, init_cond=k0 == 0)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def tile_acc(
+                self,
+                acc: pl.Tile[[64, 64], pl.FP32, pl.Mem.Acc],
+                lhs: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat],
+                rhs: pl.Tile[[32, 64], pl.FP16, pl.Mem.Mat],
+                k0: pl.Scalar[pl.INDEX],
+            ) -> pl.Tile[[64, 64], pl.FP32, pl.Mem.Acc]:
+                return pl.tile.matmul_acc(acc, lhs, rhs, k0 == 0)
+
+            @pl.function(type=pl.FunctionType.InCore)
+            def tile_gemv_acc(
+                self,
+                acc: pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[1, 64])],
+                lhs: pl.Tile[[1, 128], pl.FP16, pl.Mem.Mat],
+                rhs: pl.Tile[[128, 64], pl.FP16, pl.Mem.Mat],
+                k0: pl.Scalar[pl.INDEX],
+            ) -> pl.Tile[[16, 64], pl.FP32, pl.Mem.Acc, pl.TileView(valid_shape=[1, 64])]:
+                return pl.tile.gemv_acc(acc, lhs, rhs, init_cond=k0 == 0)
+    """)
+
+    program = pl.parse_program(source)
+    printed = python_print(program, format=False)
+
+    assert "pl.tensor.matmul_acc(acc, lhs, rhs, init_cond=k0 == 0, a_trans=False, b_trans=False)" in printed
+    assert "pl.tile.matmul_acc(acc, lhs, rhs, k0 == 0)" in printed
+    assert "pl.tile.gemv_acc(acc, lhs, rhs, init_cond=k0 == 0, acc_phase='unspecified')" in printed
 
     reparsed = pl.parse_program(printed)
     ir.assert_structural_equal(program, reparsed)

@@ -9,18 +9,23 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -51,6 +56,83 @@ namespace {
          (func->role_.has_value() && *func->role_ == Role::Orchestrator);
 }
 
+// Follow a data Var's SSA def chain back to its alloc-window-buffer LHS Var
+// (its "lineage"), so implicit allreduce calls over the same buffer share one
+// synthesized signal while distinct buffers (and therefore distinct device
+// coverage / comm domains) get distinct signals. Mirrors
+// MaterializeCommDomainScopes::ResolveWindowRecord: ``pld.tensor.window``
+// resolves through args_[0], push-based collectives (all_to_all / allgather /
+// all_to_all_v) resolve through their target arg (args_[1]), and an allreduce
+// result aliases its own data arg (args_[0]).
+//
+// Loop-carried data is an IterArg, not a Var (ConvertToSSA runs first): it has
+// no AssignStmt RHS, so follow its init value instead. IterArg has its own
+// ObjectKind, so As<Var> misses it — use AsVarLike throughout (see
+// .claude/rules/ir-kind-traits.md, same pattern as InferTileMemorySpace #2547).
+// Resolution through the init value keys every loop iteration to the carry's
+// first-iteration lineage; a loop ping-ponging between two *different-coverage*
+// windows is therefore not distinguished (documented limitation).
+[[nodiscard]] const Var* ResolveLineageKey(const VarPtr& var,
+                                           const std::unordered_map<const Var*, ExprPtr>& var_defs) {
+  std::unordered_set<const Var*> visited;
+  const Var* cur = var.get();
+  while (cur != nullptr && visited.insert(cur).second) {
+    if (cur->GetKind() == ObjectKind::IterArg) {
+      auto init = static_cast<const IterArg*>(cur)->initValue_;
+      if (auto next = AsVarLike(init)) {
+        cur = next.get();
+        continue;
+      }
+      return cur;
+    }
+    auto it = var_defs.find(cur);
+    if (it == var_defs.end() || !it->second) return cur;
+    const ExprPtr& def = it->second;
+    if (auto alias = AsVarLike(def)) {
+      // An alias to a loop carry resolves through the carry's init value.
+      if (alias->GetKind() == ObjectKind::IterArg) {
+        auto init = static_cast<const IterArg*>(alias.get())->initValue_;
+        if (auto next = AsVarLike(init)) {
+          cur = next.get();
+          continue;
+        }
+        return cur;
+      }
+      cur = alias.get();
+      continue;
+    }
+    if (auto call = As<Call>(def)) {
+      if (call->op_ && IsOp(call, "pld.tensor.window") && !call->args_.empty()) {
+        if (auto buf = AsVarLike(call->args_[0])) {
+          cur = buf.get();
+          continue;
+        }
+      }
+      if (IsTensorAllReduce(call) && !call->args_.empty()) {
+        if (auto tgt = AsVarLike(call->args_[0])) {
+          cur = tgt.get();
+          continue;
+        }
+      }
+      if (call->op_ && (IsOp(call, "pld.tensor.all_to_all") || IsOp(call, "pld.tensor.allgather")) &&
+          call->args_.size() > 1) {
+        if (auto tgt = AsVarLike(call->args_[1])) {
+          cur = tgt.get();
+          continue;
+        }
+      }
+      if (call->op_ && IsOp(call, "pld.tensor.all_to_all_v") && call->args_.size() > 1) {
+        if (auto tgt = AsVarLike(call->args_[1])) {
+          cur = tgt.get();
+          continue;
+        }
+      }
+    }
+    return cur;
+  }
+  return cur != nullptr ? cur : var.get();
+}
+
 class NameCollector : public IRVisitor {
  public:
   std::set<std::string> names;
@@ -70,10 +152,110 @@ class NameCollector : public IRVisitor {
   }
 };
 
+// One shared mesh signal per data-buffer lineage group. Each group's binding is
+// hoisted to the top of the function body and reused by every implicit-signal
+// allreduce call over that buffer (including calls inside for/while loops): the
+// host builtin kernels self-clear their barrier cells after each call, so a
+// reused signal is correct across back-to-back and loop-carried calls. Distinct
+// data buffers get distinct signals, so implicit allreduces over different
+// device subsets do not merge into one comm-domain scope.
+struct SharedSignalBinding {
+  std::vector<StmtPtr> prefix;  ///< world_size / alloc_window_buffer / window assigns
+  VarPtr signal_var;
+};
+
+struct SignalNames {
+  std::string world_size_name;
+  std::string buf_name;
+  std::string signal_name;
+};
+
+[[nodiscard]] SignalNames FreshSignalNames(std::set<std::string>* used_names, int64_t* next_id) {
+  while (true) {
+    auto suffix = std::to_string((*next_id)++);
+    SignalNames names{"__allreduce_signal_world_size_" + suffix, "__allreduce_signal_buf_" + suffix,
+                      "__allreduce_signal_" + suffix};
+    if (used_names->count(names.world_size_name) != 0 || used_names->count(names.buf_name) != 0 ||
+        used_names->count(names.signal_name) != 0) {
+      continue;
+    }
+    used_names->insert(names.world_size_name);
+    used_names->insert(names.buf_name);
+    used_names->insert(names.signal_name);
+    return names;
+  }
+}
+
+[[nodiscard]] SharedSignalBinding MakeSharedSignalBinding(std::set<std::string>* used_names, int64_t* next_id,
+                                                          const Span& span, int core_num) {
+  auto names = FreshSignalNames(used_names, next_id);
+  INTERNAL_CHECK_SPAN(core_num > 0, span)
+      << "SynthesizeAllReduceSignals requires a positive allreduce core_num";
+
+  auto world_size_call = OpRegistry::GetInstance().Create("pld.system.world_size", {}, span);
+  auto world_size_var = std::make_shared<Var>(names.world_size_name, world_size_call->GetType(), span);
+  auto world_size_assign = std::make_shared<AssignStmt>(world_size_var, world_size_call, span);
+
+  auto core_num_expr = std::make_shared<ConstInt>(core_num, DataType::INT64, span);
+  auto four = std::make_shared<ConstInt>(4, DataType::INT64, span);
+  auto signal_elements = MakeMul(world_size_var, core_num_expr, span);
+  auto size_bytes = MakeMul(signal_elements, four, span);
+
+  std::vector<std::pair<std::string, std::any>> alloc_kwargs = {{"name", names.buf_name}};
+  auto alloc_call =
+      OpRegistry::GetInstance().Create("pld.tensor.alloc_window_buffer", {size_bytes}, alloc_kwargs, span);
+  auto buf_var = std::make_shared<Var>(names.buf_name, alloc_call->GetType(), span);
+  auto buf_assign = std::make_shared<AssignStmt>(buf_var, alloc_call, span);
+
+  auto signal_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{world_size_var, core_num_expr}, span);
+  std::vector<std::pair<std::string, std::any>> window_kwargs = {{"dtype", DataType::INT32}};
+  auto window_call =
+      OpRegistry::GetInstance().Create("pld.tensor.window", {buf_var, signal_shape}, window_kwargs, span);
+  auto signal_var = std::make_shared<Var>(names.signal_name, window_call->GetType(), span);
+  auto signal_assign = std::make_shared<AssignStmt>(signal_var, window_call, span);
+
+  return {{world_size_assign, buf_assign, signal_assign}, signal_var};
+}
+
+/// Pre-scan: does this host_orch function need the synthesizer at all?
+///
+/// The synthesizer runs on any function carrying a ``pld.tensor.allreduce``
+/// (it also lifts return-position calls and rejects nested calls for
+/// explicit-signal functions); only a 1-arg call additionally needs a shared
+/// signal binding.
+class AllReduceSignalNeedFinder : public IRVisitor {
+ public:
+  bool has_allreduce = false;                           ///< any pld.tensor.allreduce call
+  std::vector<std::pair<ExprPtr, int>> implicit_calls;  ///< 1-arg calls in visit order: {data, core_num}
+  std::unordered_map<const Var*, ExprPtr> var_defs;     ///< Var* -> defining RHS (lineage resolution)
+
+ protected:
+  void VisitExpr_(const CallPtr& op) override {
+    if (IsTensorAllReduce(op)) {
+      has_allreduce = true;
+      if (op->args_.size() == 1) {
+        implicit_calls.emplace_back(op->args_[0], op->GetKwarg<int>("core_num"));
+      }
+    }
+    IRVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    // AsVarLike (not As<Var>): an SSA loop-carry LHS is an IterArg and must be
+    // resolvable back through ResolveLineageKey (ir-kind-traits.md).
+    if (auto var = AsVarLike(op->var_)) {
+      var_defs[var.get()] = op->value_;
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+};
+
 class AllReduceSignalSynthesizer : public IRMutator {
  public:
-  AllReduceSignalSynthesizer(std::set<std::string>* used_names, int64_t* next_id)
-      : used_names_(used_names), next_id_(next_id) {}
+  using SignalLookup = std::function<VarPtr(const ExprPtr&)>;
+
+  AllReduceSignalSynthesizer(std::set<std::string>* used_names, int64_t* next_id, SignalLookup signal_lookup)
+      : used_names_(used_names), next_id_(next_id), signal_lookup_(std::move(signal_lookup)) {}
 
   [[nodiscard]] bool modified() const { return modified_; }
 
@@ -96,15 +278,12 @@ class AllReduceSignalSynthesizer : public IRMutator {
       return op;
     }
 
-    auto [prefix, signal] = MakeSignalBinding(call->span_, call->GetKwarg<int>("core_num"));
     auto target = VisitExpr(call->args_[0]);
-    auto rewritten_call = MakeAllReduceCall(call, target, signal);
+    auto rewritten_call = MakeAllReduceCall(call, target, signal_lookup_(call->args_[0]));
     auto result = MutableCopy(op);
     result->value_ = rewritten_call;
-
-    prefix.push_back(result);
     modified_ = true;
-    return SeqStmts::Flatten(std::move(prefix), op->span_);
+    return result;
   }
 
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
@@ -116,13 +295,10 @@ class AllReduceSignalSynthesizer : public IRMutator {
       return op;
     }
 
-    auto [prefix, signal] = MakeSignalBinding(call->span_, call->GetKwarg<int>("core_num"));
     auto target = VisitExpr(call->args_[0]);
-    auto rewritten_call = MakeAllReduceCall(call, target, signal);
-    std::vector<StmtPtr> stmts = std::move(prefix);
-    stmts.push_back(std::make_shared<EvalStmt>(rewritten_call, op->span_, op->leading_comments_));
+    auto rewritten_call = MakeAllReduceCall(call, target, signal_lookup_(call->args_[0]));
     modified_ = true;
-    return SeqStmts::Flatten(std::move(stmts), op->span_);
+    return std::make_shared<EvalStmt>(rewritten_call, op->span_, op->leading_comments_);
   }
 
   StmtPtr VisitStmt_(const ReturnStmtPtr& op) override {
@@ -143,15 +319,7 @@ class AllReduceSignalSynthesizer : public IRMutator {
 
       CheckAllReduceCall(call);
       auto target = VisitExpr(call->args_[0]);
-      ExprPtr signal;
-      if (call->args_.size() == 1) {
-        auto [prefix, synthesized_signal] = MakeSignalBinding(call->span_, call->GetKwarg<int>("core_num"));
-        for (auto& stmt : prefix) prelude.push_back(std::move(stmt));
-        signal = synthesized_signal;
-      } else {
-        signal = VisitExpr(call->args_[1]);
-      }
-
+      auto signal = call->args_.size() == 1 ? signal_lookup_(call->args_[0]) : VisitExpr(call->args_[1]);
       auto rewritten_call = MakeAllReduceCall(call, target, signal);
       auto result_var = std::make_shared<Var>(FreshGeneratedName("__allreduce_result_"),
                                               rewritten_call->GetType(), call->span_);
@@ -168,58 +336,11 @@ class AllReduceSignalSynthesizer : public IRMutator {
     return SeqStmts::Flatten(std::move(prelude), op->span_);
   }
 
-  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
-    ++repeating_scope_depth_;
-    auto result = IRMutator::VisitStmt_(op);
-    --repeating_scope_depth_;
-    return result;
-  }
-
-  StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
-    ++repeating_scope_depth_;
-    auto result = IRMutator::VisitStmt_(op);
-    --repeating_scope_depth_;
-    return result;
-  }
-
  private:
   void CheckAllReduceCall(const CallPtr& call) const {
     CHECK_SPAN(call->args_.size() == 1 || call->args_.size() == 2, call->span_)
         << "pld.tensor.allreduce expects target[, signal], got " << call->args_.size()
         << " positional arguments";
-    // Only a *synthesized* signal is loop-bound: the binding this pass inserts
-    // cannot be allocated once per dynamic iteration, and every rank has to land
-    // on the same symmetric window. An explicit signal needs no synthesis, and
-    // the lowered kernel restores its cells to zero before returning, so
-    // carrying one across iterations is safe.
-    CHECK_SPAN(repeating_scope_depth_ == 0 || call->args_.size() == 2, call->span_)
-        << "pld.tensor.allreduce without an explicit signal is not supported inside a for/while "
-           "loop on the HOST rail: the synthesized signal binding cannot be allocated per dynamic "
-           "iteration. Pass an explicit signal buffer — it is self-clearing and reusable across "
-           "iterations — or hoist the call out of the loop.";
-  }
-
-  struct SignalNames {
-    std::string world_size_name;
-    std::string buf_name;
-    std::string signal_name;
-  };
-
-  [[nodiscard]] SignalNames FreshSignalNames() {
-    while (true) {
-      auto suffix = std::to_string((*next_id_)++);
-      auto world_size_name = "__allreduce_signal_world_size_" + suffix;
-      auto buf_name = "__allreduce_signal_buf_" + suffix;
-      auto signal_name = "__allreduce_signal_" + suffix;
-      if (used_names_->count(world_size_name) != 0 || used_names_->count(buf_name) != 0 ||
-          used_names_->count(signal_name) != 0) {
-        continue;
-      }
-      used_names_->insert(world_size_name);
-      used_names_->insert(buf_name);
-      used_names_->insert(signal_name);
-      return {world_size_name, buf_name, signal_name};
-    }
   }
 
   [[nodiscard]] std::string FreshGeneratedName(const std::string& prefix) {
@@ -231,37 +352,6 @@ class AllReduceSignalSynthesizer : public IRMutator {
     }
   }
 
-  [[nodiscard]] std::pair<std::vector<StmtPtr>, VarPtr> MakeSignalBinding(const Span& span, int core_num) {
-    auto names = FreshSignalNames();
-    INTERNAL_CHECK_SPAN(core_num > 0, span)
-        << "SynthesizeAllReduceSignals requires a positive allreduce core_num";
-
-    auto world_size_call = OpRegistry::GetInstance().Create("pld.system.world_size", {}, span);
-    auto world_size_var = std::make_shared<Var>(names.world_size_name, world_size_call->GetType(), span);
-    auto world_size_assign = std::make_shared<AssignStmt>(world_size_var, world_size_call, span);
-
-    auto core_num_expr = std::make_shared<ConstInt>(core_num, DataType::INT64, span);
-    auto four = std::make_shared<ConstInt>(4, DataType::INT64, span);
-    auto signal_elements = MakeMul(world_size_var, core_num_expr, span);
-    auto size_bytes = MakeMul(signal_elements, four, span);
-
-    std::vector<std::pair<std::string, std::any>> alloc_kwargs = {{"name", names.buf_name}};
-    auto alloc_call =
-        OpRegistry::GetInstance().Create("pld.tensor.alloc_window_buffer", {size_bytes}, alloc_kwargs, span);
-    auto buf_var = std::make_shared<Var>(names.buf_name, alloc_call->GetType(), span);
-    auto buf_assign = std::make_shared<AssignStmt>(buf_var, alloc_call, span);
-
-    auto signal_shape =
-        std::make_shared<MakeTuple>(std::vector<ExprPtr>{world_size_var, core_num_expr}, span);
-    std::vector<std::pair<std::string, std::any>> window_kwargs = {{"dtype", DataType::INT32}};
-    auto window_call =
-        OpRegistry::GetInstance().Create("pld.tensor.window", {buf_var, signal_shape}, window_kwargs, span);
-    auto signal_var = std::make_shared<Var>(names.signal_name, window_call->GetType(), span);
-    auto signal_assign = std::make_shared<AssignStmt>(signal_var, window_call, span);
-
-    return {{world_size_assign, buf_assign, signal_assign}, signal_var};
-  }
-
   [[nodiscard]] CallPtr MakeAllReduceCall(const CallPtr& call, const ExprPtr& target, const ExprPtr& signal) {
     return OpRegistry::GetInstance().Create("pld.tensor.allreduce", {target, signal}, call->kwargs_,
                                             call->span_);
@@ -269,7 +359,7 @@ class AllReduceSignalSynthesizer : public IRMutator {
 
   std::set<std::string>* used_names_;
   int64_t* next_id_;
-  int repeating_scope_depth_ = 0;
+  SignalLookup signal_lookup_;
   bool modified_ = false;
 };
 
@@ -291,8 +381,74 @@ Pass SynthesizeAllReduceSignals() {
         continue;
       }
 
-      AllReduceSignalSynthesizer synthesizer(&name_collector.names, &next_signal_id);
-      auto new_body = synthesizer.VisitStmt(func->body_);
+      // One shared mesh signal per data-buffer lineage group, hoisted before the
+      // body and reused by every implicit-signal call over that buffer (incl.
+      // inside loops — self-clearing kernels make reuse safe). Distinct data
+      // buffers get distinct signals, so implicit allreduces over different
+      // device subsets do not merge into a single comm-domain scope. The
+      // synthesizer still runs for explicit-signal functions to lift
+      // return-position calls and reject nested calls.
+      AllReduceSignalNeedFinder finder;
+      finder.VisitStmt(func->body_);
+      if (!finder.has_allreduce) {
+        new_functions[gvar] = func;
+        continue;
+      }
+
+      std::vector<const void*> lineage_order;
+      std::unordered_map<const void*, int> lineage_core_num;
+      std::unordered_map<const void*, VarPtr> lineage_to_signal;
+      std::vector<StmtPtr> body_stmts;
+      for (const auto& [data_expr, core_num] : finder.implicit_calls) {
+        const void* key;
+        // AsVarLike (not As<Var>): loop-carried data is an IterArg and must
+        // resolve through its lineage group, not fall back to a per-call
+        // signal (ir-kind-traits.md).
+        if (auto data_var = AsVarLike(data_expr)) {
+          key = static_cast<const void*>(ResolveLineageKey(data_var, finder.var_defs));
+        } else {
+          key = static_cast<const void*>(data_expr.get());  // non-Var data → per-call signal
+        }
+        auto [it, inserted] = lineage_core_num.emplace(key, core_num);
+        if (!inserted) {
+          it->second = std::max(it->second, core_num);
+        } else {
+          lineage_order.push_back(key);
+        }
+      }
+      for (const void* key : lineage_order) {
+        auto binding = MakeSharedSignalBinding(&name_collector.names, &next_signal_id, func->span_,
+                                               lineage_core_num[key]);
+        lineage_to_signal[key] = binding.signal_var;
+        body_stmts.insert(body_stmts.end(), binding.prefix.begin(), binding.prefix.end());
+      }
+      StmtPtr body_to_visit;
+      if (body_stmts.empty()) {
+        body_to_visit = func->body_;
+      } else {
+        body_stmts.push_back(func->body_);
+        body_to_visit = SeqStmts::Flatten(std::move(body_stmts), func->span_);
+      }
+
+      AllReduceSignalSynthesizer::SignalLookup signal_lookup = [&lineage_to_signal,
+                                                                &finder](const ExprPtr& data) -> VarPtr {
+        const void* key;
+        // AsVarLike (not As<Var>): loop-carried data is an IterArg and must
+        // resolve through its lineage group, not fall back to a per-call
+        // signal (ir-kind-traits.md).
+        if (auto data_var = AsVarLike(data)) {
+          key = static_cast<const void*>(ResolveLineageKey(data_var, finder.var_defs));
+        } else {
+          key = static_cast<const void*>(data.get());
+        }
+        auto it = lineage_to_signal.find(key);
+        INTERNAL_CHECK(it != lineage_to_signal.end())
+            << "SynthesizeAllReduceSignals: no synthesized signal for allreduce data lineage";
+        return it->second;
+      };
+
+      AllReduceSignalSynthesizer synthesizer(&name_collector.names, &next_signal_id, signal_lookup);
+      auto new_body = synthesizer.VisitStmt(body_to_visit);
       if (!synthesizer.modified()) {
         new_functions[gvar] = func;
         continue;

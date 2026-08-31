@@ -6,7 +6,7 @@ baseline is Little-oil/PTOAS `main`
 `d852dd2dba3e5bf7a69ce8324eb88afc336e8a33`: 189 public interfaces from the manual
 plus 15 source-only compatibility/tile interfaces still present in `PTOOps.td`, for a
 total of 204. Column statuses were checked against the **current PyPTO source** (last
-updated 2026-08-11). When an op is added or changed, update only its corresponding row.
+updated 2026-08-14). When an op is added or changed, update only its corresponding row.
 
 The matrix includes public/compatibility interfaces even when their PyPTO level is
 `internal`. Separately, it excludes 32 additional `PTOOps.td` ops that exist only
@@ -93,7 +93,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tdiv | TDIV | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | verified on A2/A3 hardware; A5 hardware verification pending |
 | pto.tmax | TMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tmin | TMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.trem | TREM | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.trem | TREM | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 exact-op hardware ST passed for FP32 and INT32 within the ISA domain `[-2^24, 2^24]`, including domain boundaries plus full/tail valid shapes; A5 hardware pending |
 | pto.tpartadd | TPARTADD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tpartmax | TPARTMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tpartmin | TPARTMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
@@ -108,7 +108,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tdivs | TDIVS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tmaxs | TMAXS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tmins | TMINS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.trems | TREMS | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.trems | TREMS | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 exact-op hardware ST passed for FP32 and INT32 scalar forms within `[-2^24, 2^24]`, including both INT32 boundaries, negative values, and tail valid shapes; A5 hardware pending |
 | pto.taddc | TADD + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tsubc | TSUB + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.taddsc | TADDS + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
@@ -124,8 +124,8 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.trelu | TRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tlrelu | TLRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.taddrelu | VADDRELU | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
-| pto.tfmod | TFMOD | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tfmods | TFMODS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.tfmod | TFMOD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 exact-op hardware ST passed for FP32 tile-tile forms with full and tail valid shapes; A5 hardware pending |
+| pto.tfmods | TFMODS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 exact-op hardware ST passed for FP32 scalar forms, including negative values and tail valid shapes; A5 hardware pending |
 | pto.tpow | TPOW | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
 | pto.tpows | TPOWS | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
 | pto.trandom | TRANDOM | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | PTOAS source-only compatibility interface |
@@ -208,7 +208,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tget_scale_addr | GetScaleAddr + TASSIGN | tile | ✅ | ✅ | ✅ | ❌ | — | NEW frontend+codegen; Mat→scale `tmov` emitted in source order, PTOAS `PTOA5NormalizeTMovPass` reorders bind-before-fill; see [operators MX constraints](ir/05-operators.md#mx--ascend950-ptoas-constraints) |
 | pto.tmov.fp | TMOV_FP | tile | ✅ | ❌ | ❌ | ❌ | — | backend hook exists; IR/Python frontend and ST are missing |
 | pto.tquant | TQUANT | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
-| pto.tquant.mx | TQUANT (overload) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
+| pto.tquant.mx | TQUANT (overload) | tile | ✅ | ✅ | ❌ | ✅ | — | A5 MXFP8-only standalone quantization frontend+codegen+hardware ST (`group_axis` A/B); MXFP4 quant deferred |
 | pto.tstore_fp | TSTORE_FP | tile | ✅ | ❌ | ❌ | ❌ | — | the current backend emits `pto.tstore.fp` |
 | pto.tdequant | TDEQUANT | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
 | **Synchronization (8)** |  |  |  |  |  |  |  |  |

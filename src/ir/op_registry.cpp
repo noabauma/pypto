@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <any>
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <optional>
@@ -27,6 +28,7 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memory_space.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
 
@@ -39,6 +41,109 @@ namespace {
 ///
 /// Kept out of line so `Span::to_string()` is only paid on the error path.
 std::string LocationSuffix(const Span& span) { return span.is_valid() ? " at " + span.to_string() : ""; }
+
+/// Render an allowed-space list as "Acc" / "Vec or Acc" / "Vec, Mat or Acc".
+std::string FormatAllowedSpaces(const std::vector<MemorySpace>& allowed) {
+  std::string out;
+  for (size_t i = 0; i < allowed.size(); ++i) {
+    if (i > 0) out += (i + 1 == allowed.size()) ? " or " : ", ";
+    out += MemorySpaceToString(allowed[i]);
+  }
+  return out;
+}
+
+/// Reject an operand whose explicit memory space no pass can legalize.
+///
+/// Three states, three outcomes:
+///
+///  * **unset** — always legal. `nullopt` is the IR's "not decided yet", and
+///    `InferTileMemorySpace` (pass 17) places the tile from consumer demand.
+///    The `TileMemoryInferred` verifier checks the outcome afterwards.
+///  * **set and allowed** — legal, nothing to do.
+///  * **set, not allowed, but reachable by a `tile.move`** — also legal here.
+///    Pass 17's MoveCollector inserts the move. This is the ordinary case for
+///    `tile.matmul`'s Left/Right operands, reached from Mat by an MTE1 tmov.
+///  * **set, not allowed, and unreachable** — a user error, reported here.
+///
+/// Only the last case is rejected, and the axis is *reachability in the ISA's
+/// move graph*, not aliasing. In practice it fires on `Acc`: nothing writes L0C
+/// except the MAD unit, so no target's SoC memory graph has an inbound
+/// edge to `Acc` on any target. A tile that must be an accumulator therefore has
+/// to be *created* in `Acc` — no copy can put it there afterwards. Without this
+/// check the pass emits a `pto.tmov` into L0C that PTOAS rejects much later,
+/// naming neither the tile nor the line that created it.
+///
+/// Deliberately narrow. `OpRegistry::Create` is not only the user-authoring
+/// path: passes call it constantly on half-rewritten IR, where an operand may
+/// still be the pre-legalization value (a GM tensor awaiting its `tile.load`, an
+/// operand a later phase will bridge). Rejecting every constraint violation here
+/// would reject those transients. So this checks only what *no* later phase can
+/// repair, whatever order they run in:
+///
+///  * A `DDR`-resident operand is skipped outright — GM values reach on-chip by
+///    `tile.load`, a different mechanism from `tile.move`, and always available.
+///  * Otherwise the operand is rejected only when the constraint set contains no
+///    space that any target can move into from where the operand actually is.
+///    Today that means exactly one thing: a constraint of `{Acc}`. Nothing writes
+///    L0C but the MAD unit, so an accumulator must be *created* in `Acc`.
+///
+/// Everything else — a Vec operand needing Left, a Mat operand needing Vec — is
+/// left alone here even when it is also unimplementable, because at construction
+/// time we cannot tell a settled operand from a transient one. Those belong to
+/// `InferTileMemorySpace`'s MoveCollector, which runs on settled IR and knows the
+/// configured target's exact adjacency via `SoC::GetMemoryGraph()`.
+void CheckOperandMemorySpaceReachable(const OpMemorySpaceSpec& spec, const std::string& op_name,
+                                      const std::vector<ExprPtr>& args, const Span& span) {
+  if (spec.input_constraints.empty()) return;
+
+  const size_t n = std::min(spec.input_constraints.size(), args.size());
+  for (size_t idx = 0; idx < n; ++idx) {
+    const auto& allowed = spec.input_constraints[idx];
+    if (allowed.empty() || !args[idx]) continue;
+
+    auto tile_type = As<TileType>(args[idx]->GetType());
+    if (!tile_type) continue;
+    const auto space = tile_type->memory_space_;
+    if (!space.has_value()) continue;          // unset: the compiler will place it
+    if (*space == MemorySpace::DDR) continue;  // reached by tile.load, not tile.move
+    if (std::find(allowed.begin(), allowed.end(), *space) != allowed.end()) continue;
+
+    // Reachable from ANY on-chip space, not just this operand's: that is what
+    // distinguishes "this particular hop is missing" (leave it to pass 17) from
+    // "this destination has no inbound edge at all" (unfixable, reject now).
+    const bool destination_ever_reachable =
+        std::any_of(allowed.begin(), allowed.end(), [](MemorySpace target) {
+          for (MemorySpace from : {MemorySpace::Vec, MemorySpace::Mat, MemorySpace::Acc, MemorySpace::Left,
+                                   MemorySpace::Right, MemorySpace::Bias}) {
+            if (IsTileMoveEverSupported(from, target)) return true;
+          }
+          return false;
+        });
+    if (destination_ever_reachable) continue;
+
+    const std::string wanted = FormatAllowedSpaces(allowed);
+    std::string msg = "The operator " + op_name + " requires argument " + std::to_string(idx) +
+                      " to live in " + wanted + " memory, but it is in " + MemorySpaceToString(*space) +
+                      " memory. No target has any data path into " + wanted +
+                      " memory -- only the matrix unit writes it -- so the compiler " +
+                      "cannot insert a copy to bridge them. The value has to be produced there " +
+                      "in the first place: either by a matmul, or by an allocation that names " +
+                      "the space (target_memory=pl.MemorySpace." + MemorySpaceToString(allowed[0]) +
+                      "), or by an allocation left unset for the compiler to place.";
+    if (allowed.size() == 1 && allowed[0] == MemorySpace::Acc) {
+      // The common way to land here is a zero-initialized accumulator written as
+      // `tile.full`, whose output space is fixed to UB and so can never be it.
+      // Name the replacement, because there is no in-place rewrite of `tile.full`
+      // that would work: `init_cond` removes the need to pre-zero at all.
+      msg +=
+          " Note that `tile.full` fills UB and cannot produce an accumulator. To start an"
+          " accumulation from zero, drop the pre-zeroed tile and pass"
+          " `init_cond=<true on the first step>` to the accumulating op instead -- it overwrites"
+          " on that step rather than accumulating into it.";
+    }
+    throw ValueError(msg + LocationSuffix(span));
+  }
+}
 
 }  // namespace
 
@@ -180,6 +285,29 @@ CallPtr OpRegistry::CreateImpl(const std::string& op_name, const std::vector<Exp
   }
   INTERNAL_CHECK_SPAN(result_type, span) << "Type deduction failed for '" + op_name + "'";
 
+  // The declared output arity and the deduced shape must agree. A mismatch means
+  // the registration and its f_deduce_type disagree about what the operator
+  // produces, which would surface much later as a null element var inside
+  // multi-output codegen. The reverse direction matters just as much: a tuple
+  // result nobody declared has no arity for codegen to read, so its elements
+  // would never be resolved.
+  const size_t declared_arity = entry.GetOutputArity();
+  auto deduced_tuple = As<TupleType>(result_type);
+  if (declared_arity > 1) {
+    INTERNAL_CHECK_SPAN(deduced_tuple, span)
+        << "Internal error: '" << op_name << "' declares set_output_arity(" << declared_arity
+        << ") but deduced a non-tuple " << result_type->TypeName();
+    INTERNAL_CHECK_SPAN(deduced_tuple->types_.size() == declared_arity, span)
+        << "Internal error: '" << op_name << "' declares set_output_arity(" << declared_arity
+        << ") but deduced a TupleType with " << deduced_tuple->types_.size() << " elements";
+  } else {
+    INTERNAL_CHECK_SPAN(!deduced_tuple, span)
+        << "Internal error: '" << op_name << "' deduced a TupleType result without declaring "
+        << "set_output_arity(" << deduced_tuple->types_.size()
+        << "); multi-output codegen reads the arity from the registry and would not "
+           "resolve this call's elements";
+  }
+
   // Apply OpMemorySpaceSpec to TileType results that lack memory_space.
   // This ensures the deduced type carries memory_space even when individual
   // type deduction functions omit it (fixes issue #553).
@@ -189,6 +317,9 @@ CallPtr OpRegistry::CreateImpl(const std::string& op_name, const std::vector<Exp
   // that lacks a memory_space. Heterogeneous-output ops should set
   // memory_space_ inside f_deduce_type rather than relying on this fallback.
   const auto& mem_spec = entry.GetMemorySpec();
+  if (mem_spec.has_value()) {
+    CheckOperandMemorySpaceReachable(*mem_spec, op_name, args, span);
+  }
   if (mem_spec.has_value() && mem_spec->deduce_output_memory) {
     auto resolve_memory_space = [&]() -> std::optional<MemorySpace> {
       auto resolved = mem_spec->deduce_output_memory(kwargs);
@@ -276,6 +407,145 @@ void OpRegistry::ValidateTileOps() const {
       msg += "\n  - " + name;
     }
     throw ValueError(msg);
+  }
+}
+
+void OpRegistry::ValidateArgEffects() const {
+  std::vector<std::string> unclassified;
+  std::vector<std::string> channel_without_write;
+  for (const auto& [name, entry] : registry_) {
+    // A write channel describes *how* an operator writes, so declaring one
+    // while writing nothing is incoherent — and it is the shape that hides a
+    // missing classification, since `set_write_channel()` creates the effect
+    // spec as a side effect and would otherwise make the operator look
+    // classified.
+    if (entry.GetWriteChannel().has_value() && !entry.WritesAnyArg()) {
+      channel_without_write.push_back(name);
+    }
+    const auto& spec = entry.GetMemorySpec();
+    if (!spec.has_value() || !spec->output_reuses_input_arg.has_value()) continue;
+    const size_t reused = *spec->output_reuses_input_arg;
+    // Ask about the reused argument specifically. A registration that named a
+    // different argument still leaves this one defaulting to `Read`, and the
+    // whole point of the gate is that such a default is a decision nobody made.
+    if (entry.HasDeclaredArgEffect(reused)) continue;
+    unclassified.push_back(name + " (in-place on argument " + std::to_string(reused) + ")");
+  }
+  if (!channel_without_write.empty()) {
+    std::sort(channel_without_write.begin(), channel_without_write.end());
+    std::string msg =
+        "The following ops declare a write channel but write through no argument. A channel says "
+        "how an op writes, so one without a write is either a stray declaration or a missing "
+        "one — add the .set_arg_effect(<index>, ...) that was meant to accompany it, or drop the "
+        ".set_write_channel(...):";
+    for (const auto& name : channel_without_write) {
+      msg += "\n  - " + name;
+    }
+    throw ValueError(msg);
+  }
+  if (!unclassified.empty()) {
+    std::sort(unclassified.begin(), unclassified.end());
+    std::string msg =
+        "The following ops update an argument in place but never declared what they do to it. "
+        "Direction inference reads an undeclared operator as a pure consumer, so the write is "
+        "silently dropped. Add .set_arg_effect(<index>, ArgEffect::Write) — ArgEffect::ReadWrite "
+        "when the op accumulates into the slot — or .no_arg_writes() when the slot is metadata "
+        "rather than data:";
+    for (const auto& name : unclassified) {
+      msg += "\n  - " + name;
+    }
+    throw ValueError(msg);
+  }
+}
+
+void OpRegistry::ValidateMultiOutputOps() const {
+  std::vector<std::string> unclassified;
+  std::vector<std::string> leaked_destinations;
+  std::vector<std::string> workspace_out_of_range;
+  std::vector<std::string> workspace_never_written;
+  std::vector<std::string> reuses_input;
+  for (const auto& [name, entry] : registry_) {
+    if (entry.GetOutputArity() <= 1) continue;
+    const size_t arg_count = entry.GetArgumentCount();
+    for (size_t i = 0; i < arg_count; ++i) {
+      // An argument nobody classified defaults to Read, and a destination tile
+      // reads exactly like an input under that default. Demanding a verdict is
+      // what turns the leak from invisible into a registration a reviewer sees.
+      if (!entry.HasDeclaredArgEffect(i)) {
+        unclassified.push_back(name + " (argument " + std::to_string(i) + ")");
+        continue;
+      }
+      // A written argument is either scratch the hardware needs or a result the
+      // caller reads. The first is legitimate and must say so; the second is a
+      // destination that belongs in the TupleType.
+      if (entry.MayWriteArg(i) && !entry.IsWorkspaceArg(i)) {
+        leaked_destinations.push_back(name + " (argument " + std::to_string(i) + ")");
+      }
+    }
+    // A workspace declaration is a claim about an argument that exists and that
+    // the hardware writes. Neither half is implied by the loop above: an index
+    // past the end names nothing, and `.no_arg_writes().set_workspace_arg(0)`
+    // classifies argument 0 as Read while calling it hardware-written scratch.
+    // Either way the operator reads as a pure consumer of a slot it writes.
+    for (size_t i : entry.GetWorkspaceArgs()) {
+      if (i >= arg_count) {
+        workspace_out_of_range.push_back(name + " (argument " + std::to_string(i) + " of " +
+                                         std::to_string(arg_count) + ")");
+      } else if (!entry.MayWriteArg(i)) {
+        workspace_never_written.push_back(name + " (argument " + std::to_string(i) + ")");
+      }
+    }
+    const auto& spec = entry.GetMemorySpec();
+    if (spec.has_value() && spec->output_reuses_input_arg.has_value()) {
+      reuses_input.push_back(name);
+    }
+  }
+  auto fail = [](std::string msg, std::vector<std::string> names) {
+    std::sort(names.begin(), names.end());
+    for (const auto& name : names) msg += "\n  - " + name;
+    throw ValueError(msg);
+  };
+  if (!unclassified.empty()) {
+    fail(
+        "The following multi-output ops left an argument unclassified. An operator that "
+        "returns several values must reach a verdict about every argument it takes: an "
+        "undeclared slot defaults to Read, which is indistinguishable from a destination "
+        "tile smuggled into the argument list. Add .set_arg_effect(<index>, ...) for each "
+        "argument — or .no_arg_writes() when the operator writes through none of them:",
+        std::move(unclassified));
+  }
+  if (!leaked_destinations.empty()) {
+    fail(
+        "The following multi-output ops write through an argument that was never declared "
+        "scratch. A written argument is either a workspace the hardware needs — say so with "
+        ".set_workspace_arg(<index>) — or a destination the caller reads, which must be an "
+        "element of the deduced TupleType instead. A destination in the argument list makes "
+        "the caller pre-allocate a buffer InitMemRef owns:",
+        std::move(leaked_destinations));
+  }
+  if (!workspace_out_of_range.empty()) {
+    fail(
+        "The following multi-output ops declare a workspace argument that does not exist. "
+        "set_workspace_arg() names a positional argument, so an index past the end is a "
+        "typo that silently protects nothing:",
+        std::move(workspace_out_of_range));
+  }
+  if (!workspace_never_written.empty()) {
+    fail(
+        "The following multi-output ops declare a workspace argument the operator never "
+        "writes. A workspace is hardware-written scratch by definition; declaring one Read "
+        "-- or reaching that classification through no_arg_writes() -- leaves direction "
+        "inference treating a real write as a read, which is the dropped dependency edge "
+        "this check exists to prevent. Declare the effect that matches what the hardware "
+        "does, or drop the workspace marker:",
+        std::move(workspace_never_written));
+  }
+  if (!reuses_input.empty()) {
+    fail(
+        "The following multi-output ops declare set_output_reuses_input(N). With several "
+        "results, \"the output reuses input N\" cannot say which one, and InitMemRef would "
+        "bind the tuple temporary rather than an element. Drop the declaration:",
+        std::move(reuses_input));
   }
 }
 
