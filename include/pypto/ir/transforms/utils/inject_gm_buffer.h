@@ -45,6 +45,14 @@ struct GMBufferInjectionSpec {
   /// True for a call that makes its enclosing function need the buffer.
   std::function<bool(const CallPtr&)> is_trigger;
 
+  /// Call-site direction for the appended argument.
+  ///
+  /// Only consulted when the call already carries an ``arg_directions`` attr,
+  /// which is the case for a pass running after DeriveCallDirections. Appending
+  /// the arg without extending that vector trips the Call invariant that the two
+  /// have equal length.
+  ArgDirection arg_direction;
+
   /// Pass name, used only in internal-error messages.
   std::string pass_name;
 };

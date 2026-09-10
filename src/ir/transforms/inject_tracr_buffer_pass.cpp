@@ -108,6 +108,13 @@ Pass InjectTracrBuffer() {
                                                 .dtype = DataType::INT64,
                                                 .elems = kTracrBufferElems,
                                                 .is_trigger = IsCommMarkerSite,
+                                                // NoDep, not OutputExisting: the
+                                                // trace buffer is written by the
+                                                // kernel but must never order two
+                                                // tasks against each other, or the
+                                                // profiler would serialize the
+                                                // schedule it is measuring.
+                                                .arg_direction = ArgDirection::NoDep,
                                                 .pass_name = "InjectTracrBuffer"};
     transform_utils::InjectGMBufferParamInPlace(functions, spec);
 

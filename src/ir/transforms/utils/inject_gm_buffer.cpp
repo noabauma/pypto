@@ -71,6 +71,23 @@ bool HasTriggerOps(const std::vector<StmtPtr>& stmts, const TriggerFn& is_trigge
   return false;
 }
 
+/// Append ``arg`` to a call-like node, keeping the ``arg_directions`` attr in
+/// step. The attr is absent before DeriveCallDirections runs and must match
+/// ``args_`` in length once present.
+template <typename NodePtr>
+void AppendArgWithDirection(const NodePtr& node, const ExprPtr& arg, ArgDirection dir) {
+  node->args_.push_back(arg);
+  // attrs_ is an association *vector*, not a map.
+  for (auto& [key, value] : node->attrs_) {
+    if (key != kAttrArgDirections) continue;
+    auto dirs = AnyCast<std::vector<ArgDirection>>(value, "attr key: arg_directions");
+    if (dirs.empty()) return;  // empty means "not yet resolved"; leave it that way
+    dirs.push_back(dir);
+    value = std::any(std::move(dirs));
+    return;
+  }
+}
+
 bool HasBufferParam(const FunctionPtr& func, const std::string& param_name) {
   for (const auto& param : func->params_) {
     if (param->name_hint_ == param_name) return true;
@@ -167,7 +184,7 @@ FunctionPtr AddBufferParam(const FunctionPtr& func, const GMBufferInjectionSpec&
 
 /// Append ``gm_param`` to every call that targets a function in ``modified_funcs``.
 StmtPtr RewriteCallsWithParam(const StmtPtr& body, const std::unordered_set<std::string>& modified_funcs,
-                              const VarPtr& gm_param, const std::string& pass_name) {
+                              const VarPtr& gm_param, ArgDirection dir, const std::string& pass_name) {
   auto stmts = FlattenBody(body);
   std::vector<StmtPtr> new_stmts;
   bool any_changed = false;
@@ -180,13 +197,13 @@ StmtPtr RewriteCallsWithParam(const StmtPtr& body, const std::unordered_set<std:
     if (auto call = std::dynamic_pointer_cast<const Call>(expr)) {
       if (!should_rewrite(call->op_)) return nullptr;
       auto new_call = MutableCopy(call);
-      new_call->args_.push_back(gm_param);
+      AppendArgWithDirection(new_call, gm_param, dir);
       return new_call;
     }
     if (auto submit = std::dynamic_pointer_cast<const Submit>(expr)) {
       if (!should_rewrite(submit->op_)) return nullptr;
       auto new_submit = MutableCopy(submit);
-      new_submit->args_.push_back(gm_param);
+      AppendArgWithDirection(new_submit, gm_param, dir);
       return new_submit;
     }
     return nullptr;
@@ -210,7 +227,7 @@ StmtPtr RewriteCallsWithParam(const StmtPtr& body, const std::unordered_set<std:
       }
     }
     if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
-      auto nb = RewriteCallsWithParam(for_stmt->body_, modified_funcs, gm_param, pass_name);
+      auto nb = RewriteCallsWithParam(for_stmt->body_, modified_funcs, gm_param, dir, pass_name);
       if (nb != for_stmt->body_) {
         auto new_for = MutableCopy(for_stmt);
         new_for->body_ = nb;
@@ -220,11 +237,11 @@ StmtPtr RewriteCallsWithParam(const StmtPtr& body, const std::unordered_set<std:
         new_stmts.push_back(stmt);
       }
     } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
-      auto nt = RewriteCallsWithParam(if_stmt->then_body_, modified_funcs, gm_param, pass_name);
+      auto nt = RewriteCallsWithParam(if_stmt->then_body_, modified_funcs, gm_param, dir, pass_name);
       std::optional<StmtPtr> ne;
       const auto& else_body = if_stmt->else_body_;
       if (else_body.has_value()) {
-        ne = RewriteCallsWithParam(*else_body, modified_funcs, gm_param, pass_name);
+        ne = RewriteCallsWithParam(*else_body, modified_funcs, gm_param, dir, pass_name);
       }
       bool body_changed = (nt != if_stmt->then_body_);
       if (!body_changed && ne.has_value() && else_body.has_value()) {
@@ -240,7 +257,7 @@ StmtPtr RewriteCallsWithParam(const StmtPtr& body, const std::unordered_set<std:
         new_stmts.push_back(stmt);
       }
     } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
-      auto nb = RewriteCallsWithParam(while_stmt->body_, modified_funcs, gm_param, pass_name);
+      auto nb = RewriteCallsWithParam(while_stmt->body_, modified_funcs, gm_param, dir, pass_name);
       if (nb != while_stmt->body_) {
         auto new_while = MutableCopy(while_stmt);
         new_while->body_ = nb;
@@ -250,7 +267,7 @@ StmtPtr RewriteCallsWithParam(const StmtPtr& body, const std::unordered_set<std:
         new_stmts.push_back(stmt);
       }
     } else if (auto scope = std::dynamic_pointer_cast<const ScopeStmt>(stmt)) {
-      auto nb = RewriteCallsWithParam(scope->body_, modified_funcs, gm_param, pass_name);
+      auto nb = RewriteCallsWithParam(scope->body_, modified_funcs, gm_param, dir, pass_name);
       if (nb != scope->body_) {
         new_stmts.push_back(CloneScopeWithBody(scope, nb, pass_name));
         any_changed = true;
@@ -305,14 +322,14 @@ StmtPtr RewriteCallsWithPerCallBuffer(const StmtPtr& body,
       auto [create_stmt, gm_var] = make_gm_create();
       // Copy rather than reconstruct, so the original's kwargs_ and attrs_ survive.
       auto new_call = MutableCopy(call);
-      new_call->args_.push_back(gm_var);
+      AppendArgWithDirection(new_call, gm_var, spec.arg_direction);
       return std::make_pair(create_stmt, ExprPtr(new_call));
     }
     if (auto submit = std::dynamic_pointer_cast<const Submit>(expr)) {
       if (!should_rewrite(submit->op_)) return std::make_pair(StmtPtr{}, ExprPtr{});
       auto [create_stmt, gm_var] = make_gm_create();
       auto new_submit = MutableCopy(submit);
-      new_submit->args_.push_back(gm_var);
+      AppendArgWithDirection(new_submit, gm_var, spec.arg_direction);
       return std::make_pair(create_stmt, ExprPtr(new_submit));
     }
     return std::make_pair(StmtPtr{}, ExprPtr{});
@@ -459,7 +476,7 @@ void InjectGMBufferParamInPlace(std::vector<FunctionPtr>& functions, const GMBuf
     }
 
     if (!mod_callees.empty()) {
-      auto nb = RewriteCallsWithParam(func->body_, mod_callees, gm_param, spec.pass_name);
+      auto nb = RewriteCallsWithParam(func->body_, mod_callees, gm_param, spec.arg_direction, spec.pass_name);
       auto updated = MutableCopy(func);
       updated->body_ = nb;
       func = updated;

@@ -80,6 +80,9 @@ Pass InjectGMPipeBuffer() {
         .dtype = DataType::FP32,
         .elems = kGMPipeBufferPlaceholderElems,
         .is_trigger = [](const CallPtr& call) { return op_predicates::IsInitializePipe(call); },
+        // Unused in practice: this pass runs before DeriveCallDirections, so no
+        // call carries the attr yet. Declared for the day that ordering changes.
+        .arg_direction = ArgDirection::OutputExisting,
         .pass_name = "InjectGMPipeBuffer"};
     transform_utils::InjectGMBufferParamInPlace(functions, spec);
 
