@@ -109,10 +109,10 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tmaxs | TMAXS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tmins | TMINS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.trems | TREMS | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 exact-op hardware ST passed for FP32 and INT32 scalar forms within `[-2^24, 2^24]`, including both INT32 boundaries, negative values, and tail valid shapes; A5 hardware pending |
-| pto.taddc | TADD + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tsubc | TSUB + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.taddsc | TADDS + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tsubsc | TSUBS + TADD | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.taddc | TADD + TADD | tile | ✅ | ✅ | ❌ | ✅ | — | verified on A2/A3 hardware, including overflow, full/tail valid shapes, and result/src0 alias and non-alias paths; A5 hardware verification pending |
+| pto.tsubc | TSUB + TADD | tile | ✅ | ✅ | ❌ | ✅ | — | verified on A2/A3 hardware, including borrow, full/tail valid shapes, and result/src0 alias and non-alias paths; A5 hardware verification pending |
+| pto.taddsc | TADDS + TADD | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 hardware passes full, column-tail, and combined-tail shapes with result/src0 alias and non-alias paths; PTO ISA v0.57's full-column row-tail fast path is a strict expected failure; A5 hardware verification pending |
+| pto.tsubsc | TSUBS + TADD | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 hardware passes full, column-tail, and combined-tail shapes with result/src0 alias and non-alias paths; PTO ISA v0.57's full-column row-tail fast path is a strict expected failure; A5 hardware verification pending |
 | pto.tabs | TABS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tneg | TNEG | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.texp | TEXP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
@@ -167,15 +167,15 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | canonical 4-input path; verified on A2/A3 hardware, A5 hardware verification pending |
 | **Bitwise Operations (11)** |  |  |  |  |  |  |  |  |
-| pto.tand | TAND | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tor | TOR | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.txor | TXOR | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.tand | TAND | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit patterns across full, row-tail, column-tail, and combined-tail shapes; A5 hardware verification pending |
+| pto.tor | TOR | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit patterns across full, row-tail, column-tail, and combined-tail shapes; A5 hardware verification pending |
+| pto.txor | TXOR | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit patterns with explicit tmp across all four shape classes; IR UT covers alias rejection; A5 hardware verification pending |
 | pto.tshl | TSHL | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tshr | TSHR | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tnot | TNOT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tands | TANDS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tors | TORS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.txors | TXORS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.tnot | TNOT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | covered by the pre-existing same-name `tile.not` ST |
+| pto.tands | TANDS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit tiles with immediate/SSA scalars across all four shape classes; A5 hardware verification pending |
+| pto.tors | TORS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit tiles with immediate/SSA scalars across all four shape classes; A5 hardware verification pending |
+| pto.txors | TXORS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 hardware passes signed/unsigned 8/16-bit tiles with immediate/SSA scalars and explicit tmp across all four shape classes; IR UT covers alias rejection; A5 hardware verification pending |
 | pto.tshls | TSHLS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tshrs | TSHRS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | **Data Rearrangement (15)** |  |  |  |  |  |  |  |  |
@@ -274,6 +274,6 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tassign | TASSIGN | internal | ✅ | — | — | — | — | inactive backend hook; no standalone ST |
 
 **Stats**: 204 public/compatibility PTOAS ops; 113 have a pypto tile frontend and 75 have a tensor frontend
-(plus four non-tile/tensor `pl.prefetch.*` ops); 111 have same-name ST coverage
-(107 regular STs and 4 distributed STs); 61 lack same-name ST coverage (51 regular and 10 distributed);
-within these 204, another 32 ops are not suitable for standalone STs.
+(plus four non-tile/tensor `pl.prefetch.*` ops); 121 have same-name ST coverage
+(117 regular STs and 4 distributed STs); 51 lack same-name ST coverage (41 regular and 10 distributed);
+the remaining 32 ops are not suitable for standalone STs.

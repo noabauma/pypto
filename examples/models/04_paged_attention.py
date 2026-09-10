@@ -38,9 +38,9 @@ import struct
 
 import pypto.language as pl
 import torch
-from pypto.backend import BackendType
+from pypto import ir
 from pypto.ir.pass_manager import OptimizationStrategy
-from pypto.runtime import RunConfig, run
+from pypto.runtime import RunConfig
 
 # ── Shared InCore kernels (module-level, reusable across programs) ──────────
 
@@ -613,8 +613,15 @@ def main():
         context_len=context_len,
         scale=scale,
     )
-    run(
-        program,
+    run_config = RunConfig(
+        platform="a2a3",
+        device_id=11,
+        strategy=OptimizationStrategy.Default,
+        dump_passes=True,
+        enable_chip_swimlane=args.enable_chip_swimlane,
+    )
+    compiled = ir.compile(program, **run_config.compile_kwargs())
+    compiled(
         query,
         key_cache,
         value_cache,
@@ -622,14 +629,7 @@ def main():
         context_lens,
         out,
         config,
-        config=RunConfig(
-            platform="a2a3",
-            device_id=11,
-            strategy=OptimizationStrategy.Default,
-            dump_passes=True,
-            backend_type=BackendType.Ascend910B,
-            enable_chip_swimlane=args.enable_chip_swimlane,
-        ),
+        config=run_config,
     )
 
     # Golden validation

@@ -54,7 +54,8 @@ assert compiled.param_names == ["a", "b", "out"]
 
 ### `ir.compile` parameters
 
-Seventeen, of which four carry most decisions. The rest have defaults you rarely move.
+Eighteen, of which four carry most decisions. The rest have defaults you rarely
+move. All are keyword-only — only `program` is positional.
 
 | Parameter | Default | What it decides |
 | --------- | ------- | --------------- |
@@ -75,6 +76,7 @@ Seventeen, of which four carry most decisions. The rest have defaults you rarely
 | `enable_pypto_l0c_double_buffer` | `None` | L0C double buffering |
 | `emit_source_loc` | `None` | Carry DSL source locations into the emitted `.pto` |
 | `dump_ptoas_passes` | `False` | Also dump ptoas's own pass IR |
+| `runtime` | `None` | Simpler runtime ABI to target — `TENSORMAP_AND_RINGBUFFER` or `HOST_BUILD_GRAPH` (what `@pl.jit.graph` needs — [Functions](../language/01-functions.md)); `None` inherits the active `PassContext`. The worker must match it |
 
 ### Pass dumps
 
@@ -108,9 +110,10 @@ want when the question is "which pass changed this".
 cache holds — so a later call with the same specialization key gets the identical object.
 
 It exposes the whole extraction surface, which is what a harness driving the runtime
-directly needs: `chip_callable`, `runtime_name`, `runtime_config`, `build_orch_args`,
-`build_call_config`, `output_dir`, `platform`, `output_indices`, `param_names`,
-`orchestration_names`, `has_return`.
+directly needs: `chip_callable`, `runtime_name`, `runtime_config`, `output_dir`,
+`platform`, `output_indices`, `param_names`, `orchestration_names`, `has_return`.
+Argument marshalling is not part of that surface — dispatch through
+[`ChipWorker`](01-run.md#explicit-dispatch), which does it for you.
 
 `lower(*args)` goes one step less far: it runs the passes and returns the `Program`,
 writing no artifacts — which also means no `passes_dump/`. It is the right form for

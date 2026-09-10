@@ -204,6 +204,73 @@ class TestAllowEarlyResolveParsing:
                     return out
 
 
+class TestTimingSlotParsing:
+    def test_spmd_submit_records_slot_as_attr(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def producer(self, x: pl.Tensor[[1], pl.FP32]) -> pl.Tensor[[1], pl.FP32]:
+                return x
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, x: pl.Tensor[[1], pl.FP32]) -> pl.Tensor[[1], pl.FP32]:
+                with pl.manual_scope():
+                    out, _ = pl.spmd_submit(self.producer, x, core_num=4, timing_slot=15)
+                return out
+
+        (submit,) = _main_submits(Prog)
+        assert submit.attrs["task_timing_slot"] == 15
+
+    @pytest.mark.parametrize(
+        ("slot", "error"),
+        [
+            ("-1", "timing_slot must be a non-negative integer literal in 0..15"),
+            ("16", "timing_slot must be in 0..15, got 16"),
+            ("True", "timing_slot must be a non-negative integer literal in 0..15"),
+            ("1.5", "timing_slot must be a non-negative integer literal in 0..15"),
+            ("slot", "timing_slot must be a non-negative integer literal in 0..15"),
+        ],
+    )
+    def test_invalid_slot_rejected(self, slot, error):
+        source = """
+import pypto.language as pl
+
+@pl.program
+class Prog:
+    @pl.function(type=pl.FunctionType.InCore)
+    def producer(self, x: pl.Tensor[[1], pl.FP32]) -> pl.Tensor[[1], pl.FP32]:
+        return x
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, x: pl.Tensor[[1], pl.FP32]) -> pl.Tensor[[1], pl.FP32]:
+        with pl.manual_scope():
+            out, _ = pl.submit(self.producer, x, timing_slot=SLOT)
+        return out
+""".replace("SLOT", slot)
+        with pytest.raises(ParserSyntaxError, match=error):
+            pl.parse_program(source)
+
+    def test_timing_slot_round_trips_as_submit_attr(self):
+        source = """
+import pypto.language as pl
+
+@pl.program
+class Prog:
+    @pl.function(type=pl.FunctionType.InCore)
+    def producer(self, x: pl.Tensor[[1], pl.FP32]) -> pl.Tensor[[1], pl.FP32]:
+        return x
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def main(self, x: pl.Tensor[[1], pl.FP32]) -> pl.Tensor[[1], pl.FP32]:
+        with pl.manual_scope():
+            out, _ = pl.submit(self.producer, x, timing_slot=0)
+        return out
+"""
+        program = pl.parse_program(source)
+        reparsed = pl.parse_program(program.as_python())
+        ir.assert_structural_equal(reparsed, program)
+
+
 class TestAllowEarlyResolveRoundTrip:
     def test_round_trips_through_printer(self):
         Prog = _plain_flag_program()

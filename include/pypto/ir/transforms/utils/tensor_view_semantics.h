@@ -14,10 +14,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "pypto/core/dtype.h"
@@ -26,6 +28,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 
 namespace pypto::ir::tensor_view_semantics {
@@ -97,6 +100,47 @@ constexpr int64_t kNzFractalRow = 16;
 constexpr int64_t kNzC0SizeByte = 32;
 constexpr int64_t kNzC0SizeBit = kNzC0SizeByte * 8;
 
+/// Arity of pto-isa's NZ ``GlobalTensor`` — ``<B, C/c0, R/16, 16, c0>``.
+///
+/// Fixed, not derived from the logical rank: the leading batch slot is present
+/// whether or not the logical tensor has a leading axis, which is why a logical
+/// rank-2 NZ tensor blocks to rank 5 (batch ``1``) rather than rank 4. PTOAS
+/// enforces this exactly — ``user-specified layout=nz requires a rank-5 view``.
+constexpr size_t kNzBlockedRank = 5;
+
+/// Highest logical rank that has a canonical blocked NZ form.
+///
+/// ``kNzBlockedRank`` minus the two dims the trailing logical ``[R, C]`` pair
+/// expands into. A logical rank-4 tensor would need its two leading axes folded
+/// into the single batch slot; that fold is sound on the *shape* (a dense
+/// row-major tensor's leading strides collapse exactly) but not yet on the
+/// *offsets*, which would have to re-associate ``[i, j, ...]`` into ``i*E + j``
+/// — precisely the arithmetic ``BlockNzOffsets`` refuses to invent. Rejected
+/// rather than silently mis-addressed until that is built.
+constexpr size_t kNzMaxLogicalRank = 3;
+
+/// Gate a logical NZ rank to the window that has a canonical blocked form.
+///
+/// Both ``BlockNzShape`` and ``BlockNzOffsets`` must agree on the accepted
+/// window — they produce the two halves of one ``tile.load`` and a rank they
+/// disagree on would emit a view whose shape and coordinates have different
+/// arity. ``what`` names which half is being blocked so the message points at
+/// the offending annotation rather than at whichever half ran first.
+///
+/// A ``CHECK`` rather than an ``INTERNAL_CHECK``: the rank comes from a user's
+/// ``pl.NZ`` annotation, and rank 4+ is a documented scope limit, not a broken
+/// invariant.
+inline void CheckNzLogicalRank(size_t rank, const char* what, const Span& span = Span::unknown()) {
+  CHECK_SPAN(rank >= 2, span) << "NZ layout requires a tensor of rank >= 2 (the trailing pair is the "
+                              << "fractal plane), got " << what << " of rank " << rank << ".";
+  CHECK_SPAN(rank <= kNzMaxLogicalRank, span)
+      << "NZ layout supports a logical rank of at most " << kNzMaxLogicalRank << " ([B, R, C]), got " << what
+      << " of rank " << rank << ". pto-isa declares NZ at a fixed rank-" << kNzBlockedRank
+      << " arity <B, C/c0, R/16, 16, c0> with a single batch slot, so a higher-rank logical tensor "
+      << "would have to fold its leading axes into that one slot — not supported yet. Reshape to "
+      << "[B, R, C] before the NZ annotation, or annotate the tensor as pl.ND.";
+}
+
 /// Number of elements in one NZ C0 line (32 bytes) for ``dtype``.
 ///
 /// Derived from the *bit* width, not ``GetByte()``. ``GetByte()`` is
@@ -124,15 +168,20 @@ inline int64_t NzC0Elems(DataType dtype) {
   return kNzC0SizeBit / bits;
 }
 
-/// True when ``shape`` is already in blocked NZ form: rank >= 4 with trailing
-/// dims ``[16, c0]``.
+/// True when ``shape`` is in canonical blocked NZ form: exactly
+/// ``kNzBlockedRank`` dims, with trailing dims ``[16, c0]``.
+///
+/// The rank test is an equality, not a lower bound. Any other rank is a shape
+/// PTOAS refuses to assemble, so accepting one here would let it pass every
+/// downstream invariant check and fail only in the backend, naming SSA the user
+/// never wrote.
 ///
 /// This is the post-``BlockNzTensorViews`` invariant. It is a *structural*
 /// test, not a proof of provenance — an ordinary ND tensor that happens to end
 /// in ``[16, c0]`` also satisfies it. Callers use it to assert that a tensor
 /// *tagged* NZ has been blocked, never to infer that a tensor *is* NZ.
 inline bool IsBlockedNzShape(const std::vector<ExprPtr>& shape, DataType dtype) {
-  if (shape.size() < 4) return false;
+  if (shape.size() != kNzBlockedRank) return false;
   // A predicate must answer, not throw: a dtype with no NZ C0 line simply has
   // no blocked form. ``NzC0Elems`` raises for those, so screen them here.
   const auto bits = static_cast<int64_t>(dtype.GetBit());
@@ -142,19 +191,27 @@ inline bool IsBlockedNzShape(const std::vector<ExprPtr>& shape, DataType dtype) 
   return fractal && line && fractal->value_ == kNzFractalRow && line->value_ == NzC0Elems(dtype);
 }
 
-/// Rewrite a logical shape ``[..., R, C]`` into the blocked NZ shape
-/// ``[..., C/c0, R/16, 16, c0]`` that pto-isa's ``Layout::NZ`` GlobalTensor
-/// requires. Rank grows by 2 (the trailing logical pair becomes four dims).
+/// Rewrite a logical shape ``[B, R, C]`` (or ``[R, C]``) into the canonical
+/// blocked NZ shape ``[B, C/c0, R/16, 16, c0]`` that pto-isa's ``Layout::NZ``
+/// GlobalTensor requires.
+///
+/// The result is always ``kNzBlockedRank`` dims — the trailing logical ``[R, C]``
+/// pair expands into four, and the leading batch slot is *materialised as ``1``*
+/// when the logical tensor has no leading axis. That slot is what makes the form
+/// canonical: pto-isa declares NZ at a fixed arity, so a logical rank-2 tensor
+/// blocked to rank 4 is not a smaller NZ tensor, it is a shape PTOAS rejects.
 ///
 /// The blocked shape's *row-major* strides are exactly pto-isa's NZ strides:
 ///
-///   row-major over ``[..., C/c0, R/16, 16, c0]``
-///     = ``[..., (C/c0)*R*c0, (R/16)*16*c0, 16*c0, c0, 1]``
-///     = ``[..., C*R,          R*c0,         16*c0, c0, 1]``
+///   row-major over ``[B, C/c0, R/16, 16, c0]``
+///     = ``[(C/c0)*R*c0, (R/16)*16*c0, 16*c0, c0, 1]``
+///     = ``[C*R,          R*c0,         16*c0, c0, 1]``
 ///     = ``BaseShape2D<T, R, C, Layout::NZ>``
 ///
 /// so NZ needs no dedicated stride rule — ``BuildLogicalStridesFromLayout``
-/// routes it through ``BuildRowMajorStrides`` once the shape is blocked.
+/// routes it through ``BuildRowMajorStrides`` once the shape is blocked. The
+/// synthesised ``B = 1`` costs nothing there: a leading extent of 1 contributes
+/// a stride the addressing never multiplies by anything but zero.
 ///
 /// Alignment is a *user* contract (the annotation asserts how the bytes were
 /// written), so violations raise ``pypto::ValueError`` naming the authoring fix.
@@ -162,9 +219,7 @@ inline bool IsBlockedNzShape(const std::vector<ExprPtr>& shape, DataType dtype) 
 /// divisible, and silently mis-addressing GM is worse than refusing to compile.
 inline std::vector<ExprPtr> BlockNzShape(const std::vector<ExprPtr>& shape, DataType dtype,
                                          const Span& span = Span::unknown()) {
-  CHECK_SPAN(shape.size() >= 2, span)
-      << "NZ layout requires a tensor of rank >= 2 (the trailing pair is the fractal plane), got rank "
-      << shape.size();
+  CheckNzLogicalRank(shape.size(), "shape", span);
   const int64_t c0 = NzC0Elems(dtype);
 
   auto rows = As<ConstInt>(shape[shape.size() - 2]);
@@ -182,70 +237,267 @@ inline std::vector<ExprPtr> BlockNzShape(const std::vector<ExprPtr>& shape, Data
       << " bits / " << dtype.GetBit() << "-bit '" << dtype.ToString() << "'), got " << cols->value_ << ".";
 
   std::vector<ExprPtr> blocked;
-  blocked.reserve(shape.size() + 2);
-  for (size_t i = 0; i + 2 < shape.size(); ++i) blocked.push_back(shape[i]);
+  blocked.reserve(kNzBlockedRank);
   auto make_index = [&span](int64_t v) { return std::make_shared<ConstInt>(v, DataType::INDEX, span); };
-  blocked.push_back(make_index(cols->value_ / c0));             // C/c0  — column blocks (outermost)
+  // Batch: the logical leading axis when there is one, else a materialised 1.
+  blocked.push_back(shape.size() > 2 ? shape[0] : make_index(1));
+  blocked.push_back(make_index(cols->value_ / c0));             // C/c0  — column blocks
   blocked.push_back(make_index(rows->value_ / kNzFractalRow));  // R/16 — row fractals
   blocked.push_back(make_index(kNzFractalRow));                 // 16    — rows within a fractal
   blocked.push_back(make_index(c0));                            // c0    — contiguous C0 line
+  INTERNAL_CHECK_SPAN(blocked.size() == kNzBlockedRank, span)
+      << "Internal error: blocked NZ shape has rank " << blocked.size() << ", expected " << kNzBlockedRank;
   return blocked;
 }
 
-/// Map logical offsets ``[..., r0, c0off]`` into the blocked NZ coordinate
-/// system ``[..., c0off/c0, r0/16, 0, 0]`` produced by ``BlockNzShape``.
+/// How an index expression is bound, supplied by the pass that owns the
+/// enclosing function.
 ///
-/// A slice must start on a fractal boundary; an unaligned offset has no blocked
-/// representation and is rejected rather than silently truncated.
+/// A slice offset reaches ``BlockNzOffsets`` as the SSA name it was bound to
+/// (``n0__ssa_v0``), never as the arithmetic that produced it, so without these
+/// facts the only provable offset is a literal constant. Both callbacks are
+/// optional: a default-constructed ``NzOffsetFacts`` proves nothing beyond
+/// constant folding.
+struct NzOffsetFacts {
+  /// The expression an SSA ``Var`` was assigned, or nullptr when unknown.
+  std::function<ExprPtr(const VarPtr&)> definition;
+  /// Whether a ``Var`` holds a multiple of ``divisor`` by construction — a loop
+  /// variable whose start and step are both multiples. Such a variable has no
+  /// exact structural quotient (nothing in the IR names its trip count), so the
+  /// property is the only thing that licenses dividing it.
+  std::function<bool(const VarPtr&, int64_t)> is_multiple_of;
+  /// Whether a ``Var`` is non-negative by construction. Two sources qualify: a
+  /// loop variable whose start and step are both non-negative, and a variable
+  /// bound to an operator whose result cannot be negative (the SPMD block
+  /// index). The second is an *operator* fact, which is why the owning pass
+  /// supplies it rather than this header deciding it structurally.
+  std::function<bool(const VarPtr&)> is_non_negative;
+};
+
+/// Node-visit allowance for one ``IsProvableMultipleOf`` walk.
+///
+/// The walk follows SSA definitions, so a diamond-shaped def chain
+/// (``x = y + y``) can be re-entered exponentially. Bounding the visits keeps
+/// the proof O(1) per offset — and the pass O(N) — and exhausting the budget
+/// degrades to a refusal, never to a wrong answer.
+constexpr int kNzDivideStepBudget = 256;
+
+/// Whether every runtime value of ``expr`` is a multiple of ``divisor``.
+///
+/// This only *proves* the property; it deliberately does not build the
+/// quotient. Re-associating the offset arithmetic to divide it symbolically —
+/// rewriting ``nb * 256`` into ``nb * 16`` — is unsound, because IR arithmetic
+/// wraps at its declared width while the rewritten form does not:
+///
+///     x : INT32 = 1 << 24
+///     (x * 256) / 16   ==  0            // x * 256 wraps to 0 in i32
+///     x * (256 / 16)   ==  268435456    // re-associated: no wrap, wrong answer
+///
+/// Widening is not the culprit and matching the original width does not help:
+/// with ``a * b = q * 2^W + r``, the original yields ``r / d`` while any
+/// re-association yields ``r / d + q * 2^(W - log2 d)``. Callers therefore
+/// divide the *result* of the original expression (``FloorDiv(expr, divisor)``),
+/// which evaluates the offset exactly as written and only then divides.
+///
+/// The proof itself survives wraparound because every divisor here is a power
+/// of two and therefore divides ``2^W``: reducing a multiple of ``d`` modulo
+/// ``2^W`` leaves a multiple of ``d``. ``INTERNAL_CHECK`` pins that precondition
+/// rather than leaving it implicit.
+inline bool IsProvableMultipleOf(const ExprPtr& expr, int64_t divisor, const NzOffsetFacts& facts,
+                                 int* budget) {
+  INTERNAL_CHECK(divisor > 0 && (divisor & (divisor - 1)) == 0)
+      << "Internal error: NZ divisibility proofs require a power-of-two divisor (it must divide the "
+         "wraparound modulus to survive fixed-width overflow), got "
+      << divisor;
+  if (!expr || --*budget < 0) return false;
+
+  if (auto const_expr = As<ConstInt>(expr)) return const_expr->value_ % divisor == 0;
+
+  // One divisible factor makes the whole product divisible.
+  if (auto mul = As<Mul>(expr)) {
+    return IsProvableMultipleOf(mul->left_, divisor, facts, budget) ||
+           IsProvableMultipleOf(mul->right_, divisor, facts, budget);
+  }
+
+  if (auto add = As<Add>(expr)) {
+    return IsProvableMultipleOf(add->left_, divisor, facts, budget) &&
+           IsProvableMultipleOf(add->right_, divisor, facts, budget);
+  }
+
+  if (auto sub = As<Sub>(expr)) {
+    return IsProvableMultipleOf(sub->left_, divisor, facts, budget) &&
+           IsProvableMultipleOf(sub->right_, divisor, facts, budget);
+  }
+
+  // ``As<Var>`` deliberately excludes ``IterArg`` (see ir-kind-traits): an
+  // IterArg's value changes every iteration, so neither its initial value nor
+  // any binding recorded for it proves anything about the value this use sees.
+  if (auto var = As<Var>(expr)) {
+    if (facts.is_multiple_of && facts.is_multiple_of(var, divisor)) return true;
+    if (facts.definition) {
+      if (auto def = facts.definition(var)) {
+        return IsProvableMultipleOf(def, divisor, facts, budget);
+      }
+    }
+  }
+
+  return false;
+}
+
+/// Whether every runtime value of ``expr`` is non-negative.
+///
+/// Divisibility alone does not make a blocked coordinate safe. ``n0 = -16`` is
+/// a perfectly good multiple of 16, and ``FloorDiv(n0, 16)`` is ``-1``; codegen
+/// then clamps a negative ``pto.partition_view`` offset to 0 rather than
+/// failing, so the load silently reads fractal 0 instead of reporting anything.
+/// That is the same silent-wrong-data shape #2543 fixed for row indices. A
+/// literal ``-16`` is already rejected by the constant path, so without this a
+/// negative offset would be caught inline and waved through once bound to a
+/// name.
+///
+/// ``Sub`` is deliberately absent: ``a - b`` is negative whenever ``b > a``,
+/// and nothing here bounds either side. A difference is therefore refused, even
+/// though its divisibility is provable.
+inline bool IsProvableNonNegative(const ExprPtr& expr, const NzOffsetFacts& facts, int* budget) {
+  if (!expr || --*budget < 0) return false;
+
+  if (auto const_expr = As<ConstInt>(expr)) return const_expr->value_ >= 0;
+
+  // Both operands non-negative implies the product and the sum are too. The
+  // converse cases (two negatives multiplying to a positive) are not worth
+  // proving: refusing them costs nothing real.
+  if (auto mul = As<Mul>(expr)) {
+    return IsProvableNonNegative(mul->left_, facts, budget) &&
+           IsProvableNonNegative(mul->right_, facts, budget);
+  }
+
+  if (auto add = As<Add>(expr)) {
+    return IsProvableNonNegative(add->left_, facts, budget) &&
+           IsProvableNonNegative(add->right_, facts, budget);
+  }
+
+  if (auto var = As<Var>(expr)) {
+    if (facts.is_non_negative && facts.is_non_negative(var)) return true;
+    if (facts.definition) {
+      if (auto def = facts.definition(var)) {
+        return IsProvableNonNegative(def, facts, budget);
+      }
+    }
+  }
+
+  return false;
+}
+
+/// Map logical offsets ``[b, r0, c0off]`` (or ``[r0, c0off]``) into the blocked
+/// NZ coordinate system ``[b, c0off/c0, r0/16, 0, 0]`` produced by
+/// ``BlockNzShape``.
+///
+/// Mirrors ``BlockNzShape`` slot for slot, including the batch: a logical
+/// rank-2 slice gets a materialised ``0`` against that shape's materialised
+/// ``1``. The two must stay in lockstep — a ``tile.load`` whose shapes and
+/// offsets disagree on arity is malformed well before PTOAS sees it.
+///
+/// A slice must start on a fractal boundary. A constant offset is folded
+/// directly; a symbolic one is accepted only when ``IsProvableMultipleOf``
+/// proves it a multiple of the axis factor, and is then divided as a whole
+/// rather than re-associated. Anything else is rejected rather than silently
+/// truncated.
 inline std::vector<ExprPtr> BlockNzOffsets(const std::vector<ExprPtr>& offsets, DataType dtype,
-                                           const Span& span = Span::unknown()) {
-  CHECK_SPAN(offsets.size() >= 2, span) << "NZ layout requires rank >= 2 offsets, got " << offsets.size();
+                                           const Span& span = Span::unknown(),
+                                           const NzOffsetFacts& facts = {}) {
+  CheckNzLogicalRank(offsets.size(), "offsets", span);
   const int64_t c0 = NzC0Elems(dtype);
 
-  // Milestone 1 maps only *constant* trailing offsets. A symbolic offset would
-  // need a divisibility proof plus an algebraic rewrite (``nb*256`` -> ``nb*16``
-  // for the 16-row axis); that is not implemented, so even a provably aligned
-  // expression is refused rather than guessed at. This is the limit that keeps
-  // a loop-derived slice (``n0 = nb * N_TILE``) out of NZ for now.
-  auto row_off = As<ConstInt>(offsets[offsets.size() - 2]);
-  auto col_off = As<ConstInt>(offsets.back());
-  CHECK_SPAN(row_off, span) << "NZ layout does not support a dynamic offset on shape[-2] yet: only a "
-                            << "constant offset (a multiple of " << kNzFractalRow << ") can be mapped to "
-                            << "blocked coordinates. A loop-derived slice offset is not supported yet.";
-  CHECK_SPAN(col_off, span) << "NZ layout does not support a dynamic offset on shape[-1] yet: only a "
-                            << "constant offset (a multiple of c0 = " << c0 << ") can be mapped to "
-                            << "blocked coordinates. A loop-derived slice offset is not supported yet.";
-  CHECK_SPAN(row_off->value_ >= 0 && row_off->value_ % kNzFractalRow == 0, span)
-      << "NZ slice offset on shape[-2] must be a non-negative multiple of " << kNzFractalRow << ", got "
-      << row_off->value_ << ".";
-  CHECK_SPAN(col_off->value_ >= 0 && col_off->value_ % c0 == 0, span)
-      << "NZ slice offset on shape[-1] must be a non-negative multiple of c0 = " << c0 << ", got "
-      << col_off->value_ << ".";
+  // A constant keeps its own diagnostic: the offending value is in hand, so the
+  // message can name it. Only a symbolic offset needs the proof machinery, and
+  // its message has to describe the shapes that *are* provable instead.
+  auto block_axis = [&](const ExprPtr& offset, int64_t divisor, const char* axis,
+                        const std::string& unit) -> ExprPtr {
+    if (auto const_offset = As<ConstInt>(offset)) {
+      CHECK_SPAN(const_offset->value_ >= 0 && const_offset->value_ % divisor == 0, span)
+          << "NZ slice offset on shape[" << axis << "] must be a non-negative multiple of " << unit
+          << ", got " << const_offset->value_ << ".";
+      return std::make_shared<ConstInt>(const_offset->value_ / divisor, DataType::INDEX, span);
+    }
+    // Both halves of the constant path's "non-negative multiple" contract have
+    // to be re-proven for a symbolic offset, or the same value would be
+    // rejected written inline and accepted once bound to a name.
+    int budget = kNzDivideStepBudget;
+    CHECK_SPAN(IsProvableMultipleOf(offset, divisor, facts, &budget), span)
+        << "NZ layout requires the slice offset on shape[" << axis << "] to be a multiple of " << unit
+        << ", and this one cannot be proven to be. Provable forms are a constant, a loop variable whose "
+        << "start and step are both multiples of " << unit
+        << ", and any sum, difference or constant multiple built from those. Slice on a " << unit
+        << "-aligned boundary, or annotate the tensor as pl.ND.";
+    int sign_budget = kNzDivideStepBudget;
+    CHECK_SPAN(IsProvableNonNegative(offset, facts, &sign_budget), span)
+        << "NZ layout requires the slice offset on shape[" << axis
+        << "] to be non-negative, and this one cannot be proven to be. A negative offset is clamped to 0 "
+        << "at the partition view rather than rejected, so it would read the wrong fractal silently. "
+        << "Provable forms are a non-negative constant, the SPMD block index, a loop variable whose "
+        << "start and step are both non-negative, and any sum or product built from those — note that a "
+        << "difference never qualifies. Slice from a non-negative offset, or annotate the tensor as "
+        << "pl.ND.";
+    // Divide the offset's *result*, never its arithmetic: the expression keeps
+    // its own dtype and wraparound behaviour, and only the value it produces is
+    // divided. See ``IsProvableMultipleOf`` for why re-association is unsound.
+    return MakeFloorDiv(offset, std::make_shared<ConstInt>(divisor, DataType::INDEX, span), span);
+  };
+
+  // Evaluate the row axis first so its diagnostic wins when both are malformed.
+  auto row_blocked =
+      block_axis(offsets[offsets.size() - 2], kNzFractalRow, "-2", std::to_string(kNzFractalRow));
+  auto col_blocked = block_axis(offsets.back(), c0, "-1", "c0 = " + std::to_string(c0));
 
   std::vector<ExprPtr> blocked;
-  blocked.reserve(offsets.size() + 2);
-  for (size_t i = 0; i + 2 < offsets.size(); ++i) blocked.push_back(offsets[i]);
+  blocked.reserve(kNzBlockedRank);
   auto make_index = [&span](int64_t v) { return std::make_shared<ConstInt>(v, DataType::INDEX, span); };
-  blocked.push_back(make_index(col_off->value_ / c0));
-  blocked.push_back(make_index(row_off->value_ / kNzFractalRow));
+  // Batch: the logical leading offset when there is one, else the only
+  // in-range coordinate for the shape's materialised extent of 1.
+  blocked.push_back(offsets.size() > 2 ? offsets[0] : make_index(0));
+  blocked.push_back(std::move(col_blocked));
+  blocked.push_back(std::move(row_blocked));
   blocked.push_back(make_index(0));  // start of the fractal's rows
   blocked.push_back(make_index(0));  // start of the C0 line
+  INTERNAL_CHECK_SPAN(blocked.size() == kNzBlockedRank, span)
+      << "Internal error: blocked NZ offsets have rank " << blocked.size() << ", expected " << kNzBlockedRank;
   return blocked;
+}
+
+/// True when ``shape`` is in canonical blocked MX form:
+/// ``[1, positive block count, positive group count, 16, 2]``.
+///
+/// Structural only — callers assert that a tensor *tagged* MX has been
+/// blocked, never infer that a tensor *is* MX from shape alone.
+inline bool IsBlockedMxShape(const std::vector<ExprPtr>& shape) {
+  if (shape.size() != 5) return false;
+  auto batch = As<ConstInt>(shape[0]);
+  auto block_count = As<ConstInt>(shape[1]);
+  auto group_count = As<ConstInt>(shape[2]);
+  auto fractal_rows = As<ConstInt>(shape[3]);
+  auto fractal_cols = As<ConstInt>(shape[4]);
+  return batch && block_count && group_count && fractal_rows && fractal_cols && batch->value_ == 1 &&
+         block_count->value_ > 0 && group_count->value_ > 0 &&
+         fractal_rows->value_ == tile_view_semantics::kMXSFractalRows &&
+         fractal_cols->value_ == tile_view_semantics::kMXSFractalCols;
 }
 
 /// Build packed canonical strides for the given (shape, layout).
 ///
-/// Definitions (per RFC #1300 §2.3, amended for NZ):
+/// Definitions (per RFC #1300 §2.3, amended for NZ / MX):
 ///   ND : strides[n-1] = 1; strides[k] = strides[k+1] * shape[k+1]
 ///   DN : strides[n-2] = 1; strides[n-1] = shape[n-2];
 ///        strides[n-3] = shape[n-2] * shape[n-1];
 ///        strides[k]   = strides[k+1] * shape[k+1]   (k = n-4 .. 0)
 ///   NZ : row-major over the *blocked* shape (see ``BlockNzShape``). RFC #1300
 ///        originally declared NZ unrepresentable; that holds for a logical 2-D
-///        shape but not for the blocked rank-(r+2) form, whose strides are
+///        shape but not for the blocked rank-5 form, whose strides are
 ///        ordinary row-major and match pto-isa's ``BaseShape2D<..., NZ>``
 ///        exactly. Callers must block the shape first — ``CheckNzViewIsBlocked``
 ///        enforces that invariant downstream.
+///   MX : row-major over the blocked rank-5 shape. Logical rank-2 MX strides
+///        are not physical GM addressing; callers must block first, and
+///        ``IsBlockedMxShape`` enforces that invariant downstream.
 ///
 /// Throws ``pypto::ValueError`` for DN layout with rank < 2.
 inline std::vector<ExprPtr> BuildLogicalStridesFromLayout(const std::vector<ExprPtr>& shape,
@@ -253,8 +505,7 @@ inline std::vector<ExprPtr> BuildLogicalStridesFromLayout(const std::vector<Expr
   size_t ndim = shape.size();
   if (ndim == 0) return {};
 
-  // NZ joins the row-major family once its shape is blocked — see the NZ note
-  // above and ``BlockNzShape``.
+  // NZ / MX join the row-major family once their shapes are blocked.
   if (layout == TensorLayout::ND || layout == TensorLayout::NZ || IsMxTensorLayout(layout)) {
     return BuildRowMajorStrides(shape);
   }
@@ -383,7 +634,7 @@ inline CanonicalCheckResult CheckCanonicalView(const std::vector<ExprPtr>& shape
 
   size_t n = shape.size();
 
-  // Blocked NZ is row-major over its rank-(r+2) shape, so it shares the ND
+  // Blocked NZ is row-major over its rank-5 shape, so it shares the ND
   // canonical form. ``CheckNzViewIsBlocked`` separately enforces that an NZ
   // view has actually been blocked; this only checks the stride structure.
   if (layout == TensorLayout::ND || layout == TensorLayout::NZ || IsMxTensorLayout(layout)) {

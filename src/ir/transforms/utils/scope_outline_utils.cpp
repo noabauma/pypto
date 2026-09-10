@@ -37,11 +37,13 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
+#include "pypto/ir/transforms/structural_comparison.h"
 #include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/deferred_wait_contract.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
 #include "pypto/ir/transforms/utils/result_alias_utils.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
+#include "pypto/ir/transforms/utils/scalar_output_hoist.h"
 #include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/transforms/utils/var_collectors.h"
 #include "pypto/ir/type.h"
@@ -66,6 +68,37 @@ std::vector<CallWriteTarget> CallWriteTargets(const CallPtr& call) {
 }
 
 namespace {
+
+/**
+ * @brief Whether a statement is, or contains, a scope of one particular kind.
+ *
+ * Answers the one question that decides whether the tail-use set of a block
+ * position is worth computing at all (see `ScopeOutliner::VisitStmt_` for
+ * `SeqStmts`). Stops at the first match — presence is all the caller needs.
+ */
+class ScopeKindPresenceChecker : public IRVisitor {
+ public:
+  explicit ScopeKindPresenceChecker(ScopeKind kind) : kind_(kind) {}
+
+  [[nodiscard]] bool Found() const { return found_; }
+
+  void VisitStmt(const StmtPtr& stmt) override {
+    if (found_ || !stmt) return;
+    // ``As<ScopeStmt>`` matches every scope kind: ``ScopeStmt`` is one of the
+    // base types whose ``KindTrait`` lists a ``kinds[]`` array, so this is not
+    // the exact-kind match ``.claude/rules/ir-kind-traits.md`` warns about.
+    auto scope = As<ScopeStmt>(stmt);
+    if (scope && scope->GetScopeKind() == kind_) {
+      found_ = true;
+      return;
+    }
+    IRVisitor::VisitStmt(stmt);
+  }
+
+ private:
+  ScopeKind kind_;
+  bool found_ = false;
+};
 
 /**
  * @brief Visitor to collect target tensors of tile.store calls (by pointer identity).
@@ -273,7 +306,7 @@ class ParamReadCollector : public IRVisitor {
   /// *prefix*, with ``args_.size() <= params_.size()`` — the omitted tail is
   /// runtime-allocated and never appears as an argument here. The trailing
   /// ``CommCtx`` params that would break that identity are materialised by
-  /// pass 43, long after any outliner runs, so the prefix mapping is exact at
+  /// pass 46, long after any outliner runs, so the prefix mapping is exact at
   /// this point (`.claude/rules/pass-submit-awareness.md`).
   ///
   /// Anything that fails those constraints — no program to resolve the callee,
@@ -358,6 +391,21 @@ class ParamReadCollector : public IRVisitor {
     for (const auto& dep : op->deps_) {
       if (dep) VisitExpr(dep);
     }
+    // ``core_num_`` and ``predicate_`` are first-class SSA-bearing operands, not
+    // metadata, and this override replaces the base walk rather than extending
+    // it — so anything reachable only through them is invisible here unless it
+    // is visited explicitly. Both are pure reads: a block count sizes the launch
+    // and a predicate decides whether it runs; neither can be a destination.
+    //
+    // A predicate is `` (t[i] > 0) ``, so it genuinely names a *tensor*. Dropping
+    // it costs a real direction: a capture that a callee declares ``Out`` is
+    // skipped on the argument path above, so the predicate is its only read, and
+    // without it the parameter comes out ``Out`` instead of ``InOut`` — the
+    // runtime then has no input edge for the value the predicate must evaluate.
+    // The argument skip is what exposes this, so the two are only ever wrong
+    // together.
+    if (op->core_num_.has_value() && *op->core_num_) VisitExpr(*op->core_num_);
+    if (op->predicate_.has_value() && *op->predicate_) VisitExpr(*op->predicate_);
     for (const auto& [key, value] : op->attrs_) {
       if (!ShouldVisitScopeAttr(key)) continue;
       ForEachAttrExpr(value, [this](const ExprPtr& e) { VisitExpr(e); });
@@ -744,7 +792,14 @@ std::unordered_set<const Var*> ScopeOutliner::ComputeFallbackUsedAfter(const Sco
   if (!inside_nested_scope_body_) {
     var_collectors::VarDefUseCollector def_collector;
     def_collector.VisitStmt(scope->body_);
-    used_after = def_collector.var_defs;
+    // Scalars are excluded from the defensive "export every definition"
+    // fallback. The runtime cannot return one, so exporting a scalar nobody
+    // asked for can only turn a harmless local into a hard error further down
+    // (the scalar-output hoist would have to lift it, or reject the scope).
+    for (const Var* var : def_collector.var_defs) {
+      if (As<ScalarType>(var->GetType())) continue;
+      used_after.insert(var);
+    }
   }
   used_after.insert(store_collector.store_targets.begin(), store_collector.store_targets.end());
   return used_after;
@@ -788,6 +843,28 @@ StmtPtr ScopeOutliner::VisitStmt_(const SeqStmtsPtr& op) {
     }
   }
 
+  // Which children are, or contain, a scope of the kind this outliner extracts.
+  //
+  // The tail-use set below is read by exactly two paths, and both are reached
+  // only from a target-kind scope: the ``used_after`` merge in this function,
+  // and ``required_outputs_`` in ``VisitScopeKind``. Propagating it into a child
+  // with no such scope anywhere inside therefore cannot change the result — the
+  // set is written, never read, and restored on the way out.
+  //
+  // That matters because the scan is a *subtree walk per following statement*,
+  // so running it at every position makes a block of M statements quadratic in
+  // M, against the O(N log N) bound in `.claude/rules/pass-complexity.md`. One
+  // linear presence walk reduces it to the handful of positions that can
+  // actually consume the answer, which for the shape that occurs in practice —
+  // a few scopes among many plain statements — is linear overall. A block whose
+  // every child holds a target scope costs exactly what it did before.
+  std::vector<bool> needs_tail_uses(op->stmts_.size(), false);
+  for (size_t i = 0; i < op->stmts_.size(); ++i) {
+    ScopeKindPresenceChecker presence(target_scope_kind_);
+    presence.VisitStmt(op->stmts_[i]);
+    needs_tail_uses[i] = presence.Found();
+  }
+
   for (size_t i = 0; i < op->stmts_.size(); ++i) {
     if (dropped_indices.count(i)) {
       // Skip the ``with pl.at(...) as tid:`` placeholder — OutlineScope
@@ -797,16 +874,19 @@ StmtPtr ScopeOutliner::VisitStmt_(const SeqStmtsPtr& op) {
       continue;
     }
     auto scope = std::dynamic_pointer_cast<const ScopeStmt>(op->stmts_[i]);
-    // Always compute what's used in the tail of this SeqStmts; this set is
-    // the "used_after" for a target scope at position i, and doubles as the
-    // required_outputs_ propagated into a non-target statement so any
-    // target-kind scope nested inside knows what needs to leak out.
-    var_collectors::VarDefUseCollector after_ref_collector;
-    for (size_t j = i + 1; j < op->stmts_.size(); ++j) {
-      if (dropped_indices.count(j)) continue;
-      after_ref_collector.VisitStmt(op->stmts_[j]);
+    // What's used in the tail of this SeqStmts: the "used_after" for a target
+    // scope at position i, and the required_outputs_ propagated into a
+    // non-target statement so any target-kind scope nested inside knows what
+    // needs to leak out. Empty when nothing at this position can read it.
+    std::unordered_set<const Var*> after_refs;
+    if (needs_tail_uses[i]) {
+      var_collectors::VarDefUseCollector after_ref_collector;
+      for (size_t j = i + 1; j < op->stmts_.size(); ++j) {
+        if (dropped_indices.count(j)) continue;
+        after_ref_collector.VisitStmt(op->stmts_[j]);
+      }
+      after_refs = after_ref_collector.GetAllVarRefs();
     }
-    auto after_refs = after_ref_collector.GetAllVarRefs();
 
     if (scope && scope->GetScopeKind() == target_scope_kind_) {
       // Also include variables required by parent scope
@@ -888,6 +968,8 @@ StmtPtr ScopeOutliner::VisitScopeKind(const std::shared_ptr<const ScopeT>& op) {
 StmtPtr ScopeOutliner::VisitStmt_(const InCoreScopeStmtPtr& op) { return VisitScopeKind(op); }
 
 StmtPtr ScopeOutliner::VisitStmt_(const ClusterScopeStmtPtr& op) { return VisitScopeKind(op); }
+
+StmtPtr ScopeOutliner::VisitStmt_(const GraphScopeStmtPtr& op) { return VisitScopeKind(op); }
 
 StmtPtr ScopeOutliner::VisitStmt_(const HierarchyScopeStmtPtr& op) { return VisitScopeKind(op); }
 
@@ -1412,16 +1494,38 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
            "must register its completion condition";
   }
 
+  // A Scalar live-out is unrepresentable in a device kernel's return set: the
+  // runtime passes scalars in by value and returns only tensors (#631). Move
+  // the ones the caller can compute out of the body *before* any of the
+  // analysis below runs, so they are simply not defined here any more — the
+  // output set then never sees them, and a body that still reads one captures
+  // it as an ordinary scalar parameter. Everything downstream analyses
+  // ``scope_body``, not ``op->body_``.
+  UpwardExposedUseCollector pre_hoist_live_in;
+  pre_hoist_live_in.VisitStmt(op->body_);
+  auto hoist = PlanScalarOutputHoist(op->body_, pre_hoist_live_in.ordered, used_after);
+  // Span source is the blocker itself, which the predicate guarantees non-null
+  // in the failure path.
+  CHECK_SPAN(hoist.blocker == nullptr, hoist.blocker != nullptr ? hoist.blocker->span_ : op->span_)
+      << "scope '" << outlined_func_name << "' computes scalar '"
+      << (hoist.blocker != nullptr ? hoist.blocker->name_hint_ : std::string())
+      << "' from device-side data and uses it after the scope, so the kernel would have to "
+         "return it. A device kernel cannot return a scalar: the runtime passes scalars in by "
+         "value and returns only tensors. Write the value into a [1] tensor output and read it "
+         "back outside the scope with pl.tensor.read(t, [0]), or move the computation out of the "
+         "scope so it depends only on values the caller already has";
+  const StmtPtr scope_body = hoist.new_body;
+
   // Definitions made by the scope body (before recursing) — the basis for the
   // output set below, and for the rebind check that follows the input set.
   var_collectors::VarDefUseCollector body_collector;
-  body_collector.VisitStmt(op->body_);
+  body_collector.VisitStmt(scope_body);
 
   // Store targets present in the scope body. Needed both for the captured
   // read-modify-write check below and, further down, to decide whether a
   // post-store alias's original target already appears in output_vars.
   StoreTargetCollector store_collector;
-  store_collector.VisitStmt(op->body_);
+  store_collector.VisitStmt(scope_body);
 
   // Inputs: the scope's live-in set — variables the body reads before it
   // (re)defines them, so their incoming value comes from the caller.
@@ -1434,7 +1538,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   // input_vars[i].get() is the body pointer, the key used for both the body
   // substitution and the call-site lookup below.
   UpwardExposedUseCollector live_in;
-  live_in.VisitStmt(op->body_);
+  live_in.VisitStmt(scope_body);
 
   std::vector<VarPtr> input_vars;
   for (const Var* var_ptr : live_in.ordered) {
@@ -1467,12 +1571,12 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
 
   // Collect type info from scope body for output variables
   VarCollector scope_var_collector;
-  scope_var_collector.VisitStmt(op->body_);
+  scope_var_collector.VisitStmt(scope_body);
 
   // Map any SSA post-store alias (var_def bound to a tile.store call) back
   // to its store target so we don't export the same tensor twice.
   PostStoreAliasCollector post_store_collector;
-  post_store_collector.VisitStmt(op->body_);
+  post_store_collector.VisitStmt(scope_body);
 
   // Aliases deferred to the call-site emission: each pair maps a
   // scope-local SSA post-store alias (pointer identity in the scope body)
@@ -1567,7 +1671,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   for (const auto& var : output_vars) {
     required_outputs_.insert(var.get());
   }
-  auto recursed_body = VisitStmt(op->body_);
+  auto recursed_body = VisitStmt(scope_body);
   func_name_ = saved_func_name;
   scope_counter_ = saved_scope_counter;
   var_types_ = saved_var_types;
@@ -1580,7 +1684,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   // Create fresh parameters for the outlined function.
   // Infer param directions from the inner callee when possible (requires program_).
   std::vector<ParamDirection> inferred_directions =
-      InferParamDirections(input_vars, op->body_, store_output_set);
+      InferParamDirections(input_vars, scope_body, store_output_set);
   std::vector<VarPtr> input_params;
   std::vector<ParamDirection> input_param_directions;
   std::unordered_map<const Var*, VarPtr> var_substitution_map;
@@ -1604,7 +1708,6 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
 
   // Create fresh output variables for the outlined function
   std::vector<VarPtr> outlined_output_vars;
-  std::vector<TypePtr> return_types;
   for (const auto& out_var : output_vars) {
     bool is_store = store_output_set.count(out_var.get()) > 0;
     TypePtr var_type;
@@ -1632,7 +1735,6 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     outlined_used_names.insert(out_var_name);
     auto outlined_var = std::make_shared<Var>(out_var_name, var_type, op->span_);
     outlined_output_vars.push_back(outlined_var);
-    return_types.push_back(var_type);
     if (!is_store) {
       var_substitution_map[out_var.get()] = outlined_var;
     }
@@ -1680,7 +1782,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   // into var_remap_ keyed by the original Var, so the chain
   //   old → seed (initial param/outlined) → freshened (after type remap)
   // collapses to old → freshened. Pick that out and replace the stale
-  // entry in input_params / outlined_output_vars / return_types.
+  // entry in input_params / outlined_output_vars.
   const auto& post_remap = subst_mutator.GetVarRemap();
   auto resolve_to_freshened = [&](const VarPtr& original, const VarPtr& seeded) -> VarPtr {
     auto it = post_remap.find(original.get());
@@ -1703,14 +1805,24 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       if (it != post_remap.end()) {
         if (auto freshened = AsVarLike(it->second)) {
           outlined_output_vars[i] = freshened;
-          return_types[i] = freshened->GetType();
         }
       }
       continue;
     }
     auto freshened = resolve_to_freshened(output_vars[i], outlined_output_vars[i]);
     outlined_output_vars[i] = freshened;
-    return_types[i] = freshened->GetType();
+  }
+
+  // Map each captured input Var to its positional index. The index is exact for
+  // BOTH surfaces the translations below need: ``input_params`` is built
+  // index-parallel to ``input_vars`` and is what the outlined ``Function`` is
+  // constructed from, and ``call_args`` is built from ``input_vars`` in the same
+  // order. Built once here and reused by output canonicalization and the attr
+  // translations further down.
+  std::unordered_map<const Var*, int32_t> input_var_to_idx;
+  input_var_to_idx.reserve(input_vars.size());
+  for (size_t i = 0; i < input_vars.size(); ++i) {
+    input_var_to_idx[input_vars[i].get()] = static_cast<int32_t>(i);
   }
 
   // Build outlined function body (transformed body + return statement).
@@ -1721,28 +1833,66 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   // the param makes the return->param mapping explicit by pointer identity
   // so orchestration codegen never re-derives it heuristically (#1702).
   StmtPtr outlined_body;
+  std::vector<TypePtr> return_types;
   if (outlined_output_vars.empty()) {
     outlined_body = transformed_body;
   } else {
-    std::unordered_map<const Var*, VarPtr> input_to_param;
-    for (size_t i = 0; i < input_vars.size(); ++i) {
-      input_to_param[input_vars[i].get()] = input_params[i];
-    }
-    std::vector<ExprPtr> return_exprs;
-    return_exprs.reserve(outlined_output_vars.size());
+    // Trace every generated result in one indexed walk. ConvertToSSA may order
+    // If phis by SSA name while captures stay in first-read order; branch
+    // consensus proves which captured buffer each phi still represents.
+    auto return_param_indices = return_lineage::TraceToParamIndicesForOutlining(
+        outlined_output_vars, transformed_body, input_params, program_,
+        /*trace_if_merges=*/outlined_func_type_ == FunctionType::InCore);
+    std::vector<ExprPtr> return_exprs(outlined_output_vars.begin(), outlined_output_vars.end());
     for (size_t i = 0; i < output_vars.size(); ++i) {
-      VarPtr ret = outlined_output_vars[i];
+      auto& ret = return_exprs[i];
+      auto& param_idx = return_param_indices[i];
       if (store_output_set.count(output_vars[i].get())) {
         // Store target: also an input, so the param is known directly.
-        auto param_it = input_to_param.find(output_vars[i].get());
-        if (param_it != input_to_param.end()) ret = param_it->second;
-      } else if (AsTensorTypeLike(ret->GetType())) {
-        if (auto param = return_lineage::TraceToParam(ret, transformed_body, input_params, program_)) {
-          ret = param;
-        }
+        auto param_it = input_var_to_idx.find(output_vars[i].get());
+        param_idx = param_it == input_var_to_idx.end()
+                        ? std::nullopt
+                        : std::optional<size_t>(static_cast<size_t>(param_it->second));
       }
-      return_exprs.push_back(ret);
+      if (!param_idx || *param_idx >= input_params.size() || !AsTensorTypeLike(ret->GetType()) ||
+          !structural_equal(ret->GetType(), input_params[*param_idx]->GetType())) {
+        param_idx.reset();
+        continue;
+      }
+      ret = input_params[*param_idx];
     }
+
+    // An outlined InCore function and its caller are generated together, so
+    // canonicalize their shared output contract here. Out/InOut parameter
+    // declaration order is the ABI order; SSA phi names and definition order
+    // are not. Stay conservative when any result is fresh, scalar, ambiguous,
+    // or duplicates another result's parameter.
+    bool can_order = outlined_func_type_ == FunctionType::InCore;
+    std::unordered_set<size_t> seen_params;
+    for (const auto& param_idx : return_param_indices) {
+      if (!param_idx || *param_idx >= input_param_directions.size() ||
+          (input_param_directions[*param_idx] != ParamDirection::Out &&
+           input_param_directions[*param_idx] != ParamDirection::InOut) ||
+          !seen_params.insert(*param_idx).second) {
+        can_order = false;
+        break;
+      }
+    }
+    if (can_order) {
+      std::vector<size_t> order(return_exprs.size());
+      for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+      std::stable_sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
+        return return_param_indices[lhs].value() < return_param_indices[rhs].value();
+      });
+      auto reorder = [&](auto& values) {
+        auto original = values;
+        for (size_t i = 0; i < order.size(); ++i) values[i] = original[order[i]];
+      };
+      reorder(output_vars);
+      reorder(return_exprs);
+    }
+    return_types.reserve(return_exprs.size());
+    for (const auto& ret : return_exprs) return_types.push_back(ret->GetType());
     auto return_stmt = std::make_shared<ReturnStmt>(return_exprs, op->span_);
 
     std::vector<StmtPtr> body_stmts;
@@ -1753,18 +1903,6 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     }
     body_stmts.push_back(return_stmt);
     outlined_body = std::make_shared<SeqStmts>(body_stmts, op->span_);
-  }
-
-  // Map each captured input Var to its positional index. The index is exact for
-  // BOTH surfaces the translations below need: ``input_params`` is built
-  // index-parallel to ``input_vars`` and is what the outlined ``Function`` is
-  // constructed from, and ``call_args`` is built from ``input_vars`` in the same
-  // order. Built once here, ahead of the attr resolution that follows, and
-  // reused by the no_dep / dump translations further down.
-  std::unordered_map<const Var*, int32_t> input_var_to_idx;
-  input_var_to_idx.reserve(input_vars.size());
-  for (size_t i = 0; i < input_vars.size(); ++i) {
-    input_var_to_idx[input_vars[i].get()] = static_cast<int32_t>(i);
   }
 
   // Register the outlined function (propagate level/role from ScopeStmt, convert split/core_num to attrs)
@@ -1838,10 +1976,10 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
   // ``split`` mode from the region node — but only when the scope itself
   // carries no AUTO cross-core transfer split (``incore->split_``), which has
   // a separate meaning. The authoritative per-region mode is ``node->split_``
-  // (consumed at pass 21).
+  // (consumed at pass 23).
   auto append_split_aiv_attr = [&](SplitMode incore_split) {
     SplitAivModeSummaryFinder finder;
-    finder.VisitStmt(op->body_);
+    finder.VisitStmt(scope_body);
     if (!finder.found) return;
     // A function-level AUTO split (optimizations=[pl.split(mode)], carried as the
     // scope's own split_) and explicit pl.split_aiv region(s) are mutually
@@ -1872,7 +2010,7 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
     // share one mode (``uniform_mode``) AND that mode is a real split. Differing
     // sibling modes have no single representative: leave the function-level mode
     // unset — the authoritative per-region mode rides ``node->split_`` (consumed
-    // at pass 20). No need to re-check incore_split here: the CHECK above
+    // at pass 23). No need to re-check incore_split here: the CHECK above
     // guarantees it is None.
     //
     // ``SplitMode::None`` is excluded for the same reason the sibling
@@ -1971,12 +2109,26 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       << "pl.at(...) containing pld.system.defer_wait cannot use "
          "allow_early_resolve=True; the waiter's TaskId must remain unresolved until its "
          "registered signal condition is satisfied";
-  // Dispatch predicate (``with pl.spmd(..., predicate=(t[i] > 0)):``). Rides
-  // on the scope from parse through SSA (which versions the Vars inside it);
-  // moved onto ``Submit::predicate_`` below, after which the attr is gone —
-  // the field is the single source of truth, so it is deliberately NOT copied
+  // Dispatch predicate (``with pl.spmd(..., predicate=(t[i] > 0)):`` or
+  // ``with pl.at(level=pl.Level.CORE_GROUP, predicate=...):``). Rides on the
+  // scope from parse through SSA (which versions the Vars inside it); moved
+  // onto ``Submit::predicate_`` below, after which the attr is gone — the
+  // field is the single source of truth, so it is deliberately NOT copied
   // into ``submit_attrs``.
   ExprPtr scope_predicate = op->GetAttr<ExprPtr>(kAttrPredicate, nullptr);
+  if (scope_predicate) {
+    // Resolve the operand tensor to the value current *as of this scope*,
+    // exactly as ``call_args`` are resolved above. A target-kind scope skips
+    // the base ``MutateScopeAttrs`` walk (VisitScopeKind goes straight to
+    // OutlineScope), so the attr still names the pre-outline SSA version. When
+    // an earlier sibling scope wrote that tensor, the version it names is a
+    // scope-local post-store alias that no longer exists in the parent
+    // function — leaving it would emit a Submit referencing a dangling Var
+    // (UseAfterDefCheck). ``VisitExpr_(const VarPtr&)`` applies
+    // ``store_target_renames_``, whose entries for such aliases were
+    // registered when the earlier scope was outlined.
+    scope_predicate = VisitExpr(scope_predicate);
+  }
 
   // Dependency edges (or an early-resolve flag, or a dispatch predicate)
   // force the Submit shape: deps live in the typed ``Submit::deps_`` field,
@@ -2206,6 +2358,25 @@ StmtPtr ScopeOutliner::OutlineScope(const ScopeStmtPtr& op,
       auto alias_it = var_objects_.find(alias_ptr);
       if (alias_it != var_objects_.end()) SetStoreTargetRename(alias_it->second, rename_it->second);
     }
+  }
+
+  // The hoisted scalar definitions belong to the caller now, ahead of the call:
+  // the body may capture one as a scalar arg, and the parent's later statements
+  // reference it directly. Register them in the outer symbol table first — the
+  // recursion above restored it, so these Vars are otherwise invisible to a
+  // sibling scope that captures one (same reason scope_task_id_var is
+  // registered when it is synthesised).
+  if (!hoist.hoisted.empty()) {
+    for (const auto& stmt : hoist.hoisted) {
+      auto assign = As<AssignStmt>(stmt);
+      INTERNAL_CHECK(assign) << "Internal error: scalar hoist produced a non-AssignStmt";
+      var_types_[assign->var_.get()] = assign->var_->GetType();
+      var_objects_[assign->var_.get()] = assign->var_;
+      known_names_.insert(assign->var_->name_hint_);
+    }
+    std::vector<StmtPtr> combined = hoist.hoisted;
+    combined.push_back(result);
+    result = SeqStmts::Flatten(std::move(combined), op->span_);
   }
   return result;
 }

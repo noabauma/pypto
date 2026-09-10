@@ -125,16 +125,13 @@ def preprocess_ptoas_output(content: str) -> str:
         filtered.append(line)
 
     result = _restore_mgather_wrapper_operands("".join(filtered))
-    # The current PTOAS emitter spells the 128-byte, chip-resident descriptor
-    # ``Tensor``.  Simpler renamed that runtime ABI type to ``ChipTensor``
-    # (simpler#1681), then split it in two (simpler#1974): the 72-byte
-    # ``ChipTensor`` is now only the argument as it arrives at the boundary,
-    # while the 128-byte descriptor a kernel actually reads is its runtime's
-    # own type, spelled ``TaskTensor`` by the per-runtime ``tensor.h`` shim.
-    # Rewrite the exact identifier before embedding the body in PyPTO's
-    # wrapper; names such as ``GlobalTensor`` are intentionally unaffected by
-    # the word boundaries.
-    result = re.sub(r"\bTensor\b", "TaskTensor", result)
+    # The PTOAS emitter and the runtime now spell the 128-byte, chip-resident
+    # descriptor the same way -- ``Tensor`` -- so nothing has to be rewritten
+    # here.  Simpler renamed that runtime ABI type to ``ChipTensor``
+    # (simpler#1681), split it in two (simpler#1974) so the 72-byte
+    # ``ChipTensor`` is only the argument as it arrives at the boundary, and
+    # then named the descriptor a kernel actually reads ``Tensor`` in the
+    # per-runtime ``tensor.h`` shim (simpler#2044), retiring ``Tensor``.
     result = re.sub(
         r'(?:extern\s*"C"\s*)?(?:__global__\s+)?AICORE\s+void',
         "static __aicore__ void",

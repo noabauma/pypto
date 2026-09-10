@@ -991,6 +991,68 @@ def test_all_to_all_v_in_host_orchestrator_is_left_for_host_collective_lowering(
     assert "pld.tile.put" not in op_names
 
 
+def test_all_to_all_v_in_chip_orchestrator_is_left_for_l2_collective_lowering():
+    """A CHIP orchestration body is the managed L2 rail's, not this one's.
+
+    Expanding the composite there would emit tensor-level put/notify/wait into
+    an orchestration body, which is not a legal place for them;
+    LowerL2TensorCollectives turns the call into one local AIV task instead.
+    """
+    SIZE = _AAV_SIZE
+    nr = _AAV_NRANKS
+    total = _AAV_TOTAL
+
+    @pl.program
+    class ChipAllToAllV:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_pipeline(
+            self,
+            inp: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+            counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+            recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[total, SIZE], pl.FP32]:
+            return pld.tensor.all_to_all_v(inp, data, signal, counts, recv_counts)
+
+    After = passes.lower_composite_ops()(ChipAllToAllV)
+    op_names = set(_collect_op_names(After))
+
+    assert "pld.tensor.all_to_all_v" in op_names
+    assert "pld.system.notify" not in op_names
+    assert "pld.tile.put" not in op_names
+
+
+def test_incore_all_to_all_v_rejects_multi_core_request():
+    """The composite rail runs inside one kernel, so it is single-core.
+
+    A multi-AIV request must name the rail that can honour it rather than
+    silently lowering to a single-block exchange.
+    """
+    SIZE = _AAV_SIZE
+    nr = _AAV_NRANKS
+    total = _AAV_TOTAL
+
+    @pl.program
+    class MultiCoreInCore:
+        @pl.function(type=pl.FunctionType.InCore)
+        def exchange_step(
+            self,
+            inp: pl.Tensor[[total, SIZE], pl.FP32],
+            counts: pl.Tensor[[nr, 1], pl.INT32],
+            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+            recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pl.Tensor[[total, SIZE], pl.FP32]:
+            result = pld.tensor.all_to_all_v(inp, data, signal, counts, recv_counts, core_num=4)
+            row = pl.load(result, [0, 0], [1, SIZE])
+            return pl.store(row, [0, 0], out)
+
+    with pytest.raises(ValueError, match="requires core_num=1"):
+        passes.lower_composite_ops()(MultiCoreInCore)
+
+
 def test_allreduce_without_signal_is_rejected_outside_host_orchestrator():
     SIZE = _ALLREDUCE_SIZE
 
@@ -2124,24 +2186,43 @@ def test_reduce_scatter_lowering_is_idempotent():
     ir.assert_structural_equal(twice, once)
 
 
-def test_reduce_scatter_deducer_rejects_unsupported_reduce_op():
-    """First-version lowering supports ``ReduceOp.Sum`` only — the deducer
-    must reject other variants."""
+def _build_reduce_scatter_op_program(reduce_op):
+    """Build a minimal Before program for a given ``pld.tensor.reduce_scatter`` op."""
     SIZE = _REDUCE_SCATTER_SIZE
     nr = _REDUCE_SCATTER_NRANKS
 
-    with pytest.raises((ValueError, TypeError, ParserError)):
+    @pl.program
+    class ReduceScatterOp:
+        @pl.function(type=pl.FunctionType.InCore)
+        def reduce_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, SIZE], pl.FP32]:
+            data = pld.tensor.reduce_scatter(data, signal, op=reduce_op)
+            return data
 
-        @pl.program
-        class BadOp:
-            @pl.function(type=pl.FunctionType.InCore)
-            def f(
-                self,
-                data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
-                signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-            ) -> pl.Tensor[[nr, SIZE], pl.FP32]:
-                data = pld.tensor.reduce_scatter(data, signal, op=pld.ReduceOp.Max)
-                return data
+    return ReduceScatterOp
+
+
+def test_reduce_scatter_supports_all_reduce_ops():
+    """All four reduce ops decompose; the accumulate step uses the matching
+    tile op (add / maximum / minimum / mul) instead of a hard-coded tile.add."""
+    op_to_tile_op = {
+        pld.ReduceOp.Sum: "tile.add",
+        pld.ReduceOp.Max: "tile.maximum",
+        pld.ReduceOp.Min: "tile.minimum",
+        pld.ReduceOp.Prod: "tile.mul",
+    }
+    for reduce_op, tile_op in op_to_tile_op.items():
+        After = passes.lower_composite_ops()(_build_reduce_scatter_op_program(reduce_op))
+        op_names = set(_collect_op_names(After))
+        assert "pld.tensor.reduce_scatter" not in op_names, (
+            "lower_composite_ops must remove the composite reduce_scatter call entirely"
+        )
+        assert tile_op in op_names, (
+            f"reduce_scatter({reduce_op}) expected {tile_op} in lowered IR, got {sorted(op_names)}"
+        )
 
 
 # ============================================================================

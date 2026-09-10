@@ -14,6 +14,7 @@ import importlib
 import inspect
 import re
 import warnings
+from pathlib import Path
 
 import pypto.language as pl
 import pypto.language.distributed as pld
@@ -23,16 +24,17 @@ from pypto.ir.compiled_program import CompiledProgram
 from pypto.jit.decorator import (
     _SYNTHESIZED_DYN_PREFIX,
     JITFunction,
+    _allocate_generated_names,
     _arg_ref,
     _build_param_mapping,
     _compute_per_func_dyndim_maps,
+    _discover_dep_bindings,
     _discover_deps,
     _extract_call_args_for_dep,
     _extract_local_tensor_metas,
     _extract_tensor_meta,
     _resolve_dep_call_metadata,
     _rewrite_jit_error,
-    _run_config_compile_kwargs,
     _scan_dep_io,
     _scan_dynamic_dims,
     _SlicedArg,
@@ -648,6 +650,480 @@ class TestMultiFuncDepDiscovery:
         assert len(deps) == 0
 
 
+class TestAliasedDepCallName:
+    """A dep reached under a name other than its own.
+
+    ``from mod import kernel as kern`` (and the equivalent ``kern = kernel``
+    rebinding) leaves the caller's AST calling ``kern``, while the callee's
+    ``__name__`` stays ``kernel``. Every call-site lookup must key on the
+    former; only the generated ``@pl.function`` keeps the latter.
+    """
+
+    @staticmethod
+    def _aliased_entry():
+        """Return ``(entry, dep)`` where ``entry`` calls ``dep`` via an alias.
+
+        The dep's parameters are deliberately named differently from the
+        caller's variables, so nothing resolves by coincidence of names.
+        """
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+            tile = pl.load(src, [0, 0], [64, 64])
+            pl.store(tile, [0, 0], dst)
+            return dst
+
+        kern = copy_incore  # the alias an ``import ... as`` would bind
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            kern(a, c)
+            return c
+
+        return entry, copy_incore
+
+    def test_discovery_reports_call_name_and_func_name(self):
+        entry, dep = self._aliased_entry()
+        bindings = _discover_dep_bindings(entry._func)
+        assert [(b.call_name, b.dep.__name__) for b in bindings] == [("kern", "copy_incore")]
+        assert bindings[0].dep is dep
+
+    def test_discover_deps_view_drops_call_names(self):
+        entry, dep = self._aliased_entry()
+        assert _discover_deps(entry._func) == [dep]
+
+    def test_scan_dep_io_keyed_by_call_name(self):
+        """``_dep_out_metas`` looks the entry up by the AST's ``ast.Name``."""
+        entry, _ = self._aliased_entry()
+        io = _scan_dep_io(entry._func)
+        assert "kern" in io
+        assert "copy_incore" not in io
+        param_names, output_params = io["kern"]
+        assert param_names == ["src", "dst"]
+        assert output_params == ["dst"]
+
+    def test_dep_metadata_resolves_through_alias(self):
+        """The reported failure: metadata came back empty, blaming the shapes."""
+        entry, dep = self._aliased_entry()
+        caller_meta = {
+            "a": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
+            "c": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
+        }
+        dep_meta, _, _ = _resolve_dep_call_metadata(
+            dep, entry._func, caller_meta, {}, {}, {}, dep_call_name="kern"
+        )
+        # Positional call-site mapping, not the name-based fallback: the dep's
+        # own parameter names appear nowhere in the caller.
+        assert dep_meta["src"].shape == (64, 64)
+        assert dep_meta["dst"].shape == (64, 64)
+
+    def test_context_carries_call_name_and_generated_name(self):
+        torch = pytest.importorskip("torch")
+        entry, _ = self._aliased_entry()
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+
+        dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "copy_incore")
+        assert dep_ctx.tensor_meta["src"].shape == (64, 64)
+
+        entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
+        assert entry_ctx.dep_names == ["kern"]
+        assert entry_ctx.dep_func_names == {"kern": "copy_incore"}
+
+    def test_generated_source_calls_the_generated_name(self):
+        """The body rewrite must target ``self.copy_incore``, not ``self.kern``."""
+        torch = pytest.importorskip("torch")
+        entry, _ = self._aliased_entry()
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        source = Specializer("_jit_entry", contexts).specialize()
+
+        assert "self.copy_incore(a, c)" in source
+        assert "kern" not in source
+        # And it still parses — an unrewritten bare call does not.
+        assert isinstance(pl.parse(source), ir.Program)
+
+    def test_two_aliases_for_one_dep_both_rewrite(self):
+        """Both call names map onto the single generated function."""
+        torch = pytest.importorskip("torch")
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+            tile = pl.load(src, [0, 0], [64, 64])
+            pl.store(tile, [0, 0], dst)
+            return dst
+
+        first = copy_incore
+        second = copy_incore
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            first(a, c)
+            second(a, c)
+            return c
+
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
+        assert entry_ctx.dep_func_names == {"first": "copy_incore", "second": "copy_incore"}
+
+        source = Specializer("_jit_entry", contexts).specialize()
+        assert source.count("self.copy_incore(a, c)") == 2
+        # One generated function, called twice.
+        assert source.count("def copy_incore(self") == 1
+
+    def test_module_global_alias_from_import(self):
+        """The reported shape: ``from mod import kernel as kern`` at module scope.
+
+        Discovery reads the entry's ``__globals__``, so the alias must resolve
+        there too — not only through the closure path the other cases use.
+        """
+        import importlib.util  # noqa: PLC0415
+        import types  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        torch = pytest.importorskip("torch")
+
+        fixture_path = Path(__file__).parent / "_alias_dep_fixture.py"
+        spec = importlib.util.spec_from_file_location("_alias_dep_fixture", fixture_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        def _entry_raw(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            # Bound below, as ``import ... as kern`` would, via the rebuilt globals.
+            kern(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            return c
+
+        # ``from _alias_dep_fixture import copy_incore as kern`` binds the dep
+        # under ``kern`` in the importing module's globals.
+        new_globals = {**_entry_raw.__globals__, "kern": module.copy_incore}
+        entry = JITFunction(
+            types.FunctionType(
+                _entry_raw.__code__,
+                new_globals,
+                _entry_raw.__name__,
+                _entry_raw.__defaults__,
+                _entry_raw.__closure__,
+            ),
+            func_type="orchestration",
+        )
+
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+
+        dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "copy_incore")
+        assert dep_ctx.tensor_meta["src"].shape == (64, 64)
+        source = Specializer("_jit_entry_raw", contexts).specialize()
+        assert "self.copy_incore(a, c)" in source
+        assert isinstance(pl.parse(source), ir.Program)
+
+    def test_aliased_dep_out_metadata_propagates_to_capture(self):
+        """``out = kern(a, buf)`` inherits the meta of the arg bound to ``dst``."""
+
+        @jit.incore
+        def copy_incore(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+            tile = pl.load(src, [0, 0], [64, 64])
+            pl.store(tile, [0, 0], dst)
+            return dst
+
+        kern = copy_incore
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            buf = pl.create_tensor([32, 16], dtype=pl.FP32)
+            out = kern(a, buf)
+            return out
+
+        metas = _extract_local_tensor_metas(
+            entry._func,
+            seed_meta={
+                "a": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
+                "c": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
+            },
+        )
+        # ``out`` captures the dep's Out param, which the call site bound to
+        # ``buf`` — resolvable only if _scan_dep_io keyed the dep by "kern".
+        assert metas["out"].shape == (32, 16)
+
+
+class TestDuplicateDepNames:
+    """Two distinct deps that share a ``__name__``.
+
+    Both emit into one ``@pl.program`` class, so the generated names must be
+    made unique — otherwise the parser refuses the whole program with a bare
+    ``Duplicate function name "helper"``, and the entry's two call sites both
+    rewrite to the same ``self.helper``.
+    """
+
+    @staticmethod
+    def _factory_entry():
+        """``entry`` calling two same-named kernels built by one factory."""
+
+        def make(rows):
+            @jit.incore
+            def helper(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+                tile = pl.load(src, [0, 0], [rows, 64])
+                pl.store(tile, [0, 0], dst)
+                return dst
+
+            return helper
+
+        first, second = make(32), make(64)
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            first(a, c)
+            second(a, c)
+            return c
+
+        return entry
+
+    @staticmethod
+    def _contexts_for(entry):
+        torch = pytest.importorskip("torch")
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
+        return entry._build_contexts(tmeta, sv, sd, pfd)
+
+    def test_same_named_deps_get_distinct_generated_names(self):
+        contexts = self._contexts_for(self._factory_entry())
+        assert [ctx.func_name for ctx in contexts] == ["helper", "helper__2", "entry"]
+        # The uniquified context still finds its ``def`` in its own source.
+        assert [ctx.source_def_name for ctx in contexts] == ["helper", "helper", "entry"]
+
+    def test_each_call_site_targets_its_own_specialization(self):
+        contexts = self._contexts_for(self._factory_entry())
+        entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
+        assert entry_ctx.dep_func_names == {"first": "helper", "second": "helper__2"}
+
+    def test_generated_program_parses_and_keeps_both_bodies(self):
+        contexts = self._contexts_for(self._factory_entry())
+        source = Specializer("_jit_entry", contexts).specialize()
+
+        assert "def helper(self" in source
+        assert "def helper__2(self" in source
+        assert "self.helper(a, c)" in source
+        assert "self.helper__2(a, c)" in source
+        # Each specialization folded its own ``rows``; naming them apart is
+        # what keeps both bodies in the program.
+        assert "pl.load(src, [0, 0], [32, 64])" in source
+        assert "pl.load(src, [0, 0], [64, 64])" in source
+
+        program = pl.parse(source)
+        assert isinstance(program, ir.Program)
+        assert {f.name for f in program.functions} == {"helper", "helper__2", "entry"}
+
+    def test_deps_from_two_modules_sharing_a_name(self):
+        """The reported shape: two modules each defining the same kernel name.
+
+        The fixture module is loaded twice under different module names, so the
+        two ``copy_incore`` objects are genuinely distinct functions that agree
+        on ``__name__`` — exactly what two ``expert_routed`` definitions give.
+        """
+        import importlib.util  # noqa: PLC0415
+        import types  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        fixture_path = Path(__file__).parent / "_alias_dep_fixture.py"
+
+        def _load(mod_name):
+            spec = importlib.util.spec_from_file_location(mod_name, fixture_path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.copy_incore
+
+        left, right = _load("_dup_name_left"), _load("_dup_name_right")
+        assert left.__name__ == right.__name__ == "copy_incore"
+        assert left._func is not right._func
+
+        def _entry_raw(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            left(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            right(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            return c
+
+        new_globals = {**_entry_raw.__globals__, "left": left, "right": right}
+        entry = JITFunction(
+            types.FunctionType(
+                _entry_raw.__code__,
+                new_globals,
+                _entry_raw.__name__,
+                _entry_raw.__defaults__,
+                _entry_raw.__closure__,
+            ),
+            func_type="orchestration",
+        )
+
+        contexts = self._contexts_for(entry)
+        assert [ctx.func_name for ctx in contexts] == [
+            "copy_incore",
+            "copy_incore__2",
+            "_entry_raw",
+        ]
+        source = Specializer("_jit_entry_raw", contexts).specialize()
+        assert "self.copy_incore(a, c)" in source
+        assert "self.copy_incore__2(a, c)" in source
+        assert isinstance(pl.parse(source), ir.Program)
+
+    def test_dep_sharing_the_entry_name_yields_to_the_entry(self):
+        """The entry keeps the name the user called; the dep is the one moved."""
+
+        def make():
+            @jit.incore
+            def entry(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+                tile = pl.load(src, [0, 0], [64, 64])
+                pl.store(tile, [0, 0], dst)
+                return dst
+
+            return entry
+
+        dep = make()
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            dep(a, c)
+            return c
+
+        contexts = self._contexts_for(entry)
+        assert [ctx.func_name for ctx in contexts] == ["entry__2", "entry"]
+        entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
+        assert entry_ctx.dep_func_names == {"dep": "entry__2"}
+        assert isinstance(pl.parse(Specializer("_jit_entry", contexts).specialize()), ir.Program)
+
+    def test_dep_layouts_cache_key_tracks_which_dep_declared_which_layout(self):
+        """Swapping two same-named deps' layouts must change the cache key.
+
+        ``dep_layouts`` is a *sorted* tuple, so it carries no position — keyed
+        by ``__name__`` it collapsed, and the second call got the first call's
+        artifact even though the generated signatures differ.
+        """
+        import importlib.util  # noqa: PLC0415
+        import types  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        fixture_path = Path(__file__).parent / "_dup_layout_fixture.py"
+
+        def _load(mod_name):
+            """Load the fixture, returning ``(helper, its globals dict)``.
+
+            A postponed annotation is resolved against the function's own
+            globals, so rebinding ``LAYOUT`` there is what changes the layout
+            the dep declares — the module's ``__dict__`` is that same mapping.
+            """
+            spec = importlib.util.spec_from_file_location(mod_name, fixture_path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.helper, module.__dict__
+
+        (left, left_globals), (right, right_globals) = (
+            _load("_dup_layout_left"),
+            _load("_dup_layout_right"),
+        )
+
+        def _entry_raw(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            left(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            right(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            return c
+
+        new_globals = {**_entry_raw.__globals__, "left": left, "right": right}
+        entry = JITFunction(
+            types.FunctionType(
+                _entry_raw.__code__,
+                new_globals,
+                _entry_raw.__name__,
+                _entry_raw.__defaults__,
+                _entry_raw.__closure__,
+            ),
+            func_type="orchestration",
+        )
+
+        left_globals["LAYOUT"], right_globals["LAYOUT"] = ir.TensorLayout.NZ, ir.TensorLayout.ND
+        first = entry._dep_declared_layouts()
+
+        left_globals["LAYOUT"], right_globals["LAYOUT"] = ir.TensorLayout.ND, ir.TensorLayout.NZ
+        second = entry._dep_declared_layouts()
+
+        # Each triple names the generated function whose signature carries the
+        # layout, so the swap is visible.
+        assert first == (
+            ("helper", "src", str(ir.TensorLayout.NZ)),
+            ("helper__2", "src", str(ir.TensorLayout.ND)),
+        )
+        assert second == (
+            ("helper", "src", str(ir.TensorLayout.ND)),
+            ("helper__2", "src", str(ir.TensorLayout.NZ)),
+        )
+        assert first != second
+
+
+class TestAllocateGeneratedNames:
+    """Unit coverage for the generated-name allocator itself."""
+
+    @staticmethod
+    def _jit_named(name, *, func_type="incore", external_core_type=None):
+        """A JITFunction over a trivial body — the allocator reads only names.
+
+        Each call builds a fresh function object, so same-named holders are
+        distinct keys, exactly as two factory-built kernels are.
+        """
+
+        def _f():
+            pass
+
+        _f.__name__ = name
+        return JITFunction(_f, func_type=func_type, external_core_type=external_core_type)
+
+    def test_entry_is_named_first(self):
+        entry = self._jit_named("k")
+        dep = self._jit_named("k")
+        names = _allocate_generated_names(entry, [dep])
+        assert names[id(entry._func)] == "k"
+        assert names[id(dep._func)] == "k__2"
+
+    def test_three_way_clash_counts_up(self):
+        entry = self._jit_named("e")
+        deps = [self._jit_named("k") for _ in range(3)]
+        names = _allocate_generated_names(entry, deps)
+        assert [names[id(d._func)] for d in deps] == ["k", "k__2", "k__3"]
+
+    def test_suffix_shaped_user_name_does_not_collide(self):
+        """A user function literally named ``k__2`` still gets its own slot."""
+        entry = self._jit_named("e")
+        deps = [self._jit_named("k__2"), self._jit_named("k"), self._jit_named("k")]
+        names = _allocate_generated_names(entry, deps)
+        generated = [names[id(d._func)] for d in deps]
+        assert generated == ["k__2", "k", "k__3"]
+        assert len(set(generated)) == len(generated)
+
+    def test_mixed_extern_reserves_its_member_names(self):
+        """A mixed extern occupies ``base``, ``base_aic`` and ``base_aiv``."""
+        entry = self._jit_named("e")
+        mixed = self._jit_named("k", func_type="extern", external_core_type="mixed")
+        plain = self._jit_named("k_aic")
+        names = _allocate_generated_names(entry, [mixed, plain])
+        assert names[id(mixed._func)] == "k"
+        assert names[id(plain._func)] == "k_aic__2"
+
+    def test_one_function_reached_twice_keeps_one_name(self):
+        """A diamond dep appears once in the map, not twice."""
+        entry = self._jit_named("e")
+        dep = self._jit_named("k")
+        names = _allocate_generated_names(entry, [dep, dep])
+        assert names[id(dep._func)] == "k"
+        assert len(names) == 2
+
+
 class TestMultiFuncIntegration:
     """End-to-end multi-function @pl.jit compilation with @pl.jit.incore deps."""
 
@@ -827,6 +1303,70 @@ def _reshape_body(src: pl.Tensor, out: pl.Out[pl.Tensor]) -> pl.Tensor:
 def _callsite_metadata_kernel(x: pl.Tensor, out: pl.Out[pl.Tensor]) -> pl.Tensor:
     """Dependency used by point-in-time call-site metadata tests."""
     return out
+
+
+# --- Callee-allocated dep results -------------------------------------------
+# A helper that allocates its own outputs and returns them, rather than writing
+# into pl.Out params the caller allocated. Its results' shape/dtype live only in
+# its body, so the caller's metadata pool has to descend into it.
+
+
+@jit.inline
+def _make_pair_inline(x: pl.Tensor):
+    """Inline helper returning two tensors it created itself."""
+    a = pl.create_tensor([1, 8], dtype=pl.FP32)
+    b = pl.create_tensor([16, 8], dtype=pl.FP16)
+    with pl.at(level=pl.Level.CORE_GROUP):
+        a[:, :] = x[0:1, :]
+        b[:, :] = pl.cast(x[0:16, :], pl.FP16)
+    return a, b
+
+
+def _tuple_dep_return_body(x: pl.Tensor, out: pl.Out[pl.Tensor]) -> pl.Tensor:
+    """Plain (undecorated) caller: unpacks a tuple of callee-allocated tensors."""
+    a, b = _make_pair_inline(x)  # noqa: F841 — the metas under test
+    return out
+
+
+@jit.inline
+def _widen_inline(src: pl.Tensor):
+    """Inline helper whose own allocation is sized off its parameter."""
+    cols = pl.tensor.dim(src, 1)
+    wide = pl.create_tensor([2, cols], dtype=pl.FP32)
+    return wide
+
+
+def _param_sized_dep_body(x: pl.Tensor) -> pl.Tensor:
+    """Plain (undecorated) caller: the callee sizes its result from the arg."""
+    wide = _widen_inline(x)
+    return wide
+
+
+def _arity_mismatch_body(x: pl.Tensor) -> pl.Tensor:
+    """Plain (undecorated) caller: one target against a two-element return."""
+    only_one = _make_pair_inline(x)
+    return only_one
+
+
+@jit.inline
+def _mixed_pair_inline(x: pl.Tensor):
+    """Inline helper returning one typeable local and one the extractor declines.
+
+    ``pl.reshape`` with a non-static shape is strict on purpose (a reshape's
+    dims are constrained by the source's element count), so ``opaque`` has no
+    meta on the callee side either.
+    """
+    opaque = pl.reshape(x, [2, pl.tensor.dim(x, 1)])
+    known = pl.create_tensor([4, 4], dtype=pl.FP16)
+    return opaque, known
+
+
+def _mixed_pair_body(x: pl.Tensor) -> pl.Tensor:
+    """Plain (undecorated) caller: rebinds a known local through a helper that
+    returns one typeable result and one it cannot type."""
+    a = pl.create_tensor([16, 8], dtype=pl.FP32)
+    a, b = _mixed_pair_inline(a)
+    return b
 
 
 # --- Runtime-sized local extents (synthesized DynDim) ------------------------
@@ -1073,6 +1613,112 @@ class TestSliceAndDepReturnMetadata:
         out = torch.empty(16, 32)
         program = split_entry.lower(src, out)
         assert isinstance(program, ir.Program)
+
+    def test_extract_local_tensor_metas_callee_allocated_tuple_return(self):
+        """A dep with no ``Out`` params still resolves: its returned locals'
+        metas are read out of the callee's own body."""
+        seed = {
+            "x": TensorMeta(shape=(16, 8), dtype=DataType.FP32),
+            "out": TensorMeta(shape=(16, 8), dtype=DataType.FP32),
+        }
+        metas = _extract_local_tensor_metas(_tuple_dep_return_body, seed_meta=seed)
+        # Each target takes the pl.create_tensor meta of the matching returned
+        # name — including the dtype, which differs between the two.
+        assert metas["a"] == TensorMeta(shape=(1, 8), dtype=DataType.FP32)
+        assert metas["b"] == TensorMeta(shape=(16, 8), dtype=DataType.FP16)
+
+    def test_callee_allocated_tuple_return_flows_into_next_dep(self, monkeypatch, tmp_path):
+        """The reported failure: two tensors an inline helper created itself are
+        unpacked and passed to a second inline helper, whose params then have no
+        inferred metadata.
+
+        Driven through ``compile()``, not ``lower()``: ``lower()`` stops after
+        the passes, so a codegen precondition the metadata affects would not
+        fire here. ``PTOAS_ROOT`` is pointed at nothing so the run stays
+        source-only and needs no assembler (the
+        ``test_jit_compile_extraction`` pattern).
+        """
+        torch = pytest.importorskip("torch")
+        monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "missing_ptoas"))
+
+        @jit.inline
+        def make_pair(x: pl.Tensor[[1, 8], pl.FP32]):
+            a = pl.create_tensor([1, 8], dtype=pl.FP32)
+            b = pl.create_tensor([1, 8], dtype=pl.FP32)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                a[:, :] = x[:, :]
+                b[:, :] = pl.mul(x[:, :], 2.0)
+            return a, b
+
+        @jit.inline
+        def consume_pair(a: pl.Tensor, b: pl.Tensor, out: pl.Tensor):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                out[:, :] = pl.add(a[:, :], b[:, :])
+
+        @jit
+        def pair_entry(x: pl.Tensor[[1, 8], pl.FP32], out: pl.Out[pl.Tensor[[1, 8], pl.FP32]]):
+            a, b = make_pair(x)
+            consume_pair(a, b, out)
+
+        compiled = pair_entry.compile(torch.randn(1, 8), torch.empty(1, 8))
+        assert isinstance(compiled, CompiledProgram)
+
+    def test_callee_allocated_single_return_flows_into_next_dep(self, monkeypatch, tmp_path):
+        """The single-value shape of the same rule: ``buf = helper(x)`` where
+        ``helper`` allocates ``buf`` itself. Compiled, not just lowered, for the
+        reason given above."""
+        torch = pytest.importorskip("torch")
+        monkeypatch.setenv("PTOAS_ROOT", str(tmp_path / "missing_ptoas"))
+
+        @jit.inline
+        def double_inline(x: pl.Tensor[[1, 8], pl.FP32]):
+            scaled = pl.create_tensor([1, 8], dtype=pl.FP32)
+            with pl.at(level=pl.Level.CORE_GROUP):
+                scaled[:, :] = pl.mul(x[:, :], 2.0)
+            return scaled
+
+        @jit.inline
+        def copy_inline(src: pl.Tensor, out: pl.Tensor):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                out[:, :] = src[:, :]
+
+        @jit
+        def single_entry(x: pl.Tensor[[1, 8], pl.FP32], out: pl.Out[pl.Tensor[[1, 8], pl.FP32]]):
+            scaled = double_inline(x)
+            copy_inline(scaled, out)
+
+        compiled = single_entry.compile(torch.randn(1, 8), torch.empty(1, 8))
+        assert isinstance(compiled, CompiledProgram)
+
+    def test_callee_allocated_return_sized_from_its_param(self):
+        """A callee whose allocation is sized off a parameter resolves through
+        the call site: the seed metas descend with the recursion."""
+        seed = {"x": TensorMeta(shape=(4, 64), dtype=DataType.FP16)}
+        metas = _extract_local_tensor_metas(_param_sized_dep_body, seed_meta=seed)
+        # ``pl.create_tensor(..., dtype=pl.FP32)`` sized by ``pl.tensor.dim(src, 1)``
+        # of the caller's ``x``.
+        assert metas["wide"] == TensorMeta(shape=(2, 64), dtype=DataType.FP32)
+
+    def test_partially_resolved_tuple_clears_the_unresolved_target(self):
+        """A target the callee rebinds to something untypeable must not keep the
+        metadata it carried *before* the call — that shape describes a tensor
+        the helper already replaced, and the next dep would silently receive it.
+        Clearing it restores the clear ``_build_params`` error."""
+        seed = {"x": TensorMeta(shape=(16, 8), dtype=DataType.FP32)}
+        metas = _extract_local_tensor_metas(_mixed_pair_body, seed_meta=seed)
+        # ``b`` still resolves from the callee's own pl.create_tensor ...
+        assert metas["b"] == TensorMeta(shape=(4, 4), dtype=DataType.FP16)
+        # ... while ``a`` drops its stale pre-call [16, 8] FP32 rather than
+        # advertising it to whatever consumes ``a`` next.
+        assert "a" not in metas
+
+    def test_callee_return_arity_mismatch_resolves_nothing(self):
+        """A target that does not line up with the callee's return list is
+        declined rather than mis-paired — the clear ``_build_params`` error
+        beats a wrong shape."""
+        seed = {"x": TensorMeta(shape=(16, 8), dtype=DataType.FP32)}
+        metas = _extract_local_tensor_metas(_arity_mismatch_body, seed_meta=seed)
+        assert "only_one" not in metas
 
     def test_runtime_sized_slice_uses_static_parent_dim(self):
         """A pl.slice with a runtime-scalar width is advertised to the consuming
@@ -1649,7 +2295,7 @@ class TestSlicedDispatchMetadata:
             entry_func=_per_rank_dispatch_body,
             entry_param_names=["inputs", "outputs"],
             deps=[_dyn_sliced_chip],
-            callers_by_dep_id={id(_dyn_sliced_chip._func): [_per_rank_dispatch_body]},
+            callers_by_dep_id={id(_dyn_sliced_chip._func): [(_per_rank_dispatch_body, "_dyn_sliced_chip")]},
             call_args_cache=call_args_cache,
         )
         host_map = maps[id(_per_rank_dispatch_body)]
@@ -1785,8 +2431,9 @@ class TestInlineFuncIntegration:
 
         deps_topo, callers_by_id, callees_by_id, _ = entry._get_dep_graph()
         assert [d.__name__ for d in deps_topo] == ["leaf", "mid"]
-        assert callers_by_id[id(leaf._func)] == [mid._func]
-        assert callers_by_id[id(mid._func)] == [entry._func]
+        # Callers are recorded with the name their source calls the dep by.
+        assert callers_by_id[id(leaf._func)] == [(mid._func, "leaf")]
+        assert callers_by_id[id(mid._func)] == [(entry._func, "mid")]
         assert callees_by_id[id(entry._func)] == ["mid"]
         assert callees_by_id[id(mid._func)] == ["leaf"]
         assert callees_by_id[id(leaf._func)] == []
@@ -1861,9 +2508,10 @@ class TestInlineFuncIntegration:
         # shared leaf, so dyn-dim / dynvar propagation visits every branch
         # rather than just the first DFS path.
         shared_callers = callers_by_id[id(shared._func)]
-        assert {c.__name__ for c in shared_callers} == {"a_helper", "b_helper"}
-        assert callers_by_id[id(a_helper._func)] == [entry_diamond._func]
-        assert callers_by_id[id(b_helper._func)] == [entry_diamond._func]
+        assert {c.__name__ for c, _ in shared_callers} == {"a_helper", "b_helper"}
+        assert {name for _, name in shared_callers} == {"shared"}
+        assert callers_by_id[id(a_helper._func)] == [(entry_diamond._func, "a_helper")]
+        assert callers_by_id[id(b_helper._func)] == [(entry_diamond._func, "b_helper")]
 
         a = torch.randn(32, 32)
         out = torch.empty(32, 32)
@@ -2359,55 +3007,15 @@ class TestCompileKwargForwarding:
     Before this fix, ``_compile`` only forwarded ``skip_ptoas`` and
     ``platform`` — every other compile knob a user set on ``RunConfig``
     (``strategy``, ``dump_passes``, ...) was silently dropped on the JIT path.
+
+    The mapping itself is ``RunConfig.compile_kwargs`` and is tested in
+    ``tests/ut/runtime/test_run_config.py``; what these cases pin is that the
+    JIT path uses it rather than a second copy of it.
     """
-
-    def test_run_config_compile_kwargs_maps_fields(self, tmp_path):
-        """Compile-side RunConfig fields map onto the ir.compile() parameter names."""
-        artifacts_dir = tmp_path / "jit_artifacts"
-        cfg = RunConfig(
-            strategy=OptimizationStrategy.Default,
-            dump_passes=True,
-            dump_ptoas_passes=True,
-            compile_profiling=True,
-            save_kernels_dir=str(artifacts_dir),
-            analyze_auto_scopes_for_deps=True,
-        )
-        kwargs = _run_config_compile_kwargs(cfg)
-        assert kwargs["strategy"] == OptimizationStrategy.Default
-        assert kwargs["dump_passes"] is True
-        assert kwargs["dump_ptoas_passes"] is True
-        assert kwargs["profiling"] is True  # mapped from RunConfig.compile_profiling
-        assert kwargs["output_dir"] == str(artifacts_dir)  # from RunConfig.save_kernels_dir
-        assert kwargs["analyze_auto_scopes_for_deps"] is True
-        assert "diagnostic_phase" in kwargs
-        assert "disabled_diagnostics" in kwargs
-        # backend_type is derived from `platform` by ir.compile(); not forwarded.
-        assert "backend_type" not in kwargs
-
-    def test_run_config_compile_kwargs_omits_unset_output_dir(self):
-        """save_kernels_dir left unset omits output_dir so ir.compile()'s default applies."""
-        kwargs = _run_config_compile_kwargs(RunConfig())
-        assert "output_dir" not in kwargs
-
-    def test_run_config_compile_kwargs_forwards_distributed_config(self):
-        """A RunConfig.distributed_config is forwarded so @pl.jit.host kernels go distributed."""
-        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
-
-        dc = DistributedConfig(device_ids=[0, 1])
-        kwargs = _run_config_compile_kwargs(RunConfig(distributed_config=dc))
-        # Forwarded verbatim (same object) so ir.compile() emits a
-        # DistributedCompiledProgram for the HOST-level entry.
-        assert kwargs["distributed_config"] is dc
-
-    def test_run_config_compile_kwargs_omits_unset_distributed_config(self):
-        """distributed_config left unset is omitted so ir.compile()'s single-chip default applies."""
-        kwargs = _run_config_compile_kwargs(RunConfig())
-        assert "distributed_config" not in kwargs
-        assert kwargs["analyze_auto_scopes_for_deps"] is False
 
     def test_make_cache_key_splits_on_distributed_config(self):
         """distributed_config participates in the cache key (distinct device_ids ≠ collide)."""
-        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
         from pypto.jit.cache import make_cache_key  # noqa: PLC0415
 
         def key_for(distributed_config):
@@ -2463,7 +3071,7 @@ class TestCompileKwargForwarding:
         different ``device_ids`` would silently target the wrong ranks.
         """
         torch = pytest.importorskip("torch")
-        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
 
         @jit
         def cfg_kernel(a: pl.Tensor[[128, 128], pl.FP32], c: pl.Out[pl.Tensor[[128, 128], pl.FP32]]):
@@ -2532,7 +3140,7 @@ class TestCompileKwargForwarding:
         assert first != second
         assert third == first
 
-    def test_resolve_compiled_splits_cache_on_ptoas_pass_dump(self, monkeypatch):
+    def test_resolve_compiled_bypasses_cache_on_ptoas_pass_dump(self, monkeypatch):
         """Enabling ptoas pass dumps cannot reuse an artifact compiled without them."""
         torch = pytest.importorskip("torch")
 
@@ -2558,11 +3166,13 @@ class TestCompileKwargForwarding:
 
         first = resolve(False)
         second = resolve(True)
+        repeated_dump = resolve(True)
         third = resolve(False)
 
-        assert compile_calls["n"] == 2
-        assert len(cfg_kernel._cache) == 2
+        assert compile_calls["n"] == 3
+        assert len(cfg_kernel._cache) == 1
         assert first != second
+        assert second != repeated_dump
         assert third == first
 
     def test_compile_forwards_run_config_kwargs(self, monkeypatch):
@@ -2588,7 +3198,7 @@ class TestCompileKwargForwarding:
         # so patching the module attribute intercepts the real compilation.
         monkeypatch.setattr(ir_compile_mod, "compile", fake_compile)
 
-        from pypto.ir.distributed_compiled_program import DistributedConfig  # noqa: PLC0415
+        from pypto.ir import DistributedConfig  # noqa: PLC0415
 
         dc = DistributedConfig(device_ids=[0, 1])
         cfg = RunConfig(
@@ -2607,8 +3217,7 @@ class TestCompileKwargForwarding:
             scalar_dtypes={},
             per_func_dyn={id(fwd_kernel._func): {}},
             pl=pl,
-            platform="a2a3sim",
-            **_run_config_compile_kwargs(cfg),
+            **cfg.compile_kwargs(),
         )
         assert result == "fake-compiled-program"
         assert captured["strategy"] == OptimizationStrategy.Default
@@ -2621,8 +3230,8 @@ class TestCompileKwargForwarding:
         # compile to a DistributedCompiledProgram and dispatch per-rank.
         assert captured["distributed_config"] is dc
 
-    def test_compile_without_kwargs_forwards_only_defaults(self, monkeypatch):
-        """_compile with no extra kwargs forwards only skip_ptoas + platform."""
+    def test_compile_without_output_dir_allocates_one(self, monkeypatch):
+        """Each JIT compilation owns an automatic directory when none is supplied."""
         ir_compile_mod = importlib.import_module("pypto.ir.compile")
 
         @jit
@@ -2650,8 +3259,8 @@ class TestCompileKwargForwarding:
             per_func_dyn={id(plain_kernel._func): {}},
             pl=pl,
         )
-        assert set(captured) == {"skip_ptoas", "platform"}
-        assert captured["platform"] is None
+        assert set(captured) == {"skip_ptoas", "output_dir"}
+        assert Path(captured["output_dir"]).is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -2843,9 +3452,9 @@ class TestClosureConstantFolding:
     def test_rebound_closure_cell_splits_the_cache(self):
         """A rebound cell must not silently reuse the previous artifact.
 
-        ``_get_source_hash`` hashes the function *text*, which a ``nonlocal``
-        rebind leaves byte-identical, so the closure values have to enter the
-        key separately. Two distinct factory instances would not catch this —
+        A ``nonlocal`` rebind leaves the function text byte-identical, so the
+        source dependency hash must capture the changed value.
+        Two distinct factory instances would not catch this —
         they are different ``JITFunction`` objects with their own caches.
         """
         torch = pytest.importorskip("torch")
@@ -2855,17 +3464,12 @@ class TestClosureConstantFolding:
         out = torch.zeros(64, 64, dtype=torch.float32)
 
         del a, out
-        before = entry._folded_closure_constants()
         source_hash_before = entry._get_source_hash()
+        static_hash_before = entry._get_static_source_hash()
         set_rows(96)
-        after = entry._folded_closure_constants()
 
-        # The text-based hash cannot see the rebind — that is the whole problem.
-        assert entry._get_source_hash() == source_hash_before
-        # The closure component does, so the composed key differs.
-        assert before != after
-        assert ("entry", "rows", "64") in before
-        assert ("entry", "rows", "96") in after
+        assert entry._get_static_source_hash() == static_hash_before
+        assert entry._get_source_hash() != source_hash_before
 
     def test_rebound_closure_cell_recompiles_instead_of_reusing(self):
         """The observable consequence: ``compile()`` must not hand back the
@@ -2890,26 +3494,20 @@ class TestClosureConstantFolding:
         assert entry.compile(a, out, config=RunConfig(platform="a2a3sim")) is compiled_after
         assert len(entry._cache) == 2
 
-    def test_closure_constants_key_component_is_stable_and_typed(self):
-        """Equal state yields an equal component (so a genuine re-call still
-        hits the cache), and ``repr`` keeps look-alike values apart."""
-        from pypto.jit.cache import make_cache_key  # noqa: PLC0415
+    def test_closure_source_hash_is_stable_and_typed(self):
+        """The source hash distinguishes folded closure types and stays stable."""
 
-        def key_for(closure_constants):
-            return make_cache_key(
-                source_hash="h",
-                param_names=["x"],
-                tensor_shapes={"x": (64, 64)},
-                tensor_dtypes={"x": DataType.FP32},
-                dynamic_dims=set(),
-                scalar_values={},
-                closure_constants=closure_constants,
-            )
+        def make_entry(value: int | float | bool):
+            @jit
+            def entry(x):
+                return pl.add(x, value)
 
-        base = key_for((("entry", "rows", "1"),))
-        assert base == key_for((("entry", "rows", "1"),))
-        # 1 / 1.0 / True all fold, and all produce different literals.
-        assert len({base, key_for((("entry", "rows", "1.0"),)), key_for((("entry", "rows", "True"),))}) == 3
+            return entry
+
+        entry = make_entry(1)
+        base = entry._get_source_hash()
+        assert base == entry._get_source_hash()
+        assert len({base, *(make_entry(value)._get_source_hash() for value in (1.0, True))}) == 3
 
     def test_module_globals_still_fold(self):
         """Closure bindings are merged on top of globals, not instead of them."""

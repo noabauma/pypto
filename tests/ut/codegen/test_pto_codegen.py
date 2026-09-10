@@ -151,6 +151,36 @@ def _single_line(lines: list[str], token: str, *, startswith: bool = False) -> s
     return matched[0]
 
 
+def test_gm_scalar_write_between_converted_ops_keeps_store_and_reload():
+    """The GM side effect survives the full pipeline, between its two loads."""
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+            first: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            second: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+        ):
+            r = pl.row_max(x)
+            first[0:16, 0:1] = r
+            pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+            y = pl.add(x, 2.0)
+            second[0:16, 0:32] = y
+            return  # noqa: PLR1711 (DSL return terminator)
+
+    mlir = _generate_default_mlir(Before)
+    lines = _get_mlir_lines(mlir)
+    scalar_store = _single_line(lines, "pto.store_scalar")
+    assert ", %arg0[" in scalar_store, "the scalar store must target the original x pointer"
+    assert "pto.tsetval" not in mlir, "a GM write must not be redirected into a UB tile"
+    loads = [line for line in lines if "pto.tload " in line]
+    assert len(loads) == 2, "the second computation must reload x after its GM write"
+    assert lines.index(loads[0]) < lines.index(scalar_store) < lines.index(loads[1])
+    assert mlir.count("pto.tstore ") == 2, "only the two output tensors need bulk stores"
+
+
 SAMPLE_PTOAS_OUTPUT = """\
 #include "pto/pto-inst.hpp"
 using namespace pto;
@@ -169,6 +199,63 @@ __global__ AICORE void test_func(__gm__ float* v1, float v2, __gm__ float* v3) {
   TSTORE(v3);
   return;
 }
+"""
+
+SAMPLE_GROUPED_SPLIT_PTOAS_OUTPUT = """\
+#include "pto/pto-inst.hpp"
+using namespace pto;
+
+AICORE void split_cube(__gm__ float* v1) {
+  return;
+}
+
+AICORE void split_vec(__gm__ float* v1, int32_t v4) {
+  auto v2 = TPipe<0, Direction::DIR_C2V, 512, 8, 2, false>(v1, 0, 0);
+  Tile<TileType::Vec, float, 8, 16, BLayout::RowMajor> v3;
+  TPOP<TPipe<0, Direction::DIR_C2V, 512, 8, 2, false>,
+       Tile<TileType::Vec, float, 8, 16, BLayout::RowMajor>,
+       TileSplitAxis::TILE_UP_DOWN>(v2, v3);
+  return;
+}
+"""
+
+
+def _split_ptoas_output_for(
+    func_name: str,
+    *,
+    runtime_lane_param: bool = False,
+    direction: str = "DIR_C2V",
+    include_push: bool = False,
+) -> str:
+    """Return one split PTOAS function, optionally with a V2C push."""
+
+    params = "__gm__ float* v1"
+    if runtime_lane_param:
+        params += ", int32_t v2"
+    pipe = "v3" if runtime_lane_param else "v2"
+    popped = "v4" if runtime_lane_param else "v3"
+    produced = "v5" if runtime_lane_param else "v4"
+    push = ""
+    if include_push:
+        push = f"""\
+  TPUSH<TPipe<0, Direction::{direction}, 1024, 4, 2, false>,
+        Tile<TileType::Vec, bfloat16_t, 8, 16, BLayout::RowMajor>,
+        TileSplitAxis::TILE_UP_DOWN>({pipe}, {produced});
+"""
+    return f"""\
+#include "pto/pto-inst.hpp"
+using namespace pto;
+
+AICORE void {func_name}({params}) {{
+  auto {pipe} = TPipe<0, Direction::{direction}, 1024, 4, 2, false>(v1, 0, 0);
+  Tile<TileType::Vec, float, 8, 16, BLayout::RowMajor> {popped};
+  Tile<TileType::Vec, bfloat16_t, 8, 16, BLayout::RowMajor> {produced};
+  TPOP<TPipe<0, Direction::{direction}, 1024, 4, 2, false>,
+       Tile<TileType::Vec, float, 8, 16, BLayout::RowMajor>,
+       TileSplitAxis::TILE_UP_DOWN>({pipe}, {popped});
+{push}
+  return;
+}}
 """
 
 
@@ -417,10 +504,10 @@ def test_pto_codegen_gemv_family_uses_exact_ops_and_single_row_mat_layout():
         ) -> pl.Tensor[[1, 64], pl.FP32]:
             lhs = pl.load(a, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
             rhs = pl.load(b, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
-            partial = pl.tile.gemv(lhs, rhs, acc_phase="partial")
+            partial = pl.tile.gemv(lhs, rhs, acc_phase=pl.AccPhase.Partial)
             out = pl.store(partial, [0, 0], out)
-            final = pl.tile.gemv(lhs, rhs, acc_phase="final")
-            out = pl.store(final, [0, 0], out)
+            final = pl.tile.gemv(lhs, rhs, acc_phase=pl.AccPhase.Final)
+            out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
             return out
 
         @pl.function(type=pl.FunctionType.InCore)
@@ -434,10 +521,10 @@ def test_pto_codegen_gemv_family_uses_exact_ops_and_single_row_mat_layout():
             lhs = pl.load(a, [0, 0], [1, 128], target_memory=pl.MemorySpace.Mat)
             rhs = pl.load(b, [0, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
             bias_tile = pl.load(bias, [0, 0], [1, 64], target_memory=pl.MemorySpace.Mat)
-            partial = pl.tile.gemv_bias(lhs, rhs, bias_tile, acc_phase="partial")
+            partial = pl.tile.gemv_bias(lhs, rhs, bias_tile, acc_phase=pl.AccPhase.Partial)
             out = pl.store(partial, [0, 0], out)
-            final = pl.tile.gemv_bias(lhs, rhs, bias_tile, acc_phase="final")
-            out = pl.store(final, [0, 0], out)
+            final = pl.tile.gemv_bias(lhs, rhs, bias_tile, acc_phase=pl.AccPhase.Final)
+            out = pl.store(final, [0, 0], out, st_phase=pl.STPhase.Final)
             return out
 
         @pl.function(type=pl.FunctionType.InCore)
@@ -452,9 +539,9 @@ def test_pto_codegen_gemv_family_uses_exact_ops_and_single_row_mat_layout():
             result = pl.tile.gemv(lhs0, rhs0)
             lhs1 = pl.load(a, [0, 128], [1, 128], target_memory=pl.MemorySpace.Mat)
             rhs1 = pl.load(b, [128, 0], [128, 64], target_memory=pl.MemorySpace.Mat)
-            result = pl.tile.gemv_acc(result, lhs1, rhs1, acc_phase="partial")
-            result = pl.tile.gemv_acc(result, lhs1, rhs1, acc_phase="final")
-            out = pl.store(result, [0, 0], out)
+            result = pl.tile.gemv_acc(result, lhs1, rhs1, acc_phase=pl.AccPhase.Partial)
+            result = pl.tile.gemv_acc(result, lhs1, rhs1, acc_phase=pl.AccPhase.Final)
+            out = pl.store(result, [0, 0], out, st_phase=pl.STPhase.Final)
             return out
 
     mlir_code = _generate_default_mlir(GemvCodegenProgram)
@@ -467,6 +554,9 @@ def test_pto_codegen_gemv_family_uses_exact_ops_and_single_row_mat_layout():
         for phase in ("partial", "final"):
             attr = f"{{accPhase = #pto<acc_phase {phase}>}}"
             assert any(attr in line for line in op_lines)
+
+    tstore_lines = [line for line in mlir_code.splitlines() if "pto.tstore" in line]
+    assert sum("{stPhase = #pto<st_phase final>}" in line for line in tstore_lines) == 3
 
     row_mat_allocs = [
         line for line in _get_alloc_tile_lines(mlir_code) if "loc=mat" in line and "rows=1," in line
@@ -990,22 +1080,19 @@ def test_pto_codegen_tile_int_literal_scalar_is_not_index():
 
 
 @pytest.mark.parametrize(
-    ("op_name", "pto_op_name", "needs_tmp"),
+    ("op_name", "pto_op_name"),
     [
-        ("tile.ands", "pto.tands", False),
-        ("tile.ors", "pto.tors", False),
-        ("tile.xors", "pto.txors", True),
-        ("tile.shls", "pto.tshls", False),
-        ("tile.shrs", "pto.tshrs", False),
+        ("tile.shls", "pto.tshls"),
+        ("tile.shrs", "pto.tshrs"),
     ],
 )
-def test_pto_codegen_tile_bitwise_scalar_index_operand_is_cast_to_i32(op_name, pto_op_name, needs_tmp):
-    """Tile-scalar bitwise codegen must never pass an index operand to PTOAS.
+def test_pto_codegen_tile_shift_scalar_index_operand_is_cast_to_i32(op_name, pto_op_name):
+    """Tile-scalar shift codegen must never pass an index operand to PTOAS.
 
-    Python wrappers normalize bare literals before constructing the call, but
-    deserialized or directly constructed IR can still carry an INDEX scalar.
-    The backend contract for all five instructions requires the scalar operand
-    to be emitted as i32.
+    Shift amounts have an i32 PTOAS contract independent of the tile dtype, so
+    deserialized or directly constructed INDEX operands are widened here. The
+    bitwise scalar family instead requires a same-width signless scalar and is
+    covered separately.
     """
     span = ir.Span.unknown()
     tensor_type = ir.TensorType([32, 32], DataType.INT32)
@@ -1016,8 +1103,6 @@ def test_pto_codegen_tile_bitwise_scalar_index_operand_is_cast_to_i32(op_name, p
         input_tile = ib.let("input_tile", tile.load(input_tensor, [0, 0], [32, 32]))
         scalar = ir.ConstInt(5, DataType.INDEX, span)
         args = [input_tile, scalar]
-        if needs_tmp:
-            args.append(ib.let("tmp", tile.create([32, 32], DataType.INT32)))
         result_tile = ib.let("result_tile", ir.create_op_call(op_name, args, {}, span))
         result = ib.let("result", tile.store(result_tile, [0, 0], output_tensor))
         f.return_type(tensor_type)
@@ -1034,8 +1119,8 @@ def test_pto_codegen_tile_bitwise_scalar_index_operand_is_cast_to_i32(op_name, p
     assert any("arith.index_cast" in line and "index to i32" in line for line in lines)
 
 
-def test_pto_codegen_tile_bitwise_unsigned_scalar_is_bridged_to_i32():
-    """A UINT32 Tile–Scalar operand must be bridged to signless i32 for PTOAS."""
+def test_pto_codegen_tile_bitwise_unsigned_scalar_is_normalized_without_bridge():
+    """UINT32 literal sugar directly creates the same-width signless i32 operand."""
 
     @pl.program
     class UIntAndsProgram:
@@ -1049,7 +1134,27 @@ def test_pto_codegen_tile_bitwise_unsigned_scalar_is_bridged_to_i32():
     tands = _single_line(lines, "pto.tands")
     assert ", ui32) outs" not in tands, f"scalar operand is still unsigned: {tands}"
     assert ", i32) outs" in tands, f"scalar operand is not i32: {tands}"
-    assert any("builtin.unrealized_conversion_cast" in line and "ui32 to i32" in line for line in lines)
+    assert not any("builtin.unrealized_conversion_cast" in line and "ui32 to i32" in line for line in lines)
+
+
+def test_pto_codegen_tensor_bitwise_unsigned_ssa_scalar_keeps_i16():
+    """Tensor-to-tile lowering forwards an explicit signless companion scalar unchanged."""
+
+    @pl.program
+    class UIntOrsSSAProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def ors_test(
+            self,
+            src: pl.Tensor[[32, 32], pl.UINT16],
+            scalar_src: pl.Tensor[[1], pl.INT16],
+        ) -> pl.Tensor[[32, 32], pl.UINT16]:
+            scalar: pl.Scalar[pl.INT16] = pl.read(scalar_src, [0])
+            return pl.tensor.ors(src, scalar)
+
+    lines = _get_mlir_lines(_generate_default_mlir(UIntOrsSSAProgram))
+    tors = _single_line(lines, "pto.tors")
+    assert ", i16) outs" in tors, f"scalar operand is not same-width i16: {tors}"
+    assert not any("i16 to i32" in line for line in lines)
 
 
 def test_pto_codegen_tensor_int_literal_scalar_is_not_index():
@@ -1237,12 +1342,10 @@ class TestPreprocessPtoasOutput:
         result = _preprocess_ptoas_output(SAMPLE_PTOAS_OUTPUT)
         assert "ptoas_bitcast" in result
 
-    def test_renames_only_standalone_ptoas_tensor_type(self):
-        source = "Tensor value; GlobalTensor<float> global; TensorView view; TaskTensor ready;\n"
+    def test_leaves_ptoas_tensor_type_names_untouched(self):
+        source = "Tensor value; GlobalTensor<float> global; TensorView view; ChipTensor arg;\n"
 
-        assert _preprocess_ptoas_output(source) == (
-            "TaskTensor value; GlobalTensor<float> global; TensorView view; TaskTensor ready;\n"
-        )
+        assert _preprocess_ptoas_output(source) == source
 
     def test_mgather_preprocess_fast_path_preserves_unrelated_content(self):
         source = "AICORE void kernel() {\n  TSTORE(v3);\n}\n"
@@ -1360,17 +1463,17 @@ class TestGenerateArgUnpacking:
     def test_tensor_only(self):
         func = _make_func("test_fn", [("a", "tensor"), ("b", "tensor"), ("out", "tensor")])
         code, names = _generate_arg_unpacking(func)
-        assert "reinterpret_cast<__gm__ TaskTensor*>(args[0])" in code
-        assert "reinterpret_cast<__gm__ TaskTensor*>(args[1])" in code
-        assert "reinterpret_cast<__gm__ TaskTensor*>(args[2])" in code
+        assert "reinterpret_cast<__gm__ Tensor*>(args[0])" in code
+        assert "reinterpret_cast<__gm__ Tensor*>(args[1])" in code
+        assert "reinterpret_cast<__gm__ Tensor*>(args[2])" in code
         assert names == ["a", "b", "out"]
 
     def test_mixed_tensor_scalar(self):
         func = _make_func("test_fn", [("input", "tensor"), ("scale", "scalar"), ("output", "tensor")])
         code, names = _generate_arg_unpacking(func)
         # Tensors-first: input=args[0], output=args[1], scale=args[2]
-        assert "reinterpret_cast<__gm__ TaskTensor*>(args[0])" in code
-        assert "reinterpret_cast<__gm__ TaskTensor*>(args[1])" in code
+        assert "reinterpret_cast<__gm__ Tensor*>(args[0])" in code
+        assert "reinterpret_cast<__gm__ Tensor*>(args[1])" in code
         assert "scale_conv.u64 = args[2];" in code
         assert "float scale = scale_conv.val;" in code
         assert names == ["input", "output", "scale"]
@@ -1757,21 +1860,23 @@ class TestGenerateKernelWrapper:
         transformed = _run_default_passes(SplitWrapperProgram)
         func = transformed.get_function("split_vec")
         assert func is not None
+        assert _uses_dynamic_subblock_id(func) is True
         assert transformed.get_function("split_vec__aiv1") is None
 
-        wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
+        wrapper = _generate_kernel_wrapper(
+            func,
+            _split_ptoas_output_for(func.name, runtime_lane_param=True),
+        )
         assert "PYPTO_FIXED_SUBBLOCK_ID" not in wrapper
-        assert wrapper.count("#if !defined(__CPU_SIM)\n") == 2
-        assert '#if !defined(__CPU_SIM)\n#include "intrinsic.h"' in wrapper
-        assert "[[block_local]] static int32_t pypto_runtime_subblock_id;" in wrapper
         assert '#include "intrinsic.h"' in wrapper
-        assert "#define get_subblockid() pypto_runtime_subblock_id" in wrapper
-        assert (
-            "#if !defined(__CPU_SIM)\n"
-            "    // Read A2A3 mixed-task subblock id from runtime dispatch context\n"
-            "    pypto_runtime_subblock_id = get_sub_block_id(args);\n"
-            "#endif"
-        ) in wrapper
+        assert "[[block_local]]" not in wrapper
+        assert "#define get_subblockid()" not in wrapper
+        assert "int32_t __pypto_runtime_subblock_idx" not in wrapper
+        assert "TileSplitAxis::TILE_UP_DOWN>(v3, v4 PYPTO_SPLIT_RUNTIME_LANE_ARG(v2));" in wrapper
+        assert "#define PYPTO_SPLIT_RUNTIME_LANE_ARG(subblock_id) , subblock_id" in wrapper
+        assert "#undef PYPTO_SPLIT_RUNTIME_LANE_ARG" in wrapper
+        assert "int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);" in wrapper
+        assert "split_vec(out__ssa_v0, __gm_pipe_buffer, __pypto_spmd_subblock_idx);" in wrapper
 
     def test_no_split_dual_dispatch_wrapper_uses_runtime_subblock_bridge_on_a2a3(self):
         @pl.program
@@ -1792,9 +1897,147 @@ class TestGenerateKernelWrapper:
 
         wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)
         assert "PYPTO_FIXED_SUBBLOCK_ID" not in wrapper
-        assert "[[block_local]] static int32_t pypto_runtime_subblock_id;" in wrapper
-        assert "#define get_subblockid() pypto_runtime_subblock_id" in wrapper
-        assert "pypto_runtime_subblock_id = get_sub_block_id(args);" in wrapper
+        assert "[[block_local]]" not in wrapper
+        assert "#define get_subblockid()" not in wrapper
+        assert "int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);" in wrapper
+        assert "__pypto_spmd_subblock_idx);" in wrapper
+
+    def test_split_fifo_calls_reuse_existing_dynamic_subblock_parameter(self):
+        """A function using the lane op forwards its existing PTOAS parameter to FIFO calls."""
+
+        @pl.program
+        class ExplicitLaneSplitProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def split_vec(self):
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                pl.tile.get_subblock_idx()
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe_buf)
+                popped: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1
+                )
+                pl.tfree_to_aic(popped)
+
+        func = ExplicitLaneSplitProgram.get_function("split_vec")
+        assert func is not None
+
+        wrapper = _generate_kernel_wrapper(
+            func,
+            _split_ptoas_output_for(func.name, runtime_lane_param=True),
+        )
+
+        assert "int32_t __pypto_runtime_subblock_idx" not in wrapper
+        assert "TileSplitAxis::TILE_UP_DOWN>(v3, v4 PYPTO_SPLIT_RUNTIME_LANE_ARG(v2));" in wrapper
+        assert "int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);" in wrapper
+        assert "split_vec(__pypto_spmd_subblock_idx);" in wrapper
+
+    def test_legacy_fixed_lane_wrapper_keeps_compile_time_subblock_id(self):
+        """Legacy lane-specialized AIV wrappers retain their fixed lane override."""
+
+        @pl.program
+        class FixedLaneSplitProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def split_vec__aiv1(self):
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(dir_mask=1, slot_size=512, c2v_consumer_buf=pipe_buf)
+                popped: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1
+                )
+                pl.tfree_to_aic(popped)
+
+        func = FixedLaneSplitProgram.get_function("split_vec__aiv1")
+        assert func is not None
+
+        wrapper = _generate_kernel_wrapper(func, _split_ptoas_output_for(func.name))
+
+        assert "#define PYPTO_FIXED_SUBBLOCK_ID 1" in wrapper
+        assert "#define get_subblockid() PYPTO_FIXED_SUBBLOCK_ID" in wrapper
+        assert "TileSplitAxis::TILE_UP_DOWN>(v2, v3);" in wrapper
+        assert "__pypto_runtime_subblock_idx" not in wrapper
+
+    def test_one_automatic_pipe_supports_different_sequential_split_tile_sizes(self):
+        """Per-call lane forwarding must not assume one byte offset per automatic FIFO."""
+
+        @pl.program
+        class SequentialTransfersProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def split_vec(self):
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                pipe_buf = pl.reserve_buffer(name="c2v_slot_buffer", size=65536, base=0x1000)
+                pl.aiv_initialize_pipe(
+                    pipe_buf,
+                    pipe_buf,
+                    dir_mask=3,
+                    slot_size=16384,
+                    slot_num=4,
+                )
+                first: pl.Tile[[16, 64], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1
+                )
+                reply: pl.Tile[[16, 64], pl.FP32] = pl.tile.muls(first, 2.0)
+                pl.tpush_to_aic(reply, split=1)
+                pl.tfree_to_aic(first)
+                second: pl.Tile[[16, 128], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1
+                )
+                pl.tfree_to_aic(second)
+
+        func = SequentialTransfersProgram.get_function("split_vec")
+        assert func is not None
+        fixture = """\
+#include "pto/pto-inst.hpp"
+using namespace pto;
+
+AICORE void split_vec() {
+  auto pipe = TPipe<0, Direction::DIR_BOTH, 16384, 4, 4, false>(0, 0, 0);
+  Tile<TileType::Vec, float, 16, 64, BLayout::RowMajor> first;
+  Tile<TileType::Vec, float, 16, 64, BLayout::RowMajor> reply;
+  Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor> second;
+  TPOP<TPipe<0, Direction::DIR_BOTH, 16384, 4, 4, false>,
+       Tile<TileType::Vec, float, 16, 64, BLayout::RowMajor>,
+       TileSplitAxis::TILE_UP_DOWN>(pipe, first);
+  TPUSH<TPipe<0, Direction::DIR_BOTH, 16384, 4, 4, false>,
+        Tile<TileType::Vec, float, 16, 64, BLayout::RowMajor>,
+        TileSplitAxis::TILE_UP_DOWN>(pipe, reply);
+  TFREE<TPipe<0, Direction::DIR_BOTH, 16384, 4, 4, false>,
+        TileSplitAxis::TILE_UP_DOWN>(pipe);
+  TPOP<TPipe<0, Direction::DIR_BOTH, 16384, 4, 4, false>,
+       Tile<TileType::Vec, float, 16, 128, BLayout::RowMajor>,
+       TileSplitAxis::TILE_UP_DOWN>(pipe, second);
+  return;
+}
+"""
+
+        wrapper = _generate_kernel_wrapper(func, fixture)
+
+        assert wrapper.count("PYPTO_SPLIT_RUNTIME_LANE_ARG(__pypto_runtime_subblock_idx)") == 3
+        assert "TileSplitAxis::TILE_UP_DOWN>(pipe);" in wrapper
+        assert ".setEntryOffset(" not in wrapper
+
+    def test_split_fifo_bridge_fails_closed_when_ptoas_omits_an_endpoint_kind(self):
+        """Missing split PTOAS endpoint directions are rejected during wrapper generation."""
+
+        @pl.program
+        class BidirectionalProgram:
+            @pl.function(type=pl.FunctionType.AIV)
+            def split_vec(self):
+                pl.func_attr({"split": pl.SplitMode.UP_DOWN})
+                pipe_buf = pl.reserve_buffer(name="pipe", size=4096, base=0x1000)
+                pl.aiv_initialize_pipe(pipe_buf, pipe_buf, dir_mask=3, slot_size=1024)
+                popped: pl.Tile[[8, 16], pl.FP32, pl.MemorySpace.Vec, pl.TileView()] = pl.tpop_from_aic(
+                    split=1
+                )
+                produced: pl.Tile[[8, 16], pl.BF16] = pl.tile.cast(popped, target_type=pl.BF16)
+                pl.tpush_to_aic(produced, split=1)
+                pl.tfree_to_aic(popped)
+
+        func = BidirectionalProgram.get_function("split_vec")
+        assert func is not None
+        pop_only = _split_ptoas_output_for(func.name, direction="DIR_BOTH")
+
+        with pytest.raises(RuntimeError, match=r"IR push/pop=1/1, PTOAS push/pop=0/1"):
+            _generate_kernel_wrapper(func, pop_only)
 
     def test_split_aiv_wrapper_uses_runtime_subblock_bridge_in_group_output_on_a2a3(
         self, tmp_path, monkeypatch
@@ -1832,10 +2075,13 @@ class TestGenerateKernelWrapper:
         split_vec = transformed.get_function("split_vec")
         assert split_cube is not None
         assert split_vec is not None
+        assert _uses_dynamic_subblock_id(split_vec) is True
 
         monkeypatch.setattr(
             "pypto.backend.pto_backend._compile_pto_module",
-            lambda _pto_code, _module_name, _output_dir, _memory_planner=None: SAMPLE_PTOAS_OUTPUT,
+            lambda _pto_code, _module_name, _output_dir, _memory_planner=None: (
+                SAMPLE_GROUPED_SPLIT_PTOAS_OUTPUT
+            ),
         )
 
         result_files = {}
@@ -1854,12 +2100,11 @@ class TestGenerateKernelWrapper:
         split_vec_wrapper = next(
             content for path, content in result_files.items() if path.endswith("split_vec.cpp")
         )
-        assert "static __aicore__ void test_func" in split_cube_wrapper
-        assert "static __aicore__ void test_func" in split_vec_wrapper
-        assert '#if !defined(__CPU_SIM)\n#include "intrinsic.h"' in split_vec_wrapper
-        assert "[[block_local]] static int32_t pypto_runtime_subblock_id;" in split_vec_wrapper
-        assert "#define get_subblockid() pypto_runtime_subblock_id" in split_vec_wrapper
-        assert "pypto_runtime_subblock_id = get_sub_block_id(args);" in split_vec_wrapper
+        assert "static __aicore__ void split_cube" in split_cube_wrapper
+        assert "static __aicore__ void split_vec" in split_vec_wrapper
+        assert "__pypto_runtime_subblock_idx" not in split_cube_wrapper
+        assert "TileSplitAxis::TILE_UP_DOWN>(v2, v3);" in split_cube_wrapper
+        assert "TileSplitAxis::TILE_UP_DOWN>(v2, v3 PYPTO_SPLIT_RUNTIME_LANE_ARG(v4));" in split_vec_wrapper
 
     def test_spmd_wrapper_drops_macro_bridge_and_appends_block_args(self):
         @pl.program
@@ -3149,20 +3394,38 @@ def test_pto_codegen_tensor_view_aliases_input_base_ptr():
 
 
 def test_pto_codegen_rank3_tensor_view_mat_load_uses_input_base_ptr():
-    """A rank-3 tensor.view remains rooted at the input's raw GM pointer."""
+    """A rank-3 tensor.view remains rooted at the input's raw GM pointer.
+
+    The source *window* keeps its ND rank while the destination *tile* is 2D --
+    exactly the shape ``FlattenTileNdTo2D`` leaves behind for a rank>2 load whose
+    window it does not collapse. Building the load with its deduced rank-3 tile
+    type instead would model IR no pipeline can produce: PTO's ``tile_buf`` is
+    2D, and ``ExtractTileTypeInfo`` types one from ``shape_[0]`` / ``shape_[1]``
+    alone, so a rank-3 tile would be emitted as a ``[2, 16]`` buffer.
+    """
     span = ir.Span.unknown()
     src_type = ir.TensorType([2, 16, 32], DataType.FP32)
     src = ir.Var("src", src_type, span)
 
     view_call = ir.op.tensor.view(src, [2, 16, 32])
     view_var = ir.Var("src_view", view_call.type, span)
-    load_call = ir.op.tile.load(
+    deduced_load = ir.op.tile.load(
         view_var,
         [0, 0, 0],
         [2, 16, 32],
         target_memory=pl.MemorySpace.Mat,
     )
-    tile_var = ir.Var("tile", load_call.type, span)
+    nd_tile_type = deduced_load.type
+    assert isinstance(nd_tile_type, ir.TileType)
+    flat_tile_type = ir.TileType(
+        [2 * 16, 32],
+        nd_tile_type.dtype,
+        None,
+        nd_tile_type.tile_view,
+        nd_tile_type.memory_space,
+    )
+    load_call = ir.Call(deduced_load.op, deduced_load.args, deduced_load.kwargs, flat_tile_type, span)
+    tile_var = ir.Var("tile", flat_tile_type, span)
 
     body = ir.SeqStmts(
         [

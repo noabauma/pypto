@@ -142,6 +142,14 @@ def submit(*args: Any, **kwargs: Any) -> Any:
     ``deps=[...]`` as a precision tool to patch edges the runtime cannot
     infer; in ``pl.manual_scope()``, use it to declare every edge.
 
+    In a distributed HOST orchestrator, the returned TaskId is backed by the
+    L3 runtime's opaque ``TaskHandle``. Each explicit ``deps=[producer]`` entry
+    lowers to ``TaskArgs.add_dep_wait(producer)`` and therefore adds ordering
+    without extending the producer's resource lifetime, on top of the
+    automatically maintained per-rank communication ordering. This HOST form
+    accepts individual TaskIds and requires every callee argument, including
+    Out/InOut tensors, because L3 does not allocate output tensors.
+
     The optional ``dumps=[...]`` kwarg is the submit-side selective tensor
     dump surface (symmetric with ``deps=``): it lists tensor arguments of
     this submit to mark for dump (simpler#844), so an enabled dump pipeline
@@ -222,8 +230,9 @@ def spmd_submit(*args: Any, **kwargs: Any) -> Any:
     ``core_num`` is a **required keyword argument** (a positive integer
     expression) — the positional slots are the kernel's own arguments.
     ``sync_start`` (default ``False``) requires all blocks to launch atomically.
-    ``deps=[...]``, ``allow_early_resolve=True`` and ``predicate=(...)`` work
-    exactly as on [`submit`][pypto.language.submit] (note: a ``sync_start`` task cannot itself be
+    ``deps=[...]``, ``allow_early_resolve=True``, ``timing_slot=N`` and
+    ``predicate=(...)`` work exactly as on [`submit`][pypto.language.submit]
+    (note: a ``sync_start`` task cannot itself be
     block-by-block pre-staged, but it can still be flagged to let its consumers
     pre-stage). The callee may be an InCore / AIC / AIV kernel or a co-scheduled
     Group.

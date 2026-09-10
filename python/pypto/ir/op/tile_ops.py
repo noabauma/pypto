@@ -20,6 +20,7 @@ from typing import Any
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
+    AccPhase,
     Call,
     ConstFloat,
     ConstInt,
@@ -28,6 +29,7 @@ from pypto.pypto_core.ir import (
     PadValue,
     ScalarType,
     Span,
+    STPhase,
     TensorLayout,
     TileLayout,
 )
@@ -37,9 +39,11 @@ from ..utils import (
     _normalize_const_to_dtype,
     _normalize_expr,
     _normalize_scalar_operand,
+    _normalize_signless_same_width_scalar_operand,
     _to_int32_scalar,
     _to_make_tuple,
     resolve_cast_mode,
+    resolve_saturation_deviation,
 )
 from ._pad_value import normalize_pad_value
 
@@ -75,28 +79,6 @@ def _create_tile_binary_call(
     if isinstance(rhs_expr.type, ScalarType):
         return _ir_core.create_op_call(scalar_op_name, [lhs, rhs_expr], {}, span)
     return _ir_core.create_op_call(tile_op_name, [lhs, rhs_expr], {}, span)
-
-
-def _normalize_sels_scalar_operand(src: Expr, scalar: int | float | Expr, span: Span) -> Expr:
-    """Normalize TSELS scalar constants to the PTOAS-compatible element dtype."""
-    scalar_expr = _normalize_scalar_operand(src, scalar, span, retype_constants=True)
-    src_type = src.type
-    if not isinstance(src_type, _ir_core.TileType) or not isinstance(scalar_expr, ConstInt):
-        return scalar_expr
-
-    signed_dtype_and_bits = {
-        DataType.UINT8: (DataType.INT8, 8),
-        DataType.UINT16: (DataType.INT16, 16),
-        DataType.UINT32: (DataType.INT32, 32),
-    }.get(src_type.dtype)
-    if signed_dtype_and_bits is None:
-        return scalar_expr
-
-    signed_dtype, bits = signed_dtype_and_bits
-    value = scalar_expr.value
-    if value >= 1 << (bits - 1):
-        value -= 1 << bits
-    return ConstInt(value, signed_dtype, span)
 
 
 # ============================================================================
@@ -228,9 +210,10 @@ def load(
             element must be an integer scalar — one extent per dimension, never a
             nested tuple.
         target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
-            ``None`` (the default) leaves the space unset so InferTileMemorySpace
-            places the tile from consumer demand; the kwarg is then omitted from
-            the op entirely. MX-layout tensors require an explicit MemorySpace.Mat.
+            ``None`` (the default) leaves an ordinary load unset so
+            InferTileMemorySpace places the tile from consumer demand. An
+            MX-layout load instead defaults to MemorySpace.Mat, the only memory
+            that the raw MX load instruction can target.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts that ``offsets + valid_shape`` stays inside the source
             and is rejected when that provably fails; with ``clamp=True`` the
@@ -255,10 +238,12 @@ def load(
     source_layout = getattr(tensor_view, "layout", None)
     is_mx = source_layout in (TensorLayout.MX_A_ZZ, TensorLayout.MX_B_NN)
 
-    if is_mx and target_memory != MemorySpace.Mat:
+    if is_mx and target_memory is None:
+        target_memory = MemorySpace.Mat
+    elif is_mx and target_memory != MemorySpace.Mat:
         raise ValueError(
-            "tile.load of an MX-layout tensor requires explicit target_memory=MemorySpace.Mat "
-            f"(MX scale loads are L1/Mat only); got {target_memory}"
+            "tile.load of an MX-layout tensor only supports target_memory=MemorySpace.Mat "
+            f"(omitting target_memory selects Mat automatically); got {target_memory}"
         )
 
     # Validate target_memory: only Vec and Mat are allowed for load. ``None``
@@ -310,6 +295,7 @@ def store(
     span: Span | None = None,
     *,
     atomic: int = 0,
+    st_phase: STPhase = STPhase.Unspecified,
 ) -> Call:
     """Copy data from unified buffer (tile) to tensor.
 
@@ -324,6 +310,10 @@ def store(
         atomic: ``AtomicType`` underlying int — 0 (``kNone``, plain overwrite) or
             1 (``kAdd``, atomic-add into global memory). The kwarg is omitted
             entirely when 0 so non-atomic stores are unchanged.
+        st_phase: Unit-flag-aware store phase. ``STPhase.Unspecified`` (default)
+            preserves ordinary stores; ``STPhase.Final`` checks and clears the
+            flag published by a final phased accumulator producer. The kwarg is
+            omitted entirely for the default so existing stores remain unchanged.
 
     Returns:
         Call expression that returns the output tensor
@@ -336,6 +326,8 @@ def store(
         args = [tile, offsets_tuple, output_tensor]
 
     kwargs: dict[str, Any] = {"atomic": atomic} if atomic else {}
+    if st_phase != STPhase.Unspecified:
+        kwargs["st_phase"] = int(st_phase)
     return _ir_core.create_op_call("tile.store", args, kwargs, actual_span)
 
 
@@ -1294,14 +1286,14 @@ def ands(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
 
     Args:
         lhs: Tile (TileType)
-        rhs: Scalar (int/Expr with INT32 ScalarType)
+        rhs: Same-width signless integer scalar (int/Expr)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise bitwise AND with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    rhs_expr = _normalize_signless_same_width_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.ands", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1329,14 +1321,14 @@ def ors(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
 
     Args:
         lhs: Tile (TileType)
-        rhs: Scalar (int/Expr with INT32 ScalarType)
+        rhs: Same-width signless integer scalar (int/Expr)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for element-wise bitwise OR with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    rhs_expr = _normalize_signless_same_width_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.ors", [lhs, rhs_expr], {}, actual_span)
 
 
@@ -1365,7 +1357,7 @@ def xors(lhs: Expr, rhs: int | Expr, tmp: Expr, span: Span | None = None) -> Cal
 
     Args:
         lhs: Tile (TileType)
-        rhs: Scalar (int/Expr with INT32 ScalarType)
+        rhs: Same-width signless integer scalar (int/Expr)
         tmp: Temporary tile (TileType) required by the hardware
         span: Optional source span for debugging (auto-captured if not provided)
 
@@ -1373,7 +1365,7 @@ def xors(lhs: Expr, rhs: int | Expr, tmp: Expr, span: Span | None = None) -> Cal
         Call expression for element-wise bitwise XOR with scalar
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    rhs_expr = _normalize_signless_same_width_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call("tile.xors", [lhs, rhs_expr, tmp], {}, actual_span)
 
 
@@ -1396,14 +1388,14 @@ def prelu(tile: Expr, slope: Expr, tmp: Expr, span: Span | None = None) -> Call:
 
 
 def addc(lhs: Expr, rhs: Expr, rhs2: Expr, span: Span | None = None) -> Call:
-    """Element-wise addition of three tiles.
+    """Element-wise carry addition of three tiles.
 
-    Computes lhs + rhs + rhs2 element-wise. Maps to the TADDC hardware intrinsic.
+    Computes ``src0 + src1 + carry`` element-wise. Maps to TADDC.
 
     Args:
-        lhs: Left-hand side tile (TileType)
-        rhs: Right-hand side tile (TileType)
-        rhs2: Third tile (TileType)
+        lhs: First source tile (TileType)
+        rhs: Second source tile (TileType)
+        rhs2: Per-element carry-in tile (TileType), normally containing 0 or 1
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1414,14 +1406,14 @@ def addc(lhs: Expr, rhs: Expr, rhs2: Expr, span: Span | None = None) -> Call:
 
 
 def subc(lhs: Expr, rhs: Expr, rhs2: Expr, span: Span | None = None) -> Call:
-    """Element-wise subtraction of three tiles.
+    """Element-wise carry subtraction of three tiles.
 
-    Computes lhs - rhs - rhs2 element-wise. Maps to the TSUBC hardware intrinsic.
+    Computes ``src0 - src1 + carry`` element-wise. Maps to TSUBC.
 
     Args:
-        lhs: Left-hand side tile (TileType)
-        rhs: Right-hand side tile (TileType)
-        rhs2: Third tile (TileType)
+        lhs: Minuend tile (TileType)
+        rhs: Subtrahend tile (TileType)
+        rhs2: Per-element carry-in tile (TileType), normally containing 0 or 1
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1432,14 +1424,14 @@ def subc(lhs: Expr, rhs: Expr, rhs2: Expr, span: Span | None = None) -> Call:
 
 
 def addsc(lhs: Expr, rhs: int | float | Expr, rhs2: Expr, span: Span | None = None) -> Call:
-    """Element-wise addition of tile, scalar, and tile.
+    """Element-wise scalar carry addition.
 
-    Computes lhs + rhs + rhs2 element-wise. Maps to the TADDSC hardware intrinsic.
+    Computes ``src0 + scalar + carry`` element-wise. Maps to TADDSC.
 
     Args:
-        lhs: Left-hand side tile (TileType)
-        rhs: Scalar (int/float/Expr with ScalarType)
-        rhs2: Third tile (TileType)
+        lhs: Source tile (TileType)
+        rhs: Scalar addend with the same dtype as ``lhs``
+        rhs2: Per-element carry-in tile (TileType), normally containing 0 or 1
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1451,14 +1443,14 @@ def addsc(lhs: Expr, rhs: int | float | Expr, rhs2: Expr, span: Span | None = No
 
 
 def subsc(lhs: Expr, rhs: int | float | Expr, rhs2: Expr, span: Span | None = None) -> Call:
-    """Element-wise subtraction of tile, scalar, and tile.
+    """Element-wise scalar carry subtraction.
 
-    Computes lhs - rhs - rhs2 element-wise. Maps to the TSUBSC hardware intrinsic.
+    Computes ``src0 - scalar + carry`` element-wise. Maps to TSUBSC.
 
     Args:
-        lhs: Left-hand side tile (TileType)
-        rhs: Scalar (int/float/Expr with ScalarType)
-        rhs2: Third tile (TileType)
+        lhs: Minuend tile (TileType)
+        rhs: Scalar subtrahend with the same dtype as ``lhs``
+        rhs2: Per-element carry-in tile (TileType), normally containing 0 or 1
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1533,7 +1525,12 @@ def sels(
         Call expression for per-element tile/scalar selection
     """
     actual_span = _get_span_or_capture(span)
-    scalar_expr = _normalize_sels_scalar_operand(src, scalar, actual_span)
+    scalar_expr = _normalize_signless_same_width_scalar_operand(
+        src,
+        scalar,
+        actual_span,
+        retype_constants=True,
+    )
     return _ir_core.create_op_call("tile.sels", [mask, src, tmp, scalar_expr], {}, actual_span)
 
 
@@ -1769,6 +1766,7 @@ def cast(
     span: Span | None = None,
     *,
     tmp: Expr | None = None,
+    saturation_mode: str | int | None = None,
 ) -> Call:
     """Cast tile to target data type (element-wise).
 
@@ -1778,8 +1776,15 @@ def cast(
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
         span: Optional source span for debugging (auto-captured if not provided)
-        tmp: Optional A2/A3 PTOAS scratch tile for non-saturating narrowing
-             tcvt. Normally compiler-generated.
+        tmp: Optional A2/A3 PTOAS scratch tile for a non-saturating narrowing
+             tcvt. Normally compiler-generated, and only for a cast that opted
+             out of saturation — the saturating form is native and reads none.
+        saturation_mode: Destination saturation — "on" (1) clamps out-of-range
+             results to the destination range, "off" (0) selects the target's
+             non-saturating conversion. ``None`` takes the destination's own
+             default — ``DEFAULT_SATURATION_MODE`` ("on") for an integer
+             destination, the target's own behavior for a float one. Only a
+             deviation from that default is recorded on the call.
 
     Returns:
         Call expression for element-wise cast to target dtype
@@ -1791,7 +1796,10 @@ def cast(
     mode_val = resolve_cast_mode(mode)
 
     actual_span = _get_span_or_capture(span)
+    deviation = resolve_saturation_deviation(saturation_mode, target_type)
     kwargs: dict[str, Any] = {"target_type": target_type, "mode": mode_val}
+    if deviation is not None:
+        kwargs["saturation_mode"] = deviation
     args: list[Expr] = [tile] if tmp is None else [tile, tmp]
     return _ir_core.create_op_call("tile.cast", args, kwargs, actual_span)
 
@@ -2105,7 +2113,13 @@ def batch_matmul_acc(
     return _ir_core.create_op_call("tile.batch_matmul_acc", args, {}, actual_span)
 
 
-def gemv(lhs: Expr, rhs: Expr, span: Span | None = None, *, acc_phase: str = "unspecified") -> Call:
+def gemv(
+    lhs: Expr,
+    rhs: Expr,
+    span: Span | None = None,
+    *,
+    acc_phase: AccPhase = AccPhase.Unspecified,
+) -> Call:
     """General Matrix-Vector multiplication: C[1,N] = A[1,K] @ B[K,N].
 
     ``lhs`` must have exactly one physical and logical row. The rhs logical K
@@ -2115,14 +2129,15 @@ def gemv(lhs: Expr, rhs: Expr, span: Span | None = None, *, acc_phase: str = "un
     Args:
         lhs: Row vector tile (TileType [1, K])
         rhs: Right-hand side tile (TileType [K, N])
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``AccPhase.Partial`` for
+            intermediate chunks and ``AccPhase.Final`` for the last chunk.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for GEMV
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gemv", [lhs, rhs], {"acc_phase": acc_phase}, actual_span)
+    return _ir_core.create_op_call("tile.gemv", [lhs, rhs], {"acc_phase": int(acc_phase)}, actual_span)
 
 
 def gemv_acc(
@@ -2131,7 +2146,7 @@ def gemv_acc(
     rhs: Expr,
     span: Span | None = None,
     *,
-    acc_phase: str = "unspecified",
+    acc_phase: AccPhase = AccPhase.Unspecified,
     init_cond: Expr | None = None,
 ) -> Call:
     """GEMV with accumulation: C[1,N] += A[1,K] @ B[K,N].
@@ -2149,7 +2164,8 @@ def gemv_acc(
         acc: Accumulator tile (TileType [1, N])
         lhs: Row vector tile (TileType [1, K])
         rhs: Right-hand side tile (TileType [K, N])
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``AccPhase.Partial`` for
+            intermediate chunks and ``AccPhase.Final`` for the last chunk.
         span: Optional source span for debugging (auto-captured if not provided)
         init_cond: Optional BOOL scalar predicate selecting overwrite over accumulate
 
@@ -2158,7 +2174,12 @@ def gemv_acc(
     """
     actual_span = _get_span_or_capture(span)
     args = [acc, lhs, rhs] if init_cond is None else [acc, lhs, rhs, init_cond]
-    return _ir_core.create_op_call("tile.gemv_acc", args, {"acc_phase": acc_phase}, actual_span)
+    return _ir_core.create_op_call(
+        "tile.gemv_acc",
+        args,
+        {"acc_phase": int(acc_phase)},
+        actual_span,
+    )
 
 
 def gemv_bias(
@@ -2167,7 +2188,7 @@ def gemv_bias(
     bias: Expr,
     span: Span | None = None,
     *,
-    acc_phase: str = "unspecified",
+    acc_phase: AccPhase = AccPhase.Unspecified,
 ) -> Call:
     """GEMV with bias add: C[1,N] = A[1,K] @ B[K,N] + bias[1,N].
 
@@ -2180,14 +2201,20 @@ def gemv_bias(
         rhs: Right-hand side tile (TileType [K, N])
         bias: Bias tile (TileType [1, N]) with the accumulator dtype (FP32 for
             floating-point matrix operands, INT32 for integer matrix operands)
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``AccPhase.Partial`` for
+            intermediate chunks and ``AccPhase.Final`` for the last chunk.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression for GEMV with bias
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gemv_bias", [lhs, rhs, bias], {"acc_phase": acc_phase}, actual_span)
+    return _ir_core.create_op_call(
+        "tile.gemv_bias",
+        [lhs, rhs, bias],
+        {"acc_phase": int(acc_phase)},
+        actual_span,
+    )
 
 
 # ============================================================================
@@ -2662,7 +2689,8 @@ def col_sum(tile: Expr, tmp_tile: Expr | None = None, span: Span | None = None) 
     Args:
         tile: Input tile (TileType [M, N])
         tmp_tile: Optional scratch tile (TileType, same shape/dtype as input) that
-            activates binary-tree reduction.
+            activates binary-tree reduction. Unlike the arg reductions, this is
+            not enforced by type deduction -- pass the input's shape and dtype.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2763,7 +2791,8 @@ def col_argmax(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile (TileType) with exactly the same shape and dtype as
+            ``tile`` -- the kernel reads the column count from the tmp/src extent
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -2781,7 +2810,8 @@ def col_argmin(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
     Args:
         tile: Input tile (TileType [M, N])
-        tmp_tile: Temporary tile (TileType)
+        tmp_tile: Scratch tile (TileType) with exactly the same shape and dtype as
+            ``tile`` -- the kernel reads the column count from the tmp/src extent
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:

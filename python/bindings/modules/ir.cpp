@@ -40,6 +40,7 @@
 #include "pypto/ir/function.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/phase.h"
 #include "pypto/ir/pipe.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/reflection/field_visitor.h"
@@ -138,6 +139,12 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
     } else if (nb::isinstance<AtomicType>(item.second)) {
       // Cast enum to int for storage — pld.tensor.put reads as int
       kwargs.emplace_back(key, static_cast<int>(nb::cast<AtomicType>(item.second)));
+    } else if (nb::isinstance<AccPhase>(item.second)) {
+      // Cast enum to int for storage — tile.gemv-family ops read as int
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<AccPhase>(item.second)));
+    } else if (nb::isinstance<STPhase>(item.second)) {
+      // Cast enum to int for storage — tile.store reads as int
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<STPhase>(item.second)));
     } else if (nb::isinstance<PadValue>(item.second)) {
       kwargs.emplace_back(key, nb::cast<PadValue>(item.second));
     } else if (nb::isinstance<ArgDirection>(item.second)) {
@@ -498,7 +505,7 @@ void BindIR(nb::module_& m) {
   tvs.def("build_logical_strides_from_layout", &tensor_view_semantics::BuildLogicalStridesFromLayout,
           nb::arg("shape"), nb::arg("layout"),
           "Build packed canonical strides for (shape, layout). "
-          "NZ is row-major over its blocked rank-(r+2) shape, the same rule as ND. "
+          "NZ is row-major over its blocked rank-5 shape, the same rule as ND. "
           "Raises ValueError on DN with rank < 2.");
 
   tvs.def(
@@ -978,6 +985,24 @@ void BindIR(nb::module_& m) {
         return channel.has_value() ? nb::cast(*channel) : nb::none();
       },
       nb::arg("op_name"), "The hardware path an operator's writes travel, or None when it declared none");
+
+  nb::enum_<LaneInvariantArg>(ir, "LaneInvariantArg",
+                              "Why an argument carries no lane-indexed data under automatic AIV splitting")
+      .value("Scratch", LaneInvariantArg::Scratch,
+             "Hardware workspace; full width and halved are both correct")
+      .value("IndexAddressedSource", LaneInvariantArg::IndexAddressedSource,
+             "Lookup table read at absolute indices; only full width is correct")
+      .value("AbsoluteIndexedDestination", LaneInvariantArg::AbsoluteIndexedDestination,
+             "Destination written at absolute indices; only full width is correct");
+
+  ir.def(
+      "get_op_lane_invariant_arg",
+      [](const std::string& op_name, size_t arg_index) -> nb::object {
+        auto kind = OpRegistry::GetInstance().GetEntry(op_name).GetLaneInvariantArgKind(arg_index);
+        return kind.has_value() ? nb::cast(*kind) : nb::none();
+      },
+      nb::arg("op_name"), nb::arg("arg_index"),
+      "Why one positional argument carries no lane-indexed data, or None when the operator declared none");
 
   // Var - const shared_ptr
   auto var_class = nb::class_<Var, Expr>(ir, "Var", "Variable reference expression");
@@ -1606,6 +1631,7 @@ void BindIR(nb::module_& m) {
       .value("CommDomain", ScopeKind::CommDomain,
              "Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch window buffers)")
       .value("SplitAiv", ScopeKind::SplitAiv, "Explicit AIV-split region (pl.split_aiv)")
+      .value("Graph", ScopeKind::Graph, "Recordable orchestration region (pl.graph)")
       .export_values();
 
   // SplitMode enum
@@ -1637,6 +1663,16 @@ void BindIR(nb::module_& m) {
       "Combine mode for global-memory writes — pld.tensor.put (TPUT) and tile.store (TSTORE)")
       .value("None_", AtomicType::kNone, "Plain store — overwrite the destination")
       .value("Add", AtomicType::kAdd, "Atomically add the source data into the destination");
+
+  nb::enum_<AccPhase>(ir, "AccPhase", nb::is_arithmetic(),
+                      "Producer-side unit-flag phase for GEMV accumulator operations")
+      .value("Unspecified", AccPhase::kUnspecified, "Do not use the unit-flag protocol")
+      .value("Partial", AccPhase::kPartial, "Check the unit flag without setting it")
+      .value("Final", AccPhase::kFinal, "Check and set the unit flag");
+
+  nb::enum_<STPhase>(ir, "STPhase", nb::is_arithmetic(), "Consumer-side unit-flag phase for tile.store")
+      .value("Unspecified", STPhase::kUnspecified, "Do not use the unit-flag protocol")
+      .value("Final", STPhase::kFinal, "Check and clear the unit flag");
 
   nb::enum_<ReduceOp>(ir, "ReduceOp", nb::is_arithmetic(),
                       "Reduction operator for collective reductions (pld.tensor.allreduce, ...)")
@@ -1693,6 +1729,20 @@ void BindIR(nb::module_& m) {
       },
       scope_attrs_doc);
 
+  // GraphScopeStmt
+  auto graph_scope_stmt_class = nb::class_<GraphScopeStmt, ScopeStmt>(
+      ir, "GraphScopeStmt", "Graph scope: a recordable orchestration region");
+  graph_scope_stmt_class.def(nb::init<std::string, const StmtPtr&, const Span&>(), nb::arg("name_hint"),
+                             nb::arg("body"), nb::arg("span"),
+                             "Create a Graph scope statement (name_hint is the region name)");
+  BindFields<GraphScopeStmt>(graph_scope_stmt_class);
+  graph_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const GraphScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
   // HierarchyScopeStmt
   auto hierarchy_scope_stmt_class = nb::class_<HierarchyScopeStmt, ScopeStmt>(
       ir, "HierarchyScopeStmt", "Hierarchy scope: distributed-hierarchy region");
@@ -1740,7 +1790,7 @@ void BindIR(nb::module_& m) {
       "Explicit AIV-split region across 2 subblocks. mode=NONE is task-parallel "
       "(no halving; both lanes run the full body via aiv_id); UP_DOWN/LEFT_RIGHT "
       "halve vector compute on the split axis. Erased by LowerAutoVectorSplit "
-      "(pass 20); never reaches codegen.");
+      "(pass 23); never reaches codegen.");
   split_aiv_scope_stmt_class.def(nb::init<SplitMode, int, std::string, const StmtPtr&, const Span&>(),
                                  nb::arg("split"), nb::arg("count") = 2, nb::arg("name_hint") = "",
                                  nb::arg("body"), nb::arg("span"), "Create an AIV-split scope statement");

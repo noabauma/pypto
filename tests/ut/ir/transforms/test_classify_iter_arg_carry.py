@@ -381,7 +381,7 @@ def test_no_dep_arg_carry_is_not_a_rebind():
     ``pl.at(no_dep_args=[out])`` stamps the *call-site* direction ``NoDep``; the
     callee's ``ParamDirection`` stays ``Out``/``InOut``, which is what codegen's
     own result alias (``CollectOutIndices``) reads. Classifying such a carry as a
-    rebind would have codegen materialise a fresh ``TaskTensor`` for a slot it is
+    rebind would have codegen materialise a fresh ``Tensor`` for a slot it is
     simultaneously aliasing to the arg.
 
     Written in the scope form because ``no_dep_args`` is a ``pl.at`` / ``pl.submit``

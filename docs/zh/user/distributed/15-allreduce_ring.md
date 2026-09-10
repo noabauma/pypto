@@ -107,4 +107,5 @@ for s in pl.range(nranks - 1):
 - [05-tutorials](05-tutorials.md) — 教程索引（本步骤 = 第 10 行）
 - [14-allreduce_two_phase](14-allreduce_two_phase.md) — 两阶段形态（步骤 09）
 - [01-collectives](01-collectives.md) §AllReduce — 参考（Ring Mode、信号形状、`Sum`/`FP32`）
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[16-allreduce_reveal](16-allreduce_reveal.md) — 替你选择 mesh 或 ring 的内置原语

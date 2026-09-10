@@ -584,6 +584,14 @@ REGISTER_OP("tile.transpose")
     // buffer, and InitMemRef never inherits the input's buffer for it.
     .set_output_memory_inherit_input()
     .not_inplace_safe()
+    // NOT declared lane-invariant. DeduceTileTransposeType validates the tmp's
+    // dtype and rank but not its extents, so type deduction is blind here and
+    // leaving the argument undeclared is what makes automatic AIV splitting
+    // treat a full-width tmp as per-lane data and reject it. That is the right
+    // answer: pto.ttrans reads the transposed extents out of this buffer, so a
+    // tmp wider than the halved input is out of contract. (A transpose whose
+    // axes touch the split axis is refused earlier still, by
+    // FindTransposeSplitHazard.)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileTransposeType(args, kwargs);
@@ -865,6 +873,48 @@ TypePtr DeduceTileScatterUpdateType(const std::vector<ExprPtr>& args,
       << "tile.scatter_update: src dtype (" << src_type->dtype_.ToString() << ") must match input dtype ("
       << input_type->dtype_.ToString() << ")";
 
+  // The shape relation this op documents, enforced here rather than left to codegen.
+  // `index` names b*s rows and `src` supplies their payloads, so a src that does not
+  // cover them is a silent wrong answer -- and stating the relation in the type is what
+  // lets LowerAutoVectorSplit re-derive both operands' per-lane extents from the
+  // operator instead of falling back on a heuristic (gh#2612).
+  //
+  // Only a PROVABLE mismatch is an error; an undecidable symbolic relation is left to
+  // the backend, so dynamic extents keep working exactly as before.
+  const auto& idx_shape = index_type->shape_;
+  const auto& src_shape = src_type->shape_;
+  const auto& in_shape = input_type->shape_;
+  CHECK(ProveValidExtentEqual(src_shape.back(), in_shape.back()) != ProofResult::kFalse)
+      << "tile.scatter_update: src's last dimension must match input's (the row width d), but got src "
+      << FormatShape(src_shape) << " against input " << FormatShape(in_shape);
+  if (in_shape.size() == 2) {
+    // 2D: src is [b*s, d] -- one flat row per index entry. Prove against the PRODUCT
+    // rather than three literals, so a symbolic-but-decidable pair (`[n, 1]` index
+    // against an `[n + 1, d]` src) is still caught.
+    auto rows_needed = MakeMul(idx_shape[0], idx_shape[1]);
+    CHECK(ProveValidExtentEqual(src_shape[0], rows_needed) != ProofResult::kFalse)
+        << "tile.scatter_update: 2D src must have b*s rows, one per index entry, but got src "
+        << FormatShape(src_shape) << " against index " << FormatShape(idx_shape);
+  } else {
+    // 4D: src is [b, s, 1, d] -- its leading two axes ARE the index shape.
+    for (size_t d = 0; d < 2; ++d) {
+      CHECK(ProveValidExtentEqual(src_shape[d], idx_shape[d]) != ProofResult::kFalse)
+          << "tile.scatter_update: 4D src's leading dimensions must match index's [b, s], but got src "
+          << FormatShape(src_shape) << " against index " << FormatShape(idx_shape);
+    }
+    // Axis 2 is a structural singleton in BOTH declared 4D layouts -- input
+    // [blockNum, blockSize, 1, d] and src [b, s, 1, d]. It is not a data extent, so a
+    // non-unit value is not a bigger scatter, it is a shape that means nothing.
+    auto one = std::make_shared<ConstInt>(1, DataType::INDEX, args[0]->span_);
+    CHECK(ProveValidExtentEqual(src_shape[2], one) != ProofResult::kFalse)
+        << "tile.scatter_update: 4D src's axis 2 must be the singleton of [b, s, 1, d], but got src "
+        << FormatShape(src_shape);
+    CHECK(ProveValidExtentEqual(in_shape[2], one) != ProofResult::kFalse)
+        << "tile.scatter_update: 4D input's axis 2 must be the singleton of "
+           "[blockNum, blockSize, 1, d], but got input "
+        << FormatShape(in_shape);
+  }
+
   for (const auto& [key, val] : kwargs) {
     if (key == "dim") {
       int dim_val = AnyCast<int>(val, "kwarg key: dim");
@@ -903,6 +953,10 @@ REGISTER_OP("tile.scatter_update")
     .set_output_reuses_input(0)
     // DPS: the indexed rows are rewritten, every other row passes through.
     .set_arg_effect(0, ArgEffect::ReadWrite)
+    // `index` names rows of the WHOLE input, so a partitioned destination is
+    // written at the wrong offsets. Only the destination is declared: `index`
+    // and `src` are ordinary per-lane data and must be sharded.
+    .set_lane_invariant_arg(0, LaneInvariantArg::AbsoluteIndexedDestination)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileScatterUpdateType(args, kwargs);

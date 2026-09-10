@@ -29,7 +29,7 @@ from unittest.mock import Mock, patch
 import pytest
 from pypto.pypto_core.passes import MemoryPlanner
 from pypto.runtime import execute_artifact
-from pypto.runtime.runner import RunConfig, _DfxOpts
+from pypto.runtime.runner import DfxOptions, RunConfig
 
 _ST_DIR = Path(__file__).resolve().parents[2] / "st"
 if str(_ST_DIR) not in sys.path:
@@ -69,11 +69,12 @@ def _planner_case():
     )
 
 
-def _write_minimal_compile_output(_program, output_dir, **_kwargs):
-    (output_dir / "kernels").mkdir(parents=True)
-    (output_dir / "kernels" / "kernel.cpp").touch()
-    (output_dir / "orchestration").mkdir()
-    (output_dir / "orchestration" / "orch.cpp").touch()
+def _write_minimal_compile_output(_program, *, output_dir, **_kwargs):
+    work_dir = Path(output_dir)
+    (work_dir / "kernels").mkdir(parents=True)
+    (work_dir / "kernels" / "kernel.cpp").touch()
+    (work_dir / "orchestration").mkdir()
+    (work_dir / "orchestration" / "orch.cpp").touch()
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +122,10 @@ def test_precompile_forwards_session_memory_planner(tmp_path):
     case = _planner_case()
     with (
         patch.object(
-            test_runner,
-            "compile_program",
+            test_runner.ir,
+            "compile",
             side_effect=_write_minimal_compile_output,
-        ) as compile_program,
+        ) as ir_compile,
         patch.object(test_runner, "_write_golden_for_test_case"),
     ):
         test_runner._compile_for_cache(
@@ -135,7 +136,7 @@ def test_precompile_forwards_session_memory_planner(tmp_path):
             analyze_auto_scopes_for_deps=False,
             session_memory_planner=MemoryPlanner.DSA_RP,
         )
-    assert compile_program.call_args.kwargs["memory_planner"] == MemoryPlanner.DSA_RP
+    assert ir_compile.call_args.kwargs["memory_planner"] == MemoryPlanner.DSA_RP
 
 
 def test_inline_compile_forwards_session_memory_planner():
@@ -147,15 +148,15 @@ def test_inline_compile_forwards_session_memory_planner():
     )
     with (
         patch.object(
-            test_runner,
-            "compile_program",
+            test_runner.ir,
+            "compile",
             side_effect=_write_minimal_compile_output,
-        ) as compile_program,
+        ) as ir_compile,
         patch.object(test_runner, "_write_golden_for_test_case"),
     ):
         result = test_runner.TestRunner(config)._run_inline(case, "a2a3sim")
     assert result.passed, result.error
-    assert compile_program.call_args.kwargs["memory_planner"] == MemoryPlanner.DSA_RP
+    assert ir_compile.call_args.kwargs["memory_planner"] == MemoryPlanner.DSA_RP
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +165,11 @@ def test_inline_compile_forwards_session_memory_planner():
 
 
 def test_dfx_to_cli_empty_for_default():
-    assert test_runner._dfx_to_cli(_DfxOpts()) == []
+    assert test_runner._dfx_to_cli(DfxOptions()) == []
 
 
 def test_dfx_to_cli_emits_only_enabled_flags():
-    dfx = _DfxOpts(enable_chip_swimlane=True, enable_dump_args=2, enable_pmu=5, enable_dep_gen=True)
+    dfx = DfxOptions(enable_chip_swimlane=True, enable_dump_args=2, enable_pmu=5, enable_dep_gen=True)
     argv = test_runner._dfx_to_cli(dfx)
     assert argv == [
         "--enable-chip-swimlane",
@@ -255,7 +256,7 @@ def test_dfx_to_cli_round_trips_the_swimlane_level():
     # Regression (issue #2385): a level 1-3 capture must survive the harness ->
     # execute_artifact CLI hop instead of being flattened to the bare flag.
     for level in (1, 2, 3, 4):
-        argv = test_runner._dfx_to_cli(_DfxOpts(enable_chip_swimlane=level))
+        argv = test_runner._dfx_to_cli(DfxOptions(enable_chip_swimlane=level))
         assert argv == ["--enable-chip-swimlane", str(level)]
         # ``--device-id`` is the parser's only required argument.
         parsed = execute_artifact._build_parser().parse_args([*argv, "--device-id", "0"])
@@ -278,7 +279,7 @@ def test_parse_executed_device():
 
 
 def test_task_submit_argv_and_pass(tmp_path):
-    dfx = _DfxOpts(enable_chip_swimlane=True)
+    dfx = DfxOptions(enable_chip_swimlane=True)
     with patch.object(
         test_runner.subprocess,
         "run",
@@ -313,7 +314,7 @@ def test_task_submit_pins_device_when_requested(tmp_path):
         test_runner.subprocess, "run", return_value=_proc(0, "PYPTO_EXEC_RESULT=PASS device=2\n")
     ) as run:
         passed, _, device = test_runner._run_artifact_via_task_submit(
-            tmp_path, "a2a3", _DfxOpts(), 600, 1800, device="2"
+            tmp_path, "a2a3", DfxOptions(), 600, 1800, device="2"
         )
     assert passed is True
     assert device == 2
@@ -326,7 +327,7 @@ def test_task_submit_real_failure(tmp_path):
         test_runner.subprocess, "run", return_value=_proc(1, "PYPTO_EXEC_RESULT=FAIL\n", "Traceback: boom")
     ):
         passed, error, device = test_runner._run_artifact_via_task_submit(
-            tmp_path, "a2a3", _DfxOpts(), 600, 1800
+            tmp_path, "a2a3", DfxOptions(), 600, 1800
         )
     assert passed is False
     assert device is None
@@ -336,14 +337,18 @@ def test_task_submit_real_failure(tmp_path):
 
 def test_task_submit_queue_timeout_is_distinguished(tmp_path):
     with patch.object(test_runner.subprocess, "run", return_value=_proc(1, "", "")):
-        passed, error, _ = test_runner._run_artifact_via_task_submit(tmp_path, "a2a3", _DfxOpts(), 600, 1800)
+        passed, error, _ = test_runner._run_artifact_via_task_submit(
+            tmp_path, "a2a3", DfxOptions(), 600, 1800
+        )
     assert passed is False
     assert "queue wait timed out" in error
 
 
 def test_task_submit_watchdog_kill_is_distinguished(tmp_path):
     with patch.object(test_runner.subprocess, "run", return_value=_proc(137, "", "")):
-        passed, error, _ = test_runner._run_artifact_via_task_submit(tmp_path, "a2a3", _DfxOpts(), 600, 1800)
+        passed, error, _ = test_runner._run_artifact_via_task_submit(
+            tmp_path, "a2a3", DfxOptions(), 600, 1800
+        )
     assert passed is False
     assert "--max-time" in error
 
@@ -354,7 +359,9 @@ def test_task_submit_exec_failure(tmp_path, exc):
     # not a device test failure — with the "do not pass --execute-via-task-submit"
     # hint so the operator knows to drop the flag on this host.
     with patch.object(test_runner.subprocess, "run", side_effect=exc):
-        passed, error, _ = test_runner._run_artifact_via_task_submit(tmp_path, "a2a3", _DfxOpts(), 600, 1800)
+        passed, error, _ = test_runner._run_artifact_via_task_submit(
+            tmp_path, "a2a3", DfxOptions(), 600, 1800
+        )
     assert passed is False
     assert "do not pass --execute-via-task-submit" in error
 
@@ -385,7 +392,7 @@ def test_sim_platform_never_borrows_a_card():
     tc.get_name.return_value = "case_sim"
     timing = SimpleNamespace(device_wall_us=1.0, host_wall_us=2.0)
     with (
-        patch.object(test_runner, "_execute_on_device", return_value=timing) as on_dev,
+        patch.object(test_runner, "_execute_golden_case", return_value=timing) as on_dev,
         patch.object(test_runner, "_run_artifact_via_task_submit") as via_ts,
     ):
         result = test_runner._fused_execute_task(
@@ -399,18 +406,18 @@ def test_sim_platform_never_borrows_a_card():
     via_ts.assert_not_called()
 
 
-def test_fused_compile_records_sdma_capability(tmp_path):
-    fake_compile_and_assemble = Mock(
-        return_value=(object(), "tensormap_and_ringbuffer", {"enable_sdma": True})
+def test_fused_compile_records_sdma_capability(tmp_path, stub_device_runner):
+    stub_device_runner._compile_and_assemble.return_value = (
+        object(),
+        "tensormap_and_ringbuffer",
+        {"enable_sdma": True},
     )
-    fake_device_runner = SimpleNamespace(compile_and_assemble=fake_compile_and_assemble)
     tc = Mock()
 
     with (
         patch.object(test_runner, "_resolve_platform", return_value="a2a3"),
         patch.object(test_runner, "_cache_key", return_value="prefetch@a2a3"),
         patch.object(test_runner, "_compile_for_cache"),
-        patch.dict(sys.modules, {"pypto.runtime.device_runner": fake_device_runner}),
     ):
         artifact = test_runner._fused_compile_task(tc, tmp_path, "a2a3", False, False)
 
@@ -431,7 +438,7 @@ def test_batch_argv_and_per_artifact_results(tmp_path):
     # wd2 fails, wd3 has no marker (process died before reaching it).
     stdout = f"PYPTO_EXEC_RESULT=PASS work_dir={wd1} device=2\nPYPTO_EXEC_RESULT=FAIL work_dir={wd2}\n"
     with patch.object(test_runner.subprocess, "run", return_value=_proc(1, stdout, "boom")) as run:
-        results = test_runner._run_batch_via_task_submit(entries, manifest, "auto", _DfxOpts(), 600, 1800)
+        results = test_runner._run_batch_via_task_submit(entries, manifest, "auto", DfxOptions(), 600, 1800)
     # manifest written + batch command shape
     assert json.loads(manifest.read_text()) == [
         {"work_dir": str(wd1), "platform": "a2a3"},
@@ -452,7 +459,7 @@ def test_batch_missing_task_submit(tmp_path):
     entries = [(tmp_path / "a@a2a3", "a2a3")]
     with patch.object(test_runner.subprocess, "run", side_effect=FileNotFoundError):
         results = test_runner._run_batch_via_task_submit(
-            entries, tmp_path / "b.json", "auto", _DfxOpts(), 600, 1800
+            entries, tmp_path / "b.json", "auto", DfxOptions(), 600, 1800
         )
     ok, error, _ = results[str(tmp_path / "a@a2a3")]
     assert ok is False

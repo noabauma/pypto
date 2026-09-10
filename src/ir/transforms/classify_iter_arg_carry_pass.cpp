@@ -279,7 +279,7 @@ class AliasForest {
 
     // A single-result call to a kernel that writes one of its args (e.g. an
     // InCore kernel): the result aliases the arg the callee actually returns,
-    // mirroring the codegen alias ``const TaskTensor& result = args[out_idx];``.
+    // mirroring the codegen alias ``const Tensor& result = args[out_idx];``.
     // For kernels with multiple Out params (e.g. real result + GM scratch passed
     // through pl.spmd mixed dispatch), tracing the ReturnStmt back to its Param
     // avoids aliasing the result to an arbitrary scratch tensor.

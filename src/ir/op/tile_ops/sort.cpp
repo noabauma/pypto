@@ -70,10 +70,27 @@ TypePtr DeduceTileSort32Type(const std::vector<ExprPtr>& args,
       << "The operator " << op_name << " requires src dtype to be FP16 or FP32, but got "
       << src_type->dtype_.ToString();
 
-  // Second arg: idx tile
+  // Second arg: idx tile — one index per src element, so it is shaped like src.
+  // TSORT32 pairs src[i] with idx[i] positionally; an idx that does not cover src
+  // reads past its own buffer, and a wider one silently ignores the tail. State the
+  // relation in the type so it is enforced once here instead of per consumer
+  // (gh#2612 -- LowerAutoVectorSplit is otherwise blind to this operand and cannot
+  // tell a legal full-width one from per-lane data left un-sharded).
+  //
+  // Only a PROVABLE mismatch is an error; an undecidable symbolic relation is left
+  // to the backend, so dynamic extents keep working exactly as before.
   auto idx_type = As<TileType>(args[1]->GetType());
   CHECK(idx_type) << "The operator " << op_name << " requires second argument to be a TileType, but got "
                   << args[1]->GetType()->TypeName();
+  CHECK(idx_type->shape_.size() == src_type->shape_.size())
+      << "The operator " << op_name << " requires idx to have the same rank as src (one index per element), "
+      << "but got idx rank " << idx_type->shape_.size() << " against src rank " << src_type->shape_.size();
+  for (size_t d = 0; d < src_type->shape_.size(); ++d) {
+    CHECK(ProveValidExtentEqual(idx_type->shape_[d], src_type->shape_[d]) != ProofResult::kFalse)
+        << "The operator " << op_name << " requires idx to have the same shape as src (one index per "
+        << "element), but got idx shape " << FormatShape(idx_type->shape_) << " against src shape "
+        << FormatShape(src_type->shape_);
+  }
 
   if (args.size() == 3) {
     auto tmp_type = As<TileType>(args[2]->GetType());
@@ -114,6 +131,11 @@ REGISTER_OP("tile.sort32")
     .set_input_memory(2, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .not_inplace_safe()
+    // tmp IS exempt for the same target reason as tile.gather's: the "same dtype
+    // and capacity as src" rule is an A2/A3 one that the PTOAS verifier already
+    // enforces where the target is known. Rejecting here would break the form
+    // A5 accepts to duplicate a check this pass cannot make accurately.
+    .set_lane_invariant_arg(2)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileSort32Type(args, kwargs, "tile.sort32");
@@ -191,6 +213,13 @@ REGISTER_OP("tile.mrgsort_format2")
     .set_input_memory(4, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .not_inplace_safe()
+    // NOT declared lane-invariant: in the 5-argument (4-way) form where arg 4 is
+    // the workspace, DeduceTileMrgSortType reads its extent, so a full-width one
+    // beside halved inputs is already rejected by the auto-split pass's
+    // type-consistency check. `tmp_or_src2` / `tmp_or_src3` are unclassifiable
+    // for a different reason: which of them is workspace is decided by the
+    // positional argument COUNT, not by a kwarg, so a per-position declaration
+    // cannot express it. They stay undeclared, and the pass treats them as data.
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileMrgSortType(args, kwargs, "tile.mrgsort_format2");

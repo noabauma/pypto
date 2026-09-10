@@ -14,7 +14,7 @@ lower-level primitives only when building a custom protocol.
 | ---- | ------ | ----------- |
 | `NotifyOp` | `AtomicAdd`, `Set` | Signal deposit mode. `AtomicAdd`: atomically increment the peer's signal slot (use for multi-rank barriers). `Set`: overwrite the peer's signal slot (use for 1:1 handshakes). |
 | `WaitCmp` | `Eq`, `Ge` | Wait predicate. `Eq`: block until signal slot equals expected value. `Ge`: block until signal slot >= expected value. |
-| `ReduceOp` | `Sum`, `Max`, `Min`, `Prod` | Reduction operator for collective operations. Support is per-operation: `allreduce` accepts all four; `reduce_scatter` accepts only `Sum` and rejects the rest at the deducer. |
+| `ReduceOp` | `Sum`, `Max`, `Min`, `Prod` | Reduction operator for collective operations. Support is per-operation: `allreduce` accepts all four; `reduce_scatter` accepts all four on the InCore rail, while the HOST builtin rail currently lowers only `Sum`. |
 | `AtomicType` | `None_`, `Add` | Remote-store combine mode. `None_`: plain store. `Add`: atomically accumulate into peer's destination — requires an `fp32`/`bf16`/`fp16`/`int32`/`int16`/`int8` destination, and a `bf16` destination requires the Ascend910B (A2/A3) profile. |
 | `DistributedTensor` | — | A tensor view bound to a comm-domain window buffer. Every collective and RMA op requires this type on the window side. |
 | `CommCtx` | — | Communication context handle. Produced by `get_comm_ctx()`; consumed by `rank()` and `nranks()`. |
@@ -350,7 +350,7 @@ require the full 3-segment namespace.
 ## Runnable Examples
 
 The [tutorials](05-tutorials.md) teach each primitive by hand before
-any builtin is revealed (steps 03–07 ship; 08–16 are planned):
+any builtin is revealed (all steps 03–16 ship):
 
 | Primitive | Tutorial step |
 | --------- | ------------- |

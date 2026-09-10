@@ -37,6 +37,7 @@ from typing import Any
 import pypto.language as pl
 import pytest
 import torch
+from harness import st
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
 from pypto.runtime.runner import RunConfig
 
@@ -69,6 +70,12 @@ def _gemv_output_dtype(dtype: DataType) -> DataType:
 
 def _cfg() -> RunConfig:
     return RunConfig(rtol=_RTOL, atol=_ATOL)
+
+
+# The Cube GEMV lhs needs a whole 512-byte block of physical K, so the aligned
+# contraction length is a function of the operand dtype.
+_AB_DTYPES = (DataType.BF16, DataType.FP16, DataType.INT8)
+_ALIGNED_K = {DataType.BF16: 256, DataType.FP16: 256, DataType.INT8: 512}
 
 
 # ===========================================================================
@@ -207,10 +214,13 @@ class TestMatmulBias:
         result = test_runner.run(MatmulBiasTestCase(narrow=narrow, config=_cfg()))
         assert result.passed, f"Test failed: {result.error}"
 
+    # Declared rather than built in the body: ``out_m=2 * M`` is arithmetic on a
+    # name, which collection's source-parsing route cannot evaluate, so this
+    # case used to compile on its own instead of in the pool.
     @pytest.mark.platforms("a2a3")
-    def test_tile_matmul_bias_offset(self, test_runner):
-        result = test_runner.run(MatmulBiasTestCase(out_m=2 * M, off_row=M, config=_cfg()))
-        assert result.passed, f"Test failed: {result.error}"
+    @st.cases(st.from_legacy(MatmulBiasTestCase(out_m=2 * M, off_row=M, config=_cfg())))
+    def test_tile_matmul_bias_offset(self, case_run):
+        case_run.assert_passed()
 
 
 # ===========================================================================
@@ -237,7 +247,7 @@ class GemvTestCase(PTOTestCase):
         bias=False,
         narrow=None,
         ab_dtype=DataType.FP32,
-        acc_phase="unspecified",
+        acc_phase=pl.AccPhase.Unspecified,
         config=None,
     ):
         super().__init__(config)
@@ -248,7 +258,7 @@ class GemvTestCase(PTOTestCase):
     def get_name(self) -> str:
         op = "gemv_bias" if self._bias else "gemv"
         narrowed = f"_n{self._narrow}" if self._narrow else ""
-        phase = f"_{self._acc_phase}" if self._acc_phase != "unspecified" else ""
+        phase = f"_{self._acc_phase.name.lower()}" if self._acc_phase != pl.AccPhase.Unspecified else ""
         return f"tile_{op}_1x{self._k}x{self._n}_{self._ab.value}{narrowed}{phase}"
 
     def define_tensors(self) -> list[TensorSpec]:
@@ -283,6 +293,7 @@ class GemvTestCase(PTOTestCase):
         valid_k = VALID_K if self._narrow in ("K", "KN") else k
         valid_n = VALID_N if self._narrow in ("N", "KN") else n
         acc_phase = self._acc_phase
+        st_phase = pl.STPhase.Final if acc_phase == pl.AccPhase.Final else pl.STPhase.Unspecified
         a_valid = [1, valid_k]
         b_valid = [valid_k, valid_n]
 
@@ -312,7 +323,8 @@ class GemvTestCase(PTOTestCase):
                         target_memory=pl.MemorySpace.Mat,
                         clamp=True,
                     )
-                    out = pl.store(pl.tile.gemv(tile_a, tile_b, acc_phase=acc_phase), [0, 0], out)
+                    result = pl.tile.gemv(tile_a, tile_b, acc_phase=acc_phase)
+                    out = pl.store(result, [0, 0], out, st_phase=st_phase)
                     return out
 
                 @pl.function(type=pl.FunctionType.Orchestration)
@@ -355,7 +367,7 @@ class GemvTestCase(PTOTestCase):
                     clamp=True,
                 )
                 result = pl.tile.gemv_bias(tile_a, tile_b, tile_bias, acc_phase=acc_phase)
-                out = pl.store(result, [0, 0], out)
+                out = pl.store(result, [0, 0], out, st_phase=st_phase)
                 return out
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -421,15 +433,9 @@ class TestGemv:
         result = test_runner.run(GemvTestCase(k=512, n=64, ab_dtype=DataType.INT8, config=_cfg()))
         assert result.passed, f"Test failed: {result.error}"
 
-    @pytest.mark.skip(
-        reason="Issue #2428: GEMV with acc_phase='final' intermittently hangs on device "
-        "(SCHEDULER_TIMEOUT sub_class=S1:running-stalled), which poisons the shared chip-run "
-        "lane and fails every remaining artifact in the ST batch. Temporarily skipped to "
-        "unblock CI; re-enable once the hang is root-caused."
-    )
     @pytest.mark.platforms("a2a3")
     def test_tile_gemv_final_phase(self, test_runner):
-        result = test_runner.run(GemvTestCase(k=128, n=64, acc_phase="final", config=_cfg()))
+        result = test_runner.run(GemvTestCase(k=128, n=64, acc_phase=pl.AccPhase.Final, config=_cfg()))
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.platforms("a2a3")
@@ -453,22 +459,25 @@ class TestGemvBias:
         result = test_runner.run(GemvTestCase(k=128, bias=True, narrow="K", config=_cfg()))
         assert result.passed, f"Test failed: {result.error}"
 
+    # The K that keeps the physical Cube block whole depends on the dtype, and a
+    # conditional expression bound to a local is past what collection can
+    # evaluate from source -- so the dtype axis moves into the declaration and
+    # the K comes from a table. Same shape in ``test_tile_gemv_acc_dtype``.
     @pytest.mark.platforms("a2a3")
-    @pytest.mark.parametrize("ab_dtype", [DataType.BF16, DataType.FP16, DataType.INT8])
-    def test_tile_gemv_bias_dtype(self, test_runner, ab_dtype):
-        k = 512 if ab_dtype == DataType.INT8 else 256
-        result = test_runner.run(GemvTestCase(k=k, n=64, bias=True, ab_dtype=ab_dtype, config=_cfg()))
-        assert result.passed, f"Test failed: {result.error}"
-
-    @pytest.mark.skip(
-        reason="Issue #2428: GEMV with acc_phase='final' intermittently hangs on device "
-        "(SCHEDULER_TIMEOUT sub_class=S1:running-stalled), which poisons the shared chip-run "
-        "lane and fails every remaining artifact in the ST batch. Temporarily skipped to "
-        "unblock CI; re-enable once the hang is root-caused."
+    @st.cases(
+        *(
+            st.from_legacy(GemvTestCase(k=_ALIGNED_K[d], n=64, bias=True, ab_dtype=d, config=_cfg()))
+            for d in _AB_DTYPES
+        )
     )
+    def test_tile_gemv_bias_dtype(self, case_run):
+        case_run.assert_passed()
+
     @pytest.mark.platforms("a2a3")
     def test_tile_gemv_bias_final_phase(self, test_runner):
-        result = test_runner.run(GemvTestCase(k=128, n=64, bias=True, acc_phase="final", config=_cfg()))
+        result = test_runner.run(
+            GemvTestCase(k=128, n=64, bias=True, acc_phase=pl.AccPhase.Final, config=_cfg())
+        )
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.platforms("a2a3")
@@ -533,8 +542,9 @@ class GemvAccTestCase(PTOTestCase):
         out_dt = pl.INT32 if self._ab == DataType.INT8 else pl.FP32
         valid_k = VALID_K if self._narrow in ("K", "KN") else k_chunk
         valid_n = VALID_N if self._narrow in ("N", "KN") else n
-        first_phase = "partial" if self._phased else "unspecified"
-        last_phase = "final" if self._phased else "unspecified"
+        first_phase = pl.AccPhase.Partial if self._phased else pl.AccPhase.Unspecified
+        last_phase = pl.AccPhase.Final if self._phased else pl.AccPhase.Unspecified
+        store_phase = pl.STPhase.Final if self._phased else pl.STPhase.Unspecified
         a_valid = [1, valid_k]
         b_valid = [valid_k, valid_n]
 
@@ -574,7 +584,7 @@ class GemvAccTestCase(PTOTestCase):
                     clamp=True,
                 )
                 acc = pl.tile.gemv_acc(acc, a1, b1, acc_phase=last_phase)
-                out = pl.store(acc, [0, 0], out)
+                out = pl.store(acc, [0, 0], out, st_phase=store_phase)
                 return out
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -708,18 +718,15 @@ class TestGemvAcc:
         assert result.passed, f"Test failed: {result.error}"
 
     @pytest.mark.platforms("a2a3")
-    @pytest.mark.parametrize("ab_dtype", [DataType.BF16, DataType.FP16, DataType.INT8])
-    def test_tile_gemv_acc_dtype(self, test_runner, ab_dtype):
-        k_chunk = 512 if ab_dtype == DataType.INT8 else 256
-        result = test_runner.run(GemvAccTestCase(k_chunk=k_chunk, n=64, ab_dtype=ab_dtype, config=_cfg()))
-        assert result.passed, f"Test failed: {result.error}"
-
-    @pytest.mark.skip(
-        reason="Issue #2428: GEMV with acc_phase='final' intermittently hangs on device "
-        "(SCHEDULER_TIMEOUT sub_class=S1:running-stalled), which poisons the shared chip-run "
-        "lane and fails every remaining artifact in the ST batch. Temporarily skipped to "
-        "unblock CI; re-enable once the hang is root-caused."
+    @st.cases(
+        *(
+            st.from_legacy(GemvAccTestCase(k_chunk=_ALIGNED_K[d], n=64, ab_dtype=d, config=_cfg()))
+            for d in _AB_DTYPES
+        )
     )
+    def test_tile_gemv_acc_dtype(self, case_run):
+        case_run.assert_passed()
+
     @pytest.mark.platforms("a2a3")
     def test_tile_gemv_acc_partial_final_phases(self, test_runner):
         result = test_runner.run(GemvAccTestCase(n=64, phased=True, config=_cfg()))

@@ -128,4 +128,5 @@ get 侧是接收方发起的镜像：
   约束
 - [01-collectives](../distributed/01-collectives.md) — 集合通信如何组合这些
   移动（步骤 08–16）
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[12-dynamic_rank_count](12-dynamic_rank_count.md) — 同一个环，与 rank 数量无关

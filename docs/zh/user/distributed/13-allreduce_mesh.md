@@ -115,4 +115,5 @@ rank 读取。round 密集：`P-1` 次远程读取加一个 barrier。正是这�
 - [01-collectives](01-collectives.md) §AllReduce — mesh 模式参考
 - [09-barrier](09-barrier.md) — 这里复用的 notify/wait barrier（步骤 04）
 - [10-remote_load_store](10-remote_load_store.md) — `remote_load`（步骤 05）
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[14-allreduce_two_phase](14-allreduce_two_phase.md) — 同样的结果，流量约减半

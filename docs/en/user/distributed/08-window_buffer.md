@@ -104,4 +104,5 @@ windows do not cost what their shape suggests.
 - [02-primitives](../distributed/02-primitives.md) §Window Buffer Management —
   the full API
 - [00-model](../distributed/00-model.md) §Glossary — window buffer, signal
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [09-barrier](09-barrier.md) — signals only, no data

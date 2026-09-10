@@ -269,6 +269,10 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+    - name: Set up Python for lint hooks
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
     - name: pre-commit
       uses: pre-commit/action@v3.0.0
       with:
@@ -406,14 +410,14 @@ jobs:
     #
     # One leg per architecture, because the cache it fills is the host's own
     # disk and the self-hosted fleet is no longer one machine. The `cpu` and
-    # `npu` pools each span an aarch64 box (cpu-N / npu-N) and an x86_64 one
-    # (infra024-cpu-x64-N / infra024-npu-a2a3-N), and #2525 dropped the `arm64`
-    # pin from every consumer so a job lands on whichever is free — measured
-    # over eight runs, 43% of cpu-pool jobs and half the npu ones go to the
-    # x86_64 host. A single-arch prebuild would leave that host cold and those
-    # jobs building in place, which is exactly what this removes. Each leg's
-    # cpu runner shares a machine, and therefore a CI_CACHE_ROOT, with that
-    # machine's npu runners, so warming from the cpu pool reaches both.
+    # `npu` pools each span one aarch64 box and one x86_64 box, and #2525
+    # dropped the `arm64` pin from every consumer so a job lands on whichever of
+    # the two is free — measured over eight runs, 43% of cpu-pool jobs and half
+    # the npu ones go to the x86_64 host. A single-arch prebuild would leave
+    # that host cold and those jobs building in place, which is exactly what
+    # this removes. Each leg's cpu runner shares a machine, and therefore a
+    # CI_CACHE_ROOT, with that machine's npu runners, so warming from the cpu
+    # pool reaches both.
     #
     # `arm64` / `x64` are the labels the runner application applies on its own
     # (`ARM64` / `X64`); label matching is case-insensitive, and the lowercase
@@ -947,6 +951,37 @@ jobs:
           python examples/distributed/11_allreduce_reveal.py -p a2a3sim -d 0,1,2,3
           echo "=== examples/distributed/11_allreduce_reveal.py --mode ring -d 0,1,2,3 ==="
           python examples/distributed/11_allreduce_reveal.py -p a2a3sim -d 0,1,2,3 --mode ring
+          # Steps 12-15: the collective zoo — every documented invocation must
+          # be CI-validated. P=2 default ran in the loop above; add the P=2
+          # builtin reveal and the P=4 legs (both modes; the per-rank patterns
+          # are most distinct at P=4).
+          echo "=== examples/distributed/12_broadcast.py --mode builtin -d 0,1 ==="
+          python examples/distributed/12_broadcast.py -p a2a3sim -d 0,1 --mode builtin
+          echo "=== examples/distributed/12_broadcast.py -d 0,1,2,3 ==="
+          python examples/distributed/12_broadcast.py -p a2a3sim -d 0,1,2,3
+          echo "=== examples/distributed/12_broadcast.py --mode builtin -d 0,1,2,3 ==="
+          python examples/distributed/12_broadcast.py -p a2a3sim -d 0,1,2,3 --mode builtin
+          echo "=== examples/distributed/13_allgather.py --mode builtin -d 0,1 ==="
+          python examples/distributed/13_allgather.py -p a2a3sim -d 0,1 --mode builtin
+          echo "=== examples/distributed/13_allgather.py -d 0,1,2,3 ==="
+          python examples/distributed/13_allgather.py -p a2a3sim -d 0,1,2,3
+          echo "=== examples/distributed/13_allgather.py --mode builtin -d 0,1,2,3 ==="
+          python examples/distributed/13_allgather.py -p a2a3sim -d 0,1,2,3 --mode builtin
+          echo "=== examples/distributed/14_reduce_scatter.py --mode builtin -d 0,1 ==="
+          python examples/distributed/14_reduce_scatter.py -p a2a3sim -d 0,1 --mode builtin
+          echo "=== examples/distributed/14_reduce_scatter.py -d 0,1,2,3 ==="
+          python examples/distributed/14_reduce_scatter.py -p a2a3sim -d 0,1,2,3
+          echo "=== examples/distributed/14_reduce_scatter.py --mode builtin -d 0,1,2,3 ==="
+          python examples/distributed/14_reduce_scatter.py -p a2a3sim -d 0,1,2,3 --mode builtin
+          echo "=== examples/distributed/15_all_to_all.py --mode builtin -d 0,1 ==="
+          python examples/distributed/15_all_to_all.py -p a2a3sim -d 0,1 --mode builtin
+          echo "=== examples/distributed/15_all_to_all.py -d 0,1,2,3 ==="
+          python examples/distributed/15_all_to_all.py -p a2a3sim -d 0,1,2,3
+          echo "=== examples/distributed/15_all_to_all.py --mode builtin -d 0,1,2,3 ==="
+          python examples/distributed/15_all_to_all.py -p a2a3sim -d 0,1,2,3 --mode builtin
+          # Step 16: the composition capstone at P=4.
+          echo "=== examples/distributed/16_putting_it_together.py -d 0,1,2,3 ==="
+          python examples/distributed/16_putting_it_together.py -p a2a3sim -d 0,1,2,3
 
       # The teaching ladders. These carry the manual's beginner/intermediate/
       # advanced/utils citations, so leaving them unrun let the pages point at
@@ -1083,24 +1118,20 @@ jobs:
     # TEST MODE: keep the device runner so DEVICE_ID/DEVICE_ID exist and pin
     # task-submit to that card (validates the new compile-card-free + task-submit
     # execute flow deterministically). FLIP TO PROD: change this to
-    # `[self-hosted, linux, x64, cpu]` and drop --task-submit-device below so
+    # `[self-hosted, linux, cpu]` and drop --task-submit-device below so
     # cases borrow any free card via `--device auto`.
     #
-    # Pinned to x86_64 to free the aarch64 npu box for the jobs that can only
-    # run there. Since #2525 the `npu` label spans an aarch64 box (runners
-    # `npu-N`) and an x86_64 one (the `*-npu-a2a3-N` instances), and both
-    # `dist-system-tests` and `pypto-lib-model` are pinned to `arm64, npu` (see
-    # their own comments) — so every run of this job that lands on aarch64 takes
-    # that box away from them. `x64` is the label the runner application applies
-    # on its own (`X64`; label matching is case-insensitive) — the same pair
-    # `prebuild-wheels` matrixes over.
+    # Unpinned: takes whichever half of the `npu` pool is free. This job used to
+    # carry an `x64` pin, and its only purpose was to keep the aarch64 npu box
+    # free for `dist-system-tests` / `pypto-lib-model`, which were pinned to it.
+    # Those pins are gone (the x86_64 npu host has been repaired), so the
+    # reservation has nothing left to reserve.
     #
-    # This is a scheduling pin, not a health one, and unlike `dist-system-tests`
-    # it is not working around anything: over the 120 most recent ci.yml runs
-    # both jobs go red on BOTH halves at indistinguishable rates (aarch64 4 red
-    # / 55, x86_64 9 red / 87), failing the same batched step. Lift it if the
-    # arm64 pins it makes room for are lifted.
-    runs-on: [self-hosted, linux, x64, npu]
+    # Lifting it costs no signal, because it was a scheduling pin and not a
+    # health one: over the 120 ci.yml runs before it was lifted both jobs went
+    # red on BOTH halves at indistinguishable rates (aarch64 4 red / 55, x86_64
+    # 9 red / 87), failing the same batched step.
+    runs-on: [self-hosted, linux, npu]
     defaults:
       run:
         working-directory: st-checkout
@@ -1173,13 +1204,19 @@ jobs:
           # compile + golden card-free, device run BATCHED via task-submit. The
           # `not device_batch` (direct @pl.jit / config=test_config) tests for
           # ALL dirs run in the `system-tests-direct` job.
-          python -m pytest tests/st -v -m device_batch \
+          #
+          # `not swimlane` because those assert on a chip-swimlane record and
+          # skip without `--enable-chip-swimlane`, which this step does not pass.
+          # They ran here only to skip, and 35 silent skips buried the real ones;
+          # the flagged steps in `system-tests-direct` run them for real.
+          python -m pytest tests/st -v -m "device_batch and not swimlane and not multi_card" \
             --ignore=tests/st/distributed \
             --ignore=tests/st/codegen \
             --ignore=tests/st/runtime/ops \
             --ignore=tests/st/runtime/cross_core \
             --ignore=tests/st/runtime/framework_and_models/test_dump_tag.py \
-            --precompile-workers=32 --execute-via-task-submit --execute-batch-size=64 \
+            --precompile-workers=32 --strict-case-discovery \
+            --execute-via-task-submit --execute-batch-size=64 \
             --task-queue-timeout=1800 --task-max-time=600 --task-submit-device="$DEVICE_ID"
 
       - name: Kill orphaned task-submit tasks
@@ -1194,7 +1231,7 @@ jobs:
     #      runtime/ops + runtime/cross_core. These have many tests but cheap
     #      compiles (~80s measured vs ~404s for the heavy dirs in `system-tests`),
     #      so they are paired here with the direct + DFX tail.
-    #   2. Direct-device (mechanism B): `-m 'not device_batch'` over ALL of
+    #   2. Direct-device (mechanism B): `-m 'not device_batch and not multi_card'` over ALL of
     #      tests/st (the in-process @pl.jit / config=test_config tests, including
     #      the direct tests under the heavy dirs that `system-tests` skips).
     #   3. DFX steps: paged-attention / multi-orch L2 / swimlane / dump-args.
@@ -1217,24 +1254,20 @@ jobs:
       contents: read
     # TEST MODE: keep the device runner so DEVICE_ID exists and pin task-submit
     # to that card. FLIP TO PROD: change this to
-    # `[self-hosted, linux, x64, cpu]` and drop --task-submit-device / the
+    # `[self-hosted, linux, cpu]` and drop --task-submit-device / the
     # explicit --device below so cases borrow any free card via `--device auto`.
     #
-    # Pinned to x86_64 to free the aarch64 npu box for the jobs that can only
-    # run there. Since #2525 the `npu` label spans an aarch64 box (runners
-    # `npu-N`) and an x86_64 one (the `*-npu-a2a3-N` instances), and both
-    # `dist-system-tests` and `pypto-lib-model` are pinned to `arm64, npu` (see
-    # their own comments) — so every run of this job that lands on aarch64 takes
-    # that box away from them. `x64` is the label the runner application applies
-    # on its own (`X64`; label matching is case-insensitive) — the same pair
-    # `prebuild-wheels` matrixes over.
+    # Unpinned: takes whichever half of the `npu` pool is free. This job used to
+    # carry an `x64` pin, and its only purpose was to keep the aarch64 npu box
+    # free for `dist-system-tests` / `pypto-lib-model`, which were pinned to it.
+    # Those pins are gone (the x86_64 npu host has been repaired), so the
+    # reservation has nothing left to reserve.
     #
-    # This is a scheduling pin, not a health one, and unlike `dist-system-tests`
-    # it is not working around anything: over the 120 most recent ci.yml runs
-    # both jobs go red on BOTH halves at indistinguishable rates (aarch64 4 red
-    # / 55, x86_64 9 red / 87), failing the same batched step. Lift it if the
-    # arm64 pins it makes room for are lifted.
-    runs-on: [self-hosted, linux, x64, npu]
+    # Lifting it costs no signal, because it was a scheduling pin and not a
+    # health one: over the 120 ci.yml runs before it was lifted both jobs went
+    # red on BOTH halves at indistinguishable rates (aarch64 4 red / 55, x86_64
+    # 9 red / 87), failing the same batched step.
+    runs-on: [self-hosted, linux, npu]
     defaults:
       run:
         working-directory: st-direct-checkout
@@ -1291,12 +1324,13 @@ jobs:
           test -n "$DEVICE_ID" || { echo "DEVICE_ID is empty in the runner env"; exit 1; }
           python -m pytest tests/st/runtime/ops tests/st/runtime/cross_core \
             -v -m device_batch \
-            --precompile-workers=32 --execute-via-task-submit --execute-batch-size=64 \
+            --precompile-workers=32 --strict-case-discovery \
+            --execute-via-task-submit --execute-batch-size=64 \
             --task-queue-timeout=1800 --task-max-time=600 --task-submit-device="$DEVICE_ID"
 
       - name: Test direct-device (mechanism B — one card, in-process)
         timeout-minutes: 30
-        # ALL `-m 'not device_batch'` tests across tests/st (both shards' dirs):
+        # ALL `-m 'not device_batch and not multi_card'` tests across tests/st (both shards' dirs):
         # direct @pl.jit kernel calls / config=test_config (and no-fixture device
         # tests), which execute the device synchronously in-process and cannot be
         # batched. Wrap them whole in ONE task-submit card session and run
@@ -1306,16 +1340,23 @@ jobs:
         # per-test and new tests need no edit. swimlane is --ignore'd here — it runs
         # in its own flagged step. (paged_attention has its own step below — passing
         # it as an explicit path here collapses pytest's dir collection.)
+        # test_graph_execution is --ignore'd for a different reason: a ChipWorker
+        # binds one (platform, device_id, runtime), and that file mixes
+        # host_build_graph cases with a default-runtime A/B twin. Two runtimes in
+        # one process poison the shared lane — the first Graph test failed 507018
+        # and took the rest of the step's tests with it — so it runs --forked
+        # below, one process per test.
         run: |
           source activate.sh
           echo "[device] DEVICE_ID=$DEVICE_ID"
           test -n "$DEVICE_ID" || { echo "DEVICE_ID is empty in the runner env"; exit 1; }
           task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 1800 \
             --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest \
-              tests/st -v -m 'not device_batch' \
+              tests/st -v -m 'not device_batch and not multi_card' \
               --ignore=tests/st/distributed \
               --ignore=tests/st/codegen \
               --ignore=tests/st/runtime/framework_and_models/test_perf_swimlane.py \
+              --ignore=tests/st/runtime/framework_and_models/test_graph_execution.py \
               --device=\$TASK_DEVICE --platform=a2a3"
 
       - name: Test paged-attention codegen (numeric compare, in device env)
@@ -1342,12 +1383,59 @@ jobs:
             --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest tests/st/distributed/test_l2_multi_orch.py -v --device=\$TASK_DEVICE"
 
       - name: Test swimlane output
+        # --precompile-workers is what gives these tests an artifact directory at
+        # all: they read the record through `case_run.dfx(...)`, which resolves
+        # inside the case's own work_dir, and conftest returns early -- no pool,
+        # no work_dir -- when the flag is absent.
+        #
+        # No --forked, which it used to pass: a forked child cannot resolve the
+        # parent's compile futures, and the step hung until the 900s task cap
+        # when the two were combined. Unforked it is 4 passed in 11s.
         run: |
           source activate.sh
           task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 600 \
-            --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py -v --device=\$TASK_DEVICE --platform=a2a3 --enable-chip-swimlane --forked"
+            --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest tests/st/runtime/framework_and_models/test_perf_swimlane.py -v --device=\$TASK_DEVICE --platform=a2a3 --enable-chip-swimlane --precompile-workers=8"
+
+      - name: Test scheduling swimlane assertions
+        # The 35 swimlane assertions under runtime/scheduling had never run: they
+        # gate on `--enable-chip-swimlane`, which CI passed only to
+        # test_perf_swimlane.py, so every one of them skipped in the batched
+        # shard. Selected by the `swimlane` marker rather than by path, so the
+        # correctness cases sharing these files are not re-run here.
+        #
+        # --precompile-workers, and no --forked, for the reasons on the two steps
+        # above: each test reads its record through `case_run.dfx(...)`, which
+        # needs the pool to have published a work_dir, and several tests sharing
+        # one declared case then share its single device run.
+        #
+        # --device-num 2 because the device-pool path runs one case per card in
+        # --device. Measured on a2a3 over these 19 cases: 122s on one card, 66s
+        # on two, 35s on four. Two is the setting, not four: the extra 31s does
+        # not justify holding four of a shared pool's cards for the length of
+        # this step. Concurrency here was unreachable until the pre-submitter,
+        # and unsafe until the device-init lock in pypto.runtime.worker.
+        run: |
+          source activate.sh
+          task-submit --device "$DEVICE_ID" --device-num 2 --timeout 3600 --max-time 1200 \
+            --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest \
+              tests/st/runtime/scheduling -v -m swimlane \
+              --device=\$TASK_DEVICE --platform=a2a3 --enable-chip-swimlane \
+              --precompile-workers=8 --strict-case-discovery"
+
+      - name: Test Graph record-and-replay (one process per test)
+        # --forked because a ChipWorker binds one (platform, device_id, runtime):
+        # the host_build_graph cases and the default-runtime A/B twin in this file
+        # cannot share a process.
+        run: |
+          source activate.sh
+          task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 600 \
+            --run "cd $GITHUB_WORKSPACE/st-direct-checkout && source activate.sh && python -m pytest tests/st/runtime/framework_and_models/test_graph_execution.py -v --device=\$TASK_DEVICE --platform=a2a3 --forked"
 
       - name: Test dump-args output
+        # No pool and --forked, unlike the swimlane steps: this file's cases stay
+        # fixture-driven (see TestSubmitDumpsManifest's inline_case marker), and
+        # --forked is what keeps TestDumpTagManifest's module fixture in a
+        # process of its own.
         run: |
           source activate.sh
           task-submit --device "$DEVICE_ID" --timeout 3600 --max-time 600 \
@@ -1379,43 +1467,46 @@ jobs:
     # TEST MODE: keep the 2-device runner and pin task-submit to DEVICE_ID
     # (see system-tests). FLIP TO PROD: cpu runner + `--device auto --device-num 2`.
     #
-    # Pinned to aarch64, which is a workaround and not a fix. Since #2525 gave
-    # the `npu` pool a second host, the label spans an aarch64 box (runners
-    # `npu-N`) and an x86_64 one (`infra024-npu-a2a3-N`), and this job's
-    # communication cases do not survive the x86_64 half. Over the 19 most
-    # recent completed runs: 11/11 green on aarch64, 3 green / 5 red on x86_64.
-    #
-    # The reason to pin is not the red check, it is that the failure WEDGES THE
-    # CARD. A red run starts with one collective hanging --
+    # Runs on the whole `npu` pool, x86_64 half included. It was pinned to
+    # aarch64 for a while and the evidence behind that pin is worth keeping:
+    # over the 19 completed runs before it, this job was 11/11 green on aarch64
+    # and 3 green / 5 red on the x86_64 half, and a red run there did not merely
+    # fail, it WEDGED THE CARD. One collective hangs --
     #   chip run lane is poisoned: finalize_native_run failed
     #   aclrtSynchronizeStreamWithTimeout (AICPU) failed: 507018
     # -- and from there the device cannot be re-entered at all: 207 subsequent
     # cases die in `simpler_init failed with code 507033`, and the recovery path
     # fails the same way (`force_reset_device: aclrtSetDevice(2) failed: 507033`,
     # `attach_current_thread: rtSetDevice(12) failed: 507033`). Both borrowed
-    # cards end up unusable and CI cannot reset them itself.
+    # cards end up unusable and CI cannot reset them itself, and that host's
+    # ten npu runner instances share ONE set of cards, so the damage is not
+    # contained to the job that hit it.
     #
-    # `infra024-npu-a2a3-1..10` are ten runner instances on ONE machine sharing
-    # ONE set of cards, so cards left in that state are not contained to the job
-    # that hit it. pypto-lib-model is pinned alongside this job as a precaution
-    # for the same reason; see its comment for why that evidence is weaker.
+    # The pin is lifted because THE HOST WAS REPAIRED. Corroborating signal from
+    # the 43 most recent ci.yml runs (2026-08-31 11:28 -> 2026-09-01 06:40,
+    # sampled 2026-09-01): that host's single-card npu jobs are 62 green / 5 red
+    # (`system-tests` 32/2, `system-tests-direct` 30/3), and the reds are
+    # scattered rather than clustered -- none of the host-wide failure waves that
+    # went with the wedging. What that window does NOT contain is a MULTI-CARD
+    # run there: this job and `pypto-lib-model` were pinned to aarch64 for all 43
+    # of them, so the first two-card runs on x86_64 are the ones that follow this
+    # change. Watch them.
     #
-    # Two things this evidence does NOT establish, so do not repeat them as
-    # fact. (1) That this job is the origin of the host's bad cards: over one
-    # morning the x86_64 host showed a failure wave across ALL its npu jobs,
-    # single-card `system-tests` / `system-tests-direct` included, and a
-    # two-card run of this job passed in the middle of it -- which it could not
-    # have done if the cards were globally wedged. A likelier reading is that
-    # some cards are bad at any given time and this job, needing two, draws one
-    # more often. (2) That the split is architectural: the 3 green x86_64 runs
-    # interleave with the red ones in time, so this is that host's health, not
-    # its ISA. Pinning buys a trustworthy signal; it does not diagnose the host.
+    # The earlier analysis also recorded two things its evidence did NOT
+    # establish, and both cut against ever restoring the pin. (1) That this job
+    # is the origin of the host's bad cards: over one morning the x86_64 host
+    # showed a failure wave across ALL its npu jobs, single-card `system-tests` /
+    # `system-tests-direct` included, and a two-card run of this job passed in
+    # the middle of it -- which it could not have done if the cards were globally
+    # wedged. A likelier reading is that some cards are bad at any given time and
+    # this job, needing two, draws one more often. (2) That the split is
+    # architectural: the 3 green x86_64 runs interleaved with the red ones in
+    # time, so this was that host's health, not its ISA.
     #
-    # Cost: the job no longer draws from the x86_64 half of the npu pool, so it
-    # can queue behind the aarch64 box for a two-card slot. #2525 dropped the
-    # arch label from every self-hosted job deliberately; remove this one again
-    # once multi-card comm stops wedging cards there -- it is not permanent.
-    runs-on: [self-hosted, linux, arm64, npu]
+    # So if the wedging returns, the thing to fix is the host again, not an arch
+    # label -- the aarch64 box is being decommissioned and will not be there to
+    # move to.
+    runs-on: [self-hosted, linux, npu]
     defaults:
       run:
         working-directory: dist-checkout
@@ -1475,6 +1566,19 @@ jobs:
           task-submit --device "$DEVICE_ID" --device-num 2 --timeout 3600 --max-time 1800 \
             --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && python -m pytest tests/st/distributed -v --device=\$TASK_DEVICE --ignore=tests/st/distributed/test_l2_multi_orch.py"
 
+      - name: Test multi-card cases outside tests/st/distributed
+        # Multi-card used to be selected by directory, so a test needing two
+        # cards anywhere else was collected by a single-card step and skipped
+        # itself from the body. `@pytest.mark.multi_card(n)` makes the
+        # requirement selectable, and this step is where those tests get the
+        # cards: test_benchmark_l3_surfaces_per_rank_timing had never once run.
+        run: |
+          source activate.sh
+          task-submit --device "$DEVICE_ID" --device-num 2 --timeout 3600 --max-time 900 \
+            --run "cd $GITHUB_WORKSPACE/dist-checkout && source activate.sh && python -m pytest \
+              tests/st -v -m multi_card --ignore=tests/st/distributed \
+              --device=\$TASK_DEVICE --platform=a2a3"
+
       - name: Kill orphaned task-submit tasks
         if: always()
         uses: ./.github/actions/kill-orphaned-tasks
@@ -1501,26 +1605,24 @@ jobs:
     # TEST MODE: keep the device runner and pin task-submit to its card (see
     # system-tests). FLIP TO PROD: cpu runner + `--device auto`.
     #
-    # Pinned to aarch64 as a PRECAUTION, weaker evidence than the pin on
-    # dist-system-tests. One step here is multi-card -- the DeepSeek moe example
+    # Runs on the whole `npu` pool, x86_64 half included. It was pinned to
+    # aarch64 as a PRECAUTION alongside dist-system-tests, on weaker evidence
+    # than that job's: one step here is multi-card -- the DeepSeek moe example
     # at `--ep 2` -- and a failing multi-card run is known to leave the cards it
     # borrowed unusable (see dist-system-tests for the 507018 -> 507033 cascade
-    # and the failing force_reset). `infra024-npu-a2a3-1..10` are ten runner
-    # instances on ONE machine sharing ONE set of cards, so damage there is not
-    # contained to the job that caused it.
+    # and the failing force_reset), on a host whose ten runner instances share
+    # ONE set of cards.
     #
-    # What is NOT established: that this job has ever wedged anything. Its moe
-    # step has never itself failed (1 pass on x86_64; otherwise skipped behind
-    # an earlier step), and the x86_64 host shows a host-wide npu failure wave
-    # that also takes down single-card jobs, so the two red runs here -- both in
-    # single-card Qwen3 steps -- are at least as likely to be victims of that
-    # wave as evidence of anything this job did. The pin buys insurance against
-    # a failure mode whose damage lands on OTHER jobs, not a fix for this one.
-    #
-    # Cost: nine single-card steps lose the x86_64 half of the pool to contain
-    # one multi-card step. This is the first thing to unpin -- do it as soon as
-    # the x86_64 host is healthy, or split the moe step into its own job.
-    runs-on: [self-hosted, linux, arm64, npu]
+    # It was always the first of the two to unpin, and it goes with
+    # dist-system-tests now that the x86_64 npu host has been repaired (see that
+    # job for the health data). Nothing here was ever shown to wedge anything:
+    # the moe step has never itself failed (1 pass on x86_64; otherwise skipped
+    # behind an earlier step), and the two red runs were both single-card Qwen3
+    # steps during a host-wide x86_64 npu failure wave that also took down
+    # single-card jobs. If multi-card runs start wedging cards again, split the
+    # moe step into its own job rather than reaching for an arch label -- nine
+    # single-card steps should not pay for one multi-card one.
+    runs-on: [self-hosted, linux, npu]
     defaults:
       run:
         working-directory: lib-checkout

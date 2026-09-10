@@ -496,6 +496,10 @@ class PTOCodegen : public CodegenBase {
     std::string source_type;
     std::string row_off_ssa;
     std::string col_off_ssa;
+    /// Original pure index expressions. Equal expressions can emit different
+    /// scalar SSAs, but still name the same slice/writeback window.
+    ir::ExprPtr row_offset;
+    ir::ExprPtr col_offset;
     std::string materialize_target_ssa;
     std::string materialize_target_type;
     std::optional<ir::MemorySpace> source_memory_space;
@@ -731,7 +735,7 @@ class PTOCodegen : public CodegenBase {
  protected:
   // Statement-entry dispatch guard: rejects any SplitAivScopeStmt that survived
   // to PTO codegen (it must be lowered and erased by LowerAutoVectorSplit,
-  // pass 21). The base visitor would otherwise silently unwrap it.
+  // pass 23). The base visitor would otherwise silently unwrap it.
   void VisitStmt(const ir::StmtPtr& stmt) override;
 
   // Override visitor methods for code generation - Statements

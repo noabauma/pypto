@@ -176,12 +176,14 @@ from pypto.ir.utils import (
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
+    AccPhase,
     AtomicType,
     CachePolicy,
     Expr,
     MemorySpace,
     PadValue,
     Span,
+    STPhase,
     TileLayout,
 )
 
@@ -422,8 +424,9 @@ def load(
             be an integer scalar — one extent per dimension, not a nested
             ``[start, extent]`` pair.
         target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
-            ``None`` (the default) leaves the space unset for the compiler to place.
-            MX-layout tensors require an explicit MemorySpace.Mat.
+            ``None`` (the default) leaves an ordinary load unset for the compiler
+            to place. MX-layout tensors default to MemorySpace.Mat so they can be
+            passed directly to ``matmul_mx`` and placed from its operand position.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts ``offsets + valid_shape`` stays inside the source and is
             rejected when that provably fails; ``clamp=True`` cuts the request back
@@ -471,6 +474,7 @@ def store(
     shapes: Sequence[IntLike] | None = None,
     *,
     atomic: AtomicType = AtomicType.None_,
+    st_phase: STPhase = STPhase.Unspecified,
 ) -> _TensorT:
     """Copy data from tile back to tensor.
 
@@ -492,6 +496,9 @@ def store(
             fp32 / bf16 / fp16 / int32 / int16 / int8. bf16 atomic-add is
             available on the Ascend910B (A2/A3) profile; it is not supported on
             A5, where an fp32 accumulator + cast is required instead.
+        st_phase: Consumer-side unit-flag phase. A producer that finishes with
+            ``acc_phase=pl.AccPhase.Final`` must be consumed by a store with
+            ``st_phase=pl.STPhase.Final`` so the unit flag is cleared.
 
     Returns:
         Tensor wrapping the store operation
@@ -503,11 +510,18 @@ def store(
         >>> result = store(tile, [0, 0, 0], tensor)
         >>> # atomic-add store (split-K)
         >>> result = store(partial, [0, 0], out, atomic=pl.AtomicType.Add)
+        >>> # clear the unit flag after a final phased accumulation
+        >>> result = store(acc, [0, 0], out, st_phase=pl.STPhase.Final)
     """
     normalized_offsets = _normalize_intlike(offsets)
     normalized_shapes = _normalize_intlike(shapes) if shapes is not None else None
     call_expr = _ir_ops.store(
-        tile.unwrap(), normalized_offsets, output_tensor.unwrap(), normalized_shapes, atomic=int(atomic)
+        tile.unwrap(),
+        normalized_offsets,
+        output_tensor.unwrap(),
+        normalized_shapes,
+        atomic=int(atomic),
+        st_phase=st_phase,
     )
     return output_tensor.__class__(expr=call_expr)
 
@@ -1283,6 +1297,7 @@ def cast(
     mode: str | int = "round",
     *,
     tmp: Tile | None = None,
+    saturation_mode: str | int | None = None,
 ) -> Tile:
     """Cast tile to target data type (element-wise).
 
@@ -1291,7 +1306,22 @@ def cast(
         target_type: Target data type (DataType)
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
-        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated.
+        tmp: Optional A2/A3 PTOAS scratch tile. Normally compiler-generated,
+             and only for a cast that opted out of saturation — the saturating
+             form is native and reads none.
+        saturation_mode: Destination saturation — ``"on"`` (1) clamps a
+             rounded value that falls outside the destination range to that
+             range; ``"off"`` (0) keeps the target's non-saturating
+             conversion, including its overflow and non-finite behavior.
+             **Defaults to** ``"on"`` **for an integer destination**:
+             nothing standard fixes what an overflowing conversion to an integer
+             produces, clamping is the safer of the two to get by accident, and
+             it is what the hardware converts natively. A float destination keeps
+             the target's own IEEE behavior (an out-of-range narrowing yields an
+             infinity) unless you ask otherwise. When the cast lowers to a chain
+             of native conversions, the mode applies to the final hop. On A2/A3 a
+             saturating narrowing cast needs no ``tmp``, so the compiler
+             generates none; a caller-supplied ``tmp`` is still honored.
 
     Returns:
         Tile wrapping the cast operation
@@ -1300,7 +1330,7 @@ def cast(
         >>> tile_fp32 = pl.tile.cast(tile_bf16, pl.FP32)
     """
     tmp_expr = None if tmp is None else tmp.unwrap()
-    call_expr = _ir_ops.cast(tile.unwrap(), target_type, mode, tmp=tmp_expr)
+    call_expr = _ir_ops.cast(tile.unwrap(), target_type, mode, tmp=tmp_expr, saturation_mode=saturation_mode)
     return Tile(expr=call_expr)
 
 
@@ -1339,10 +1369,9 @@ def quant_mx(
         Cube RHS layout; scale col/col NN.
 
     Note:
-        ``quant_mx`` and ``matmul_mx`` cannot currently share one InCore mixed
-        task. Stage the quantized data and scale through GM between separate
-        AIV and AIC kernels; automatic cross-core data+scale transport is a
-        follow-up.
+        On Ascend950, ``quant_mx`` and ``matmul_mx`` may share one InCore mixed
+        task. The compiler carries both generated results over V2C; the
+        FP8E8M0 scale keeps its logical MX scale layout.
     """
     if group_axis not in (0, 1):
         raise ValueError(f"pl.quant_mx group_axis must be 0 or 1, but got {group_axis!r}")
@@ -1572,7 +1601,7 @@ def matmul_mx_bias(lhs: Tile, lhs_scale: Tile, rhs: Tile, rhs_scale: Tile, bias:
     return Tile(expr=call_expr)
 
 
-def gemv(lhs: Tile, rhs: Tile, acc_phase: str = "unspecified") -> Tile:
+def gemv(lhs: Tile, rhs: Tile, acc_phase: AccPhase = AccPhase.Unspecified) -> Tile:
     """General Matrix-Vector multiplication: C[1,N] = A[1,K] @ B[K,N].
 
     ``lhs`` must have exactly one physical and logical row. The rhs logical K
@@ -1582,7 +1611,8 @@ def gemv(lhs: Tile, rhs: Tile, acc_phase: str = "unspecified") -> Tile:
     Args:
         lhs: Row vector tile [1, K]
         rhs: Right-hand side tile [K, N]
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``pl.AccPhase.Partial``
+            for intermediate chunks and ``pl.AccPhase.Final`` for the last chunk.
 
     Returns:
         Tile wrapping the gemv operation
@@ -1595,7 +1625,7 @@ def gemv_acc(
     acc: Tile,
     lhs: Tile,
     rhs: Tile,
-    acc_phase: str = "unspecified",
+    acc_phase: AccPhase = AccPhase.Unspecified,
     *,
     init_cond: BoolLike | None = None,
 ) -> Tile:
@@ -1625,7 +1655,8 @@ def gemv_acc(
         acc: Accumulator tile [1, N]
         lhs: Row vector tile [1, K]
         rhs: Right-hand side tile [K, N]
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``pl.AccPhase.Partial``
+            for intermediate chunks and ``pl.AccPhase.Final`` for the last chunk.
         init_cond: Optional predicate selecting overwrite over accumulate
 
     Returns:
@@ -1641,7 +1672,12 @@ def gemv_acc(
     return Tile(expr=call_expr)
 
 
-def gemv_bias(lhs: Tile, rhs: Tile, bias: Tile, acc_phase: str = "unspecified") -> Tile:
+def gemv_bias(
+    lhs: Tile,
+    rhs: Tile,
+    bias: Tile,
+    acc_phase: AccPhase = AccPhase.Unspecified,
+) -> Tile:
     """GEMV with bias add: C[1,N] = A[1,K] @ B[K,N] + bias[1,N].
 
     ``bias`` must use the GEMV output dtype and its valid shape must cover the
@@ -1653,7 +1689,8 @@ def gemv_bias(lhs: Tile, rhs: Tile, bias: Tile, acc_phase: str = "unspecified") 
         rhs: Right-hand side tile [K, N]
         bias: Bias tile [1, N] with the accumulator dtype (FP32 for
             floating-point matrix operands, INT32 for integer matrix operands)
-        acc_phase: Accumulation phase: ``"unspecified"``, ``"partial"``, or ``"final"``
+        acc_phase: Producer-side unit-flag phase. Use ``pl.AccPhase.Partial``
+            for intermediate chunks and ``pl.AccPhase.Final`` for the last chunk.
 
     Returns:
         Tile wrapping the gemv_bias operation
@@ -1745,7 +1782,8 @@ def col_sum(tile: Tile, tmp_tile: Tile | None = None) -> Tile:
     Args:
         tile: Input tile
         tmp_tile: Optional scratch tile (same shape/dtype as input) that selects
-            the binary-tree reduction path.
+            the binary-tree reduction path. Unlike the arg reductions, this is not
+            enforced by type deduction -- pass the input's shape and dtype.
 
     Returns:
         Tile wrapping the col_sum operation
@@ -1840,7 +1878,7 @@ def col_argmax(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
 
     Returns:
         Tile wrapping the col_argmax operation
@@ -1857,7 +1895,7 @@ def col_argmin(tile: Tile, tmp_tile: Tile) -> Tile:
 
     Args:
         tile: Input tile
-        tmp_tile: Temporary tile
+        tmp_tile: Scratch tile with exactly the same shape and dtype as ``tile``
 
     Returns:
         Tile wrapping the col_argmin operation
@@ -2824,14 +2862,14 @@ def not_(tile: Tile) -> Tile:
 
 
 def addc(lhs: Tile, rhs: Tile, rhs2: Tile) -> Tile:
-    """Element-wise addition of three tiles.
+    """Element-wise carry addition of three tiles.
 
-    Computes lhs + rhs + rhs2 element-wise. Maps to the TADDC hardware intrinsic.
+    Computes ``src0 + src1 + carry`` element-wise. Maps to TADDC.
 
     Args:
-        lhs: Left-hand side tile
-        rhs: Right-hand side tile
-        rhs2: Third tile
+        lhs: First source tile
+        rhs: Second source tile
+        rhs2: Per-element carry-in tile, normally containing 0 or 1
 
     Returns:
         Tile wrapping the addc operation
@@ -2841,14 +2879,14 @@ def addc(lhs: Tile, rhs: Tile, rhs2: Tile) -> Tile:
 
 
 def subc(lhs: Tile, rhs: Tile, rhs2: Tile) -> Tile:
-    """Element-wise subtraction of three tiles.
+    """Element-wise carry subtraction of three tiles.
 
-    Computes lhs - rhs - rhs2 element-wise. Maps to the TSUBC hardware intrinsic.
+    Computes ``src0 - src1 + carry`` element-wise. Maps to TSUBC.
 
     Args:
-        lhs: Left-hand side tile
-        rhs: Right-hand side tile
-        rhs2: Third tile
+        lhs: Minuend tile
+        rhs: Subtrahend tile
+        rhs2: Per-element carry-in tile, normally containing 0 or 1
 
     Returns:
         Tile wrapping the subc operation
@@ -2858,14 +2896,14 @@ def subc(lhs: Tile, rhs: Tile, rhs2: Tile) -> Tile:
 
 
 def addsc(lhs: Tile, rhs: int | float | Expr | Scalar, rhs2: Tile) -> Tile:
-    """Element-wise addition of tile, scalar, and tile.
+    """Element-wise scalar carry addition.
 
-    Computes lhs + rhs + rhs2 element-wise. Maps to the TADDSC hardware intrinsic.
+    Computes ``src0 + scalar + carry`` element-wise. Maps to TADDSC.
 
     Args:
-        lhs: Left-hand side tile
-        rhs: Scalar value
-        rhs2: Third tile
+        lhs: Source tile
+        rhs: Scalar addend with the same dtype as ``lhs``
+        rhs2: Per-element carry-in tile, normally containing 0 or 1
 
     Returns:
         Tile wrapping the addsc operation
@@ -2876,14 +2914,14 @@ def addsc(lhs: Tile, rhs: int | float | Expr | Scalar, rhs2: Tile) -> Tile:
 
 
 def subsc(lhs: Tile, rhs: int | float | Expr | Scalar, rhs2: Tile) -> Tile:
-    """Element-wise subtraction of tile, scalar, and tile.
+    """Element-wise scalar carry subtraction.
 
-    Computes lhs - rhs - rhs2 element-wise. Maps to the TSUBSC hardware intrinsic.
+    Computes ``src0 - scalar + carry`` element-wise. Maps to TSUBSC.
 
     Args:
-        lhs: Left-hand side tile
-        rhs: Scalar value
-        rhs2: Third tile
+        lhs: Minuend tile
+        rhs: Scalar subtrahend with the same dtype as ``lhs``
+        rhs2: Per-element carry-in tile, normally containing 0 or 1
 
     Returns:
         Tile wrapping the subsc operation

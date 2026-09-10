@@ -124,4 +124,5 @@ is exactly why the two-phase and ring variants exist.
 - [01-collectives](01-collectives.md) §AllReduce — the reference for mesh mode
 - [09-barrier](09-barrier.md) — the notify/wait barrier reused here (step 04)
 - [10-remote_load_store](10-remote_load_store.md) — `remote_load` (step 05)
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [14-allreduce_two_phase](14-allreduce_two_phase.md) — the same result in roughly half the traffic

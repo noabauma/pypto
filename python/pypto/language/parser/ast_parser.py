@@ -16,7 +16,7 @@ import warnings
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard, cast
 
 from pypto._function_attrs import AUTO_SCOPE_ATTR, EXTERNAL_SOURCE_ATTR
 from pypto.ir import IRBuilder
@@ -615,18 +615,27 @@ class _AtKwargState:
     # ``dump_vars`` transfer), and the outliner translates it into the
     # synthesised dispatch's ``kAttrDumpVars``.
     dumps_kw: "ast.keyword | None" = field(default=None)
+    # ``predicate=(t[i] > 0)`` AST kept verbatim; resolved by
+    # ``_parse_at_predicate`` only after the level / nesting gates have run, so a
+    # misplaced predicate reports *that* rather than a shape error. The parsed
+    # comparison Expr lands on ScopeStmt.attrs[predicate] and is moved onto
+    # ``Submit::predicate_`` by the outliner.
+    predicate_kw: "ast.keyword | None" = field(default=None)
     windowize: bool = False
 
 
 _SPMD_SCOPE_NAME_SUFFIX = "_spmd"
 
 # ``pl.at()`` kwargs whose AST node is stashed verbatim on ``_AtKwargState`` for
-# later resolution (duplicate-checked, then resolved by ``_parse_at_meta``).
+# later resolution: ``deps`` / ``no_dep_args`` / ``dumps`` are duplicate-checked
+# then resolved by ``_parse_at_meta``, and ``predicate`` by
+# ``_parse_at_predicate``.
 # Maps the kwarg name to its ``_AtKwargState`` field.
 _AT_STASH_KWARGS = {
     "deps": "deps_kw",
     "no_dep_args": "no_dep_args_kw",
     "dumps": "dumps_kw",
+    "predicate": "predicate_kw",
 }
 
 # Call attrs that never appear inside a printed ``attrs={...}`` dict. On
@@ -639,6 +648,11 @@ _TASK_DUMMY_ONLY_ATTRS = frozenset({"manual_dep_edges", "dummy_task"})
 # The op a bare ``predicate=None`` lowers to. Resolved through the registry getter so a rename
 # fails at import instead of silently dropping the hint from the error message below.
 _TASK_INVALID_OP = ir.get_op("system.task_invalid").name
+
+# Mirrors the runtime's ``NUM_TASK_TIMING_SLOTS`` (runtime/src/common/platform/include/common/device_phase.h),
+# re-spelled here since the parser validates ``timing_slot=`` before it ever reaches
+# codegen's own mirror, ``kRuntimeNumTaskTimingSlots`` in orchestration_codegen.cpp.
+_NUM_TASK_TIMING_SLOTS = 16
 
 
 def _split_spmd_for_loop_name_hints(name_hint: str) -> tuple[str, str]:
@@ -1354,6 +1368,8 @@ class ASTParser:
             self.parse_annotated_assignment(stmt)
         elif isinstance(stmt, ast.Assign):
             self.parse_assignment(stmt)
+        elif isinstance(stmt, ast.AugAssign):
+            self._reject_augmented_assignment(stmt)
         elif isinstance(stmt, ast.For):
             self.parse_for_loop(stmt)
         elif isinstance(stmt, ast.While):
@@ -1387,6 +1403,21 @@ class ASTParser:
         residue = self.builder.pop_pending_leading_comments()
         if residue:
             self._requeue_comments_after(stmt, residue)
+
+    def _reject_augmented_assignment(self, stmt: ast.AugAssign) -> NoReturn:
+        target = ast.unparse(stmt.target)
+        hint = f"Use an explicit assignment to {target}."
+        if isinstance(stmt.op, ast.Add):
+            hint += (
+                f" For matrix accumulation, write {target} = pl.matmul_acc("
+                f"{target}, lhs, rhs, init_cond=(k0 == 0)); init_cond selects "
+                "overwrite on the first reduction step."
+            )
+        raise UnsupportedFeatureError(
+            f"Augmented assignment is not supported in DSL functions: {ast.unparse(stmt)}",
+            span=self.span_tracker.get_span(stmt),
+            hint=hint,
+        )
 
     def _parse_body_siblings(self, body: Sequence[ast.stmt]) -> None:
         """Parse a block's body stmts, applying stale-pending sweeps between siblings.
@@ -3905,7 +3936,7 @@ class ASTParser:
                 span=self.span_tracker.get_span(kw),
                 hint=(
                     "Supported arguments: level, role, optimizations, deps, no_dep_args, dumps, "
-                    "allow_early_resolve, name_hint, windowize"
+                    "allow_early_resolve, predicate, name_hint, windowize"
                 ),
             )
 
@@ -4395,25 +4426,30 @@ class ASTParser:
         return kw.value.value
 
     # ``pl.spmd()`` keywords whose *value* the caller interprets. ``deps`` is
-    # conditionally legal (see _validate_spmd_kwarg_name).
+    # legal on every form: declaring edges is orthogonal to capturing the
+    # dispatch TaskId with ``as tid`` (see _parse_spmd_kwargs).
     _SPMD_KWARGS = frozenset(
-        {"core_num", "sync_start", "name_hint", "optimizations", "allow_early_resolve", "predicate"}
+        {
+            "core_num",
+            "sync_start",
+            "name_hint",
+            "optimizations",
+            "deps",
+            "allow_early_resolve",
+            "predicate",
+        }
     )
 
-    def _validate_spmd_kwarg_name(
-        self, kw: ast.keyword, anchor: ast.AST, *, usage_hint: str, allow_deps: bool
-    ) -> None:
+    def _validate_spmd_kwarg_name(self, kw: ast.keyword, anchor: ast.AST, *, usage_hint: str) -> None:
         """Reject a ``pl.spmd()`` keyword that is not legal in this context.
 
         Split out of :meth:`_parse_spmd_kwargs` so that method handles only what
         each keyword's *value* means, while "is this keyword name accepted here"
-        lives in one place. Covers three rejections:
+        lives in one place. Covers two rejections:
 
         * ``**kwargs`` unpacking (``kw.arg is None``) — the parser must see each
           keyword literally.
-        * ``deps=`` outside the ``as tid`` capture form, where there is no TaskId
-          to hang the edges on.
-        * any unrecognised name, whose hint lists the keywords valid *here*.
+        * any unrecognised name, whose hint lists the keywords valid here.
         """
         if kw.arg is None:
             # `pl.spmd(**cfg)` — ast.keyword.arg is None for **kwargs unpacking.
@@ -4423,24 +4459,13 @@ class ASTParser:
                 span=self.span_tracker.get_span(kw.value),
                 hint=usage_hint,
             )
-        if kw.arg == "deps" and not allow_deps:
-            raise ParserSyntaxError(
-                "pl.spmd() does not accept 'deps=' here",
-                span=self.span_tracker.get_span(kw.value),
-                hint="Use `with pl.spmd(n, deps=[...]) as tid:` (the with-form) to "
-                "declare explicit TaskId deps, or `out, tid = pl.spmd_submit(..., "
-                "deps=[...])` for the single-call form.",
-            )
-        if kw.arg == "deps" or kw.arg in self._SPMD_KWARGS:
+        if kw.arg in self._SPMD_KWARGS:
             return
-        supported = "'sync_start', 'name_hint', 'optimizations', "
-        if allow_deps:
-            supported += "'deps', "
-        supported += "'allow_early_resolve', 'predicate'"
         raise ParserSyntaxError(
             f"pl.spmd() got unexpected keyword argument '{kw.arg}'",
             span=self.span_tracker.get_span(anchor),
-            hint=f"Supported keywords: {supported}",
+            hint="Supported keywords: 'sync_start', 'name_hint', 'optimizations', 'deps', "
+            "'allow_early_resolve', 'predicate'",
         )
 
     def _parse_spmd_kwargs(
@@ -4449,7 +4474,6 @@ class ASTParser:
         call: ast.Call,
         *,
         usage_hint: str,
-        allow_deps: bool = False,
     ) -> tuple[
         "ir.Expr", bool, str, "ir.SplitMode | None", "int | None", "list[ir.Var]", bool, "ir.Expr | None"
     ]:
@@ -4466,11 +4490,14 @@ class ASTParser:
         ``optimizations=[...]`` accepts only ``pl.split(MODE)`` — see
         :meth:`_parse_spmd_optimizations_list`.
 
-        ``deps=[...]`` is accepted only when ``allow_deps`` is True (the
-        ``with pl.spmd(...) as tid:`` form). It takes the same shapes as
+        ``deps=[...]`` is accepted on every form. It takes the same shapes as
         ``pl.submit(..., deps=)`` / ``pl.at(..., deps=)`` — producer TaskId
         ``Scalar[TASK_ID]`` Vars, an ``Array[N, TASK_ID]`` carry, or the ``None``
-        sentinel — resolved via :meth:`_parse_submit_deps_kwarg`.
+        sentinel — resolved via :meth:`_parse_submit_deps_kwarg`. Capturing the
+        dispatch TaskId with ``as tid`` is orthogonal: a scope that declares
+        edges without capturing one still lowers to a ``Submit`` (the Spmd
+        outliner synthesises the unused TaskId Var), exactly as
+        ``pl.at(..., deps=[...])`` already does without an ``as`` clause.
 
         ``allow_early_resolve=True/False`` is a speculative early-dispatch hint
         (same as ``pl.submit`` / ``pl.at``); it is always accepted here (it needs
@@ -4481,10 +4508,10 @@ class ASTParser:
         the same validation as ``pl.spmd_submit(..., predicate=)``, shared via
         :meth:`_parse_submit_predicate_kwarg`. It rides on the ``SpmdScopeStmt``
         until ``OutlineSpmdScopes`` moves it onto the synthesised ``Submit``.
-        Like ``allow_early_resolve`` it needs no ``as tid`` (the outliner
-        synthesises a TaskId Var when the scope has none) and is rejected by the
-        same cluster-nesting guard. The producer-in-``deps=`` contract is checked
-        below, once ``dep_vars`` is resolved.
+        Like ``allow_early_resolve`` and ``deps=`` it needs no ``as tid`` (the
+        outliner synthesises a TaskId Var when the scope has none) and is
+        rejected by the same cluster-nesting guard. The producer-in-``deps=``
+        contract is checked below, once ``dep_vars`` is resolved.
         """
         if len(call.args) > 1:
             raise ParserSyntaxError(
@@ -4503,7 +4530,7 @@ class ASTParser:
         allow_early_resolve: bool = False
         predicate: ir.Expr | None = None
         for kw in call.keywords:
-            self._validate_spmd_kwarg_name(kw, anchor, usage_hint=usage_hint, allow_deps=allow_deps)
+            self._validate_spmd_kwarg_name(kw, anchor, usage_hint=usage_hint)
             if kw.arg == "name_hint":
                 name_hint = self._parse_scope_name_hint(kw.value, "pl.spmd()")
             elif kw.arg == "core_num":
@@ -4539,18 +4566,11 @@ class ASTParser:
         # Producer-in-deps contract, checked once dep_vars is known. Same
         # best-effort spot check as pl.spmd_submit: the scheduler reads the
         # operand at the dispatch point, so its producing task must be a
-        # dependency or the read may observe a stale value. On the plain /
-        # for-forms deps= is unavailable, so a tracked producer reports here and
-        # the error steers the author to the ``as tid`` form.
+        # dependency or the read may observe a stale value. Every pl.spmd form
+        # accepts deps=, so the remediation hint is always "add the producer".
         if predicate is not None:
             self._validate_predicate_deps(
-                "pl.spmd()",
-                predicate,
-                dep_vars,
-                self.span_tracker.get_span(anchor),
-                # allow_deps is False on the plain / for-forms, where deps= is
-                # rejected outright — the hint must not tell the author to add one.
-                deps_accepted=allow_deps,
+                "pl.spmd()", predicate, dep_vars, self.span_tracker.get_span(anchor)
             )
         return (
             core_num,
@@ -4564,23 +4584,30 @@ class ASTParser:
         )
 
     def _reject_spmd_submit_only_kwargs_in_cluster(
-        self, allow_early_resolve: bool, predicate: "ir.Expr | None", span: "ir.Span"
+        self,
+        dep_vars: "list[ir.Var]",
+        allow_early_resolve: bool,
+        predicate: "ir.Expr | None",
+        span: "ir.Span",
     ) -> None:
         """Reject Submit-only ``pl.spmd()`` kwargs on a ``pl.cluster()``-nested scope.
 
-        Covers ``allow_early_resolve=True`` and ``predicate=(...)``: both are
-        carried by ``Submit`` fields with no plain-``Call`` equivalent. A
-        cluster-nested Spmd scope is unwrapped into the Group function by
-        ``OutlineClusterScopes`` (``UnwrapNestedSpmd``) and never lowers to a
-        ``Submit``, so either would be silently dropped. Raise a clear parse-time
-        error instead, mirroring the ``as tid`` cluster rejection in
-        :meth:`_parse_spmd_scope_with_tid`. ``UnwrapNestedSpmd`` re-asserts this
-        for hand-built / deserialized IR.
+        Covers ``deps=[...]``, ``allow_early_resolve=True`` and
+        ``predicate=(...)``: each is carried by a ``Submit`` field (``deps_`` /
+        ``allow_early_resolve_`` / ``predicate_``) with no plain-``Call``
+        equivalent. A cluster-nested Spmd scope is unwrapped into the Group
+        function by ``OutlineClusterScopes`` (``UnwrapNestedSpmd``) and never
+        lowers to a ``Submit``, so any of them would be silently dropped. Raise a
+        clear parse-time error instead, mirroring the ``as tid`` cluster
+        rejection in :meth:`_parse_spmd_scope_with_tid`. ``UnwrapNestedSpmd``
+        re-asserts this for hand-built / deserialized IR.
         """
         if not self._is_inside_scope(ir.ScopeKind.Cluster):
             return
         # Report the kwarg the user actually wrote, so the message names it.
-        if allow_early_resolve:
+        if dep_vars:
+            kwarg, lost = "deps=[...]", "the dependency edges"
+        elif allow_early_resolve:
             kwarg, lost = "allow_early_resolve=True", "the early-dispatch hint"
         elif predicate is not None:
             kwarg, lost = "predicate=(...)", "the dispatch predicate"
@@ -4594,6 +4621,42 @@ class ASTParser:
             hint=f"Use a standalone `with pl.spmd(..., {kwarg}):` (implicit cluster) to keep it.",
         )
 
+    @staticmethod
+    def _build_spmd_scope_attrs(
+        dep_vars: "list[ir.Var]",
+        allow_early_resolve: bool,
+        predicate: "ir.Expr | None",
+        task_id_var: "ir.Var | None" = None,
+    ) -> "list[tuple[str, Any]]":
+        """Build a ``SpmdScopeStmt``'s attr list in canonical order.
+
+        The single source of the ordering shared by all three ``pl.spmd`` forms:
+        ``manual_dep_edges``, ``task_id_var`` (``as tid`` only), then
+        ``allow_early_resolve``, then ``predicate`` — mirroring
+        :meth:`_parse_at_meta` for ``pl.at`` scopes.
+
+        **The order is load-bearing.** ``structural_equal`` compares scope attrs
+        positionally, so a print -> reparse cycle only round-trips while this
+        matches the printer's emission order (``PrintScopeDepsAttr`` ->
+        ``PrintScopeTaskIdVarSuffix`` -> ``PrintScopeAllowEarlyResolveAttr`` ->
+        ``PrintScopePredicateAttr`` in ``python_printer.cpp``). Keeping it in one
+        place is what makes adding a kwarg a two-file change instead of a
+        four-site one.
+
+        Each entry is omitted when unset, so a plain ``with pl.spmd(n):`` yields
+        an empty list (the caller passes ``attrs=... or None``).
+        """
+        attrs: list[tuple[str, Any]] = []
+        if dep_vars:
+            attrs.append(("manual_dep_edges", dep_vars))
+        if task_id_var is not None:
+            attrs.append(("task_id_var", task_id_var))
+        if allow_early_resolve:
+            attrs.append(("allow_early_resolve", True))
+        if predicate is not None:
+            attrs.append(("predicate", predicate))
+        return attrs
+
     def _reject_submit_dispatch_metadata_in_cluster(
         self,
         *,
@@ -4602,6 +4665,7 @@ class ASTParser:
         sync_start: bool,
         allow_early_resolve: bool,
         predicate: "ir.Expr | None",
+        timing_slot: int | None,
         span: "ir.Span",
     ) -> None:
         """Reject per-task metadata on a Submit nested inside ``pl.cluster()``.
@@ -4625,6 +4689,8 @@ class ASTParser:
             metadata_fields.append("allow_early_resolve")
         if predicate is not None:
             metadata_fields.append("predicate")
+        if timing_slot is not None:
+            metadata_fields.append("timing_slot")
         if not metadata_fields:
             return
 
@@ -4903,31 +4969,27 @@ class ASTParser:
         Two forms, differing only in whether the grid dispatch's producer TaskId is
         captured — the body shape is identical (see :meth:`_emit_spmd_body`):
 
-        * ``with pl.spmd(n):`` — no captured TaskId, no ``deps=``. Accepts either a
-          dispatch body calling a pre-defined kernel (direct dispatch) or an inline
-          body auto-outlined into an InCore kernel (like ``for i in pl.spmd(n):``,
+        * ``with pl.spmd(n):`` — no captured TaskId. Accepts either a dispatch
+          body calling a pre-defined kernel (direct dispatch) or an inline body
+          auto-outlined into an InCore kernel (like ``for i in pl.spmd(n):``,
           minus the auto-bound loop var — read the per-block index inside via
           ``pl.tile.get_block_idx()``).
         * ``with pl.spmd(n, deps=[...]) as tid:`` — same body shapes, and
           additionally captures the producer ``Scalar[TASK_ID]`` (mirrors
           ``with pl.at(...) as tid:``) so it can feed a ``deps=`` edge.
 
-        TaskId capture and inline bodies are orthogonal: the inline body is outlined
-        the same way with or without ``as tid``; ``as tid`` only adds the
-        ``task_id_var`` attr that makes the dispatch lower to an ``ir.Submit``.
+        TaskId capture, ``deps=`` and inline bodies are all orthogonal: the inline
+        body is outlined the same way with or without ``as tid``; ``as tid`` only
+        adds the ``task_id_var`` attr. ``deps=`` alone is enough to force the
+        ``ir.Submit`` shape — the Spmd outliner synthesises an unused TaskId Var
+        for a scope that declares edges without capturing one, the same way
+        ``pl.at(..., deps=[...])`` works without an ``as`` clause.
         """
         with_hint = (
             "Use 'with pl.spmd(4):' with a body that dispatches a 'self.<kernel>(...)' call "
             "or reads 'pl.tile.get_block_idx()', or 'with pl.spmd(4) as tid:' to also "
             "capture the dispatch TaskId."
         )
-        # ``deps=`` is accepted ONLY with ``as tid`` — gate it by keyword presence,
-        # not by the resolved list being non-empty. _parse_submit_deps_kwarg
-        # normalizes ``deps=[]`` / ``deps=[None]`` to ``[]``, so a truthiness check
-        # would silently accept those unsupported forms on the plain with-form.
-        # Passing allow_deps=(optional_vars is not None) makes _parse_spmd_kwargs
-        # reject any ``deps=`` on the non-capturing form (and keeps its "supported
-        # keywords" hint accurate).
         (
             core_num,
             sync_start,
@@ -4937,9 +4999,7 @@ class ASTParser:
             dep_vars,
             allow_early_resolve,
             predicate,
-        ) = self._parse_spmd_kwargs(
-            stmt, context_expr, usage_hint=with_hint, allow_deps=optional_vars is not None
-        )
+        ) = self._parse_spmd_kwargs(stmt, context_expr, usage_hint=with_hint)
         scope_kind = scope_kind_map["spmd"]
         span = self.span_tracker.get_span(stmt)
 
@@ -4960,26 +5020,23 @@ class ASTParser:
             )
             return
 
-        # ``allow_early_resolve`` opts the grid dispatch into speculative
-        # early-dispatch and ``predicate`` gates it at the dispatch point (both
-        # mirror pl.submit / pl.spmd_submit). A cluster-nested pl.spmd is
-        # unwrapped into the Group function by OutlineClusterScopes and never
-        # lowers to a Submit, so either would be silently dropped — reject them
-        # here (mirrors the ``as tid`` cluster rejection in
-        # _parse_spmd_scope_with_tid).
-        self._reject_spmd_submit_only_kwargs_in_cluster(allow_early_resolve, predicate, span)
-        spmd_attrs: list[tuple[str, Any]] = [("allow_early_resolve", True)] if allow_early_resolve else []
-        # Canonical attr order: allow_early_resolve then predicate (matches the
-        # ``as tid`` form) so a print -> reparse compares equal under
-        # structural_equal's positional attr check.
-        if predicate is not None:
-            spmd_attrs.append(("predicate", predicate))
+        # ``deps=`` declares explicit producer edges, ``allow_early_resolve`` opts
+        # the grid dispatch into speculative early-dispatch, and ``predicate``
+        # gates it at the dispatch point (all three mirror pl.submit /
+        # pl.spmd_submit). A cluster-nested pl.spmd is unwrapped into the Group
+        # function by OutlineClusterScopes and never lowers to a Submit, so any
+        # of them would be silently dropped — reject them here (mirrors the
+        # ``as tid`` cluster rejection in _parse_spmd_scope_with_tid).
+        self._reject_spmd_submit_only_kwargs_in_cluster(dep_vars, allow_early_resolve, predicate, span)
+        # No task_id_var — this form captures none; the rest of the canonical
+        # order is shared with the other two forms.
+        spmd_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate)
 
-        # No ``as tid``: the plain with-form. ``deps=`` was already rejected above
-        # (allow_deps=False), so dep_vars is empty here. The shared helper leaves a
-        # dispatch body unwrapped and outlines an inline body into a synthetic
-        # InCore kernel — identical to the ``as tid`` form, minus the captured
-        # TaskId.
+        # No ``as tid``: the plain with-form. Any ``deps=`` rides on the scope as
+        # ``manual_dep_edges`` and the Spmd outliner synthesises the TaskId Var it
+        # needs to emit a Submit. The shared helper leaves a dispatch body
+        # unwrapped and outlines an inline body into a synthetic InCore kernel —
+        # identical to the ``as tid`` form, minus the captured TaskId.
         self._emit_spmd_body(
             stmt,
             span,
@@ -5044,26 +5101,13 @@ class ASTParser:
                 hint="Use `with pl.spmd(...) as tid:` (single name; nested tuples are not allowed).",
             )
 
-        # Canonical attr order (deps, task_id_var, allow_early_resolve,
-        # predicate) mirrors _parse_at_meta so a print -> reparse cycle compares
-        # equal under structural_equal's positional attr check.
-        scope_attrs: list[tuple[str, Any]] = []
-        if dep_vars:
-            scope_attrs.append(("manual_dep_edges", dep_vars))
+        # ``task_id_var`` is the only attr unique to this form. The Spmd outliner
+        # reads each one off the scope and threads it onto the synthesised Submit;
+        # ``predicate`` in particular carries live SSA Vars (the operand tensor and
+        # its indices), which ConvertToSSA versions via SubstScopeAttrs.
         tid_var = self.builder.var(optional_vars.id, ir.ScalarType(DataType.TASK_ID), span=span)
         self.scope_manager.define_var(optional_vars.id, tid_var, span=span)
-        scope_attrs.append(("task_id_var", tid_var))
-        # ``allow_early_resolve`` last (canonical order) — the Spmd outliner reads
-        # it off the scope and threads it onto the synthesised Submit, exactly as
-        # _parse_at_meta does for pl.at scopes.
-        if allow_early_resolve:
-            scope_attrs.append(("allow_early_resolve", True))
-        # ``predicate`` after it — an Expr (not a flag), read off the scope by the
-        # Spmd outliner and moved onto ``Submit.predicate``. It carries live SSA
-        # Vars (the operand tensor and its indices), which ConvertToSSA versions
-        # via SubstScopeAttrs.
-        if predicate is not None:
-            scope_attrs.append(("predicate", predicate))
+        scope_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate, tid_var)
 
         # Emit the transient ``AssignStmt(tid, system.task_invalid())`` placeholder
         # one stmt BEFORE the scope so ConvertToSSA has a def for the tid Var; the
@@ -5166,31 +5210,31 @@ class ASTParser:
                     hint=spmd_hint,
                 )
 
-        # The for-form does not capture a TaskId, so it rejects deps= (allow_deps
-        # defaults False): use the with-form `with pl.spmd(n, deps=[...]) as tid:`
-        # to wire explicit deps. dep_vars is therefore always empty here.
+        # The for-form captures no TaskId, but ``deps=`` does not need one: the
+        # edges ride on the SpmdScopeStmt and the Spmd outliner synthesises the
+        # TaskId Var required to emit a Submit. Use the with-form
+        # `with pl.spmd(n, deps=[...]) as tid:` when the dispatch must also be
+        # nameable as a later task's dependency.
         (
             core_num,
             sync_start,
             name_hint,
             split_mode,
             split_slot_num,
-            _,
+            dep_vars,
             allow_early_resolve,
             predicate,
         ) = self._parse_spmd_kwargs(stmt, iter_call, usage_hint=spmd_hint)
         spmd_name_hint, incore_name_hint = _split_spmd_for_loop_name_hints(name_hint)
 
         span = self.span_tracker.get_span(stmt)
-        # ``allow_early_resolve`` / ``predicate`` ride on the SpmdScopeStmt (read
-        # by the Spmd outliner onto the synthesised Submit). A cluster-nested
-        # pl.spmd is unwrapped into the Group and never produces a Submit, so
-        # reject them there (mirrors the with-form / as-tid guards).
-        self._reject_spmd_submit_only_kwargs_in_cluster(allow_early_resolve, predicate, span)
-        spmd_attrs: list[tuple[str, Any]] = [("allow_early_resolve", True)] if allow_early_resolve else []
-        # Canonical attr order — see the with-form.
-        if predicate is not None:
-            spmd_attrs.append(("predicate", predicate))
+        # ``deps=`` / ``allow_early_resolve`` / ``predicate`` ride on the
+        # SpmdScopeStmt (read by the Spmd outliner onto the synthesised Submit).
+        # A cluster-nested pl.spmd is unwrapped into the Group and never produces
+        # a Submit, so reject them there (mirrors the with-form / as-tid guards).
+        self._reject_spmd_submit_only_kwargs_in_cluster(dep_vars, allow_early_resolve, predicate, span)
+        # No task_id_var — the for-form captures none (see the with-form).
+        spmd_attrs = self._build_spmd_scope_attrs(dep_vars, allow_early_resolve, predicate)
         # Merge forward-sticky pl.dump_tag tensors onto the auto-outlined InCore
         # scope — the kernel the loop body lowers to. The with-form (pl.at /
         # pl.spmd / pl.cluster) routes through _parse_scope_body for this; the
@@ -5253,7 +5297,7 @@ class ASTParser:
         ``if`` — and carries the requested ``SplitMode`` on
         ``SplitAivScopeStmt::split_``. The loop variable is bound to
         ``pl.tile.get_subblock_idx()`` (the AIV lane / sub-core index) as the
-        first statement of the region body. ``LowerAutoVectorSplit`` (pass 20)
+        first statement of the region body. ``LowerAutoVectorSplit`` (pass 23)
         consumes and erases the node; it never reaches codegen.
         """
         split_aiv_hint = (
@@ -5349,7 +5393,7 @@ class ASTParser:
 
         # Build a first-class SplitAivScopeStmt region. The region body begins
         # with ``aiv_id = pl.tile.get_subblock_idx()`` and carries the requested
-        # SplitMode on the node; LowerAutoVectorSplit (pass 20) consumes it.
+        # SplitMode on the node; LowerAutoVectorSplit (pass 23) consumes it.
         #
         # FLATTEN: when the region is ALREADY in a core context, emit it in place.
         # The wrapper below exists only to give OutlineIncoreScopes something to
@@ -5508,6 +5552,100 @@ class ASTParser:
                 self._discard_tail_block_comments(stmt.body, upper_line=stmt.end_lineno)
                 self.scope_manager.exit_scope(leak_vars=True)
 
+    #: Function types whose body is a device-side kernel, where a Graph region
+    #: has nothing to record. Opaque / Orchestration / Graph / Inline are allowed.
+    _GRAPH_FORBIDDEN_FUNC_TYPES = frozenset(
+        {
+            ir.FunctionType.InCore,
+            ir.FunctionType.AIC,
+            ir.FunctionType.AIV,
+            ir.FunctionType.Group,
+            ir.FunctionType.Spmd,
+        }
+    )
+
+    def _parse_graph_scope(self, stmt: ast.With, context_expr: ast.Call) -> None:
+        """Parse ``with pl.graph("name"):`` into a GraphScopeStmt.
+
+        The region name is positional and required: ``OutlineGraphScopes`` names
+        the outlined function after it, codegen derives the emitted symbol from
+        that name, and the runtime keys its recorded Definition on the symbol. An
+        auto-generated name would still work but would silently change whenever
+        an unrelated region was added, so the user owns it.
+        """
+        span = self.span_tracker.get_span(stmt)
+
+        # An Opaque body is orchestration that has not been classified yet (a plain
+        # ``@pl.function`` / ``@pl.jit`` parses Opaque and is promoted by the
+        # outlining passes), and an Inline body is spliced into its caller before
+        # OutlineGraphScopes runs — so the rejection set is the device-side kernel
+        # types, not "everything that is not Orchestration yet".
+        if self._func_type in self._GRAPH_FORBIDDEN_FUNC_TYPES:
+            raise ParserSyntaxError(
+                f"pl.graph() is not valid inside a {self._func_type.name} function",
+                span=span,
+                hint="A Graph region records orchestration task launches, so it belongs in the "
+                "@pl.jit entry (or another @pl.jit.graph function), not in a kernel body. To make a "
+                "whole function a Graph, decorate it with @pl.jit.graph instead.",
+            )
+
+        # Hierarchy is here for a different reason than the other three: a
+        # `pl.at(level=HOST)` region is distributed orchestration, and Graph x
+        # distributed is explicitly out of scope for now (RFC #2399), so reject it
+        # at the surface rather than let it reach a pass that has never seen it.
+        for device_kind, construct in (
+            (ir.ScopeKind.InCore, "pl.at(level=...)"),
+            (ir.ScopeKind.Hierarchy, "pl.at(level=..., role=...)"),
+            (ir.ScopeKind.Cluster, "pl.cluster()"),
+            (ir.ScopeKind.Spmd, "pl.spmd(...)"),
+        ):
+            if self._is_inside_scope(device_kind):
+                raise ParserSyntaxError(
+                    f"pl.graph() cannot be nested inside `{construct}`",
+                    span=span,
+                    hint=(
+                        "A Graph region records a topology of task launches, so it must sit "
+                        "around the dispatches rather than inside one. Move the "
+                        "`with pl.graph(...):` outside."
+                        if device_kind is not ir.ScopeKind.Hierarchy
+                        else "Graph regions inside a distributed hierarchy region are not "
+                        "supported yet. Move the `with pl.graph(...):` outside."
+                    ),
+                )
+
+        if self._is_inside_scope(ir.ScopeKind.Graph):
+            raise ParserSyntaxError(
+                "pl.graph() cannot be nested inside another pl.graph()",
+                span=span,
+                hint="The host_build_graph runtime cannot record a graph inside a graph. Mark "
+                "either the outer region or the inner one, not both.",
+            )
+
+        if len(context_expr.args) != 1:
+            raise ParserSyntaxError(
+                f"pl.graph() takes exactly one positional argument (the region name), "
+                f"got {len(context_expr.args)}",
+                span=span,
+                hint="Use 'with pl.graph(\"decoder_layer\"):'",
+            )
+        if context_expr.keywords:
+            unexpected = context_expr.keywords[0].arg or "**kwargs"
+            raise ParserSyntaxError(
+                f"pl.graph() got unexpected keyword argument '{unexpected}'",
+                span=span,
+                hint="pl.graph() takes only the region name: 'with pl.graph(\"decoder_layer\"):'",
+            )
+
+        name = self._parse_scope_name_hint(context_expr.args[0], "pl.graph()")
+        if not name:
+            raise ParserSyntaxError(
+                "pl.graph() region name must not be empty",
+                span=span,
+                hint="The name becomes the recorded graph's symbol: 'with pl.graph(\"decoder_layer\"):'",
+            )
+
+        self._parse_scope_body(stmt, ir.ScopeKind.Graph, span, name_hint=name)
+
     def _parse_at_scope(
         self, stmt: ast.With, context_expr: ast.Call, optional_vars: "ast.expr | None" = None
     ) -> None:
@@ -5550,8 +5688,9 @@ class ASTParser:
         # an ``Array[N, TASK_ID]`` carry. ``with pl.at(...) as tid:`` binds a
         # fresh ``Scalar[TASK_ID]`` Var in the outer scope; the outliner
         # later wires it to ``TupleGetItem(call_lhs, last_idx)``.
+        predicate = self._parse_at_predicate(state.predicate_kw, is_core_group, span)
         scope_attrs = self._parse_at_meta(
-            deps_kw, no_dep_args_kw, dumps_kw, optional_vars, state.allow_early_resolve, span
+            deps_kw, no_dep_args_kw, dumps_kw, optional_vars, state.allow_early_resolve, predicate, span
         )
         scope_attrs = self._append_split_slot_num_attr(scope_attrs, state.split_slot_num)
         if state.windowize:
@@ -5574,9 +5713,11 @@ class ASTParser:
         # on the placeholder — they belong on the surviving scope. We pop the
         # pending-comment stack here and re-push it so the scope, emitted
         # next, absorbs them.
+        tid_var: ir.Var | None = None
         if scope_attrs is not None:
             for k, v in scope_attrs:
                 if k == "task_id_var":
+                    tid_var = v
                     leading = self.builder.pop_pending_leading_comments()
                     placeholder_rhs = ir.create_op_call("system.task_invalid", [], {}, span)
                     self.builder.assign(v, placeholder_rhs, span=span)
@@ -5612,6 +5753,102 @@ class ASTParser:
                 attrs=scope_attrs,
             )
 
+        # Record the tensors this scope writes as produced by its ``tid``, so a
+        # later ``predicate=`` over one of them is checked against ``deps=``.
+        # Same helper (and same best-effort limits) as the ``pl.spmd`` scope
+        # form; ``_parse_scope_body`` leaks body-bound names into the enclosing
+        # scope, so the lookups below resolve.
+        if tid_var is not None:
+            self._record_scope_producer(stmt.body, tid_var)
+
+    def _parse_at_predicate(
+        self, kw: "ast.keyword | None", is_core_group: bool, span: "ir.Span"
+    ) -> "ir.Expr | None":
+        """Parse ``pl.at(..., predicate=(t[i] > 0))`` — the placements that dispatch.
+
+        A dispatch predicate only has a runtime carrier where the scope becomes
+        an independently submitted L0 task, i.e. an InCore scope that
+        ``OutlineIncoreScopes`` turns into a ``Submit`` orchestration codegen
+        dispatches. Three placements never get there and would drop it silently:
+
+        * a non-CORE_GROUP ``pl.at`` builds a Hierarchy scope, which is outlined
+          into an Opaque level/role function orchestration codegen never
+          dispatches as a task;
+        * a ``pl.at`` nested inside ``pl.cluster()`` / ``pl.spmd()`` / another
+          CORE_GROUP ``pl.at`` is folded into the enclosing Group / Spmd wrapper
+          dispatch (or into the enclosing kernel body), and codegen emits
+          ``set_predicate`` from the *outer* call only;
+        * a ``pl.at`` written directly in a function body ``OutlineIncoreScopes``
+          skips — ``Group`` / ``Spmd`` / an InCore-family kernel — is never
+          outlined into a dispatch at all, so the scope reaches codegen still
+          carrying the attr and nothing reads it.
+
+        These gates read the function being parsed, so they cannot see through an
+        ``@pl.function(type=Inline)`` helper: its body parses on its own, and only
+        ``InlineFunctions`` (pass 1) reveals which call site it lands in. A helper
+        called at orchestration top level is a legal placement, so ``Inline`` is
+        accepted here and the outlining passes re-check the placement they can
+        actually see (``AssertDispatchPredicatesHaveACarrier`` in
+        ``OutlineIncoreScopes``, ``AssertNoInnerDispatchPredicate`` in
+        ``OutlineClusterScopes``), reporting a user-facing error there.
+
+        Nesting inside a *non*-CORE_GROUP ``pl.at`` is **not** rejected: the
+        inner InCore scope is still outlined into its own ``Submit`` (whether the
+        enclosing Hierarchy scope is itself outlined or survives in place), and
+        the emitted orchestration C++ carries the same ``set_predicate`` as the
+        un-nested form.
+
+        Each rejection is raised here rather than miscompiled, mirroring
+        :meth:`_reject_spmd_submit_only_kwargs_in_cluster`. The shape checks are
+        shared with the call form via
+        :meth:`_parse_submit_predicate_kwarg`; the operand's producer must also
+        be in ``deps=`` (checked in :meth:`_parse_at_meta`, which owns the
+        resolved dep list).
+        """
+        if kw is None:
+            return None
+        if not is_core_group:
+            raise ParserSyntaxError(
+                "pl.at(predicate=...) is only supported with level=pl.Level.CORE_GROUP",
+                span=span,
+                hint="A non-CORE_GROUP pl.at builds a Hierarchy scope, which is never outlined into a "
+                "task dispatch, so the dispatch predicate would be lost. Use "
+                "pl.at(level=pl.Level.CORE_GROUP, predicate=...) or pl.spmd_submit(..., predicate=...).",
+            )
+        for kind, owner in (
+            (ir.ScopeKind.Cluster, "pl.cluster()"),
+            (ir.ScopeKind.Spmd, "pl.spmd()"),
+            (ir.ScopeKind.InCore, "another pl.at(level=pl.Level.CORE_GROUP)"),
+        ):
+            if self._is_inside_scope(kind):
+                raise ParserSyntaxError(
+                    f"`pl.at(..., predicate=(...))` cannot be nested inside `{owner}` — the inner "
+                    "dispatch is folded into the enclosing task, so the dispatch predicate would be lost.",
+                    span=span,
+                    hint="Move the predicate to the enclosing dispatch, or use a top-level "
+                    "`with pl.at(level=pl.Level.CORE_GROUP, predicate=...):`.",
+                )
+        # ``OutlineIncoreScopes`` (pass 9) only rewrites ``Opaque`` and
+        # orchestration-like bodies; a Group / Spmd / InCore-family function is
+        # left untouched, so a scope written there never becomes a dispatch and
+        # the attr rides straight through to codegen. ``Inline`` is accepted:
+        # ``InlineFunctions`` (pass 1) substitutes the body into its caller, and
+        # a caller at orchestration top level is a legal placement. Which caller
+        # it is cannot be known here, so the outlining passes re-check it.
+        if self._func_type not in (
+            ir.FunctionType.Opaque,
+            ir.FunctionType.Inline,
+        ) and not ir.is_orchestration_like(self._func_type):
+            raise ParserSyntaxError(
+                "`pl.at(..., predicate=(...))` is not supported inside a "
+                f"{self._func_type.name} function — the scope is never outlined into its own task "
+                "dispatch there, so the dispatch predicate would be lost.",
+                span=span,
+                hint="Write the predicated `with pl.at(level=pl.Level.CORE_GROUP, predicate=...):` "
+                "in the orchestration function that launches this kernel.",
+            )
+        return self._parse_submit_predicate_kwarg("pl.at()", [kw])
+
     @staticmethod
     def _append_split_slot_num_attr(
         attrs: "list[tuple[str, Any]] | None", slot_num: "int | None"
@@ -5636,15 +5873,16 @@ class ASTParser:
         dumps_kw: "ast.keyword | None",
         optional_vars: "ast.expr | None",
         allow_early_resolve: bool,
+        predicate: "ir.Expr | None",
         span: "ir.Span",
     ) -> "list[tuple[str, Any]] | None":
         """Build the ScopeStmt ``attrs`` list from a ``pl.at(...)`` ``deps=`` /
-        ``no_dep_args=`` / ``dumps=`` kwarg set and a ``with ... as <tid>:``
-        capture target.
+        ``no_dep_args=`` / ``dumps=`` / ``predicate=`` kwarg set and a
+        ``with ... as <tid>:`` capture target.
 
         Returns ``None`` when none are present, leaving the scope's ``attrs_``
         empty (the typical plain ``pl.at(...)`` case). Otherwise returns a list
-        with up to four reserved keys, always in this canonical order (so a
+        with up to six reserved keys, always in this canonical order (so a
         print -> reparse cycle reproduces it byte-for-byte; structural_equal
         compares scope attrs positionally):
 
@@ -5663,6 +5901,12 @@ class ASTParser:
             outliner translates this into the synthesised dispatch's ``kAttrDumpVars``.
           * ``task_id_var``: ``VarPtr`` — the outer-scope ``Scalar[TASK_ID]``
             Var the outliner binds to the producer TaskId tuple element.
+          * ``allow_early_resolve``: ``bool`` — speculative early-dispatch hint.
+          * ``predicate``: ``ExprPtr`` — the dispatch-predicate comparison,
+            already shape- and placement-validated by
+            :meth:`_parse_at_predicate`. Unlike the keys above this is a whole
+            Expr carrying live SSA Vars (the operand tensor and its indices);
+            the outliner moves it onto ``Submit::predicate_``.
 
         The ``tid`` Var is defined in the outer scope so subsequent statements
         (e.g. another ``pl.at(..., deps=[tid])``) can reference it.
@@ -5681,19 +5925,19 @@ class ASTParser:
             and not dump_vars
             and optional_vars is None
             and not allow_early_resolve
+            and predicate is None
         ):
             return None
 
         attrs: list[tuple[str, Any]] = []
 
-        if deps_kw is not None:
-            dep_vars = self._parse_submit_deps_kwarg("pl.at()", [deps_kw], span)
-            if dep_vars:
-                # Attr keys mirror the C++ ``kAttrManualDepEdges`` /
-                # ``kAttrTaskIdVar`` / ``kAttrArgDirOverrideVars`` /
-                # ``kAttrDumpVars`` constants (include/pypto/ir/expr.h); passed
-                # as raw strings since they are not exposed to Python.
-                attrs.append(("manual_dep_edges", dep_vars))
+        dep_vars = self._parse_submit_deps_kwarg("pl.at()", [deps_kw], span) if deps_kw is not None else []
+        if dep_vars:
+            # Attr keys mirror the C++ ``kAttrManualDepEdges`` /
+            # ``kAttrTaskIdVar`` / ``kAttrArgDirOverrideVars`` /
+            # ``kAttrDumpVars`` constants (include/pypto/ir/expr.h); passed
+            # as raw strings since they are not exposed to Python.
+            attrs.append(("manual_dep_edges", dep_vars))
 
         if no_dep_args_kw is not None:
             no_dep_vars = self._parse_at_no_dep_args_kwarg(no_dep_args_kw)
@@ -5714,10 +5958,19 @@ class ASTParser:
             self.scope_manager.define_var(optional_vars.id, tid_var, span=span)
             attrs.append(("task_id_var", tid_var))
 
-        # ``allow_early_resolve`` last (canonical order) — a plain bool the
-        # outliner reads off the scope and threads onto the synthesised Submit.
+        # ``allow_early_resolve`` — a plain bool the outliner reads off the scope
+        # and threads onto the synthesised Submit.
         if allow_early_resolve:
             attrs.append(("allow_early_resolve", True))
+
+        # ``predicate`` last (canonical order, matching the pl.spmd scope form) —
+        # an Expr, not a flag, moved onto ``Submit::predicate_`` by the outliner.
+        # The producer-in-deps contract is checked here because this is where the
+        # resolved dep list lives; ``pl.at`` accepts ``deps=`` on every form, so
+        # the default ``deps_accepted=True`` hint is always the right advice.
+        if predicate is not None:
+            self._validate_predicate_deps("pl.at()", predicate, dep_vars, span)
+            attrs.append(("predicate", predicate))
 
         return attrs if attrs else None
 
@@ -5844,6 +6097,7 @@ class ASTParser:
 
         Currently supports:
         - with pl.cluster(): ... (creates ScopeStmt with Cluster scope)
+        - with pl.graph("name"): ... (creates ScopeStmt with Graph scope)
         - with pl.at(level=..., role=...): ... (creates ScopeStmt with InCore/Hierarchy scope)
         - with pl.at(level=CORE_GROUP): ... (creates ScopeStmt with InCore scope)
         - with pl.at(level=CORE_GROUP, optimizations=[pl.split(pl.SplitMode.UP_DOWN)]): ...
@@ -5909,6 +6163,11 @@ class ASTParser:
                     )
                     return
 
+                # with pl.graph("name"): ...
+                if func.attr == "graph":
+                    self._parse_graph_scope(stmt, context_expr)
+                    return
+
                 # pl.at(level=..., role=..., deps=...) [as tid]
                 if func.attr == "at":
                     self._parse_at_scope(stmt, context_expr, optional_vars=optional_vars)
@@ -5919,8 +6178,8 @@ class ASTParser:
             "Unsupported context manager in with statement",
             span=self.span_tracker.get_span(stmt),
             hint="Supported: 'with pl.cluster():', 'with pl.spmd(...):',"
-            " 'with pl.at(level=..., optimizations=[...]):', 'with pl.scope():',"
-            " or 'with pl.manual_scope():'",
+            " 'with pl.at(level=..., optimizations=[...]):', 'with pl.graph(\"name\"):',"
+            " 'with pl.scope():', or 'with pl.manual_scope():'",
         )
 
     def parse_return(self, stmt: ast.Return) -> None:
@@ -6749,7 +7008,8 @@ class ASTParser:
         """Reject unknown keyword arguments on a cross-function kernel call.
 
         ``attrs=`` surfaces call-site directions and is always allowed.
-        ``deps=`` / ``dumps=`` are accepted only on ``pl.submit(...)``;
+        ``deps=`` / ``dumps=`` / ``timing_slot=`` are accepted only on
+        ``pl.submit(...)``;
         ``core_num=`` / ``sync_start=`` only on ``pl.spmd_submit(...)``;
         ``device=`` only when the callee is an Orchestrator. Raises
         ``ParserTypeError`` with a targeted hint for the common
@@ -6761,6 +7021,7 @@ class ASTParser:
             allowed_kwargs.add("dumps")
             allowed_kwargs.add("allow_early_resolve")
             allowed_kwargs.add("predicate")
+            allowed_kwargs.add("timing_slot")
         if as_spmd:
             allowed_kwargs.update({"core_num", "sync_start"})
         if func_obj is not None and func_obj.role == ir.Role.Orchestrator:
@@ -6821,6 +7082,68 @@ class ASTParser:
             arg_idx += 1
         return callee_params, paired_args
 
+    def _validate_kernel_call_arity(
+        self,
+        method_name: str,
+        func_obj: Any,
+        n_args: int,
+        span: ir.Span,
+        as_submit: bool,
+    ) -> None:
+        """Check a ``self.<method>(...)`` call site's positional-argument count.
+
+        One place decides the call flavour; the resulting ``(lo, hi)`` window
+        then covers all three checks — an exact-arity check is just ``lo == hi``.
+
+        Args:
+            method_name: Callee name, for the diagnostic.
+            func_obj: The callee ``ir.Function``.
+            n_args: Positional argument count at the call site.
+            span: Source span of the call.
+            as_submit: Whether the site is ``pl.submit`` / ``pl.spmd_submit``.
+
+        Raises:
+            ParserTypeError: The argument count is outside the callee's window.
+        """
+        n_params = len(func_obj.params)
+        if as_submit and self._func_level == ir.Level.HOST:
+            # A distributed HOST submit dispatches to L3, which allocates no
+            # output tensors, so it cannot omit Out/InOut params the way an
+            # Orchestration-level submit can.
+            flavour, lo, hi = "host_submit", n_params, n_params
+        elif as_submit:
+            # For submit (pl.submit / pl.spmd_submit), Out- and InOut-directed
+            # parameters are runtime-allocated outputs that MAY be omitted at
+            # the call site. The lower bound is the count of non-Out/InOut
+            # params; the upper bound is all params (when Out params are passed
+            # explicitly).
+            flavour = "submit"
+            lo = sum(
+                1
+                for d in func_obj.param_directions
+                if d not in (ir.ParamDirection.Out, ir.ParamDirection.InOut)
+            )
+            hi = n_params
+        else:
+            flavour, lo, hi = "call", n_params, n_params
+
+        if lo <= n_args <= hi:
+            return
+
+        param_info = [f"{p.name_hint}: {d.name}" for p, d in zip(func_obj.params, func_obj.param_directions)]
+        hint = f"Parameters: {param_info}"
+        if flavour == "host_submit":
+            message = (
+                "Distributed HOST pl.submit(...) requires every callee argument, including "
+                f"Out/InOut tensors; function '{method_name}' expects {hi} argument(s), got {n_args}"
+            )
+        elif flavour == "submit":
+            message = f"Function '{method_name}' expects {lo}..{hi} argument(s), got {n_args}"
+            hint += ". Out/InOut params may be omitted in submit calls."
+        else:
+            message = f"Function '{method_name}' expects {hi} argument(s), got {n_args}"
+        raise ParserTypeError(message, span=span, hint=hint)
+
     def _parse_kernel_call(
         self,
         method_attr: ast.Attribute,
@@ -6873,38 +7196,7 @@ class ASTParser:
 
         # Validate argument count before parsing args to fail fast.
         if func_obj is not None:
-            if as_submit:
-                # For submit (pl.submit / pl.spmd_submit), Out- and InOut-
-                # directed parameters are runtime-allocated outputs that
-                # MAY be omitted at the call site. The lower bound is the
-                # count of non-Out/InOut params; the upper bound is all
-                # params (when Out params are passed explicitly).
-                expected_lo = sum(
-                    1
-                    for d in func_obj.param_directions
-                    if d not in (ir.ParamDirection.Out, ir.ParamDirection.InOut)
-                )
-                expected_hi = len(func_obj.params)
-                ok = expected_lo <= len(arg_nodes) <= expected_hi
-            else:
-                expected_hi = len(func_obj.params)
-                ok = len(arg_nodes) == len(func_obj.params)
-            if not ok:
-                param_info = [
-                    f"{p.name_hint}: {d.name}" for p, d in zip(func_obj.params, func_obj.param_directions)
-                ]
-                hint = (
-                    f"Parameters: {param_info}. Out/InOut params may be omitted in submit calls."
-                    if as_submit
-                    else f"Parameters: {param_info}"
-                )
-                raise ParserTypeError(
-                    f"Function '{method_name}' expects "
-                    + (f"{expected_lo}..{expected_hi}" if as_submit else f"{expected_hi}")
-                    + f" argument(s), got {len(arg_nodes)}",
-                    span=span,
-                    hint=hint,
-                )
+            self._validate_kernel_call_arity(method_name, func_obj, len(arg_nodes), span, as_submit)
 
         arg_directions = self._extract_arg_directions_from_attrs(method_name, keywords, len(arg_nodes), span)
         if arg_directions is None:
@@ -6961,9 +7253,11 @@ class ASTParser:
         # (recorded on the Submit; no-op for a plain self.kernel(...) call).
         allow_early_resolve = False
         predicate: ir.Expr | None = None
+        timing_slot: int | None = None
         if as_submit:
             allow_early_resolve = self._parse_submit_allow_early_resolve_kwarg(method_name, keywords)
             predicate = self._parse_submit_predicate_kwarg(method_name, keywords)
+            timing_slot = self._record_submit_timing_slot_attr(method_name, keywords, extra_attrs)
             if predicate is not None:
                 self._validate_predicate_deps(method_name, predicate, user_dep_vars, span)
             self._reject_submit_dispatch_metadata_in_cluster(
@@ -6972,6 +7266,7 @@ class ASTParser:
                 sync_start=sync_start,
                 allow_early_resolve=allow_early_resolve,
                 predicate=predicate,
+                timing_slot=timing_slot,
                 span=span,
             )
         return_types = func_obj.return_types if func_obj else []
@@ -7374,6 +7669,46 @@ class ASTParser:
             )
         return kw.value.value
 
+    def _parse_submit_timing_slot_kwarg(self, method_name: str, keywords: list[ast.keyword]) -> int | None:
+        """Extract an optional ``timing_slot=0..15`` task-timing tag.
+
+        The runtime has sixteen fixed task-timing slots. A tagged task contributes
+        its scheduler dispatch/finish window to the selected slot, which is
+        returned as a device-domain trace span. The slot is a compile-time
+        configuration value, so it must be an integer literal rather than an IR
+        expression.
+        """
+        kw = next((k for k in keywords if k.arg == "timing_slot"), None)
+        if kw is None:
+            return None
+        if (
+            not isinstance(kw.value, ast.Constant)
+            or not isinstance(kw.value.value, int)
+            or isinstance(kw.value.value, bool)
+        ):
+            raise ParserSyntaxError(
+                f"'{method_name}' timing_slot must be a non-negative integer literal in 0..15",
+                span=self.span_tracker.get_span(kw.value),
+                hint="Write timing_slot=0 to tag this task with task-timing slot 0.",
+            )
+        slot = kw.value.value
+        if not 0 <= slot < _NUM_TASK_TIMING_SLOTS:
+            raise ParserSyntaxError(
+                f"'{method_name}' timing_slot must be in 0..{_NUM_TASK_TIMING_SLOTS - 1}, got {slot}",
+                span=self.span_tracker.get_span(kw.value),
+                hint="Choose one of the runtime's sixteen task-timing slots (0 through 15).",
+            )
+        return slot
+
+    def _record_submit_timing_slot_attr(
+        self, method_name: str, keywords: list[ast.keyword], extra_attrs: dict[str, Any]
+    ) -> int | None:
+        """Parse ``timing_slot=`` and record its Call attr when present."""
+        slot = self._parse_submit_timing_slot_kwarg(method_name, keywords)
+        if slot is not None:
+            extra_attrs["task_timing_slot"] = slot
+        return slot
+
     def _parse_submit_predicate_kwarg(self, method_name: str, keywords: list[ast.keyword]) -> ir.Expr | None:
         """Extract the optional ``predicate=(<tensor>[<indices>] <op> <int>)`` kwarg.
 
@@ -7553,8 +7888,6 @@ class ASTParser:
         predicate: ir.Expr,
         dep_vars: list[ir.Var],
         span: ir.Span,
-        *,
-        deps_accepted: bool = True,
     ) -> None:
         """Enforce that a ``predicate=`` operand's producer is one of ``deps=``.
 
@@ -7570,12 +7903,6 @@ class ASTParser:
         parameter, say) has no tracked producer, and an ``Array[N, TASK_ID]``
         dep entry does not name its producers individually — both are skipped
         rather than risk rejecting a correct program.
-
-        ``deps_accepted`` tailors the remediation hint. The plain
-        ``with pl.spmd(...):`` and ``for i in pl.spmd(...):`` forms do not take
-        ``deps=`` at all, so telling their author to add one would send them
-        into a second, different error; there the fix is to switch to the
-        ``as tid`` capture form.
         """
         if not isinstance(predicate, self._PREDICATE_CMP_TYPES):
             return
@@ -7596,17 +7923,10 @@ class ASTParser:
         if any(d is producer_tid for d in dep_vars) and current_gen == producer_gen:
             return
         tid_name = producer_tid.name_hint
-        why = (
-            "Without it the scheduler may evaluate the predicate before the producing task has "
-            "written the tensor."
-        )
         hint = (
-            f"Add the producer to the dependency list: deps=[{tid_name}]. {why}"
-            if deps_accepted
-            else (
-                f"This form does not accept deps=. Capture the TaskId instead: "
-                f"`with pl.spmd(n, deps=[{tid_name}], predicate=...) as tid:`. {why}"
-            )
+            f"Add the producer to the dependency list: deps=[{tid_name}]. Without it the "
+            "scheduler may evaluate the predicate before the producing task has written the "
+            "tensor."
         )
         raise ParserSyntaxError(
             f"'{method_name}' predicate reads '{operand.name_hint}', which is produced by the task "
@@ -8373,8 +8693,15 @@ class ASTParser:
             self.expr_evaluator.closure_vars = prev_closure_vars
             return_expr = self._inline_return_expr
             self._inline_mode, self._inline_return_expr = prev_inline_state
-            # Leak vars so inlined definitions are visible to the caller
-            self.scope_manager.exit_scope(leak_vars=True)
+            # Keep the existing statement-level inline semantics for local
+            # definitions, but never expose formal parameter bindings. A
+            # formal may share a name with an unrelated caller variable; if it
+            # escaped, a later inline call could receive the first call's
+            # actual argument instead of the caller variable it names.
+            self.scope_manager.exit_scope(
+                leak_vars=True,
+                exclude_names=set(inline_func.param_names),
+            )
 
         if return_expr is None:
             raise ParserTypeError(

@@ -118,4 +118,5 @@ wraps, not the per-rank cost.
 - [11-put_get](11-put_get.md) — the fixed-P=2 version of this ring (step 06)
 - [02-primitives](../distributed/02-primitives.md) §System Substrate + §Put and Get — `world_size`/`nranks`, chunking
 - [00-getting_started](../00-getting_started.md) — `pl.dynamic(...)` dynamic dims
-- Next step: [05-tutorials](05-tutorials.md) — steps 08–16 (the collectives, at P=4) are planned
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
+- Next step: [13-allreduce_mesh](13-allreduce_mesh.md) — steps 08–16 build the collectives (at P=4), starting with all-reduce

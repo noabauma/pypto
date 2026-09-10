@@ -124,4 +124,5 @@ its own index.
 - [05-tutorials](05-tutorials.md) — the tutorial index (this step = row 02)
 - [00-model](../distributed/00-model.md) — model vocabulary, L2 vs L3
 - [03-execution](../distributed/03-execution.md) — worker lifecycle per level
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [08-window_buffer](08-window_buffer.md) — the memory substrate

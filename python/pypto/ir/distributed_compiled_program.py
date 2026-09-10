@@ -52,6 +52,7 @@ from .compiled_program import (
 _META_SCHEMA = 2
 
 if TYPE_CHECKING:
+    from pypto.runtime._artifact_runtime import ArtifactRuntime
     from pypto.runtime.distributed_runner import DistributedWorker, ReadOnlyHostTensor
     from pypto.runtime.runner import RunConfig
 
@@ -190,6 +191,7 @@ class DistributedCompiledProgram:
     """
 
     __test__ = False
+    _artifact_runtime: "ArtifactRuntime | None" = None
 
     def __init__(
         self,
@@ -239,7 +241,7 @@ class DistributedCompiledProgram:
     def _persist_metadata(self) -> None:
         """Write ``<output_dir>/distributed_meta.json`` for :meth:`from_dir`.
 
-        Captures exactly what :func:`execute_distributed` reads from the
+        Captures exactly what :func:`_execute_distributed` reads from the
         post-pass IR — the HOST-orchestrator param metadata (post-SSA names,
         directions, shapes, dtypes) plus the return-type count — alongside the
         platform / backend / :class:`DistributedConfig` so a later reload can
@@ -425,7 +427,7 @@ class DistributedCompiledProgram:
         live Worker; use :meth:`prepare`, allocate it through the returned
         ``DistributedWorker``, then call ``worker.run(...)``.
         """
-        from pypto.runtime.distributed_runner import execute_distributed  # noqa: PLC0415
+        from pypto.runtime.distributed_runner import _execute_distributed  # noqa: PLC0415
 
         param_infos, output_indices, return_types = self._get_metadata()
         n_params = len(param_infos)
@@ -465,7 +467,7 @@ class DistributedCompiledProgram:
                 )
             coerced.append(arg)
 
-        execute_distributed(self, coerced, config)
+        _execute_distributed(self, coerced, config)
 
         if not return_style:
             return None
@@ -486,7 +488,7 @@ class DistributedCompiledProgram:
     ) -> "DistributedWorker":
         """Prepare a reusable L3 execution handle (setup once, dispatch many).
 
-        Runs the expensive setup (``compile_and_assemble``, generated-module
+        Runs the expensive setup (``_compile_and_assemble``, generated-module
         loading, simpler ``Worker(level=3)`` construction + registration +
         ``init()``) exactly once and returns a :class:`DistributedWorker` that
         dispatches many times on the held worker. The handle also exposes

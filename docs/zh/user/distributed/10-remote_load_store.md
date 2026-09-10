@@ -144,4 +144,5 @@ pipe 上而没有任何东西为它们排序。
   `pld.tile.*` 表面
 - [01-collectives](../distributed/01-collectives.md) — all-reduce 就是这些
   移动加一个 add（步骤 08–10）
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[11-put_get](11-put_get.md) — tensor 级 push/pull

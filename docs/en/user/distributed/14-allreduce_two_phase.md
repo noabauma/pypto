@@ -109,4 +109,5 @@ mesh's `(P-1) * N`, at the cost of one extra barrier round.
 - [05-tutorials](05-tutorials.md) — the tutorial index (this step = row 09)
 - [13-allreduce_mesh](13-allreduce_mesh.md) — the baseline this step improves (step 08)
 - [01-collectives](01-collectives.md) §AllReduce — reference (Mesh Mode, Ring Mode)
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [15-allreduce_ring](15-allreduce_ring.md) — same bytes, constant per-step size

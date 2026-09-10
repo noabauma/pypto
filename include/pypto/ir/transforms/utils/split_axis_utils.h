@@ -13,6 +13,7 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_SPLIT_AXIS_UTILS_H_
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -29,6 +30,12 @@
 namespace pypto {
 namespace ir {
 namespace split_axis {
+
+/// True only for a statically singleton physical split axis.
+bool IsSingletonSplitAxis(const TileType& type, int split_dim);
+
+/// Right-align an operand to its result; missing leading axes broadcast.
+bool IsBroadcastOnSplitAxis(const TileType& operand, int result_split_dim, int result_rank);
 
 /**
  * @brief Map a SplitMode to the tile dimension it partitions.
@@ -248,6 +255,19 @@ struct TileInfo {
   int split_dim = 0;
 };
 
+/// Admission facts for a lowered data-parallel body. Broadcast roots remain
+/// neutral: allowing a replicated producer does not prove its consumers split.
+struct SplitBodyAnalysis {
+  std::unordered_set<const Var*> half_tiles;
+  std::unordered_set<const Var*> lane_scalars;
+  std::vector<std::string> full_width_vec_ops;  ///< Operator names without proven per-lane dataflow.
+  std::vector<std::string> carry_mismatches;    ///< Carry names whose backedge loses an entry shard fact.
+};
+
+SplitBodyAnalysis AnalyzeSplitBody(const std::vector<StmtPtr>& stmts, int split_dim,
+                                   const std::unordered_map<const Var*, TileInfo>& known_tiles = {},
+                                   const std::unordered_map<const Var*, VarPtr>& replacements = {});
+
 /**
  * @brief Result of injecting the per-subblock index at the top of a body.
  *
@@ -277,7 +297,7 @@ SubblockInjectionResult InjectSubblockIdx(const FunctionPtr& func, bool is_aiv);
  * @brief Inject the per-subblock index binding at the head of a region body.
  *
  * Region-scoped analogue of ``InjectSubblockIdx`` for the explicit
- * ``SplitAivScopeStmt`` consumer in LowerAutoVectorSplit (pass 20). Prepends a
+ * ``SplitAivScopeStmt`` consumer in LowerAutoVectorSplit (pass 23). Prepends a
  * fresh ``subblock_idx = tile.get_subblock_idx()`` binding to ``region_stmts``
  * (a region is always an AIV lane, so the index is always injected) and returns
  * the rewritten body plus the index expr. ``used_names`` seeds the collision-free
@@ -340,6 +360,106 @@ TransposeSplitHazard FindTransposeSplitHazard(const StmtPtr& body, int split_dim
  *        keeps the default box partition.
  * @return The rewritten statement list.
  */
+/// Propagate split tracking from each iter_arg's init value onto the carry
+/// itself, rebuilding its type at the per-lane extent. Call BEFORE lowering the
+/// body: an operation on an untracked full-width carry is otherwise reported as
+/// carrying a full-width operand even though its init was correctly halved.
+std::vector<IterArgPtr> RepairIterArgs(const std::vector<IterArgPtr>& iter_args,
+                                       std::unordered_map<const Var*, TileInfo>& tile_vars,
+                                       std::unordered_map<const Var*, VarPtr>& var_replacements,
+                                       const ExprPtr& subblock_idx, const ExprPtr& lane_stride);
+
+/// Give each loop-exit return_var the tile info of its iter_arg, so a later
+/// tile.store on it gets the per-lane offset. Call AFTER lowering the body.
+std::vector<VarPtr> RepairReturnVars(const std::vector<VarPtr>& return_vars,
+                                     const std::vector<IterArgPtr>& new_iter_args,
+                                     std::unordered_map<const Var*, TileInfo>& tile_vars,
+                                     std::unordered_map<const Var*, VarPtr>& var_replacements,
+                                     const ExprPtr& subblock_idx, const ExprPtr& lane_stride);
+
+/// Give each IfStmt merge variable the tile info its branches yield, so it stops
+/// contradicting them and a later tile.store on it gets the per-lane offset.
+/// Call AFTER lowering both branch bodies, with the LOWERED bodies: the merge is
+/// decided by what the branches actually yield, not by what they started as.
+///
+/// Both branches must exist and agree. SSA requires an else wherever return_vars
+/// are defined, so a missing one is a compiler bug. One branch yielding a halved
+/// value while the other yields a full-width one has no single merge type, and
+/// picking either silently gives one AIV lane the wrong extent -- so that is
+/// rejected rather than merged.
+/// Check a loop's BACKEDGE against its carry: the value the body yields back
+/// into slot ``i`` must be lane-local exactly when that carry is. Call AFTER
+/// lowering the body, with the LOWERED body and the repaired iter_args.
+///
+/// RepairIterArgs and RepairReturnVars cover the carry's entry and exit only, so
+/// without this a body yielding a full-width value into a halved carry emits a
+/// Yield whose declared type contradicts its value -- the gh#2203 defect on the
+/// carry path, which no operand check sees because those inspect a Call's
+/// arguments and this is a Yield.
+///
+/// Validate rather than repair: when the yielded value IS tracked the trailing
+/// Substitute already swaps in its halved replacement, and when it is not there
+/// is no halved version to substitute, so a diagnostic naming the carry is the
+/// only correct answer.
+void ValidateCarryBackedge(const StmtPtr& new_body, const std::vector<IterArgPtr>& new_iter_args,
+                           const std::unordered_map<const Var*, TileInfo>& tile_vars,
+                           const std::unordered_map<const Var*, VarPtr>& var_replacements, const Span& span);
+
+std::vector<VarPtr> RepairIfReturnVars(const std::vector<VarPtr>& return_vars, const StmtPtr& new_then_body,
+                                       const std::optional<StmtPtr>& new_else_body,
+                                       std::unordered_map<const Var*, TileInfo>& tile_vars,
+                                       std::unordered_map<const Var*, VarPtr>& var_replacements,
+                                       const ExprPtr& subblock_idx, const ExprPtr& lane_stride,
+                                       const Span& span);
+
+/// The split the pass has already applied to one operand, or nullopt when it is not
+/// lane-local. THE single answer to "did the split partition this operand, and along
+/// which axis" -- every gate must go through it.
+///
+/// A bound operand is looked up in @p tile_vars; an INLINE tuple projection
+/// (`pl.tile.store(pair[0], ...)`, which the DSL emits verbatim because nothing hoists
+/// a projection into its own binding) is not a Var and never appears there, so its axis
+/// is read back off the halved tuple type. Matching only Var is a silent wrong answer:
+/// the operand is substituted for its halved replacement regardless, leaving the
+/// consuming node a full-width declared type over per-lane data.
+std::optional<TileInfo> OperandSplitInfo(const ExprPtr& arg,
+                                         const std::unordered_map<const Var*, TileInfo>& tile_vars,
+                                         const std::unordered_map<const Var*, VarPtr>& var_replacements);
+
+/// The halved replacement for one operand, or nullptr when nothing replaces it.
+/// An inline projection is rebuilt over the replaced tuple, which re-derives the
+/// element type from it.
+ExprPtr ReplacedOperand(const ExprPtr& arg, const std::unordered_map<const Var*, VarPtr>& var_replacements);
+
+/// Rebuild @p ret with every ``tile.store`` of a tracked tile moved to this lane's
+/// half of the destination, or nullptr when it carries no such store.
+///
+/// A store that IS the return expression takes neither the AssignStmt nor the
+/// EvalStmt offset-localization arm, while the trailing Substitute swaps in the
+/// halved tile regardless. Both AIV lanes then write the same rows from different
+/// data and lane 1's half is silently lost. Both lowering arms must call this, for
+/// the same reason they must call RetypeTupleProjection.
+StmtPtr LocalizeReturnStores(const std::shared_ptr<const ReturnStmt>& ret,
+                             const std::unordered_map<const Var*, TileInfo>& tile_vars,
+                             const std::unordered_map<const Var*, VarPtr>& var_replacements,
+                             const ExprPtr& subblock_idx, const ExprPtr& lane_stride);
+
+/// Retype an ``x = tup[i]`` projection whose tuple was halved, or nullptr when
+/// @p assign is not such a projection.
+///
+/// A tuple-returning op has one split axis PER ELEMENT (tile.gather_compare answers a
+/// row split with a ``dst`` halved on dim 0 and a ``cdst`` -- shaped ``[1, rows]`` --
+/// halved on dim 1), so the projection cannot inherit a single result split dim. It
+/// reads the mapping back off the halved tuple type instead, and records the axis that
+/// moved in @p tile_vars so a later ``tile.store`` offsets each lane.
+///
+/// Both lowering arms must call this: the AUTO arm's affinity gate only routes leaf
+/// *calls* into ProcessStmts, so a projection left to its "pass through unchanged"
+/// fallback keeps a full-width declared type over a halved tuple.
+StmtPtr RetypeTupleProjection(const std::shared_ptr<const AssignStmt>& assign,
+                              std::unordered_map<const Var*, TileInfo>& tile_vars,
+                              std::unordered_map<const Var*, VarPtr>& var_replacements);
+
 std::vector<StmtPtr> ProcessStmts(const std::vector<StmtPtr>& stmts, SplitMode mode, int split_dim,
                                   std::unordered_map<const Var*, TileInfo>& tile_vars, bool is_aiv,
                                   const ExprPtr& subblock_idx,

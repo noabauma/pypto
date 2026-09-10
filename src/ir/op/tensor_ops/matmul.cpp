@@ -32,6 +32,7 @@
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
+#include "pypto/ir/span.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -66,6 +67,37 @@ void CheckContractionExtents(const ExprPtr& k_lhs, const ExprPtr& k_rhs, const s
   }
 }
 
+/// Reject an ``out_dtype`` the Cube cannot produce for these operands.
+///
+/// ``out_dtype`` names the element type the matmul's result tensor carries, and
+/// that result leaves L0C through the FIXPIPE. The accumulator is fixed by the
+/// operand domain (``MatmulAccumulatorDataType``) and the plain writeback offers
+/// exactly one conversion, ``f32 -> f16`` / ``f32 -> bf16``. An INT8 x INT8
+/// matmul therefore cannot hand back FP32: that is a dequant, and it needs a
+/// scale ``tensor.matmul`` has nowhere to carry. The other rejected directions
+/// need a scale too but are not dequantizations, so the message names the one it
+/// actually has (``DescribeCubeWritebackScaledConversion``).
+///
+/// Without this check the request is simply dropped -- ``ConvertTensorToTileOps``
+/// builds ``tile.matmul`` from the operands alone -- and the mismatch surfaces
+/// far away, as a ccec type error on the generated ``TStore`` ("the 2nd parameter
+/// maybe need a type '__cc__ float *'") or, where that store happens to compile,
+/// as silently wrong numbers.
+void CheckTensorMatmulOutDataType(DataType out_dtype, DataType lhs_dtype, DataType rhs_dtype,
+                                  const Span& span) {
+  const DataType accumulator = MatmulAccumulatorDataType(lhs_dtype, rhs_dtype);
+  if (CubeWritebackSupportsDataType(accumulator, out_dtype)) return;
+  CHECK_SPAN(false, span) << "tensor.matmul: out_dtype=" << out_dtype.ToString() << " is not supported for "
+                          << lhs_dtype.ToString() << " x " << rhs_dtype.ToString()
+                          << " operands -- the Cube accumulates them in " << accumulator.ToString()
+                          << ", and the unscaled writeback out of L0C converts only fp32 to fp16 or "
+                          << "bf16. Reaching " << out_dtype.ToString() << " from " << accumulator.ToString()
+                          << " is " << DescribeCubeWritebackScaledConversion(accumulator, out_dtype)
+                          << ", which needs a scale out_dtype cannot carry. Pass out_dtype="
+                          << accumulator.ToString()
+                          << " and convert the result explicitly with pl.cast(result, <dtype>).";
+}
+
 }  // namespace
 
 TypePtr DeduceTensorMatMulType(const std::vector<ExprPtr>& args,
@@ -73,14 +105,18 @@ TypePtr DeduceTensorMatMulType(const std::vector<ExprPtr>& args,
   // tensor.matmul requires exactly 2 Expr arguments (lhs, rhs)
   CHECK(args.size() == 2) << "tensor.matmul requires exactly 2 arguments (lhs, rhs), but got " << args.size();
 
-  // First two arguments must be TensorType
-  auto lhs_type = As<TensorType>(args[0]->GetType());
-  auto rhs_type = As<TensorType>(args[1]->GetType());
+  // Both operands must be tensor-shaped. ``AsTensorTypeLike`` accepts a
+  // ``DistributedTensorType`` (window) operand the same as a plain tensor
+  // (issue #1694): inside an InCore scope a window is just this rank's local GM,
+  // so the Cube loads it through the same ``tile.load``. The product is fresh
+  // local data, so the result below is a plain ``TensorType``, never a window view.
+  auto lhs_type = AsTensorTypeLike(args[0]->GetType());
+  auto rhs_type = AsTensorTypeLike(args[1]->GetType());
 
-  CHECK(lhs_type) << "tensor.matmul requires first argument to be a TensorType, but got "
-                  << args[0]->GetType()->TypeName();
-  CHECK(rhs_type) << "tensor.matmul requires second argument to be a TensorType, but got "
-                  << args[1]->GetType()->TypeName();
+  CHECK(lhs_type) << "tensor.matmul requires first argument to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[0]->GetType()->TypeName();
+  CHECK(rhs_type) << "tensor.matmul requires second argument to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[1]->GetType()->TypeName();
 
   // Extract shapes
   const auto& lhs_shape = lhs_type->shape_;
@@ -91,14 +127,21 @@ TypePtr DeduceTensorMatMulType(const std::vector<ExprPtr>& args,
 
   // Read kwargs (with defaults)
   DataType out_dtype;
+  bool out_dtype_requested = false;
   try {
     out_dtype = GetKwarg<DataType>(kwargs, "out_dtype");
+    out_dtype_requested = true;
   } catch (const ValueError& e) {
     auto promoted = PromoteDataTypes(lhs_type->dtype_, rhs_type->dtype_);
     CHECK(promoted) << "Cannot promote data types for tensor.matmul";
     out_dtype = *promoted;
   } catch (const TypeError& e) {
     throw TypeError("Invalid kwarg type for out_dtype: " + std::string(e.what()));
+  }
+  // Outside the try: this check reports a user error as a ValueError of its own,
+  // which the "out_dtype omitted" handler above must not swallow.
+  if (out_dtype_requested) {
+    CheckTensorMatmulOutDataType(out_dtype, lhs_type->dtype_, rhs_type->dtype_, args[0]->span_);
   }
 
   bool a_trans = GetKwarg<bool>(kwargs, "a_trans", false);
@@ -217,16 +260,24 @@ TypePtr DeduceTensorMatMulAccType(const std::vector<ExprPtr>& args,
       << "predicate, but got " << args.size();
   CheckMatmulInitCond(args, 3, "tensor.matmul_acc");
 
+  // lhs / rhs take a window operand for the same reason as in tensor.matmul above: the Cube
+  // loads them from GM. The accumulator does NOT -- it is never loaded at all (nothing but the
+  // matrix unit writes L0C), so a window has no data path into it and ConvertTensorToTileOps
+  // would reject it as "tile.matmul_acc requires acc to be a TileType". Keep the exact-kind
+  // match here so that limitation is reported at the call site, with a remedy.
   auto acc_type = As<TensorType>(args[0]->GetType());
-  auto lhs_type = As<TensorType>(args[1]->GetType());
-  auto rhs_type = As<TensorType>(args[2]->GetType());
+  auto lhs_type = AsTensorTypeLike(args[1]->GetType());
+  auto rhs_type = AsTensorTypeLike(args[2]->GetType());
 
   CHECK(acc_type) << "tensor.matmul_acc requires first argument (acc) to be a TensorType, but got "
-                  << args[0]->GetType()->TypeName();
-  CHECK(lhs_type) << "tensor.matmul_acc requires second argument (lhs) to be a TensorType, but got "
-                  << args[1]->GetType()->TypeName();
-  CHECK(rhs_type) << "tensor.matmul_acc requires third argument (rhs) to be a TensorType, but got "
-                  << args[2]->GetType()->TypeName();
+                  << args[0]->GetType()->TypeName()
+                  << ". A distributed window cannot be a Cube accumulator: only the matrix unit "
+                     "writes L0C, so there is no data path from GM into it. Accumulate into a "
+                     "local tensor and store the result into the window afterwards.";
+  CHECK(lhs_type) << "tensor.matmul_acc requires second argument (lhs) to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[1]->GetType()->TypeName();
+  CHECK(rhs_type) << "tensor.matmul_acc requires third argument (rhs) to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[2]->GetType()->TypeName();
 
   const auto& acc_shape = acc_type->shape_;
   const auto& lhs_shape = lhs_type->shape_;

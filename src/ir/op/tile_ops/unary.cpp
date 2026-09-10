@@ -30,6 +30,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
@@ -127,6 +128,8 @@ TypePtr DeduceTileCastType(const std::vector<ExprPtr>& args,
                     << " requires optional second argument 'tmp' to be a TileType, but got "
                     << args[1]->GetType()->TypeName();
   }
+
+  ValidateCastSaturationModeKwarg(kwargs, op_name);
 
   // Read target_type from kwargs
   bool found_target_type = false;
@@ -273,6 +276,11 @@ REGISTER_OP("tile.rsqrt")
     // writing the output, so the output must not share a buffer with either
     // (same constraint as tile.recip).
     .not_inplace_safe()
+    // NOT declared lane-invariant: DeduceTileRsqrtType requires tmp to match the
+    // input's rank and every dimension, so a full-width tmp beside a halved input
+    // is already rejected by the auto-split pass's type-consistency check. A
+    // declaration here could never be reached, and would read as a contract the
+    // operator itself does not grant.
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileRsqrtType(args, kwargs, "tile.rsqrt");
@@ -286,10 +294,14 @@ REGISTER_OP("tile.cast")
     .add_argument("tmp", "Optional A2/A3 scratch tile for non-saturating narrowing pto.tcvt")
     .set_attr<DataType>("target_type")
     .set_attr<int>("mode")  // Round Mode: None(0), RINT(1), ROUND(2), FLOOR(3), CEIL(4), TRUNC(5), ODD(6)
+    // Optional destination saturation: OFF(0) / ON(1). Absent means "keep the
+    // backend default" — see include/pypto/ir/cast_saturation.h.
+    .set_attr<int>("saturation_mode")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .forbid_output_alias(1)
+    .set_lane_invariant_arg(1)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileCastType(args, kwargs, "tile.cast");

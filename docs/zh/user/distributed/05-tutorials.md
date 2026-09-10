@@ -1,12 +1,12 @@
 # 分布式教程（Distributed Tutorials）
 
-`pld` 词汇表按步骤讲解：一个十六步的教程系列，每步一个概念。十一个可运行的
-示例现已交付——从 "hello rank" 到点对点移动、动态 rank 数量，以及 all-reduce
-三连与其揭示；步骤 12–15（其余集合通信）与步骤 16（组合）为规划中。
+`pld` 词汇表按步骤讲解：一个十六步的教程系列，每步一个概念。全部十六个可运行
+示例现已交付——从 "hello rank" 到点对点移动、动态 rank 数量、三种 all-reduce
+及其揭示、其余集合通信动物园，以及一个组合 kernel。
 
 > **前置条件：** 先通读[分布式编程](../distributed/index.md)章节——了解词汇，
 > 再回到这里亲手构建同样的概念。硬件：步骤 01–06 需要两个设备，步骤 07
-> 需要任意 ≥ 2 的数量（三个或更多才能看到环与 P=2 的差异），步骤 08–11
+> 需要任意 ≥ 2 的数量（三个或更多才能看到环与 P=2 的差异），步骤 08–15
 > 的集合通信对比需要四个设备。
 
 ## 思路（The idea）
@@ -23,7 +23,10 @@
   任意 P 编译——这是 P=4 集合通信所依赖的机制。
 - 步骤 08–11 用三种方式构建 **all-reduce**（mesh、two-phase、ring），然后
   揭示 `pld.tensor.allreduce`。
-- 步骤 12–15 覆盖其余集合通信；步骤 16 组合其中三种。
+- 步骤 12–15 覆盖**其余集合通信**（broadcast、allgather、reduce_scatter、
+  all_to_all），每个先手工再揭示。
+- 步骤 16 在一个 kernel 中**组合** `broadcast` + `allreduce` + `allgather`——
+  收官之作。
 
 > **揭示纪律（Reveal discipline）：** 教程页面在揭示它们的步骤之前，不会引入
 > 内置原语（`pld.tensor.barrier`、`pld.tensor.allreduce` 等）——本索引仅预告
@@ -38,8 +41,8 @@
 ## 建议阅读顺序（Suggested reading order）
 
 按顺序阅读这些步骤——**01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 →
-11 → 12 → 13 → 14 → 15 → 16**。每个页面都会重复此顺序块。步骤 01–11 现已交付；
-12–16 仍为规划中。
+11 → 12 → 13 → 14 → 15 → 16**。每个页面都会重复此顺序块。全部 16 步
+一起交付。
 
 ## 16 个步骤
 
@@ -56,19 +59,22 @@
 | 09 | `09_allreduce_two_phase.py` | All-reduce v2：reduce-scatter + all-gather | ✅ 已交付 |
 | 10 | `10_allreduce_ring.py` | All-reduce v3（ring）：沿环分块 | ✅ 已交付 |
 | 11 | `11_allreduce_reveal.py` | **揭示**：`pld.tensor.allreduce`（mesh + ring）；对比 IR | ✅ 已交付 |
-| 12 | `12_broadcast.py` | 一对多；揭示 `pld.tensor.broadcast` | 规划中 |
-| 13 | `13_allgather.py` | 全对全切片；揭示 `pld.tensor.allgather` | 规划中 |
-| 14 | `14_reduce_scatter.py` | 全对分块；揭示 `pld.tensor.reduce_scatter` | 规划中 |
-| 15 | `15_all_to_all.py` | 个性化交换；揭示 `pld.tensor.all_to_all` | 规划中 |
-| 16 | `16_putting_it_together.py` | 在一个 kernel 中组合 `broadcast` + `allreduce` + `allgather` | 规划中 |
+| 12 | `12_broadcast.py` | 一对多；揭示 `pld.tensor.broadcast` | ✅ 已交付 |
+| 13 | `13_allgather.py` | 全对全切片；揭示 `pld.tensor.allgather` | ✅ 已交付 |
+| 14 | `14_reduce_scatter.py` | 全对分块；揭示 `pld.tensor.reduce_scatter` | ✅ 已交付 |
+| 15 | `15_all_to_all.py` | 个性化交换；揭示 `pld.tensor.all_to_all` | ✅ 已交付 |
+| 16 | `16_putting_it_together.py` | 在一个 kernel 中组合 `broadcast` + `allreduce` + `allgather` | ✅ 已交付 |
 
-步骤 12–16 为**规划中**——它们将在后续 PR 中交付。下面的教程页面（06–16）
-覆盖步骤 01–11。
+全部 16 步一起交付。下面的教程页面（06–21）覆盖步骤 01–16。
 
 ## 抽象总览（The abstractions map）
 
 每个 `pld` 抽象：一行用途、文档它的章节小节、教授它的教程步骤。
 教程的**覆盖契约**：代码中存在的任何内容都必须能由某个示例教授。
+
+> 此总览中*操作*行的机器级对应物是[操作目录](../ops/01-catalog.md) §分布式——
+> 集合通信、put/get、notify/wait 与 remote load/store 家族会 lower 为列在那里
+> 的操作；上面的 window、context 与装饰器辅助项是没有目录条目的语言抽象。
 
 ### 系统基座（System substrate）
 
@@ -131,6 +137,19 @@
 | `@pl.jit` / `@pl.jit.incore` | 每设备编排 / 设备端 kernel | [03-execution](03-execution.md) | 02 |
 | `device=r` | 从主机循环将一次分发固定到某个设备 | [00-model](00-model.md) | 01 |
 | `DistributedConfig` | 编译的设备列表与 worker 数量 | [03-execution](03-execution.md) | 01 |
+
+## 阅读路径（Reading path）
+
+本阶梯是更长路径上的一站。分层的单设备示例教授本阶梯所假设的 `pl` 语言——
+它只需要 `examples/beginner/` 与 `examples/intermediate/`。下面的阶段是推荐的
+推进顺序；只有前两个是本阶梯的前置，后面的阶段是可选的后续：
+
+- `pl` 语言：`examples/beginner/` → `examples/intermediate/`
+- 分布式阶梯：`examples/distributed/01 … 16`（本系列，P ≥ 2）
+- 更大规模：`examples/advanced/` → `examples/models/`
+- 应用：pypto-lib（分布式 MoE、模型 JIT decode）
+
+分布式阶梯是唯一需要多于一个设备的站点。
 
 ## 参见（See also）
 

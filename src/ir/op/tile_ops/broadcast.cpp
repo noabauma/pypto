@@ -181,6 +181,36 @@ TypePtr DeduceTileColExpandType(const std::vector<ExprPtr>& args,
   auto col_type = As<TileType>(args[1]->GetType());
   CHECK(col_type) << "The operator " << op_name << " requires second argument to be a TileType, but got "
                   << args[1]->GetType()->TypeName();
+  // Both operands are 2D-or-higher, matching the row_expand family. A rank-1 operand
+  // has no row axis at all, so "the single row" below would be vacuous for it and a
+  // bare [cols] vector -- which is not the documented shape -- would slip through.
+  CHECK(col_type->shape_.size() >= 2)
+      << "The operator " << op_name << " requires second argument to have at least 2 dimensions, but got "
+      << col_type->shape_.size();
+  CHECK(target_type->shape_.size() >= 2)
+      << "The operator " << op_name << " requires first argument to have at least 2 dimensions, but got "
+      << target_type->shape_.size();
+
+  // The vector operand is a per-column scalar row: dst[i, j] = target[i, j] OP col[0, j].
+  // Enforce that [1, cols] contract here rather than leaving it to codegen. Two reasons:
+  // a vector whose columns do not line up with the target is a silent wrong answer, and
+  // stating the relation in the type lets a consumer re-derive the operand's extent from
+  // the result instead of declaring it (gh#2612 -- LowerAutoVectorSplit is otherwise blind
+  // to this operand and has to fall back on a heuristic to decide whether a full-width one
+  // is legal beside a halved target).
+  //
+  // Only a PROVABLE mismatch is an error: a relation the analyzer cannot decide is left to
+  // the backend, so symbolic extents keep working exactly as before.
+  CHECK(ProveValidExtentEqual(col_type->shape_.back(), target_type->shape_.back()) != ProofResult::kFalse)
+      << "The operator " << op_name << " requires the column vector's last dimension to match the target's, "
+      << "but got col_tile shape " << FormatShape(col_type->shape_) << " against target shape "
+      << FormatShape(target_type->shape_);
+  const auto one_expr = std::make_shared<ConstInt>(1, DataType::INDEX, args[1]->span_);
+  for (size_t d = 0; d + 1 < col_type->shape_.size(); ++d) {
+    CHECK(ProveValidExtentEqual(col_type->shape_[d], one_expr) != ProofResult::kFalse)
+        << "The operator " << op_name << " requires the column vector to be a single row ([1, cols]), but "
+        << "got shape " << FormatShape(col_type->shape_) << " whose dimension " << d << " is not 1";
+  }
 
   // Result has same shape as target, with promoted dtype
   auto result_dtype = PromoteDataTypes(target_type->dtype_, col_type->dtype_);
@@ -308,6 +338,7 @@ REGISTER_OP("tile.row_expand_add")
     // On A2/A3 PTOAS writes tmp while writing dst; keep those allocations
     // distinct. On A5 tmp is a placeholder, and the stricter rule is safe.
     .forbid_output_alias(2)
+    .set_lane_invariant_arg(2)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileRowExpandAddType(args, kwargs, "tile.row_expand_add");

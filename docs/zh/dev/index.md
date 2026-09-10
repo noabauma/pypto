@@ -29,10 +29,11 @@ PyPTO 的构成：IR、pass 流水线、代码生成，以及围绕它们的基�
 | [逐任务 Ring Sizing](05-runtime-ring-sizing.md) | `RunConfig` 上的三个 ring 尺寸覆盖项及其调优时机 |
 | [持久化 L3 执行](06-persistent-l3.md) | 在多个已 prepare 的分布式程序间复用同一个 worker |
 | [内存图](07-memory-map.md) | 把 pass dump 渲染成可交互的片上内存 HTML 图 |
+| [编译与执行入口](08-entry-points.md) | 全部编译与执行入口、各自所属的层，以及何时该用哪一个 |
 | [分布式算子](distributed_ops.md) | N6 分布式算子家族 —— 对集合通信与低层原语的类型化 DSL 访问 |
 | [PTOAS 算子状态矩阵](ptoas-op-status.md) | 编译器当前会发射哪些 PTOAS 公开与兼容算子 |
 
 ## 另请参阅
 
 - [PTO ISA 参考](../reference/index.md) —— 后端所面向的硬件模型。
-- [运行时文档](https://hw-native-sys.github.io/simpler/) —— 执行已编译程序的调度器。
+- [运行时文档](https://www.pypto.ai/simpler/) —— 执行已编译程序的调度器。

@@ -786,7 +786,8 @@ BatchMatmulResult LowerBatchMatmul(const AssignStmtPtr& assign, const CallPtr& c
       if (!direct_store_shape.empty()) {
         store_args.push_back(std::make_shared<MakeTuple>(direct_store_shape, store_span));
       }
-      auto batch_store = op_registry.Create("tile.store", store_args, store_span);
+      auto batch_store =
+          op_registry.Create("tile.store", store_args, direct_store.store_call->kwargs_, store_span);
       // The Var stands for the store's bound name and the AssignStmt for the whole
       // statement, so both follow the consumed statement rather than its RHS Call.
       auto batch_store_var =
@@ -960,7 +961,7 @@ BatchMatmulAccResult LowerBatchMatmulAcc(const AssignStmtPtr& assign, const Call
 
   // Memory-space concerns (Vec/Acc round-trips on the acc operand, retargetable
   // producer promotion of the loop-carried tile.create, and matching TileView
-  // layout refresh) belong to InferTileMemorySpace (pass 17, runs immediately
+  // layout refresh) belong to InferTileMemorySpace (pass 20, runs immediately
   // after this pass). See:
   //   * DemandCollector — propagates the matmul_acc Acc input_constraint back
   //     through inherit-input ops.

@@ -16,15 +16,29 @@ torch tensors::
     compiled(a, b, c)                    # in-place on default sim, device 0
     c = compiled(a, b)                   # return style
     compiled(a, b, c, device=1)          # specify device at call time
+
+**Why the ``pypto.runtime`` imports are function-local.** This module is both
+the compilation artifact and the execution handle, so it reaches forward into
+the layer below it. Each deferral has its own reason, and they are not the same:
+
+- ``device_runner`` needs the optional ``simpler`` package at import time.
+  Hoisting it would make ``simpler`` a hard requirement of ``import pypto.ir``,
+  which the unit-test runners do not have.
+- ``runner``, ``debug.run_script_writer`` and (in the L3 sibling)
+  ``distributed_runner`` import cleanly at module scope; they stay deferred to
+  keep ``pypto.ir``'s own import graph free of the dispatch layer, not because
+  hoisting them fails.
+
+The one import that genuinely could not be hoisted was the metadata the replay
+writer reads back — that cycle is gone: it lives in the ``param_info`` leaf now.
 """
 
 import ctypes
 import json
 import os
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -42,6 +56,15 @@ from pypto.pypto_core.ir import (
 )
 from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 
+# Re-exported: these moved to a leaf module so a consumer of the metadata can
+# depend on it without depending on this module. See ``param_info``.
+from .param_info import (  # noqa: F401  -- re-export
+    _DATATYPE_TO_TORCH,
+    ParamInfo,
+    _ParamInfo,
+    _to_torch_dtype,
+)
+
 # Type alias for arguments accepted by CompiledProgram.__call__().
 # Tensor params accept ``torch.Tensor`` (host), :class:`DeviceTensor`
 # (worker-resident — skips H2D/D2H, see ``pypto.runtime.DeviceTensor``), or, for
@@ -49,6 +72,10 @@ from pypto.runtime.device_tensor import DeviceTensor, StackedDeviceTensor
 # Scalar params accept Python primitives or ctypes scalars (which are
 # coerced to the correct ctypes type internally).
 CallArg = torch.Tensor | DeviceTensor | StackedDeviceTensor | int | float | bool | ctypes._SimpleCData
+
+if TYPE_CHECKING:
+    from pypto.runtime._artifact_runtime import ArtifactRuntime
+
 
 # Filename of the small JSON sidecar persisted alongside the build artifacts so
 # a single-orchestration program can be reconstructed (``from_dir``) without the
@@ -86,42 +113,6 @@ _BUILD_KIND_MARKERS = (
     "orchestration/host_orch.py",
 )
 
-# IR DataType -> torch.dtype mapping.
-# Keyed by string because nanobind DataType instances are not singletons,
-# so dict lookup by object identity / hash may fail even for equal values.
-_DATATYPE_TO_TORCH: dict[str, torch.dtype] = {
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "fp64": torch.float64,
-    "bfloat16": torch.bfloat16,
-    "int8": torch.int8,
-    "int16": torch.int16,
-    "int32": torch.int32,
-    "int64": torch.int64,
-    "uint8": torch.uint8,
-    "bool": torch.bool,
-    "index": torch.int64,
-}
-# uint16/32/64 were added in PyTorch 2.3; register only if available
-for _name in ("uint16", "uint32", "uint64"):
-    _torch_dtype = getattr(torch, _name, None)
-    if _torch_dtype is not None:
-        _DATATYPE_TO_TORCH[_name] = _torch_dtype
-del _name, _torch_dtype
-# Float8 / MX scale dtypes (PyTorch 2.1+ / 2.3+ / 2.7+); map IR string → torch.dtype.
-# Packed MXFP4 (fp4 ↔ float4_e2m1fn_x2) must be here so return-style execution
-# can allocate FP4 outputs after JIT specialization accepts the torch dtype.
-for _ir_name, _torch_name in (
-    ("fp8e4m3fn", "float8_e4m3fn"),
-    ("fp8e5m2", "float8_e5m2"),
-    ("fp8e8m0", "float8_e8m0fnu"),
-    ("fp4", "float4_e2m1fn_x2"),
-):
-    _torch_dtype = getattr(torch, _torch_name, None)
-    if _torch_dtype is not None:
-        _DATATYPE_TO_TORCH[_ir_name] = _torch_dtype
-del _ir_name, _torch_name, _torch_dtype
-
 # IR DataType -> ctypes scalar constructor mapping.
 # Used to wrap Python int/float/bool values into the correct ctypes scalar
 # when calling a compiled program with scalar parameters.
@@ -141,11 +132,6 @@ _DATATYPE_TO_CTYPE: dict[str, type[ctypes._SimpleCData]] = {
     "bool": ctypes.c_bool,
     "index": ctypes.c_int64,
 }
-
-
-def _to_torch_dtype(dtype: DataType) -> torch.dtype | None:
-    """Convert an IR DataType to the corresponding torch.dtype."""
-    return _DATATYPE_TO_TORCH.get(str(dtype))
 
 
 def _to_runtime_shape(shape: list[int], dtype: DataType) -> list[int]:
@@ -173,16 +159,6 @@ def _validate_fp4_carrier_shape(shape: Sequence[int], info: "_ParamInfo") -> Non
             f"Packed FP4 parameter {info.name!r} requires a positive runtime x2 carrier last dimension; "
             f"got shape {tuple(shape)}"
         )
-
-
-@dataclass
-class _ParamInfo:
-    """Metadata for a single orchestration function parameter."""
-
-    name: str
-    direction: ParamDirection
-    shape: list[int] | None  # None for scalar params
-    dtype: DataType
 
 
 # Reverse map ``str(DataType) -> DataType`` for JSON round-tripping (e.g. the L3
@@ -665,6 +641,7 @@ def _invoke_compiled(
     args: tuple["CallArg", ...],
     config: Any,
     caller_name: str,
+    artifact_runtime: Any = None,
 ) -> "torch.Tensor | tuple[torch.Tensor, ...] | None":
     """Shared dispatch: coerce args, call the runtime, pack outputs.
 
@@ -683,19 +660,21 @@ def _invoke_compiled(
         args, param_infos, output_indices, return_types, caller_name=caller_name
     )
 
-    from pypto.runtime.runner import RunConfig, _DfxOpts, execute_compiled  # noqa: PLC0415
+    from pypto.runtime.runner import RunConfig, _execute_compiled  # noqa: PLC0415
 
     execution_platform = platform if config is None else config.platform
     if config is None:
         config = RunConfig()
 
-    execute_compiled(
+    _execute_compiled(
         output_dir,
         coerced,
         platform=execution_platform,
         device_id=config.device_id,
-        dfx=_DfxOpts.from_run_config(config),
+        dfx=config.dfx_options(),
         aicpu_thread_num=config.aicpu_thread_num,
+        config=config,
+        **({"artifact_runtime": artifact_runtime} if artifact_runtime is not None else {}),
     )
 
     if not return_style:
@@ -775,9 +754,13 @@ class _RuntimeFacade:
         if self._chip_callable is not None:
             return
         self._check_runtime_access()
-        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+        artifact_runtime = getattr(self, "_artifact_runtime", None)
+        if artifact_runtime is None:
+            from pypto.runtime.device_runner import _compile_and_assemble  # noqa: PLC0415
 
-        cc, rn, rc = compile_and_assemble(self._output_dir, self._platform)
+            cc, rn, rc = _compile_and_assemble(self._output_dir, self._platform)
+        else:
+            cc, rn, rc = artifact_runtime.load()["."]
         # Publish the "loaded" sentinel (_chip_callable) last so a reader can
         # never observe it set while _runtime_name / _runtime_config are None.
         self._runtime_name = rn
@@ -842,6 +825,7 @@ class CompiledProgram(_RuntimeFacade):
     """
 
     __test__ = False  # Not a pytest test class
+    _artifact_runtime: "ArtifactRuntime | None" = None
 
     def __init__(
         self,
@@ -932,7 +916,7 @@ class CompiledProgram(_RuntimeFacade):
         after codegen) rather than ``kernel_config.py`` (only present after ptoas)
         so the dispatch surface is inspectable in ``skip_ptoas=True`` builds --
         calling a sub-callable without ``kernel_config.py`` then fails cleanly
-        inside ``execute_compiled`` with a ``FileNotFoundError``. Distributed (L3+)
+        inside the dispatch path with a ``FileNotFoundError``. Distributed (L3+)
         builds are excluded: they also lay out ``next_levels/<chip_task>/`` but
         expose a single canonical entry point via ``orchestration/host_orch.py`` and
         must be invoked through :meth:`__call__` directly, not by subscript.
@@ -975,7 +959,7 @@ class CompiledProgram(_RuntimeFacade):
         orchestration param metadata (names, directions, shapes, dtypes) plus
         the return-type count -- alongside the platform / backend. Runtime
         artefacts (``chip_callable`` / ``runtime_name`` / ``runtime_config``)
-        need no persistence: ``compile_and_assemble`` already rederives them
+        need no persistence: ``_compile_and_assemble`` already rederives them
         from the generated ``kernel_config.py``.
 
         Best-effort: a program without a resolvable orchestration signature
@@ -1190,9 +1174,9 @@ class CompiledProgram(_RuntimeFacade):
                 f"compiled[<name>] instead."
             )
 
-    # --- Argument builders (for users driving a simpler.Worker directly) -----
+    # --- Argument builders (internal; used by the runtime workers) ----------
 
-    def build_orch_args(
+    def _build_orch_args(
         self,
         *args: "CallArg",
         worker: Any | None = None,
@@ -1213,12 +1197,12 @@ class CompiledProgram(_RuntimeFacade):
 
         Raises:
             TypeError: Arg count / type mismatch, or called on a multi-orch
-                program (use ``compiled[<name>].build_orch_args(...)`` instead).
+                program (use ``compiled[<name>]._build_orch_args(...)`` instead).
         """
         if self._sub_chip_dirs:
             raise TypeError(
                 f"Multi-orch program has {len(self._sub_chip_dirs)} orchestrations "
-                f"{sorted(self._sub_chip_dirs)}; use compiled[<name>].build_orch_args(...)."
+                f"{sorted(self._sub_chip_dirs)}; use compiled[<name>]._build_orch_args(...)."
             )
         param_infos, output_indices, return_types = self._get_metadata()
         coerced, return_style = _coerce_args(
@@ -1226,14 +1210,14 @@ class CompiledProgram(_RuntimeFacade):
         )
         if worker is None:
             raise TypeError(
-                "build_orch_args requires the simpler Worker that will own and dispatch these TaskArgs"
+                "_build_orch_args requires the simpler Worker that will own and dispatch these TaskArgs"
             )
         from pypto.runtime.runner import _coerced_to_orch_args  # noqa: PLC0415
 
         orch_args = _coerced_to_orch_args(coerced, worker)
         return orch_args, coerced, return_style
 
-    def build_call_config(
+    def _build_call_config(
         self,
         config: Any = None,
         *,
@@ -1254,12 +1238,13 @@ class CompiledProgram(_RuntimeFacade):
         if self._sub_chip_dirs:
             raise TypeError(
                 f"Multi-orch program has {len(self._sub_chip_dirs)} orchestrations "
-                f"{sorted(self._sub_chip_dirs)}; use compiled[<name>].build_call_config(...)."
+                f"{sorted(self._sub_chip_dirs)}; use compiled[<name>]._build_call_config(...)."
             )
-        from pypto.runtime.runner import RunConfig, _build_call_config  # noqa: PLC0415
+        from pypto.runtime.runner import RunConfig  # noqa: PLC0415
+        from pypto.runtime.runner import _build_call_config as _runner_build_call_config  # noqa: PLC0415
 
         run_config = config if config is not None else RunConfig()
-        return _build_call_config(
+        return _runner_build_call_config(
             run_config,
             runtime_config=self.runtime_config,
             aicpu_thread_num_override=aicpu_thread_num,
@@ -1411,6 +1396,7 @@ class CompiledProgram(_RuntimeFacade):
             args=args,
             config=config,
             caller_name="CompiledProgram",
+            artifact_runtime=getattr(self, "_artifact_runtime", None),
         )
 
 
@@ -1455,7 +1441,7 @@ class _SubChipCallable(_RuntimeFacade):
     def output_indices(self) -> list[int]:
         return list(self._output_indices)
 
-    def build_orch_args(
+    def _build_orch_args(
         self,
         *args: "CallArg",
         worker: Any | None = None,
@@ -1469,24 +1455,25 @@ class _SubChipCallable(_RuntimeFacade):
         )
         if worker is None:
             raise TypeError(
-                "build_orch_args requires the simpler Worker that will own and dispatch these TaskArgs"
+                "_build_orch_args requires the simpler Worker that will own and dispatch these TaskArgs"
             )
         from pypto.runtime.runner import _coerced_to_orch_args  # noqa: PLC0415
 
         orch_args = _coerced_to_orch_args(coerced, worker)
         return orch_args, coerced, return_style
 
-    def build_call_config(
+    def _build_call_config(
         self,
         config: Any = None,
         *,
         aicpu_thread_num: int | None = None,
         dfx_dir: "Path | None" = None,
     ) -> Any:
-        from pypto.runtime.runner import RunConfig, _build_call_config  # noqa: PLC0415
+        from pypto.runtime.runner import RunConfig  # noqa: PLC0415
+        from pypto.runtime.runner import _build_call_config as _runner_build_call_config  # noqa: PLC0415
 
         run_config = config if config is not None else RunConfig()
-        return _build_call_config(
+        return _runner_build_call_config(
             run_config,
             runtime_config=self.runtime_config,
             aicpu_thread_num_override=aicpu_thread_num,
@@ -1515,5 +1502,5 @@ class _SubChipCallable(_RuntimeFacade):
 
 # Public re-exports for callers (e.g. ir.compile()) that need orchestration
 # parameter metadata without instantiating a full CompiledProgram.
-ParamInfo = _ParamInfo
+
 extract_param_infos = _extract_param_infos

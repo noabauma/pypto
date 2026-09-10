@@ -306,6 +306,55 @@ void CheckGatherRowOperands(const std::vector<ExprPtr>& args,
 void CheckMatmulInitCond(const std::vector<ExprPtr>& args, size_t index, const std::string& op_name);
 
 /**
+ * @brief Data type the Cube accumulator holds for a matmul over these operands
+ *
+ * The L0C accumulator is fixed by the operand domain, not by anything the caller
+ * asks for: a pair of float operands accumulates in FP32, every other pair
+ * (int operands, or a mixed pair) accumulates in INT32. ``tile.matmul`` and the
+ * ``tensor.matmul`` that lowers to it must agree on this, so both read it here.
+ *
+ * @param lhs Left operand element type
+ * @param rhs Right operand element type
+ * @return FP32 for two float operands, INT32 otherwise
+ */
+DataType MatmulAccumulatorDataType(DataType lhs, DataType rhs);
+
+/**
+ * @brief Can the Cube writeback turn @p accumulator into @p out without a scale?
+ *
+ * The matmul result leaves L0C through the FIXPIPE, and the plain (no quant
+ * parameter) writeback offers exactly one conversion: the float narrowing
+ * ``f32 -> f16`` / ``f32 -> bf16`` (``QuantMode_t::F322F16`` / ``F322BF16``; see
+ * ``GetCastPreQuantMode`` in pto-isa ``npu/a2a3/common.hpp`` and ``npu/a5/common.hpp``,
+ * which agree). Anything else is a *quantization*: an INT32 accumulator reaching
+ * FP16 or INT8 is a dequant/requant needing a scale, so from INT32 only INT32
+ * leaves unchanged.
+ *
+ * @param accumulator Accumulator element type (FP32 or INT32)
+ * @param out Requested destination element type
+ * @return true when the FIXPIPE can produce @p out from @p accumulator unscaled
+ */
+bool CubeWritebackSupportsDataType(DataType accumulator, DataType out);
+
+/**
+ * @brief Name the scaled conversion a rejected Acc writeback pair would need
+ *
+ * The pairs `CubeWritebackSupportsDataType` rejects are not all the same kind of
+ * conversion, and FIXPIPE's scaled modes are directional: an integer accumulator
+ * reaching a float destination is a *dequantization* (`DEQF16`), a float
+ * accumulator reaching an integer one is a *quantization* (`QF322B8_PRE`), and
+ * integer to a narrower integer is a *requantization* (`REQ8`). All three carry
+ * a scale, which is what a plain matmul or store has nowhere to put -- but a
+ * diagnostic that calls every one of them a dequantization is wrong for two of
+ * the three. Call this only for a pair `CubeWritebackSupportsDataType` rejects.
+ *
+ * @param accumulator Accumulator element type (FP32 or INT32)
+ * @param out Requested destination element type
+ * @return "a dequantization", "a quantization", or "a requantization"
+ */
+const char* DescribeCubeWritebackScaledConversion(DataType accumulator, DataType out);
+
+/**
  * @brief Read the elements of a tuple-typed operand
  *
  * A ``MakeTuple`` operand yields its elements directly, which preserves the
@@ -474,16 +523,26 @@ void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,
  * 1. source fully valid                  -> new_shape
  * 2. source provably empty               -> all-zero box
  * 3. only full unit axes added / removed -> surviving axes map 1:1
- * 4. contiguous flat prefix              -> rectangular box under new_shape
+ * 4. target cuts the buffer the same way -> box under new_shape
  * 5. otherwise                           -> reject
  * ```
  *
  * Cases 2 and 3 are exact because neither repartitions data: the empty set stays
  * empty under every reshape, and inserting or removing a provably-full physical
  * unit axis is a coordinate-only rank change that preserves an arbitrary
- * rectangle. Case 4 is the general rule: a region that occupies a contiguous
- * flat prefix of the buffer maps to whatever rectangle spans that same prefix in
- * the target shape, provided one exists. Tensor and tile reshape share this rule.
+ * rectangle. Case 4 is the general rule, and for a static region it is *exact*:
+ * it accepts a region if and only if some box under @p new_shape denotes the
+ * very same flat cells. Tensor and tile reshape share this rule.
+ *
+ * Case 4 reads the region as the runs of elements it fills. Neighbouring source
+ * axes belong to one run while the lower one is fully valid or the upper one is
+ * pinned to a single coordinate; anywhere else the upper axis's stride survives
+ * into the region and cuts it. Each run holds a flat prefix of its own volume,
+ * so the region maps exactly when @p new_shape groups its own dimensions into
+ * the same runs and each run's prefix falls on a dimension boundary there. A
+ * flat prefix of the whole buffer is the one-run case; ``[2, 2, 2]`` valid
+ * ``[2, 1, 2]`` is the two-run case ``2 | 4``, which ``[2, 4]`` spells as valid
+ * ``[2, 2]`` and ``[8]`` cannot spell at all.
  *
  * Case 4 is the only one that reasons about flat positions, so it is the only
  * one that depends on storage order. Pass @p row_major_contiguous false for a
@@ -491,6 +550,15 @@ void ValidateDropDimsValidExtents(const std::vector<int64_t>& drop_dims,
  * ``DN`` / ``NZ`` tensor) and a partial region that needs case 4 is rejected
  * rather than mapped against the wrong flat order. Cases 1-3 relabel axes
  * without consulting flat positions and hold under any layout.
+ *
+ * A symbolic extent narrows what case 4 can prove, but does not by itself
+ * reject: *any* run may carry a symbolic **valid** extent through unchanged,
+ * onto a target dimension of its own run whose step is exactly that run's
+ * trailing volume. What has to be static is the **physical** geometry the region
+ * is measured against -- the target extents, the extents below each run's free
+ * axis, the free axis itself on the symbolic path (its dimension has to be
+ * provably wide enough), and, once the region cuts into more than one run, each
+ * run's volume. Anything less is rejected rather than guessed.
  *
  * @param src_valid Effective valid shape of the source, resolved by ``GetValidShape``
  * @param in_shape Physical shape of the source, same rank as @p src_valid

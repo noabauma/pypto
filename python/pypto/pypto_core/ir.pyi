@@ -2301,6 +2301,9 @@ class ScopeKind(enum.Enum):
     SplitAiv = 7
     """Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)."""
 
+    Graph = 8
+    """Recordable orchestration region (pl.graph, outlined into a Graph function)."""
+
 class SplitMode(enum.Enum):
     """Split mode for cross-core data transfer."""
 
@@ -2352,6 +2355,33 @@ class AtomicType(enum.IntEnum):
     Add = 1
     """Atomically add the source data into the destination."""
 
+class AccPhase(enum.IntEnum):
+    """Producer-side unit-flag phase for GEMV accumulator operations.
+
+    Stored as ``int`` in op kwargs. The values match PTO-ISA's ``AccPhase`` ABI.
+    """
+
+    Unspecified = 0
+    """Do not use the unit-flag protocol."""
+
+    Partial = 2
+    """Check the unit flag without setting it."""
+
+    Final = 3
+    """Check and set the unit flag."""
+
+class STPhase(enum.IntEnum):
+    """Consumer-side unit-flag phase for ``tile.store``.
+
+    Stored as ``int`` in op kwargs. Supported values use PTO-ISA's ``STPhase`` ABI.
+    """
+
+    Unspecified = 0
+    """Do not use the unit-flag protocol."""
+
+    Final = 3
+    """Check and clear the unit flag."""
+
 class ReduceOp(enum.IntEnum):
     """Reduction operator for collective reductions — ``pld.tensor.allreduce`` and friends.
 
@@ -2362,9 +2392,9 @@ class ReduceOp(enum.IntEnum):
     .. note::
 
        **Per-operation support:** ``pld.tensor.allreduce`` (both the InCore
-       composite and the HOST builtin) accepts all four values. Other
-       reducing collectives are narrower — ``pld.tensor.reduce_scatter``
-       accepts only :attr:`Sum` and rejects the rest at the deducer.
+       composite and the HOST builtin) accepts all four values. On the
+       InCore rail ``pld.tensor.reduce_scatter`` also accepts all four
+       values; the HOST builtin rail lowers ``Sum`` only.
     """
 
     Sum = 0
@@ -2401,7 +2431,8 @@ class ScopeStmt(Stmt):
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         """ScopeStmt is abstract — construct an InCoreScopeStmt, ClusterScopeStmt,
-        HierarchyScopeStmt, SplitAivScopeStmt, or SpmdScopeStmt instead."""
+        HierarchyScopeStmt, SplitAivScopeStmt, GraphScopeStmt, or SpmdScopeStmt
+        instead."""
 
 class InCoreScopeStmt(ScopeStmt):
     """InCore scope: AICore sub-graph region."""
@@ -2424,6 +2455,12 @@ class ClusterScopeStmt(ScopeStmt):
 
     def __init__(self, name_hint: str = "", *, body: Stmt, span: Span) -> None:
         """Create a Cluster scope statement."""
+
+class GraphScopeStmt(ScopeStmt):
+    """Graph scope: a recordable orchestration region."""
+
+    def __init__(self, name_hint: str, *, body: Stmt, span: Span) -> None:
+        """Create a Graph scope statement (``name_hint`` is the region name)."""
 
 class HierarchyScopeStmt(ScopeStmt):
     """Hierarchy scope: distributed-hierarchy region."""
@@ -2475,7 +2512,7 @@ class SplitAivScopeStmt(ScopeStmt):
     Dispatches a region across the 2 AIV subblocks. ``mode=SplitMode.NONE`` is
     task-parallel (no halving; both lanes run the full body, dispatched via
     ``aiv_id``); ``UP_DOWN`` / ``LEFT_RIGHT`` are data-parallel (vector compute
-    halved on the split axis). Erased by LowerAutoVectorSplit (pass 20); never
+    halved on the split axis). Erased by LowerAutoVectorSplit (pass 23); never
     reaches codegen.
     """
 
@@ -3295,6 +3332,39 @@ def get_op_write_channel(op_name: str) -> WriteChannel | None:
     Returns:
         The declared channel, or None when the operator declared none (it
         writes nothing, or its writes are not GM stores)
+
+    Raises:
+        Exception: If operator is not registered
+    """
+
+class LaneInvariantArg(enum.Enum):
+    """Why an argument carries no lane-indexed data under automatic AIV splitting.
+
+    Declared only for the arguments an operator's own ``f_deduce_type`` cannot
+    speak about; ``LowerAutoVectorSplit`` decides every other operand by
+    re-deducing the halved call. See ``docs/en/dev/passes/22-lower_auto_vector_split.md``.
+    """
+
+    Scratch = ...
+    """Hardware workspace. Full width and halved are both correct."""
+
+    IndexAddressedSource = ...
+    """Lookup table read at absolute indices. Only full width is correct."""
+
+    AbsoluteIndexedDestination = ...
+    """Destination written at absolute indices. Only full width is correct."""
+
+def get_op_lane_invariant_arg(op_name: str, arg_index: int) -> LaneInvariantArg | None:
+    """Why one positional argument carries no lane-indexed data.
+
+    Args:
+        op_name: Name of the operator
+        arg_index: Positional argument index
+
+    Returns:
+        The declared kind, or None when the operator did not declare this
+        argument — automatic AIV splitting then treats it as per-lane data
+        whenever type deduction cannot decide for itself.
 
     Raises:
         Exception: If operator is not registered
@@ -4166,6 +4236,7 @@ class IRVisitor:
     def visit_while_stmt(self, op: WhileStmt) -> None: ...
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> None: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> None: ...
+    def visit_graph_scope_stmt(self, op: GraphScopeStmt) -> None: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
     def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> None: ...
@@ -4248,6 +4319,7 @@ class IRMutator:
     def visit_while_stmt(self, op: WhileStmt) -> Stmt: ...
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> Stmt: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> Stmt: ...
+    def visit_graph_scope_stmt(self, op: GraphScopeStmt) -> Stmt: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...
     def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> Stmt: ...

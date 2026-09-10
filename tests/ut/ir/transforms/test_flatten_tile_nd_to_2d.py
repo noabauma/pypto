@@ -963,6 +963,154 @@ class TestFlattenTileNdTo2DMultiOutput:
 
 
 # ----------------------------------------------------------------------------
+# Rank-raising tile.reshape / tile.reinterpret_view: the shape operand is the
+# only place a >2D tile can be introduced independently of any operand's type
+# ----------------------------------------------------------------------------
+
+
+class TestFlattenTileNdTo2DRankRaisingViews:
+    """A `pl.reshape` / `pl.reinterpret_view` onto a >2D shape collapses to 2D.
+
+    Every other tile op derives its result rank from an operand, so the pass's
+    generic substitute-and-re-deduce path lowers it for free. These two read the
+    rank off a literal shape tuple that no substitution touches, so the pass has
+    to rewrite the tuple itself. Left alone, the >2D result reached PTO codegen,
+    where ``ExtractTileTypeInfo`` types a ``tile_buf`` from ``shape_[0]`` and
+    ``shape_[1]`` only: a ``[2, 8, 128]`` tile was emitted as ``rows=2, cols=8``
+    -- 16 elements instead of 2048 -- and ptoas rejected the ``pto.treshape``
+    that carried it for a total-byte-size mismatch.
+
+    The collapse is the pass's own ``[product(leading), last]`` rule, which is
+    exactly semantics-preserving for a reshape: a tile is one contiguous
+    row-major run, so ``[2, 8, 128]`` and ``[16, 128]`` name the same elements
+    in the same order.
+    """
+
+    @pytest.mark.parametrize(
+        ("nd_shape", "flat_shape"),
+        [
+            ([2, 8, 128], [16, 128]),
+            ([16, 1, 128], [16, 128]),
+            ([4, 4, 128], [16, 128]),
+            # A genuine 2D shape change, not an identity: [16, 128] -> [128, 16].
+            ([16, 8, 16], [128, 16]),
+            ([2, 2, 4, 128], [16, 128]),
+        ],
+    )
+    def test_rank_raising_reshape_collapses_to_2d(self, nd_shape, flat_shape):
+        """`pl.reshape` onto a >2D shape becomes the merged 2D reshape."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t = pl.load(x, [0, 0], [16, 128])
+                r = pl.tile.reshape(t, nd_shape)
+                s = pl.tile.mul(r, 2.0)
+                b = pl.tile.reshape(s, [16, 128])
+                out_0 = pl.store(b, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0 = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, out_0)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t = pl.tile.load(x, [0, 0], [16, 128], [16, 128])
+                r = pl.tile.reshape(t, flat_shape)
+                s = pl.tile.muls(r, 2.0)
+                b = pl.tile.reshape(s, [16, 128])
+                out_0_1 = pl.tile.store(b, [0, 0], out_0)
+                return out_0_1
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0 = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, out_0)
+
+        After = passes.flatten_tile_nd_to_2d()(Before)
+        ir.assert_structural_equal(After, Expected)
+
+    def test_rank_raising_reshape_leaves_no_nd_tile_for_the_verifier(self):
+        """The `TileOps2D` postcondition holds after the pass, not just by exemption."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                out_0: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t = pl.load(x, [0, 0], [16, 128])
+                r = pl.tile.reshape(t, [2, 8, 128])
+                s = pl.tile.mul(r, 2.0)
+                b = pl.tile.reshape(s, [16, 128])
+                out_0 = pl.store(b, [0, 0], out_0)
+                return out_0
+
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
+                out_0 = pl.create_tensor([16, 128], dtype=pl.FP32)
+                return self.main_incore_0(x, out_0)
+
+        # The unflattened input violates the property the pass promises...
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.TileOps2D)
+        with pytest.raises(pypto.Error, match="TileOps2D"):
+            passes.verify_properties(props, Before, "before_flatten")
+
+        # ...and satisfies it afterwards.
+        After = passes.flatten_tile_nd_to_2d()(Before)
+        passes.verify_properties(props, After, "after_flatten")
+
+    def test_rank_raising_reinterpret_view_collapses_to_2d(self):
+        """`tile.reinterpret_view(..., shape=[4, 1, 16])` becomes `[4, 16]`."""
+        span = ir.Span.unknown()
+        source = ir.Var("source", ir.TileType([4, 8], DataType.FP32), span)
+        view_call = tile_ops.reinterpret_view(source, DataType.INT16, shape=[4, 1, 16], span=span)
+        view = ir.Var("view", view_call.type, span)
+        body = ir.SeqStmts(
+            [ir.AssignStmt(view, view_call, span), ir.ReturnStmt([view], span)],
+            span,
+        )
+        func = ir.Function(
+            "rank_raising_view",
+            [(source, ir.ParamDirection.In)],
+            [view_call.type],
+            body,
+            span,
+            ir.FunctionType.InCore,
+        )
+        program = ir.Program([func], "rank_raising_view", span)
+
+        after = passes.flatten_tile_nd_to_2d()(program)
+        after_func = after.get_function("rank_raising_view")
+        assert after_func is not None
+        views = [
+            c for c in _tile_calls(after_func.body) if c.op.name == ir.get_op("tile.reinterpret_view").name
+        ]
+        assert len(views) == 1
+        assert _const_int_values(cast(ir.TileType, views[0].type).shape) == [4, 16]
+
+        props = passes.IRPropertySet()
+        props.insert(passes.IRProperty.TileOps2D)
+        passes.verify_properties(props, after, "after_flatten")
+
+
+# ----------------------------------------------------------------------------
 # User-introduced rank-raising tile.reshape feeding tile.store (#1400)
 # ----------------------------------------------------------------------------
 
@@ -1011,13 +1159,17 @@ class TestFlattenTileNdTo2DReshapedStore:
             ) -> pl.Tensor[[B, S, D], pl.FP32]:
                 # 2D tile.load is unchanged by the pass.
                 x_tile = pl.tile.load(x, [0, 0], [B, D], [B, D])
-                # The user's explicit rank-raising reshape is preserved.
-                r3 = pl.tile.reshape(x_tile, [B, 1, D])
-                # The pass-inserted ``tile.reshape`` flattens the >2D tile operand of
-                # ``tile.store`` back to 2D; codegen requires a 2D tile while the
-                # original 3D shape flows through as the ``shapes`` partition operand.
-                flat_tile = pl.tile.reshape(r3, [B, D])
-                out_0_1 = pl.tile.store(flat_tile, [0, 0, 0], out_0, [B, 1, D])
+                # The user's rank-raising reshape is collapsed to its 2D form: a tile
+                # is one contiguous row-major run, so [B, 1, D] and [B, D] name the
+                # same elements. Left at rank 3 it would reach PTO codegen, where
+                # ``ExtractTileTypeInfo`` types the tile_buf from ``shape_[0]`` and
+                # ``shape_[1]`` alone and drops the trailing D.
+                r3 = pl.tile.reshape(x_tile, [B, D])
+                # The 3D shape the user wrote still flows through as the ``shapes``
+                # partition operand, which is what selects the [B, 1, D] window of the
+                # [B, S, D] output tensor. No pass-inserted flattening reshape is
+                # needed any more: the operand arrives 2D.
+                out_0_1 = pl.tile.store(r3, [0, 0, 0], out_0, [B, 1, D])
                 return out_0_1
 
             @pl.function
@@ -1342,8 +1494,17 @@ class TestFlattenTileNdTo2DPassProperties:
         with pytest.raises(pypto.Error, match="TileOps2D"):
             passes.verify_properties(props, program, "test_non_literal_offset_assemble")
 
-    def test_verifier_allows_rank_raising_reinterpret_view(self):
-        """An explicit rank-raising metadata view is exempt, like tile.reshape."""
+    def test_verifier_rejects_rank_raising_reinterpret_view(self):
+        """A rank-raising metadata view is a >2D tile like any other.
+
+        `tile.reinterpret_view` and `tile.reshape` used to be exempt from the
+        result-rank check, on the reading that an explicit rank-raising view is
+        the author's intent. It is not something PTO can hold: `tile_buf` is 2D,
+        and `ExtractTileTypeInfo` types one from `shape_[0]` / `shape_[1]` alone,
+        so the exemption only meant the wrong-sized tile was found later (or, on
+        the `memory_planner=PYPTO` path, never). The pass collapses these two ops
+        like every other; the verifier holds them to it.
+        """
         span = ir.Span.unknown()
         source = ir.Var("source", ir.TileType([4, 8], DataType.FP32), span)
         view_call = tile_ops.reinterpret_view(source, DataType.INT16, shape=[4, 1, 16], span=span)
@@ -1364,7 +1525,8 @@ class TestFlattenTileNdTo2DPassProperties:
         props = passes.IRPropertySet()
         props.insert(passes.IRProperty.TileOps2D)
 
-        passes.verify_properties(props, program, "test_rank_raising_reinterpret_view")
+        with pytest.raises(pypto.Error, match="TileOps2D"):
+            passes.verify_properties(props, program, "test_rank_raising_reinterpret_view")
 
 
 # ----------------------------------------------------------------------------
@@ -2184,7 +2346,15 @@ class TestFlattenTileNdTo2DBatchMatmul:
                     "out_tile",
                     ir.Call(bmm_op, [lhs_tile, rhs_tile], ir.TileType(out_shape, DataType.FP32), span),
                 )
-                out_r = ib.let("out_0", tile_ops.store(out_tile, [0] * len(out_shape), out_p))
+                out_r = ib.let(
+                    "out_0",
+                    tile_ops.store(
+                        out_tile,
+                        [0] * len(out_shape),
+                        out_p,
+                        atomic=int(ir.AtomicType.Add),
+                    ),
+                )
                 ib.return_stmt(out_r)
             prog.add_function(f.get_result())
 
@@ -2239,6 +2409,9 @@ class TestFlattenTileNdTo2DBatchMatmul:
         assert [self._tuple_const_values(call.args[3]) for call in store_calls] == case[
             "expected_store_shapes"
         ]
+        assert [call.kwargs for call in store_calls] == [{"atomic": int(ir.AtomicType.Add)}] * len(
+            store_calls
+        )
 
     def test_batch_matmul_a_trans_view_unrolls_per_batch_column_slice(self):
         """An a_trans lhs (natural load + ``tile.transpose_view``) unrolls per batch via
@@ -4501,6 +4674,189 @@ class TestFlattenTileNdTo2DSpans:
                     f"fused store shape element reported line {element.span.begin_line}, "
                     f"expected the consumed store's line {store_before.span.begin_line}"
                 )
+
+
+class TestRowWindowAccumulatorPacking:
+    @pytest.mark.parametrize(
+        "read_row,write_row,message",
+        [(8, 8, "aligned row offset"), (0, 16, "original window")],
+    )
+    def test_row_window_packing_rejects_unrepresentable_writeback(self, read_row, write_row, message):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat],
+                b: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat],
+                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                acc = pl.tile.create([32, 32], pl.FP32)
+                win = pl.tile.slice(acc, [16, 32], [read_row, 0])
+                part = pl.tile.matmul_acc(win, a, b, init_cond=True)
+                acc_updated = pl.tile.assemble(acc, part, [write_row, 0])
+                result = pl.tile.store(acc_updated, [0, 0], out)
+                return result
+
+        with pytest.raises(ValueError, match=message):
+            passes.flatten_tile_nd_to_2d()(Before)
+
+    def test_row_windows_pack_columns_and_restore_store_rows(self):
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat],
+                b: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat],
+                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                acc = pl.tile.create([32, 32], pl.FP32)
+                win = pl.tile.slice(acc, [16, 32], [16, 0])
+                part = pl.tile.matmul_acc(win, a, b, init_cond=True)
+                acc_updated = pl.tile.assemble(acc, part, [16, 0])
+                result = pl.tile.store(acc_updated, [0, 0], out)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat],
+                b: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat],
+                out: pl.Out[pl.Tensor[[32, 32], pl.FP32]],
+            ) -> pl.Tensor[[32, 32], pl.FP32]:
+                acc = pl.tile.create([16, 64], pl.FP32, target_memory=pl.Mem.Acc)
+                win = pl.tile.slice(acc, [16, 32], [0, 32])
+                part = pl.tile.matmul_acc(win, a, b, init_cond=True)
+                acc_updated = pl.tile.assemble(acc, part, [0, 32])
+                page0 = pl.tile.slice(acc_updated, [16, 32], [0, 0])
+                out0 = pl.tile.store(page0, [0, 0], out)
+                page1 = pl.tile.slice(acc_updated, [16, 32], [0, 32])
+                out1 = pl.tile.store(page1, [16, 0], out0)
+                return out1
+
+        after = passes.flatten_tile_nd_to_2d()(Before)
+        ir.assert_structural_equal(after, Expected)
+
+    def test_narrow_accumulator_row_windows_are_left_unpacked(self):
+        """A window at most one 16-column box wide needs no packing at all.
+
+        pto-isa's ``MadAccStrideCompatible`` returns true on ``Cols <= 16``
+        before it looks at ``ValidRow``: there is no second block column for
+        the compact write to mis-stride. Packing such a chain is unnecessary,
+        and seeding it would subject a kernel the hardware already accepts to
+        the packer's rejection rules.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat],
+                b: pl.Tile[[64, 16], pl.FP16, pl.Mem.Mat],
+                out: pl.Out[pl.Tensor[[32, 16], pl.FP32]],
+            ) -> pl.Tensor[[32, 16], pl.FP32]:
+                acc = pl.tile.create([32, 16], pl.FP32)
+                win = pl.tile.slice(acc, [16, 16], [16, 0])
+                part = pl.tile.matmul_acc(win, a, b, init_cond=True)
+                acc_updated = pl.tile.assemble(acc, part, [16, 0])
+                result = pl.tile.store(acc_updated, [0, 0], out)
+                return result
+
+        after = passes.flatten_tile_nd_to_2d()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_narrow_accumulator_accepts_mixed_row_window_heights(self):
+        """Windows of different heights have no single packed shape, but a
+        single-block-column accumulator does not need one — the pass must leave
+        it alone rather than reject it."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a16: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat],
+                a32: pl.Tile[[32, 64], pl.FP16, pl.Mem.Mat],
+                b: pl.Tile[[64, 16], pl.FP16, pl.Mem.Mat],
+                out: pl.Out[pl.Tensor[[48, 16], pl.FP32]],
+            ) -> pl.Tensor[[48, 16], pl.FP32]:
+                acc = pl.tile.create([48, 16], pl.FP32)
+                lo = pl.tile.slice(acc, [32, 16], [0, 0])
+                lo_part = pl.tile.matmul_acc(lo, a32, b, init_cond=True)
+                acc1 = pl.tile.assemble(acc, lo_part, [0, 0])
+                hi = pl.tile.slice(acc1, [16, 16], [32, 0])
+                hi_part = pl.tile.matmul_acc(hi, a16, b, init_cond=True)
+                acc2 = pl.tile.assemble(acc1, hi_part, [32, 0])
+                result = pl.tile.store(acc2, [0, 0], out)
+                return result
+
+        after = passes.flatten_tile_nd_to_2d()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_narrow_windows_of_a_wide_parent_are_left_unpacked(self):
+        """The exemption reads the window's column extent, not the parent's.
+
+        ptoas resolves a row window to the parent's physical ``Rows`` but the
+        window's ``Cols``, so a 16-column window inside one block is a single
+        L0C block column however wide its parent is. Two such windows in
+        separate blocks of a ``[48, 32]`` accumulator are addressable at unequal
+        heights, and ``CheckAccWindowContiguous`` accepts them downstream.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a16: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat],
+                a32: pl.Tile[[32, 64], pl.FP16, pl.Mem.Mat],
+                b: pl.Tile[[64, 16], pl.FP16, pl.Mem.Mat],
+                out: pl.Out[pl.Tensor[[48, 32], pl.FP32]],
+            ) -> pl.Tensor[[48, 32], pl.FP32]:
+                acc = pl.tile.create([48, 32], pl.FP32)
+                lo = pl.tile.slice(acc, [32, 16], [0, 0])
+                lo_part = pl.tile.matmul_acc(lo, a32, b, init_cond=True)
+                acc1 = pl.tile.assemble(acc, lo_part, [0, 0])
+                hi = pl.tile.slice(acc1, [16, 16], [32, 16])
+                hi_part = pl.tile.matmul_acc(hi, a16, b, init_cond=True)
+                acc2 = pl.tile.assemble(acc1, hi_part, [32, 16])
+                result = pl.tile.store(acc2, [0, 0], out)
+                return result
+
+        after = passes.flatten_tile_nd_to_2d()(Before)
+        ir.assert_structural_equal(after, Before)
+
+    def test_mixed_row_window_heights_are_reported_as_row_windows(self):
+        """A row-window chain carries no batch dimension: the rejection must not
+        blame ``tile.batch_matmul_acc`` or a batch geometry the kernel never had."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a16: pl.Tile[[16, 64], pl.FP16, pl.Mem.Mat],
+                a32: pl.Tile[[32, 64], pl.FP16, pl.Mem.Mat],
+                b: pl.Tile[[64, 32], pl.FP16, pl.Mem.Mat],
+                out: pl.Out[pl.Tensor[[64, 32], pl.FP32]],
+            ) -> pl.Tensor[[64, 32], pl.FP32]:
+                acc = pl.tile.create([64, 32], pl.FP32)
+                lo = pl.tile.slice(acc, [32, 32], [0, 0])
+                lo_part = pl.tile.matmul_acc(lo, a32, b, init_cond=True)
+                acc1 = pl.tile.assemble(acc, lo_part, [0, 0])
+                hi = pl.tile.slice(acc1, [16, 32], [32, 0])
+                hi_part = pl.tile.matmul_acc(hi, a16, b, init_cond=True)
+                acc2 = pl.tile.assemble(acc1, hi_part, [32, 0])
+                result = pl.tile.store(acc2, [0, 0], out)
+                return result
+
+        with pytest.raises(ValueError, match="row windows of different heights") as exc:
+            passes.flatten_tile_nd_to_2d()(Before)
+        assert "batch_matmul_acc" not in str(exc.value)
 
 
 if __name__ == "__main__":

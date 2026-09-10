@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pypto import ir
 from pypto.backend import (
     BackendType,
     get_backend_type,
@@ -46,7 +47,6 @@ from pypto.backend import (
 )
 from pypto.pypto_core import LogLevel, _set_thread_log_level
 from pypto.pypto_core.passes import MemoryPlanner
-from pypto.runtime import compile_program
 from pypto.runtime.golden_writer import (
     _data_dir_has_files,
     _extract_compute_golden,
@@ -55,15 +55,16 @@ from pypto.runtime.golden_writer import (
     generate_golden_source,
 )
 from pypto.runtime.runner import (
+    DfxOptions,
     RunConfig,
     RunResult,
-    _DfxOpts,
-    _execute_on_device,
+    _execute_golden_case,
     validate_persisted_outputs,
 )
 from pypto.runtime.tensor_spec import TensorSpec as RuntimeTensorSpec
 
 from harness.core.harness import PTOTestCase, platform_to_backend
+from harness.core.kernel_source import program_build_lock as _get_program_lock
 
 # tests/st/harness/core/test_runner.py -> tests/st/ -> project root
 _ST_DIR = Path(__file__).parent.parent.parent
@@ -117,6 +118,18 @@ _batch_stats: "list[tuple[str, int, int, int | None]]" = []
 # fixture via _last_device.
 _executed_device: dict[str, int] = {}
 
+# Device runs already scheduled, keyed the same way as the compile cache, each
+# with the tolerance its golden.py was written for.
+#
+# Several test functions may declare one case -- a swimlane group asserts a
+# dozen different things about a single profiled run. Without this they would
+# each schedule their own execution of an artifact that is already shared, so
+# the group costs a device run per assertion. The task-submit path has never had
+# that problem: `_case_to_batch` hands every test sharing a case the same batch
+# future. This gives the device-pool path the same property.
+_execute_futures: "dict[str, tuple[Future, tuple[float, float]]]" = {}
+_execute_futures_lock = threading.Lock()
+
 # Single-slot stash of the device id the most-recently-resolved test ran on.
 # pytest's item loop is single-threaded, so one slot is enough: TestRunner.run
 # writes, _report_device fixture reads.
@@ -135,11 +148,14 @@ _pipeline_ctx: dict = {}
 # very large suites (the excess simply queues in the pool, then task-submit).
 _MAX_TASK_SUBMIT_INFLIGHT = 512
 
+# Concurrent device runs allowed on the local device-pool path. 0 means "as many
+# as ``--device`` names"; a positive value caps it below that.
+_DEFAULT_EXECUTE_WORKERS = 0
+
 # set_backend_type is called once per backend-type group before the thread pool
-# starts.  Only get_program() needs serialisation because the @pl.program
-# decorator is not thread-safe; compile_program() writes to isolated dirs and
-# runs concurrently.
-_get_program_lock = threading.Lock()
+# starts.  Only the program build needs serialisation, under the shared
+# ``program_build_lock`` imported above (which owns the rationale); ir.compile()
+# writes to isolated dirs and runs concurrently.
 
 
 def _cache_key(
@@ -396,7 +412,7 @@ def _compile_for_cache(
 
     The backend type MUST already be set by the caller before entering the pool.
     Only ``get_program`` is serialised (via ``_get_program_lock``) because the
-    ``@pl.program`` decorator is not thread-safe; ``compile_program`` writes to
+    ``@pl.program`` decorator is not thread-safe; ``ir.compile`` writes to
     an isolated directory and runs concurrently.
     """
     backend_type = platform_to_backend(resolved_platform)
@@ -407,9 +423,9 @@ def _compile_for_cache(
             f"Test case {test_case.get_name()} must implement get_program() "
             "to return a @pl.program class or ir.Program"
         )
-    compile_program(
+    ir.compile(
         program,
-        work_dir,
+        output_dir=str(work_dir),
         strategy=test_case.get_strategy(),
         backend_type=backend_type,
         dump_passes=dump_passes,
@@ -487,9 +503,9 @@ def _fused_compile_task(
                 resolved_platform=resolved,
                 error=None,
             )
-        from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+        from pypto.runtime.device_runner import _compile_and_assemble  # noqa: PLC0415
 
-        chip_callable, runtime_name, runtime_config = compile_and_assemble(work_dir, resolved)
+        chip_callable, runtime_name, runtime_config = _compile_and_assemble(work_dir, resolved)
         enable_sdma = bool(runtime_config.get("enable_sdma", False))
         return CompileArtifact(
             work_dir=work_dir,
@@ -525,7 +541,7 @@ def _fused_compile_task(
 _RESULT_MARKER_PREFIX = "PYPTO_EXEC_RESULT"
 
 
-def _dfx_to_cli(dfx: "_DfxOpts") -> list[str]:
+def _dfx_to_cli(dfx: "DfxOptions") -> list[str]:
     """Inverse of ``execute_artifact`` DFX arg parsing.
 
     Emits only the flags whose value differs from the off-default, so a plain
@@ -648,7 +664,7 @@ def _shell_quote_run(project_root: Path, inner: "list[str]") -> str:
     )
 
 
-def _build_execute_artifact_cmd(mode_args: "list[str]", dfx: "_DfxOpts") -> list[str]:
+def _build_execute_artifact_cmd(mode_args: "list[str]", dfx: "DfxOptions") -> list[str]:
     """Assemble the ``python -m pypto.runtime.execute_artifact`` child argv.
 
     *mode_args* selects single (``--work-dir`` / ``--platform``) vs batch
@@ -725,7 +741,7 @@ def _exec_task_submit(
 def _run_artifact_via_task_submit(
     work_dir: Path,
     platform: str,
-    dfx: "_DfxOpts",
+    dfx: "DfxOptions",
     max_time: int,
     queue_timeout: int,
     device: str = "auto",
@@ -753,7 +769,7 @@ def _run_batch_via_task_submit(
     entries: "list[tuple[Path, str]]",
     manifest_path: Path,
     device: str,
-    dfx: "_DfxOpts",
+    dfx: "DfxOptions",
     max_time: int,
     queue_timeout: int,
 ) -> "dict[str, tuple[bool, str | None, int | None]]":
@@ -838,28 +854,74 @@ def _run_batch_via_task_submit(
     return results
 
 
+def _case_comparator(tc: Any) -> "Any | None":
+    """Return the case's own output comparator, or ``None`` for the default check.
+
+    Matched by type, not by attribute: a comparator is a ``Case`` concept and
+    nothing else defines one, while ``getattr(tc, "compare", None)`` answers
+    truthily for any object that auto-creates attributes — a ``Mock`` in a unit
+    test being the case that found this — and would send it down the
+    persist-then-compare path with no artifacts to read.
+    """
+    from harness.core.case import Case  # noqa: PLC0415 — avoids a module-level cycle
+
+    return tc.compare if isinstance(tc, Case) else None
+
+
+def _compare_persisted_outputs(work_dir: Path, comparator: Any) -> None:
+    """Read back the persisted outputs and hand them to *comparator*.
+
+    The device run leaves its actual outputs under ``data/actual`` and the
+    parent-computed golden under ``data/out``, both keyed by the output names
+    ``golden.py`` declares. This loads both and calls
+    ``comparator(actual, expected)``, which raises to fail the case.
+
+    Raises:
+        AssertionError: Either directory is missing its outputs, or the
+            comparator rejected them.
+    """
+    from pypto.runtime.runner import (  # noqa: PLC0415
+        _load_golden_from_data_dir,
+        _load_golden_module,
+    )
+
+    golden_module = _load_golden_module(work_dir / "golden.py")
+    output_names = set(getattr(golden_module, "__outputs__", []))
+    actual = _load_golden_from_data_dir(work_dir / "data" / "actual", output_names)
+    expected = _load_golden_from_data_dir(work_dir / "data" / "out", output_names)
+    if actual is None or expected is None:
+        raise AssertionError(
+            f"custom compare: missing persisted outputs under {work_dir}/data "
+            f"(actual={'ok' if actual else 'missing'}, expected={'ok' if expected else 'missing'})"
+        )
+    comparator(actual, expected)
+
+
 def _validate_after_device_run(
     tc: "PTOTestCase",
     work_dir: Path,
     execution_time: float,
 ) -> RunResult:
-    """Validate persisted device outputs with *tc*'s real tolerance (split path).
+    """Validate persisted device outputs with *tc*'s real check (split path).
 
     The task-submit device run is validation-free (``--no-validate``); it leaves
     the actual outputs under ``work_dir/data/actual``.  This compares them
-    against the golden using the test's ``RunConfig`` rtol/atol — the tolerance
-    is applied here, in pytest's per-item lifecycle, not in the eager run.
+    against the golden here, in pytest's per-item lifecycle rather than in the
+    eager run — with the case's own comparator when it has one, otherwise
+    elementwise at its ``RunConfig`` rtol/atol.
     """
+    comparator = _case_comparator(tc)
     try:
-        validate_persisted_outputs(work_dir, tc.config.rtol, tc.config.atol)
+        if comparator is not None:
+            _compare_persisted_outputs(work_dir, comparator)
+        else:
+            validate_persisted_outputs(work_dir, tc.config.rtol, tc.config.atol)
     except Exception as exc:  # noqa: BLE001 — surfaced as a test failure
+        how = "custom compare" if comparator is not None else f"rtol={tc.config.rtol}, atol={tc.config.atol}"
         return RunResult(
             passed=False,
             test_name=tc.get_name(),
-            error=(
-                f"golden validation failed (rtol={tc.config.rtol}, atol={tc.config.atol}):\n"
-                f"{exc}\n{traceback.format_exc()}"
-            ),
+            error=f"golden validation failed ({how}):\n{exc}\n{traceback.format_exc()}",
             execution_time=execution_time,
         )
     return RunResult(passed=True, test_name=tc.get_name(), execution_time=execution_time)
@@ -899,18 +961,28 @@ def _fused_execute_task(
     # task-submit's onboard device runs go through the batch submitter, not here.
     assert _device_pool is not None, "device pool not initialised"
     device_id = _device_pool.get()
+    comparator = _case_comparator(tc)
     try:
         _executed_device[cache_key] = device_id
-        _execute_on_device(
+        # A case with its own comparator runs validation-free and persists the
+        # actual outputs, so the comparator sees the same (actual, expected)
+        # pair here as it does on the batched path. Without the split,
+        # _execute_golden_case would apply golden.py's elementwise rtol/atol and
+        # the comparator would never be consulted.
+        _execute_golden_case(
             artifact.work_dir,
             artifact.work_dir / "golden.py",
             artifact.chip_callable,
             artifact.runtime_name,
             artifact.resolved_platform,
             device_id,
-            dfx=_pipeline_ctx.get("dfx", _DfxOpts()),
+            dfx=_pipeline_ctx.get("dfx", DfxOptions()),
             enable_sdma=artifact.enable_sdma,
+            validate=comparator is None,
+            actual_out_dir=(artifact.work_dir / "data" / "actual") if comparator is not None else None,
         )
+        if comparator is not None:
+            _compare_persisted_outputs(artifact.work_dir, comparator)
         return RunResult(
             passed=True,
             test_name=name,
@@ -939,11 +1011,31 @@ def _schedule_exec_after_golden(
     ``PTOTestCase`` (no ``RunConfig``) and therefore uses default 1e-5
     tolerances; rewriting here picks up the real ``RunConfig`` passed by
     the test body.
+
+    Memoised on *cache_key*, so several test functions declaring one case share
+    a single device run and a single ``dfx_outputs/`` -- see
+    :data:`_execute_futures`.
     """
-    if artifact.error is None and not _pipeline_ctx.get("codegen_only"):
-        _write_golden_for_test_case(tc, artifact.work_dir / "golden.py")
-    assert _execute_pool is not None, "execute pool not initialised"
-    return _execute_pool.submit(_fused_execute_task, tc, cache_key, artifact)
+    tolerance = (tc.config.rtol, tc.config.atol)
+    with _execute_futures_lock:
+        memo = _execute_futures.get(cache_key)
+        if memo is not None:
+            fut, ran_with = memo
+            # Same key, different tolerance means two distinct cases share a
+            # name. They already share the compile artifact and its golden.py,
+            # so reusing the run would silently validate one case against the
+            # other's threshold. Name the collision instead.
+            assert ran_with == tolerance, (
+                f"two cases named {tc.get_name()!r} on the same platform disagree on tolerance: "
+                f"rtol/atol {ran_with} already ran, {tolerance} requested. Give them distinct names."
+            )
+            return fut
+        if artifact.error is None and not _pipeline_ctx.get("codegen_only"):
+            _write_golden_for_test_case(tc, artifact.work_dir / "golden.py")
+        assert _execute_pool is not None, "execute pool not initialised"
+        fut = _execute_pool.submit(_fused_execute_task, tc, cache_key, artifact)
+        _execute_futures[cache_key] = (fut, tolerance)
+        return fut
 
 
 def _await_all_batches() -> None:
@@ -986,7 +1078,7 @@ def _batch_submitter(batch_size: int, cache_dir: Path) -> None:
     try:
         assert _execute_pool is not None, "execute pool not initialised"
         device = _pipeline_ctx.get("task_submit_device", "auto")
-        dfx = _pipeline_ctx.get("dfx", _DfxOpts())
+        dfx = _pipeline_ctx.get("dfx", DfxOptions())
         max_time = _pipeline_ctx.get("task_max_time", 600)
         queue_timeout = _pipeline_ctx.get("task_queue_timeout", 1800)
         # A 0 / negative batch size would never fill a batch (``len(pending) >= 0``
@@ -1078,6 +1170,7 @@ def start_pipeline(  # noqa: PLR0913
     task_queue_timeout: int = 1800,
     task_submit_device: str = "auto",
     execute_batch_size: int = 64,
+    execute_workers: int = _DEFAULT_EXECUTE_WORKERS,
     memory_planner: MemoryPlanner | None = None,
 ) -> None:
     """Spin up the compile pipeline and populate :data:`_compile_futures`.
@@ -1117,7 +1210,7 @@ def start_pipeline(  # noqa: PLR0913
         "codegen_only": codegen_only,
         "analyze_auto_scopes_for_deps": analyze_auto_scopes_for_deps,
         "memory_planner": memory_planner,
-        "dfx": _DfxOpts(
+        "dfx": DfxOptions(
             enable_chip_swimlane=enable_chip_swimlane,
             enable_dump_args=enable_dump_args,
             enable_pmu=enable_pmu,
@@ -1144,13 +1237,32 @@ def start_pipeline(  # noqa: PLR0913
         n_batches = max(1, math.ceil(len(test_cases) / max(1, execute_batch_size)))
         n_exec = min(n_batches, _MAX_TASK_SUBMIT_INFLIGHT)
     else:
-        n_exec = max(1, device_pool.qsize())
+        # One worker per card by default. Concurrency here was unreachable before
+        # the pre-submitter -- pytest's item loop submitted one execution at a
+        # time and awaited it -- so extra cards sat idle however many --device
+        # named.
+        #
+        # Reaching it first surfaced `simpler_init failed with code 507018` /
+        # `107000` on a different case each run. That is a device-context race
+        # in one process, not a host limit: four separate processes opening the
+        # same four contexts are clean. `pypto.runtime.worker._device_init_lock`
+        # serialises the open and carries the evidence; with it, four-way is
+        # clean over five runs and 19 profiled cases go 122s -> 35s.
+        #
+        # --execute-workers still caps it, for a host that wants less.
+        n_exec = device_pool.qsize() or 1
+        if execute_workers > 0:
+            n_exec = max(1, min(n_exec, execute_workers))
     _execute_pool = ThreadPoolExecutor(
         max_workers=n_exec,
         thread_name_prefix="pypto-exec",
         initializer=_set_thread_log_level,
         initargs=(pypto_log_level,),
     )
+
+    # Keyed exactly as the compile cache is, so the device-pool submitter can
+    # pair a resolved compile future back to the case that golden.py needs.
+    pool_cases: dict[str, PTOTestCase] = {}
 
     groups: dict[BackendType, list[PTOTestCase]] = {}
     for tc in test_cases:
@@ -1174,6 +1286,7 @@ def start_pipeline(  # noqa: PLR0913
         group_futs: list[Future] = []
         for tc in group:
             key = _cache_key(tc, _resolve_platform(session_platform, tc), memory_planner)
+            pool_cases[key] = tc
             cfut = compile_pool.submit(
                 _fused_compile_task,
                 tc,
@@ -1208,6 +1321,81 @@ def start_pipeline(  # noqa: PLR0913
             name="pypto-batch-submitter",
             daemon=True,
         ).start()
+    elif not codegen_only:
+        # device-pool mode: without this, submission is driven by pytest's
+        # sequential item loop -- ``run`` submits one execution and immediately
+        # awaits it, so the pool never holds more than one task and every card
+        # past the first sits idle. Measured over 19 swimlane cases: 123.9s on
+        # one card, 122.2s on four.
+        threading.Thread(
+            target=_pool_submitter,
+            args=(pool_cases,),
+            name="pypto-pool-submitter",
+            daemon=True,
+        ).start()
+
+
+def _pool_submitter(cases: "dict[str, PTOTestCase]") -> None:
+    """Submit every compiled case's device run, in compile-completion order.
+
+    The device-pool counterpart of :func:`_batch_submitter`, and it exists for
+    the same reason: the card should start working while later cases are still
+    compiling, and several cards should work at once. Concurrency is bounded
+    where it already was -- the execute pool is sized to the card count and
+    ``_fused_execute_task`` blocks on ``_device_pool.get()`` -- so this only
+    fills a queue that was never allowed to hold more than one entry.
+
+    ``_schedule_exec_after_golden`` is memoised on the cache key, so a case
+    submitted here and then reached by ``run`` yields the same future: the test
+    awaits work that is already flying rather than starting its own.
+
+    Nothing is raised out of this daemon thread. A compile that failed, or a
+    case with no artifact, is left to ``run``, which reports it against the test
+    that asked for it -- the same division of labour ``_batch_submitter`` uses.
+    """
+    pending = {cfut: key for key, cfut in _compile_futures.items() if key in cases}
+    for cfut in as_completed(list(pending)):
+        key = pending[cfut]
+        try:
+            artifact = cfut.result()
+        except Exception:  # noqa: BLE001 — surfaces on the case's own run()
+            continue
+        if artifact.error is not None:
+            continue
+        try:
+            _schedule_exec_after_golden(cases[key], key, artifact)
+        except Exception:  # noqa: BLE001 — likewise; run() re-raises in context
+            continue
+
+
+def artifact_work_dir(test_case: Any) -> "Path | None":
+    """Return the compiled artifact directory for *test_case*, if it has one.
+
+    Where the generated kernels, ``golden.py``, ``data/`` and any
+    ``dfx_outputs/`` for this case live. Only populated for a case the
+    pre-compile pipeline picked up; a case that fell to the inline path
+    compiles into a directory it does not publish, so this returns ``None``.
+
+    Args:
+        test_case: The case to look up — anything with the ``get_name`` /
+            ``get_platform`` / ``get_memory_planner`` surface.
+
+    Returns:
+        The artifact directory, or ``None`` when the case was not pre-compiled
+        or its compile task failed.
+    """
+    try:
+        cache_k = _cache_key(test_case, None, _pipeline_ctx.get("memory_planner"))
+    except ValueError:
+        return None  # no platform bound yet — nothing was compiled for it
+    fut = _compile_futures.get(cache_k)
+    if fut is None or not fut.done():
+        return None
+    try:
+        artifact = fut.result()
+    except Exception:  # noqa: BLE001 — a crashed compile has no artifact to point at
+        return None
+    return artifact.work_dir if artifact.error is None else None
 
 
 def configure_inline_task_submit(
@@ -1251,6 +1439,10 @@ def shutdown_pipeline() -> None:
         _execute_pool.shutdown(wait=False, cancel_futures=True)
     _execute_pool = None
     _case_to_batch.clear()
+    # The memoised futures belong to the pool just shut down; a later session in
+    # this process must schedule its own runs rather than await dead ones.
+    with _execute_futures_lock:
+        _execute_futures.clear()
     _batches_ready.clear()
     # NOTE: _batch_stats is intentionally NOT cleared here — pytest_terminal_summary
     # runs *after* sessionfinish (which calls this) and reads it. It is reset at
@@ -1440,9 +1632,9 @@ class TestRunner:
                 )
 
             strategy = test_case.get_strategy()
-            compile_program(
+            ir.compile(
                 program,
-                work_dir,
+                output_dir=str(work_dir),
                 strategy=strategy,
                 backend_type=backend_type,
                 dump_passes=self.config.dump_passes,
@@ -1475,9 +1667,9 @@ class TestRunner:
                     execution_time=time.time() - start_time,
                 )
 
-            from pypto.runtime.device_runner import compile_and_assemble  # noqa: PLC0415
+            from pypto.runtime.device_runner import _compile_and_assemble  # noqa: PLC0415
 
-            chip_callable, runtime_name, runtime_config = compile_and_assemble(
+            chip_callable, runtime_name, runtime_config = _compile_and_assemble(
                 work_dir,
                 resolved_platform,
             )
@@ -1497,7 +1689,7 @@ class TestRunner:
                 passed, error, device = _run_artifact_via_task_submit(
                     work_dir,
                     resolved_platform,
-                    _DfxOpts.from_run_config(self.config),
+                    self.config.dfx_options(),
                     _pipeline_ctx.get("task_max_time", 600),
                     _pipeline_ctx.get("task_queue_timeout", 1800),
                     _pipeline_ctx.get("task_submit_device", "auto"),
@@ -1516,18 +1708,26 @@ class TestRunner:
                     )
                 # Device run (--no-validate) persisted outputs; validate here.
                 return _validate_after_device_run(test_case, work_dir, time.time() - start_time)
-            # RunTiming was dropped (simpler #1177): _execute_on_device returns
+            # RunTiming was dropped (simpler #1177): _execute_golden_case returns
             # None now; timing is read from the runtime's [STRACE] log markers.
-            _execute_on_device(
+            # A case carrying its own comparator runs validation-free and
+            # persists its actual outputs, so the comparator sees the same
+            # (actual, expected) pair the batched path gives it.
+            comparator = _case_comparator(test_case)
+            _execute_golden_case(
                 work_dir,
                 golden_path,
                 chip_callable,
                 runtime_name,
                 resolved_platform,
                 self.config.device_id,
-                dfx=_DfxOpts.from_run_config(self.config),
+                dfx=self.config.dfx_options(),
                 enable_sdma=enable_sdma,
+                validate=comparator is None,
+                actual_out_dir=(work_dir / "data" / "actual") if comparator is not None else None,
             )
+            if comparator is not None:
+                _compare_persisted_outputs(work_dir, comparator)
 
             return RunResult(
                 passed=True,

@@ -103,4 +103,5 @@ for c in pl.range(nranks):
 - [05-tutorials](05-tutorials.md) — 教程索引（本步骤 = 第 09 行）
 - [13-allreduce_mesh](13-allreduce_mesh.md) — 本步骤改进的基线（步骤 08）
 - [01-collectives](01-collectives.md) §AllReduce — 参考（Mesh Mode、Ring Mode）
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[15-allreduce_ring](15-allreduce_ring.md) — 同样字节数，每步大小恒定

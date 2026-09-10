@@ -16,23 +16,30 @@
  * ``pl.Tensor[[E, N, K], pl.INT8, pl.NZ]`` asserts that the bytes in GM are
  * already in PTO-native NZ fractal order while keeping the *logical* shape and
  * slicing at the DSL level. pto-isa describes such a buffer with a blocked
- * rank-(r+2) GlobalTensor (``pto/common/pto_tile.hpp``):
+ * **rank-5** GlobalTensor (``pto/common/pto_tile.hpp``):
  *
  *     shape   = [E, K/c0, N/16, 16, c0]
  *     strides = [K*N,     N*c0, 16*c0, c0, 1]      (c0 = 256 / dtype bits)
+ *
+ * The rank is fixed, not ``logical rank + 2``: the leading batch slot exists
+ * whether or not the logical tensor has a leading axis. A logical rank-2
+ * ``[N, K]`` weight therefore blocks to ``[1, K/c0, N/16, 16, c0]``, with the
+ * batch materialised as 1 — blocking it to rank 4 instead produces a view PTOAS
+ * refuses ("user-specified layout=nz requires a rank-5 view"). Logical rank 4+
+ * has no canonical form yet and is rejected in ``CheckNzLogicalRank``.
  *
  * This pass rewrites the IR into exactly that form:
  *
  *   Phase 1 — every TensorType tagged ``TensorLayout::NZ`` gets its shape
  *             replaced by ``BlockNzShape``. The stride slot is left empty for
- *             ``MaterializeTensorStrides`` (pass 30) to fill; because a blocked
+ *             ``MaterializeTensorStrides`` (pass 33) to fill; because a blocked
  *             NZ shape's row-major strides *are* pto-isa's NZ strides, that
  *             pass needs no NZ-specific rule.
  *
  *   Phase 2 — every ``tile.load`` reading such a tensor gets its offsets /
  *             shapes / valid_shape rewritten into blocked coordinates, while
  *             its result ``TileType`` is preserved verbatim: the GM partition
- *             becomes rank-(r+2) but the destination tile stays the logical
+ *             becomes rank-5 but the destination tile stays the logical
  *             2-D ``[N_TILE, K_TILE]``.
  *
  * After this pass no logical-shaped NZ TensorType survives, so nothing
@@ -42,7 +49,7 @@
  * ``GetTensorViewTypeString`` and the ``tile.load`` ``partition_view`` emitter
  * each read the rank independently and must agree.
  *
- * Ordering constraints (see docs/en/dev/passes/14-block_nz_tensor_views.md):
+ * Ordering constraints (see docs/en/dev/passes/15-block_nz_tensor_views.md):
  *   * after ConvertTensorToTileOps / LowerCompositeOps — the ``tile.load`` ops
  *     Phase 2 rewrites must already exist;
  *   * after FlattenTileNdTo2D — declared as a ``TileOps2D`` requirement. The
@@ -53,18 +60,23 @@
  *     NZ source, so the logical window is still intact when this pass runs.
  *
  * Milestone 1 scope: read-only, matmul operands only (``target_memory=Mat``),
- * whole-byte dtypes, static shapes, fractal-aligned shapes and slice offsets.
- * Everything outside that is rejected with a diagnostic naming the authoring
- * fix — an NZ tensor must never be silently mis-addressed.
+ * whole-byte dtypes, static shapes, fractal-aligned shapes and slice offsets. A
+ * slice offset may be symbolic when its alignment is *provable* — see
+ * ``NzOffsetFactStore`` below and ``DivideIndexExactly`` in
+ * ``tensor_view_semantics.h``. Everything outside that is rejected with a
+ * diagnostic naming the authoring fix — an NZ tensor must never be silently
+ * mis-addressed.
  */
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -77,9 +89,11 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
+#include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/mutator.h"
+#include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
 #include "pypto/ir/transforms/utils/mutable_copy.h"
@@ -160,17 +174,111 @@ TypePtr BlockNzType(const TypePtr& type, const Span& span) {
   return type;
 }
 
-/// Rewrite the elements of a ``MakeTuple`` argument through ``fn``.
-ExprPtr BlockTupleArg(const ExprPtr& arg, DataType dtype, const Span& span, bool is_offsets) {
+/// Index bindings a symbolic slice offset has to be proven against.
+///
+/// A slice offset arrives at the ``tile.load`` as the SSA name it was bound to,
+/// so the arithmetic that makes it fractal-aligned lives elsewhere in the
+/// function — in the ``AssignStmt`` that defined it (``n0 = nb * 256``) or in
+/// the ``ForStmt`` that bounds it (``for k0 in pl.pipeline(512, 4096, 512)``).
+/// This collects both in one read-only walk, so the rewrite itself stays a
+/// constant-time lookup and the pass stays O(N).
+///
+/// Collected from the *pre-mutation* body: the mutator only substitutes NZ
+/// tensor Vars, so an index Var is the same node before and after.
+class NzOffsetFactStore {
+ public:
+  explicit NzOffsetFactStore(const StmtPtr& body) {
+    if (!body) return;
+    Collector collector(this);
+    collector.VisitStmt(body);
+  }
+
+  /// A view of this store. The callbacks capture ``this``, so the store must
+  /// outlive every use of the returned facts.
+  [[nodiscard]] tensor_view_semantics::NzOffsetFacts Facts() const {
+    tensor_view_semantics::NzOffsetFacts facts;
+    facts.definition = [this](const VarPtr& var) -> ExprPtr {
+      auto it = definitions_.find(var);
+      return it == definitions_.end() ? nullptr : it->second;
+    };
+    facts.is_multiple_of = [this](const VarPtr& var, int64_t divisor) {
+      auto it = loop_bindings_.find(var);
+      if (it == loop_bindings_.end()) return false;
+      // Every value the loop variable takes is ``start + i * step``, so it is a
+      // multiple of ``divisor`` exactly when both endpoints of that form are.
+      const auto& [start, step] = it->second;
+      return start % divisor == 0 && step % divisor == 0;
+    };
+    facts.is_non_negative = [this](const VarPtr& var) {
+      // The SPMD block index is a lane number, so it is never negative.
+      if (non_negative_vars_.count(var) != 0) return true;
+      auto it = loop_bindings_.find(var);
+      if (it == loop_bindings_.end()) return false;
+      // ``start + i * step`` only stays at or above ``start`` while the step
+      // does not walk downwards, so both have to be non-negative.
+      const auto& [start, step] = it->second;
+      return start >= 0 && step >= 0;
+    };
+    return facts;
+  }
+
+ private:
+  class Collector : public IRVisitor {
+   public:
+    explicit Collector(NzOffsetFactStore* store) : store_(store) {}
+
+   protected:
+    void VisitStmt_(const AssignStmtPtr& op) override {
+      // Scalars only: a tensor / tile definition can never be part of an index
+      // expression, and keeping them out bounds the map to the index IR.
+      if (op->var_ && As<ScalarType>(op->var_->GetType())) {
+        store_->definitions_.emplace(op->var_, op->value_);
+        // A block index or block count is a lane number, so it is non-negative
+        // by construction. That is an operator fact rather than a structural
+        // one, which is why it is recorded here rather than derived by the
+        // geometry helpers.
+        auto call = As<Call>(op->value_);
+        if (call && (IsOp(call, "tile.get_block_idx") || IsOp(call, "tile.get_block_num"))) {
+          store_->non_negative_vars_.insert(op->var_);
+        }
+      }
+      IRVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const ForStmtPtr& op) override {
+      auto start = As<ConstInt>(op->start_);
+      auto step = As<ConstInt>(op->step_);
+      if (op->loop_var_ && start && step) {
+        store_->loop_bindings_.emplace(op->loop_var_, std::make_pair(start->value_, step->value_));
+      }
+      IRVisitor::VisitStmt_(op);
+    }
+
+   private:
+    NzOffsetFactStore* store_;
+  };
+
+  std::unordered_map<VarPtr, ExprPtr> definitions_;
+  std::unordered_map<VarPtr, std::pair<int64_t, int64_t>> loop_bindings_;
+  std::unordered_set<VarPtr> non_negative_vars_;
+};
+
+/// Rewrite the elements of a ``MakeTuple`` coordinate argument into blocked NZ
+/// form. ``facts`` is read only on the offsets path — a shape is a static
+/// extent, never a symbolic expression.
+ExprPtr BlockTupleArg(const ExprPtr& arg, DataType dtype, const Span& span, bool is_offsets,
+                      const tensor_view_semantics::NzOffsetFacts& facts) {
   auto tuple = As<MakeTuple>(arg);
   INTERNAL_CHECK_SPAN(tuple, span) << "Internal error: tile.load coordinate argument must be a MakeTuple";
-  auto blocked = is_offsets ? tensor_view_semantics::BlockNzOffsets(tuple->elements_, dtype, span)
+  auto blocked = is_offsets ? tensor_view_semantics::BlockNzOffsets(tuple->elements_, dtype, span, facts)
                             : tensor_view_semantics::BlockNzShape(tuple->elements_, dtype, span);
   return std::make_shared<MakeTuple>(std::move(blocked), tuple->span_);
 }
 
 class BlockNzMutator : public IRMutator {
  public:
+  explicit BlockNzMutator(tensor_view_semantics::NzOffsetFacts facts) : facts_(std::move(facts)) {}
+
   void AddSubstitution(const VarPtr& old_var, const VarPtr& new_var) { var_cache_[old_var] = new_var; }
 
  protected:
@@ -244,8 +352,8 @@ class BlockNzMutator : public IRMutator {
     if (!args_changed && !type_changed) return op;
 
     // Direct ctor, not OpRegistry::Create: re-deducing ``tile.load``'s type
-    // from the now rank-(r+2) shapes argument would turn the destination tile
-    // into a rank-(r+2) TileType. The GM partition is blocked; the tile is not.
+    // from the now rank-5 shapes argument would turn the destination tile into
+    // a rank-5 TileType. The GM partition is blocked; the tile is not.
     return std::make_shared<Call>(op->op_, std::move(new_args), op->kwargs_, op->attrs_,
                                   std::move(new_return_type), op->span_);
   }
@@ -285,14 +393,15 @@ class BlockNzMutator : public IRMutator {
         << (target.has_value() ? MemorySpaceToString(*target) : std::string("no target_memory"))
         << ". An NZ tensor is a cube weight: load it into Mat, or annotate the tensor as pl.ND.";
 
-    args[1] = BlockTupleArg(args[1], dtype, op->span_, /*is_offsets=*/true);
-    args[2] = BlockTupleArg(args[2], dtype, op->span_, /*is_offsets=*/false);
+    args[1] = BlockTupleArg(args[1], dtype, op->span_, /*is_offsets=*/true, facts_);
+    args[2] = BlockTupleArg(args[2], dtype, op->span_, /*is_offsets=*/false, facts_);
     if (args.size() >= 4) {
-      args[3] = BlockTupleArg(args[3], dtype, op->span_, /*is_offsets=*/false);
+      args[3] = BlockTupleArg(args[3], dtype, op->span_, /*is_offsets=*/false, facts_);
     }
     return args;
   }
 
+  tensor_view_semantics::NzOffsetFacts facts_;
   std::unordered_map<VarPtr, VarPtr> var_cache_;
 };
 
@@ -326,7 +435,9 @@ FunctionPtr TransformFunction(const FunctionPtr& func) {
     new_return_types.push_back(std::move(new_rt));
   }
 
-  BlockNzMutator mutator;
+  // The store owns the maps the facts read, so it must outlive the mutator.
+  NzOffsetFactStore fact_store(func->body_);
+  BlockNzMutator mutator(fact_store.Facts());
   for (const auto& [old_var, new_var] : param_substitutions) {
     mutator.AddSubstitution(old_var, new_var);
   }

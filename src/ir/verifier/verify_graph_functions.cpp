@@ -32,6 +32,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -47,7 +48,9 @@
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/utils/alloc_batching.h"
+#include "pypto/ir/transforms/utils/graph_replay_invariant.h"
 #include "pypto/ir/transforms/utils/return_lineage_utils.h"
+#include "pypto/ir/transforms/utils/transform_utils.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/verifier/verifier.h"
 
@@ -293,13 +296,21 @@ void VerifySignature(const FunctionPtr& func, std::vector<Diagnostic>& diagnosti
 /// the pass had ruled out.
 ///
 /// The hoisting post-condition here is *stricter* than the rule the pass applies,
-/// and easier to check: once Step A has run, every scalar a task consumes must be
-/// a boundary parameter or a literal. Whether it was originally derivable is the
-/// pass's problem; that no derived value survives is the property.
+/// and easier to check: once Step A has run, every scalar a task consumes must
+/// have somewhere for replay to get its value — a boundary parameter's slot, or
+/// a value replay reproduces identically. Whether it was originally derivable is
+/// the pass's problem; that nothing call-varying survives is the property.
+///
+/// `ReplayInvariantSet` is the one piece shared with the pass rather than
+/// re-derived. It is not a decision the pass made and this file rubber-stamps —
+/// it is a reading of the runtime's own contract (a boundary shape is pinned by
+/// `graph_boundary_matches`, a constant-trip loop replays the same literals). Two
+/// hand-written copies of that reading could disagree, and a verifier that
+/// disagreed with the pass would reject IR the pass just produced.
 class GraphBodyChecker : public IRVisitor {
  public:
   GraphBodyChecker(ProgramPtr program, FunctionPtr func, std::vector<Diagnostic>& diagnostics)
-      : program_(std::move(program)), func_(std::move(func)), diagnostics_(diagnostics) {
+      : program_(std::move(program)), func_(std::move(func)), diagnostics_(diagnostics), invariant_(func_) {
     for (const auto& param : func_->params_) {
       if (As<ScalarType>(param->GetType()) != nullptr) {
         scalar_params_.insert(param.get());
@@ -308,6 +319,7 @@ class GraphBodyChecker : public IRVisitor {
         tensor_root_.insert(param.get());  // a parameter is its own boundary root
       }
     }
+    invariant_.Collect(func_->body_);
   }
 
   [[nodiscard]] size_t count() const { return count_; }
@@ -376,12 +388,59 @@ class GraphBodyChecker : public IRVisitor {
 
   /// An allocation outside any statement list — a loop body that is a single
   /// assign, say — is a batch of one.
-  /// Boundary provenance: a parameter is its own root, an alias inherits one.
+  /// Boundary provenance: a parameter is its own root, an alias inherits one,
+  /// and so does the result of a call that writes through a boundary argument.
+  ///
+  /// The call case is not decoration. `tmp = kernel(a, tmp)` rebinds the buffer
+  /// to a fresh SSA name, and a view of *that* name is still a view of a
+  /// boundary tensor. Tracking only bare aliases would let it slip past
+  /// `CheckBoundaryView` with a window that can move between calls — the very
+  /// thing this verifier exists to catch, reached by a name it could not see
+  /// through.
   void TrackTensorAlias(const AssignStmtPtr& op) {
     auto var = AsVarLike(op->var_);
     if (!var || As<ScalarType>(var->GetType()) != nullptr) return;
     auto aliased = AsVarLike(op->value_);
-    if (aliased && tensor_root_.count(aliased.get()) != 0) tensor_root_.insert(var.get());
+    if (aliased && tensor_root_.count(aliased.get()) != 0) {
+      tensor_root_.insert(var.get());
+      return;
+    }
+    if (auto element = As<TupleGetItemExpr>(op->value_)) {
+      auto tuple_var = AsVarLike(element->tuple_);
+      auto it = tuple_var ? tuple_result_.find(tuple_var.get()) : tuple_result_.end();
+      if (it != tuple_result_.end() && element->index_ >= 0) {
+        TrackWriteback(var, it->second, static_cast<size_t>(element->index_));
+      }
+      return;
+    }
+    auto call = transform_utils::AsCallOrSubmitView(op->value_);
+    if (!call) return;
+    if (As<TupleType>(op->value_->GetType()) != nullptr) {
+      tuple_result_[var.get()] = call;
+      return;
+    }
+    TrackWriteback(var, call, /*return_position=*/0);
+  }
+
+  /// Insert @p var as a boundary root when @p call writes it through one.
+  ///
+  /// Re-derived from `ExplicitReturnedParamIndices` rather than shared with the
+  /// pass, like every other rule here: the point is to disagree if a later
+  /// rewrite reintroduces a state the pass ruled out.
+  void TrackWriteback(const VarPtr& var, const CallPtr& call, size_t return_position) {
+    auto gvar = As<GlobalVar>(call->op_);
+    if (!gvar || !program_) return;
+    auto callee = program_->GetFunction(gvar->name_);
+    if (!callee) return;
+    const auto ret_map = return_lineage::ExplicitReturnedParamIndices(callee);
+    if (return_position >= ret_map.size()) return;
+    // Named before the guard; see the matching comment in `LegalizeGraphBoundary`.
+    const auto& returned_param = ret_map[return_position];
+    if (!returned_param.has_value()) return;
+    // The caller-supplied prefix of a `Submit` maps positionally even when it
+    // omits a runtime-allocated `Out` tail; see `Submit::args_` in ir/expr.h.
+    auto source = AsVarLike(transform_utils::CallerSuppliedArg(call, callee, *returned_param));
+    if (source && tensor_root_.count(source.get()) != 0) tensor_root_.insert(var.get());
   }
 
   void VisitStmt_(const AssignStmtPtr& op) override {
@@ -466,15 +525,18 @@ class GraphBodyChecker : public IRVisitor {
         span);
   }
 
-  /// Step B's post-condition: no view of a boundary tensor survives in the body.
+  /// Step B's post-condition: no boundary view survives whose window can move.
   ///
-  /// Stated as "none left" rather than by re-deriving which views were
-  /// hoistable, so it holds whatever the pass's collection rule becomes. Both
-  /// ways of leaving one behind are silent at runtime: recording classifies it
-  /// as a `BOUNDARY_VIEW` and `graph_rebind_tensor` patches only the buffer
-  /// address, keeping the offset *and* the shape/strides recorded on the first
-  /// call. A view whose offset or extent differs on a later call therefore
-  /// replays call one's window against call two's buffer.
+  /// Recording classifies such a view as a `BOUNDARY_VIEW`; replay restores
+  /// `start_offset = boundary.start_offset + packed_offset` with `packed_offset`
+  /// and the shape/strides taken from the *first* call's node, patching only the
+  /// address. A view whose offset or extent can differ on a later call therefore
+  /// replays call one's window against call two's buffer — silently.
+  ///
+  /// Stated on the window rather than on the pass's collection rule, so it holds
+  /// however that rule changes: a view left in place with a replay-invariant
+  /// window is not a leak, it is the only correct outcome for one the call site
+  /// cannot name.
   void CheckBoundaryView(const CallPtr& op) {
     if (!IsOp(op, "tensor.slice") && !IsOp(op, "tensor.view")) return;
     if (op->args_.empty()) return;
@@ -483,10 +545,25 @@ class GraphBodyChecker : public IRVisitor {
     // is a boundary view too, and checking only the immediate source lets it
     // verify clean while the recording freezes the first call's offset.
     if (!source || tensor_root_.count(source.get()) == 0) return;
+    if (HasReplayInvariantWindow(op)) return;
     Report("takes a view of boundary tensor '" + source->name_hint_ +
-               "' inside the region; replay patches the boundary address but keeps the offset and "
-               "shape recorded on the first call, so the view must be taken at the call site.",
+               "' inside the region whose window can differ between calls; replay patches the "
+               "boundary address but keeps the offset and shape recorded on the first call, so the "
+               "view must be taken at the call site.",
            op->span_);
+  }
+
+  /// True when both halves of @p op's window are frozen at the right values.
+  [[nodiscard]] bool HasReplayInvariantWindow(const CallPtr& op) const {
+    for (size_t i = 1; i < op->args_.size(); ++i) {
+      if (!invariant_.IsInvariant(op->args_[i])) return false;
+    }
+    auto viewed = As<TensorType>(op->GetType());
+    if (!viewed) return false;
+    for (const auto& extent : viewed->shape_) {
+      if (!invariant_.IsInvariant(extent)) return false;
+    }
+    return true;
   }
 
   void Report(const std::string& message, const Span& span) {
@@ -532,12 +609,21 @@ class GraphBodyChecker : public IRVisitor {
   void CheckScalarArgs(const std::vector<ExprPtr>& args, const Span& span) {
     for (const auto& arg : args) {
       if (!arg || As<ScalarType>(arg->GetType()) == nullptr) continue;
+      // A TaskId is topology, not a boundary scalar — see graph_replay_invariant.h.
+      if (graph_replay::IsTaskIdScalar(arg->GetType())) continue;
       if (IsLiteralScalarExpr(arg)) continue;
       auto var = AsVarLike(arg);
+      // Only a parameter itself, never a rename of one: codegen emits a
+      // surviving alias as a value copy, whose address is not the argument slot
+      // the recording anchors, so the copy is frozen at the first call's value.
+      // Step A deletes those, and one reaching here is a real leak.
       if (var && scalar_params_.count(var.get()) != 0) continue;
+      // No slot, but nothing to patch either: replay recomputes this value
+      // identically, so the copy frozen into the recording is the right one.
+      if (invariant_.IsInvariant(arg)) continue;
       Report(
-          "passes a scalar to a task that is neither a boundary parameter nor a literal, so it has "
-          "no argument slot and the runtime would freeze the first call's value into the recording.",
+          "passes a scalar to a task that has no argument slot and can differ between calls, so the "
+          "runtime would freeze the first call's value into the recording.",
           span);
     }
   }
@@ -556,10 +642,14 @@ class GraphBodyChecker : public IRVisitor {
   ProgramPtr program_;
   FunctionPtr func_;
   std::vector<Diagnostic>& diagnostics_;
+  graph_replay::ReplayInvariantSet invariant_;
   std::unordered_set<const Var*> scalar_params_;
   std::unordered_set<const Var*> tensor_params_;
   /// Tensor vars that derive from a boundary parameter, directly or by alias.
   std::unordered_set<const Var*> tensor_root_;
+  /// Tuple-valued call/submit results, so `TupleGetItemExpr` can resolve back
+  /// to the callee argument each element writes through.
+  std::unordered_map<const Var*, CallPtr> tuple_result_;
   size_t count_ = 0;
   std::unordered_set<const Stmt*> batched_;
 };

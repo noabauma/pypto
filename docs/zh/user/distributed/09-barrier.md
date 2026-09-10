@@ -139,4 +139,5 @@ window 中留下计数*，因此揭示改用数据来证明 barrier：每个 ran
   NotifyOp 与 WaitCmp — 完整信号 API
 - [01-collectives](../distributed/01-collectives.md) §Barrier — barrier 在
   集合通信中的位置
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[10-remote_load_store](10-remote_load_store.md) — 移动一个 slice

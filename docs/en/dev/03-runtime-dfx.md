@@ -56,7 +56,7 @@ table above. Most artefacts are flat files directly under the prefix;
 subdir holding `scope_stats.jsonl`. Simpler's `CallConfig::validate()`
 rejects the call if any
 flag is enabled but `output_prefix` is empty; PyPTO mirrors that contract
-on the Python side and raises `ValueError` from `execute_on_device`
+on the Python side and raises `ValueError` from `_execute_on_device`
 *before* the C++ boundary so the failure traceback points at the
 caller.
 
@@ -135,7 +135,7 @@ them, matching the existing one-shot L3 replay semantics.
 The L2 subprocess rebuilds the orchestration arguments two ways: from `golden.py`
 when driven by the pytest harness (deterministic inputs → faithful graph), or
 from a recorded spec when driven by the compiled-program API
-(`execute_compiled`). The task graph can be routed by tensor *values*, not just
+(`compiled(...)`). The task graph can be routed by tensor *values*, not just
 scalars (e.g. paged-attention `block_tables` / `seq_lens`), so the spec preserves
 real data wherever it can cross the process boundary: host `torch.Tensor`s are
 saved and reloaded verbatim, scalars are preserved exactly, and only
@@ -148,18 +148,18 @@ a *device-resident* tensor routes the graph, in which case it is approximate.
 ### From Python (`RunConfig`)
 
 ```python
-from pypto.runtime import run, RunConfig
+from pypto import ir
+from pypto.runtime import RunConfig
 
-run(
-    MyProgram, a, b, c,
-    config=RunConfig(
-        platform="a2a3sim",
-        enable_chip_swimlane=4,        # full swimlane -> chip_swimlane_records.json
-                                     # (True is the same level 4; use 1-3 for less)
-        enable_dep_gen=True,         # produces deps.json (render with deps_viewer on demand)
-        enable_pmu=4,                # PMU event = MEMORY
-    ),
+config = RunConfig(
+    platform="a2a3sim",
+    enable_chip_swimlane=4,      # full swimlane -> chip_swimlane_records.json
+                                 # (True is the same level 4; use 1-3 for less)
+    enable_dep_gen=True,         # produces deps.json (render with deps_viewer on demand)
+    enable_pmu=4,                # PMU event = MEMORY
 )
+compiled = ir.compile(MyProgram, **config.compile_kwargs())
+compiled(a, b, c, config=config)
 ```
 
 ### From pytest
@@ -331,8 +331,8 @@ this hint at the end of every scope-stats-enabled run.
 | Concern | File | Function / member |
 | ------- | ---- | ----------------- |
 | `RunConfig` field declarations | [runner.py](../../../python/pypto/runtime/runner.py) | `RunConfig` dataclass + `any_dfx_enabled()` |
-| `CallConfig` plumbing | [device_runner.py](../../../python/pypto/runtime/device_runner.py) | `execute_on_device(..., enable_*, output_prefix)` |
-| Pipeline bundle | [runner.py](../../../python/pypto/runtime/runner.py) | `_DfxOpts` dataclass + `_DfxOpts.from_run_config` |
+| `CallConfig` plumbing | [device_runner.py](../../../python/pypto/runtime/device_runner.py) | `_execute_on_device(..., enable_*, output_prefix)` |
+| Pipeline bundle | [runner.py](../../../python/pypto/runtime/runner.py) | `DfxOptions` dataclass + `RunConfig.dfx_options()` |
 | Per-flag post-run dispatch | [runner.py](../../../python/pypto/runtime/runner.py) | `_collect_dfx_artifacts` |
 | Kernel-name map synthesis | [runner.py](../../../python/pypto/runtime/runner.py) | `_write_name_map` |
 | L3 per-dispatch program marker | [distributed_runner.py](../../../python/pypto/runtime/distributed_runner.py) | `_record_dispatch_program` / `_read_dispatch_program` |

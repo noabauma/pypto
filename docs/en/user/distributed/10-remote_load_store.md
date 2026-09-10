@@ -154,4 +154,5 @@ fits on-core. `remote_store` moves what you already have on-core, in one write.
   `pld.tile.*` surface
 - [01-collectives](../distributed/01-collectives.md) — all-reduce is these
   moves plus an add (steps 08–10)
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [11-put_get](11-put_get.md) — tensor-level push/pull

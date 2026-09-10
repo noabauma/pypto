@@ -102,7 +102,7 @@ __all__ = [
     "mrgsort",
 ]
 
-from pypto.ir.utils import _elem_dtype, _get_span_or_capture, resolve_cast_mode
+from pypto.ir.utils import _elem_dtype, _get_span_or_capture, resolve_cast_mode, resolve_saturation_mode
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, PadValue
@@ -220,7 +220,8 @@ _TMP_ROW_REDUCTION_REQUIREMENT = (
 )
 _TMP_ROW_ARG_REDUCTION_REQUIREMENT = "tmp_tile with exactly the same shape and dtype as the input"
 _TMP_COL_ARG_REDUCTION_REQUIREMENT = (
-    "tmp_tile — the tile form takes caller-owned scratch, unlike pl.col_max / pl.col_min"
+    "tmp_tile with exactly the same shape and dtype as the input — the tile form takes "
+    "caller-owned scratch, unlike pl.col_max / pl.col_min"
 )
 
 
@@ -1024,6 +1025,17 @@ def matmul(
     the Tile path accepts ``out_dtype`` only when it already agrees with that
     deduction and raises otherwise.
 
+    The Tensor path allows one conversion on top of that deduction, because the
+    result drains L0C through the FIXPIPE, whose unscaled writeback narrows
+    ``FP32 -> FP16`` / ``FP32 -> BF16``. So float operands accept ``FP32``,
+    ``FP16`` or ``BF16``, and int operands accept only ``INT32``. Every rejected
+    pair is a *scale-bearing* conversion the FIXPIPE can only do with quantization
+    parameters this call has nowhere to carry — ``INT32 -> FP32`` is a
+    dequantization, ``FP32 -> INT8`` a quantization, ``INT32 -> INT8`` a
+    requantization. Requesting one (notably ``out_dtype=FP32`` on INT8 operands)
+    raises here rather than lowering to a backend type error. Convert explicitly
+    with ``pl.cast`` instead.
+
     For Tensor inputs with rank > 2 on either operand, the call is lowered to
     ``tile.batch_matmul`` (with batch broadcasting) by ``ConvertTensorToTileOps``
     and then unrolled to per-batch ``tile.matmul`` by ``FlattenTileNdTo2D``.
@@ -1308,8 +1320,11 @@ def col_argmax(input: Tile, tmp_tile: Tile) -> Tile: ...
 def col_argmax(input, tmp_tile: Tile | None = None):
     """Column-wise argmax (per-column max index, int32), dispatched by input type.
 
-    For Tile inputs, tmp_tile is required (unlike col_max). Tensor inputs must
-    omit it — the conversion injects the tmp tile — and passing one raises.
+    For Tile inputs, tmp_tile is required (unlike col_max) and must have exactly
+    the same shape and dtype as the input: the pto-isa kernel reads the column
+    count from the tmp/src extent, so an oversized scratch walks past the valid
+    columns. Tensor inputs must omit it — the conversion injects the tmp tile —
+    and passing one raises.
     """
     if isinstance(input, Tensor):
         _reject_tmp_for_tensor("col_argmax", tmp_tile, "tmp_tile")
@@ -1327,8 +1342,11 @@ def col_argmin(input: Tile, tmp_tile: Tile) -> Tile: ...
 def col_argmin(input, tmp_tile: Tile | None = None):
     """Column-wise argmin (per-column min index, int32), dispatched by input type.
 
-    For Tile inputs, tmp_tile is required (unlike col_min). Tensor inputs must
-    omit it — the conversion injects the tmp tile — and passing one raises.
+    For Tile inputs, tmp_tile is required (unlike col_min) and must have exactly
+    the same shape and dtype as the input: the pto-isa kernel reads the column
+    count from the tmp/src extent, so an oversized scratch walks past the valid
+    columns. Tensor inputs must omit it — the conversion injects the tmp tile —
+    and passing one raises.
     """
     if isinstance(input, Tensor):
         _reject_tmp_for_tensor("col_argmin", tmp_tile, "tmp_tile")
@@ -1344,6 +1362,8 @@ def cast(
     input: Tensor,
     target_type: int | DataType,
     mode: str | int = "round",
+    *,
+    saturation_mode: str | int | None = None,
 ) -> Tensor: ...
 
 
@@ -1352,6 +1372,8 @@ def cast(
     input: Tile,
     target_type: int | DataType,
     mode: str | int = "round",
+    *,
+    saturation_mode: str | int | None = None,
 ) -> Tile: ...
 
 
@@ -1360,6 +1382,8 @@ def cast(
     input: Scalar,
     target_type: int | DataType,
     mode: str | int = "round",
+    *,
+    saturation_mode: str | int | None = None,
 ) -> Scalar: ...
 
 
@@ -1367,6 +1391,8 @@ def cast(
     input: Tensor | Tile | Scalar,
     target_type: int | DataType,
     mode: str | int = "round",
+    *,
+    saturation_mode: str | int | None = None,
 ) -> Tensor | Tile | Scalar:
     """Type casting, dispatched by input type.
 
@@ -1377,16 +1403,41 @@ def cast(
             ``"rint"`` (1), ``"round"`` (2, the default), ``"floor"`` (3),
             ``"ceil"`` (4), ``"trunc"`` (5), ``"odd"`` (6). A ``Scalar`` input
             supports the default only and raises for any other mode.
+        saturation_mode: Destination saturation for a ``Tensor`` or ``Tile``
+            input, as a name or its int code -- ``"off"`` (0) or ``"on"`` (1).
+            ``"on"`` clamps a rounded value that falls outside the destination
+            range to that range; ``"off"`` keeps the target's non-saturating
+            conversion, including its overflow and non-finite behavior.
+            **Defaults to** ``"on"`` **for an integer destination**: nothing
+            standard fixes what an overflowing conversion to an integer produces,
+            clamping is the safer of the two to get by accident, and it is what
+            the hardware converts natively. A float destination keeps the
+            target's own IEEE behavior (an out-of-range narrowing yields an
+            infinity) unless you ask otherwise. When the cast lowers to a chain
+            of native conversions the mode applies to the final hop. A ``Scalar``
+            input does not support this option, so passing it one is an error
+            rather than a silent no-op.
+
+    Example:
+        >>> quantized = pl.cast(rounded_fp16, pl.INT8, mode="trunc", saturation_mode="on")
     """
     if isinstance(input, Tensor):
-        return _tensor.cast(input, target_type, mode)
+        return _tensor.cast(input, target_type, mode, saturation_mode=saturation_mode)
     if isinstance(input, Tile):
-        return _tile.cast(input, target_type, mode)
+        return _tile.cast(input, target_type, mode, saturation_mode=saturation_mode)
     if _is_scalar_like(input):
         # ``resolve_cast_mode`` runs first, so an invalid mode is still a ValueError;
         # only a *valid* mode this path cannot honour reaches the TypeError below.
         if resolve_cast_mode(mode) != 2:
             raise TypeError(f"pl.cast: Scalar inputs do not support non-default mode, got mode={mode!r}")
+        # Same ordering rule for saturation: reject an invalid *value* as a
+        # ValueError before reporting that this path supports no saturation at all.
+        if saturation_mode is not None:
+            resolve_saturation_mode(saturation_mode)
+            raise TypeError(
+                f"pl.cast: Scalar inputs do not support saturation_mode, got "
+                f"saturation_mode={saturation_mode!r}"
+            )
         dtype = DataType(target_type) if isinstance(target_type, int) else target_type
         return Scalar(expr=_ir_core.cast(_to_scalar_expr(input), dtype))
     raise TypeError(f"pl.cast: expected Tensor, Tile, or Scalar, got {type(input).__name__}")

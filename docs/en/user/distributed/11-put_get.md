@@ -136,4 +136,5 @@ full-slice form; the chapter reference documents the chunk-size rules.
   pipelining constraints
 - [01-collectives](../distributed/01-collectives.md) — how collectives compose
   these moves (steps 08–16)
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [12-dynamic_rank_count](12-dynamic_rank_count.md) — the same ring, rank-count-agnostic

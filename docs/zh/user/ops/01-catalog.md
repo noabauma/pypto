@@ -111,7 +111,7 @@
 | [`assemble`][pypto.language.tensor.assemble] | `pl.` | 把子区域写回；也可写作 `dst[i:i+16] = src` |
 | [`reinterpret_view`][pypto.language.reinterpret_view] | `pl.` | 不搬数据的重新解释 |
 | [`set_validshape`][pypto.language.set_validshape] | `pl.` | 声明 tile 的有效区域 |
-| [`cast`][pypto.language.cast] | `pl.` | 转换 dtype —— 可能展开成多跳链，见 [LegalizeTileCast](../../dev/passes/15-legalize_tile_cast.md) |
+| [`cast`][pypto.language.cast] | `pl.` | 转换 dtype —— 可能展开成多跳链，见 [LegalizeTileCast](../../dev/passes/17-legalize_tile_cast.md) |
 | [`dim`][pypto.language.tensor.dim] | `pl.` | 张量的运行期维度 |
 | [`read`][pypto.language.read] [`write`][pypto.language.write] | `pl.` | 元素访问 |
 
@@ -119,7 +119,7 @@
 
 | 算子 | 可达 | 作用 |
 | ---- | ---- | ---- |
-| `quant_mx` | `pl.` (t) | Ascend950 MXFP8 block-32 动态量化，生成 FP8E4M3FN 数据及 FP8E8M0 scale（`group_axis` 对齐 PTOAS `grpAxis`）。本版本不含 MXFP4 quant。暂不支持与 `matmul_mx` 同 InCore mixed task — 请经 GM 分核（见 [类型](../language/00-types.md)） |
+| `quant_mx` | `pl.` (t) | Ascend950 MXFP8 block-32 动态量化，生成 FP8E4M3FN 数据及 FP8E8M0 scale（`group_axis` 对齐 PTOAS `grpAxis`）。本版本不含 MXFP4 quant。可在同一 InCore mixed task 内通过 data+scale 的直接 V2C 传输供 `matmul_mx` 使用（见 [类型](../language/00-types.md)） |
 | `tmov_x2zz` | `pl.` (t) | Ascend950 指数 X-to-ZZ 布局转换（UINT8）。`tmp` 为只写 workspace；axis1 需 `dst_rows`/`dst_cols` 指定 ZZ `[M,G]`（相对 TQUANT 扁平 exp）。通常由 `quant_mx` 降级使用，而非直接调用 |
 
 ## 线性代数
@@ -132,6 +132,17 @@
 | [`batch_matmul`][pypto.language.batch_matmul] | `pl.` (t) | 批量矩阵乘，**只接受 tile 操作数**。张量请调 `pl.matmul` —— rank > 2 会在降级时派发到 `tile.batch_matmul` |
 | [`gemv`][pypto.language.tile.gemv] [`gemv_acc`][pypto.language.tile.gemv_acc] [`gemv_bias`][pypto.language.tile.gemv_bias] | `pl.` (t) | 矩阵-向量形式 |
 | [`matmul_mx`][pypto.language.tile.matmul_mx] [`matmul_mx_acc`][pypto.language.tile.matmul_mx_acc] [`matmul_mx_bias`][pypto.language.tile.matmul_mx_bias] | `pl.` (t) | A5 MX 块缩放矩阵乘 —— 进入算子的两块 data tile 必须为 FP8E4M3FN；支持的 FP4 输入形式仅为 FP4×FP8，且左侧 FP4 必须先显式 cast 为 FP8；不支持原生 FP4×FP4 |
+
+分阶段 GEMV 累加通过 `pl.AccPhase` 选择生产者阶段。以 `pl.AccPhase.Final`
+结束的生产者必须与使用 `pl.STPhase.Final` 的 store 配对：
+
+其中 `lhs0`、`rhs0`、`lhs1` 和 `rhs1` 是预加载的 tile，`output` 是目标 tensor。
+
+```python
+partial = pl.tile.gemv(lhs0, rhs0, acc_phase=pl.AccPhase.Partial)
+final = pl.tile.gemv_acc(partial, lhs1, rhs1, acc_phase=pl.AccPhase.Final)
+pl.store(final, [0, 0], output, st_phase=pl.STPhase.Final)
+```
 
 ## Gather、Scatter、排序
 
@@ -166,7 +177,7 @@
 | [`aiv_shard`][pypto.language.tile.aiv_shard] [`aic_gather`][pypto.language.tile.aic_gather] | `pl.` | 在 AIV lane 间分片 / 在 AIC 上聚回 |
 | `AUTO` | `pl.` | 由编译器选择管道参数的哨兵值 |
 
-push 与 pop 必须**配对**，且每次 pop 都必须有对应的 `tfree`。用法见 [混合 kernel 教程](../tutorials/03-mixed-kernel.md)；机制见 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md) 与 [ExpandMixedKernel](../../dev/passes/22-expand_mixed_kernel.md)。
+push 与 pop 必须**配对**，且每次 pop 都必须有对应的 `tfree`。用法见 [混合 kernel 教程](../tutorials/03-mixed-kernel.md)；机制见 [TPUSH/TPOP](../../reference/pto-isa/01-tpush_tpop.md) 与 [ExpandMixedKernel](../../dev/passes/24-expand_mixed_kernel.md)。
 
 ## 任务与依赖
 
@@ -197,7 +208,7 @@ push 与 pop 必须**配对**，且每次 pop 都必须有对应的 `tfree`。�
 | ---- | --- | ---- | -------- | ------ | ------------ | ---- |
 | AllReduce | `pld.tensor.allreduce` | `mesh`（InCore + HOST），`ring`（InCore + HOST） | `Sum`、`Max`、`Min`、`Prod`（mesh）；仅 `Sum`（HOST ring） | — | FP16、FP32（mesh；编译期硬性检查）；HOST ring：仅 FP32（4 字节） | Mesh: 每步 O(N) 远程流量。Ring: 每步 O(N/P) 远程流量，2(P-1) 步。 |
 | AllGather | `pld.tensor.allgather` | — | — | — | 仅 FP32（HOST builtin）；任意 GM dtype（InCore） | 推式。输入和 target 必须是不同的 buffer。 |
-| ReduceScatter | `pld.tensor.reduce_scatter` | — | 仅 `Sum` | — | 仅 FP32（HOST builtin）；任意 GM dtype（InCore） | 每个 rank 在调用前将全部 NR 个数据块写入。 |
+| ReduceScatter | `pld.tensor.reduce_scatter` | — | `Sum`、`Max`、`Min`、`Prod`（InCore）；仅 `Sum`（HOST builtin） | — | 仅 FP32（HOST builtin）；任意 GM dtype（InCore） | 每个 rank 在调用前将全部 NR 个数据块写入。 |
 | Broadcast | `pld.tensor.broadcast` | — | — | — | 仅 FP32（HOST builtin）；任意 GM dtype（InCore） | Root 在调用前将数据写入。 |
 | All-to-All | `pld.tensor.all_to_all` | — | — | — | 仅 FP32（HOST builtin）；任意 GM dtype（InCore） | 个性化交换。输入和 target 必须是不同的 buffer。 |
 | Barrier | `pld.tensor.barrier` | — | — | — | — | Signal 为 INT32，每次调用单次使用。 |

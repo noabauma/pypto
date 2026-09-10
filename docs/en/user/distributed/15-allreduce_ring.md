@@ -117,4 +117,5 @@ which is the ring's reason to exist.
 - [05-tutorials](05-tutorials.md) — the tutorial index (this step = row 10)
 - [14-allreduce_two_phase](14-allreduce_two_phase.md) — the two-phase shape (step 09)
 - [01-collectives](01-collectives.md) §AllReduce — reference (Ring Mode, signal shape, `Sum`/`FP32`)
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [16-allreduce_reveal](16-allreduce_reveal.md) — the builtin that picks mesh or ring for you

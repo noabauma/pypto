@@ -830,8 +830,8 @@ inline constexpr const char* kAttrCachePolicyVars = "cache_policy_vars";
  * cache-policy declarations. Holds ``std::vector<std::pair<int32_t, int>>``
  * (param index, ``CachePolicy``-as-int), sorted by index.
  *
- * Written by the scope outliner (pass 8) and consumed by
- * ``ConvertTensorToTileOps`` (pass 10), which turns each entry into a
+ * Written by ``OutlineIncoreScopes`` (pass 9) and consumed by
+ * ``ConvertTensorToTileOps`` (pass 11), which turns each entry into a
  * ``cache`` kwarg on the matching ``tile.load`` and erases the attr. Param
  * indices are only valid across that window: later passes append to and
  * prepend onto param lists.
@@ -927,6 +927,15 @@ inline constexpr const char* kAttrDevice = "device";
  */
 inline constexpr const char* kAttrCoreNum = "core_num";
 inline constexpr const char* kAttrSyncStart = "sync_start";
+
+/**
+ * @brief Reserved attr key for a selective device-timing tag on ``pl.submit``.
+ *
+ * Value type: ``int`` in ``0..15``. Written by the DSL parser and read by
+ * orchestration codegen to emit ``Arg::set_task_timing_slot``. The value has
+ * no IR references, so generic attr copying preserves it across Submit rebuilds.
+ */
+inline constexpr const char* kAttrTaskTimingSlot = "task_timing_slot";
 
 /**
  * @brief True for a ``Call`` attr key whose value is a single ``ExprPtr``

@@ -81,6 +81,29 @@ like `pld.DistributedTensor[[shape], dtype]` leave this field as `None`.
 Tile types do not have a distributed variant; cross-rank ops always operate
 on `DistributedTensor`.
 
+**Local compute over a window.** Inside an InCore scope a window slice *is*
+this rank's local GM, so the ordinary tensor ops read and write it like any
+other GM tensor. Those ops match their operand with
+[`AsTensorTypeLike`](../../../../include/pypto/ir/kind_traits.h) (both kinds)
+rather than the exact-kind `As<TensorType>`. What the result type is depends on
+whether the op yields a *view of* the window or *new data*:
+
+| Ops accepting a window | Result kind |
+| ---------------------- | ----------- |
+| `tensor.slice`, `tensor.assemble`, `tensor.view`, `tensor.write` | `DistributedTensorType` — still a view into the same comm-group allocation |
+| the element-wise and unary families, the reductions, `tensor.matmul`, `tensor.matmul_acc` (`lhs` / `rhs` only) | plain `TensorType` — the result is fresh local data |
+| `tensor.read` | `ScalarType` — one element, no view |
+
+Two documented rejections: `tensor.reinterpret_view` refuses a window outright,
+and `tensor.matmul_acc`'s **`acc`** operand must be a plain `TensorType` — only
+the matrix unit writes L0C, so there is no data path from a window into a Cube
+accumulator. Accumulate locally and store into the window afterwards.
+
+Many other tensor ops still reject a window although they read or write plain
+GM (all the broadcasts, `reshape`, `transpose`, `concat`, the gather / scatter
+family, …). `tests/ut/ir/operators/test_window_operand_acceptance.py` holds the
+authoritative per-operator classification and keeps it honest.
+
 ### TensorType with TensorView
 
 Tensor with layout and stride information for optimized memory access.
@@ -145,7 +168,7 @@ The packed canonical formulas (`BuildLogicalStridesFromLayout` in
 | ------ | ---------------- |
 | `ND` | `stride[n-1] = 1; stride[k] = stride[k+1] * shape[k+1]` |
 | `DN` (`n ≥ 2`) | `stride[n-2] = 1`; `stride[n-1] = shape[n-2]`; `stride[n-3] = shape[n-2] * shape[n-1]`; outer dims row-major |
-| `NZ` | row-major over the *blocked* rank-(r+2) shape `[..., C/c0, R/16, 16, c0]` — see [BlockNzTensorViews](../passes/14-block_nz_tensor_views.md) |
+| `NZ` | row-major over the *blocked* rank-5 shape `[B, C/c0, R/16, 16, c0]` — see [BlockNzTensorViews](../passes/15-block_nz_tensor_views.md) |
 
 **Two ways to spell the same canonical TensorView**:
 
@@ -154,7 +177,7 @@ The packed canonical formulas (`BuildLogicalStridesFromLayout` in
   canonical for the carried layout.
 - **Explicit** — every dimension's stride is spelled out.
 
-The [`MaterializeTensorStrides`](../passes/31-materialize_tensor_strides.md)
+The [`MaterializeTensorStrides`](../passes/33-materialize_tensor_strides.md)
 pass rewrites every implicit form to its explicit packed canonical so
 codegen sees a single contract. The `TensorViewCanonical` `IRProperty` +
 verifier enforces this:

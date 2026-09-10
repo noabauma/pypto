@@ -109,4 +109,5 @@ world 大小——这正是 P=4 集合通信对比所依赖的能力。
 - [02-primitives](../distributed/02-primitives.md) §系统基座 + §Put 与 Get —
   `world_size`/`nranks`、分块
 - [00-getting_started](../00-getting_started.md) — `pl.dynamic(...)` 动态维
-- 下一步：[05-tutorials](05-tutorials.md) — 步骤 08–16（集合通信，P=4）为规划中
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
+- 下一步：[13-allreduce_mesh](13-allreduce_mesh.md) — 步骤 08–16 构建各类集合通信（P=4），从 all-reduce 开始

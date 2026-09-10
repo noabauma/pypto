@@ -51,9 +51,9 @@ from collections.abc import Sequence
 
 import pypto.language as pl
 import torch
-from pypto.backend import BackendType
+from pypto import ir
 from pypto.ir.pass_manager import OptimizationStrategy
-from pypto.runtime import RunConfig, run
+from pypto.runtime import RunConfig
 
 
 def _get_default_device_id() -> int:
@@ -796,10 +796,9 @@ def main():
         device_id=args.device,
         strategy=OptimizationStrategy.Default,
         dump_passes=True,
-        backend_type=BackendType.Ascend950 if args.platform.startswith("a5") else BackendType.Ascend910B,
         enable_chip_swimlane=args.enable_chip_swimlane,
     )
-    compiled = run(program, config=run_config)
+    compiled = ir.compile(program, **run_config.compile_kwargs())
     output = compiled(*input_tensors, config=run_config)
     if not isinstance(output, torch.Tensor):
         raise TypeError(f"Expected tensor output from compiled program, got {type(output).__name__}")

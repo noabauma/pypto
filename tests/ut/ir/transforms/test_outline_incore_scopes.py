@@ -22,6 +22,34 @@ from pypto.language.parser.text_parser import parse as text_parse
 class TestOutlineIncoreScopes:
     """Test OutlineIncoreScopes pass."""
 
+    @staticmethod
+    def _output_params(func):
+        return [
+            param
+            for param, direction in zip(func.params, func.param_directions, strict=True)
+            if direction in (ir.ParamDirection.Out, ir.ParamDirection.InOut)
+        ]
+
+    @staticmethod
+    def _outlined_call(func, outlined):
+        return next(
+            stmt
+            for stmt in ir.flatten_to_stmts(func.body)
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.Call)
+            and stmt.value.op.name == outlined.name
+        )
+
+    @staticmethod
+    def _tuple_projections(func, tuple_var):
+        return [
+            (stmt.var.name_hint.split("__")[0], stmt.value.index)
+            for stmt in ir.flatten_to_stmts(func.body)
+            if isinstance(stmt, ir.AssignStmt)
+            and isinstance(stmt.value, ir.TupleGetItemExpr)
+            and stmt.value.tuple is tuple_var
+        ]
+
     def test_outline_simple_incore_scope(self):
         """Test outlining a simple InCore scope."""
 
@@ -388,6 +416,175 @@ class TestOutlineIncoreScopes:
         After = passes.outline_incore_scopes()(Before)
         ir.assert_structural_equal(After, Expected)
 
+    def test_outline_if_phi_writebacks_follow_out_param_order(self):
+        """Generated returns and caller projections share Out-param order (#2392).
+
+        The scope first captures ``b`` and then ``a``, while ConvertToSSA sorts
+        the If results lexically as ``a`` then ``b``.  The If's internal order
+        may remain lexical, but the generated function boundary must use the
+        stable captured-parameter order ``b, a``.
+
+        ``scratch`` is another captured Out parameter but is intentionally not
+        returned, proving that the canonical returned subsequence need not cover
+        every Out parameter.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                cond: pl.Scalar[pl.BOOL],
+                scratch: pl.Out[pl.Tensor[[1], pl.FP32]],
+                b: pl.Out[pl.Tensor[[16], pl.FP32]],
+                a: pl.Out[pl.Tensor[[16], pl.INT32]],
+                b_patch: pl.Tensor[[8], pl.FP32],
+                a_patch: pl.Tensor[[8], pl.INT32],
+            ) -> tuple[pl.Tensor[[16], pl.FP32], pl.Tensor[[16], pl.INT32]]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    pl.tensor.write(scratch, [0], pl.const(0.0, pl.FP32))
+                    if cond:
+                        b[0:8] = b_patch
+                        a[0:8] = a_patch
+                return b, a
+
+        ssa = passes.convert_to_ssa()(Before)
+        after = passes.outline_incore_scopes()(ssa)
+        funcs = {func.name: func for _, func in after.functions.items()}
+        outlined = next(func for func in funcs.values() if func.func_type == ir.FunctionType.InCore)
+        caller = funcs["main"]
+
+        outlined_ifs = [stmt for stmt in ir.flatten_to_stmts(outlined.body) if isinstance(stmt, ir.IfStmt)]
+        assert len(outlined_ifs) == 1
+        if_return_types = [var.type for var in outlined_ifs[0].return_vars]
+        assert [ty.dtype for ty in if_return_types if isinstance(ty, ir.TensorType)] == [
+            DataType.INT32,
+            DataType.FP32,
+        ]
+
+        output_params = self._output_params(outlined)
+        assert [param.name_hint.split("__ssa_v")[0] for param in output_params] == ["scratch", "b", "a"]
+        returned_params = output_params[1:]
+        assert [ty.dtype for ty in outlined.return_types if isinstance(ty, ir.TensorType)] == [
+            DataType.FP32,
+            DataType.INT32,
+        ]
+
+        outlined_returns = [
+            stmt for stmt in ir.flatten_to_stmts(outlined.body) if isinstance(stmt, ir.ReturnStmt)
+        ]
+        assert len(outlined_returns) == 1
+        assert list(outlined_returns[0].value) == returned_params
+
+        call_assign = self._outlined_call(caller, outlined)
+        call_type = call_assign.value.type
+        assert isinstance(call_type, ir.TupleType)
+        projections = self._tuple_projections(caller, call_assign.var)
+        assert projections == [
+            ("b", 0),
+            ("a", 1),
+        ]
+
+    def test_outline_if_phi_with_conflicting_roots_keeps_original_order(self):
+        """A branch-dependent buffer identity must not be guessed."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                cond: pl.Scalar[pl.BOOL],
+                second: pl.Out[pl.Tensor[[16], pl.FP32]],
+                first: pl.Out[pl.Tensor[[16], pl.FP32]],
+                patch: pl.Tensor[[8], pl.FP32],
+            ) -> tuple[pl.Tensor[[16], pl.FP32], pl.Tensor[[16], pl.FP32]]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    if cond:
+                        second = pl.assemble(second, patch, [0])
+                        first = pl.assemble(first, patch, [0])
+                    else:
+                        second_old: pl.Tensor[[16], pl.FP32] = second
+                        first_old: pl.Tensor[[16], pl.FP32] = first
+                        second = pl.assemble(first_old, patch, [0])
+                        first = pl.assemble(second_old, patch, [0])
+                return first, second
+
+        after = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+        funcs = {func.name: func for _, func in after.functions.items()}
+        outlined = next(func for func in funcs.values() if func.func_type == ir.FunctionType.InCore)
+
+        output_params = self._output_params(outlined)
+        assert output_params[0].name_hint.startswith("second")
+        assert output_params[1].name_hint.startswith("first")
+
+        outlined_stmts = ir.flatten_to_stmts(outlined.body)
+        if_stmt = next(stmt for stmt in outlined_stmts if isinstance(stmt, ir.IfStmt))
+        return_stmt = next(stmt for stmt in outlined_stmts if isinstance(stmt, ir.ReturnStmt))
+        assert list(return_stmt.value) == list(if_stmt.return_vars)
+        first_return, second_return = return_stmt.value
+        assert isinstance(first_return, ir.Var)
+        assert isinstance(second_return, ir.Var)
+        assert first_return.name_hint.startswith("first")
+        assert second_return.name_hint.startswith("second")
+        assert not any(value.same_as(param) for value in return_stmt.value for param in output_params)
+
+        call_assign = self._outlined_call(funcs["main"], outlined)
+        projections = self._tuple_projections(funcs["main"], call_assign.var)
+        assert projections == [
+            ("first", 0),
+            ("second", 1),
+        ]
+
+    def test_outline_mixed_fresh_and_writeback_outputs_keep_original_order(self):
+        """One fresh result makes output-contract ordering all-or-nothing."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                b: pl.Out[pl.Tensor[[16], pl.FP32]],
+                a: pl.Out[pl.Tensor[[16], pl.FP32]],
+                b_patch: pl.Tensor[[8], pl.FP32],
+                a_patch: pl.Tensor[[8], pl.FP32],
+                x: pl.Tensor[[16], pl.FP32],
+            ) -> tuple[
+                pl.Tensor[[16], pl.FP32],
+                pl.Tensor[[16], pl.FP32],
+                pl.Tensor[[16], pl.FP32],
+            ]:
+                with pl.at(level=pl.Level.CORE_GROUP):
+                    b_probe: pl.Tensor[[16], pl.FP32] = pl.add(b, b)  # noqa: F841
+                    a = pl.assemble(a, a_patch, [0])
+                    fresh: pl.Tensor[[16], pl.FP32] = pl.add(x, x)
+                    b = pl.assemble(b, b_patch, [0])
+                return a, fresh, b
+
+        after = passes.outline_incore_scopes()(passes.convert_to_ssa()(Before))
+        funcs = {func.name: func for _, func in after.functions.items()}
+        outlined = next(func for func in funcs.values() if func.func_type == ir.FunctionType.InCore)
+        output_params = self._output_params(outlined)
+        assert output_params[0].name_hint.startswith("b")
+        assert output_params[1].name_hint.startswith("a")
+
+        return_stmt = next(
+            stmt for stmt in ir.flatten_to_stmts(outlined.body) if isinstance(stmt, ir.ReturnStmt)
+        )
+        assert return_stmt.value[0].same_as(output_params[1])
+        fresh_return = return_stmt.value[1]
+        assert isinstance(fresh_return, ir.Var)
+        assert fresh_return.name_hint.startswith("fresh")
+        assert not any(return_stmt.value[1].same_as(param) for param in output_params)
+        assert return_stmt.value[2].same_as(output_params[0])
+
+        call_assign = self._outlined_call(funcs["main"], outlined)
+        projections = self._tuple_projections(funcs["main"], call_assign.var)
+        assert projections == [
+            ("a", 0),
+            ("fresh", 1),
+            ("b", 2),
+        ]
+
     def test_outline_scope_with_intermediate_computation(self):
         """Test outlining scope with computation before, inside, and after."""
 
@@ -493,20 +690,20 @@ class TestOutlineIncoreScopes:
                 self,
                 buf_a: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
                 buf_b: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
-            ) -> tuple[pl.Tensor[[16, 1], pl.FP32], pl.Tensor[[16, 128], pl.FP32]]:
+            ) -> tuple[pl.Tensor[[16, 128], pl.FP32], pl.Tensor[[16, 1], pl.FP32]]:
                 tile_a = pl.tile.full([16, 128], dtype=pl.FP32, value=0.0)
                 tile_b = pl.tile.full([16, 1], dtype=pl.FP32, value=0.0)
                 buf_a_store: pl.Tensor[[16, 128], pl.FP32] = pl.store(tile_a, [0, 0], buf_a)
                 buf_b_store: pl.Tensor[[16, 1], pl.FP32] = pl.store(tile_b, [0, 0], buf_b)
-                return (buf_b, buf_a)
+                return (buf_a, buf_b)
 
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(self, x: pl.Tensor[[16, 128], pl.FP32]) -> pl.Tensor[[16, 128], pl.FP32]:
                 buf_a: pl.Tensor[[16, 128], pl.FP32] = pl.create_tensor([16, 128], dtype=pl.FP32)
                 buf_b: pl.Tensor[[16, 1], pl.FP32] = pl.create_tensor([16, 1], dtype=pl.FP32)
                 ret = self.main_incore_0(buf_a, buf_b)
-                buf_b2 = ret[0]
-                buf_a2 = ret[1]
+                buf_a2 = ret[0]
+                buf_b2 = ret[1]  # noqa: F841
                 result: pl.Tensor[[16, 128], pl.FP32] = pl.add(buf_a2, x)
                 return result
 
@@ -1463,23 +1660,30 @@ class TestOutlineSubmitTaskId:
         assert submits[1].allow_early_resolve is True
         assert len(submits[1].deps) == 1
 
-    def test_deferred_waiter_rejects_scalar_returning_helper_call(self):
-        """Scalar bookkeeping cannot hide arbitrary kernel side effects."""
+    def test_deferred_waiter_rejects_scalar_returning_op_call(self):
+        """Scalar bookkeeping cannot hide arbitrary kernel side effects.
+
+        The waiter registers conditions and returns; anything else in its body
+        either never runs or runs at the wrong time. Scalar arithmetic and casts
+        are their own IR expression nodes, so the only *call* a waiter needs is
+        the pre-registration ``tensor.read`` anchor. Every other scalar-producing
+        call is rejected without inspecting it — a new op may hide a blocking
+        wait, communication, or payload effects behind an innocuous scalar.
+
+        ``pl.get_block_idx()`` is the vehicle because it is an ordinary lowerable
+        op: the rejection has to come from the waiter contract, not from some
+        later limitation of the shape used to trigger it.
+        """
 
         @pl.program
         class Before:
-            @pl.function(type=pl.FunctionType.InCore)
-            def scalar_helper(self, value: pl.Scalar[pl.INT32]) -> pl.Scalar[pl.INT32]:
-                return value
-
             @pl.function(type=pl.FunctionType.Orchestration)
             def main(
                 self,
                 signal: pld.DistributedTensor[[1, 1], pl.INT32],
-                expected: pl.Scalar[pl.INT32],
             ):
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="deferred_wait"):
-                    hidden: pl.Scalar[pl.INT32] = self.scalar_helper(expected)
+                    hidden: pl.Scalar[pl.INT32] = pl.get_block_idx()
                     pld.system.defer_wait(signal, offsets=[0, 0], expected=hidden, cmp=pld.WaitCmp.Ge)
 
         with pytest.raises(ValueError, match="supports only a pre-registration tensor.read"):
@@ -2584,7 +2788,7 @@ class TestOutlineNoDepArgs:
         LEFT_RIGHT) in one CORE_GROUP scope: the outlined function gets
         split_aiv=True but NO function-level ``split`` mode — there is no single
         representative mode. The authoritative per-region mode rides each
-        SplitAivScopeStmt (consumed at LowerAutoVectorSplit, pass 21); downstream
+        SplitAivScopeStmt (consumed at LowerAutoVectorSplit, pass 23); downstream
         readers key on the split_aiv marker / per-op split, not a func mode.
         """
 
@@ -2661,7 +2865,7 @@ class TestOutlineNoDepArgs:
     def test_split_aiv_preserved_in_outlined_func(self):
         """OutlineIncoreScopes outlines the enclosing InCore scope but preserves
         the nested ``SplitAivScopeStmt`` region inside the outlined function body
-        (SplitAiv is never an outline target — it is lowered in place at pass 21).
+        (SplitAiv is never an outline target — it is lowered in place at pass 23).
 
         The Expected pins the outlined two-function form: the region lives in the
         InCore ``main_incore_0`` body and the Orchestration ``main`` only carries
@@ -3296,7 +3500,7 @@ class TestOutlineCachePolicy:
 
     The Var form is *consumed* here — it must not survive onto the synthesised
     call or onto either function. Param indices are a carrier with a deliberately
-    short life: they stay valid only until ConvertTensorToTileOps (pass 10) turns
+    short life: they stay valid only until ConvertTensorToTileOps (pass 11) turns
     them into per-``tile.load`` ``cache`` kwargs, because passes after that both
     append to param lists (InjectGMPipeBuffer, MaterializeDistTensorCtx) and
     prepend onto them (MaterializeValidShapeSymbols).
@@ -3853,6 +4057,207 @@ class TestOutlineScopeInControlFlow:
 
         stmts = self._stmts(After.get_function("main"))
         assert self._name(self._call_args(stmts[2])[0]) == self._bound_name(stmts[1])
+
+
+class TestOutlineScalarOutputHoist:
+    """A scope must not hand a Scalar back to its caller (#631).
+
+    The runtime has no scalar output channel: ``Arg::add_scalar`` passes a scalar
+    *in* by value and ``TaskOutputTensors`` returns only tensors. So a Scalar the
+    scope body defines and the caller reads has to be produced in the caller
+    instead. ``ScopeOutliner`` moves the defining statements out of the body when
+    the value is a pure function of the scope's live-ins, and rejects the launch
+    when it is not.
+    """
+
+    @staticmethod
+    def _outline(program) -> ir.Program:
+        return passes.outline_incore_scopes()(passes.convert_to_ssa()(program))
+
+    @staticmethod
+    def _func(program: ir.Program, name: str) -> ir.Function:
+        func = program.get_function(name)
+        assert func is not None, f"expected a function named {name!r}, got {python_print(program)}"
+        return func
+
+    @staticmethod
+    def _scalar_returns(func: ir.Function) -> int:
+        return sum(1 for t in func.return_types if isinstance(t, ir.ScalarType))
+
+    @staticmethod
+    def _scalar_params(func: ir.Function) -> int:
+        return sum(1 for p in func.params if isinstance(p.type, ir.ScalarType))
+
+    @staticmethod
+    def _scalar_defs(func: ir.Function) -> list[ir.AssignStmt]:
+        body = func.body
+        stmts = body.stmts if isinstance(body, ir.SeqStmts) else [body]
+        return [
+            st for st in stmts if isinstance(st, ir.AssignStmt) and isinstance(st.var.type, ir.ScalarType)
+        ]
+
+    def test_caller_computable_scalar_is_hoisted_out_of_the_kernel(self):
+        """``off = base * 32`` moves to the caller; the kernel returns only tensors."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                return pl.store(t, [0], out)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                off: pl.Scalar[pl.INDEX],
+                tail: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                t: pl.Tile[[32], pl.FP32] = pl.load(x, [off], [32])
+                return pl.store(t, [0], tail)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+                tail: pl.Out[pl.Tensor[[32], pl.FP32]],
+                base: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="scaled"):
+                    off: pl.Scalar[pl.INDEX] = base * 32
+                    out = self.produce(x, out)
+                tail = self.consume(x, off, tail)
+                return tail
+
+        After = self._outline(Before)
+
+        kernel = self._func(After, "scaled")
+        assert self._scalar_returns(kernel) == 0, python_print(After)
+        # The arithmetic itself is now a statement of the caller, not a
+        # TupleGetItem unpacking a (nonexistent) scalar return.
+        defs = self._scalar_defs(self._func(After, "main"))
+        assert len(defs) == 1, python_print(After)
+        assert isinstance(defs[0].value, ir.Mul), python_print(After)
+
+    def test_hoisted_scalar_still_read_by_the_body_becomes_a_param(self):
+        """A hoisted value the body also reads comes back in as a scalar arg."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                off: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                t: pl.Tile[[32], pl.FP32] = pl.load(x, [off], [32])
+                return pl.store(t, [0], out)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                off: pl.Scalar[pl.INDEX],
+                tail: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                t: pl.Tile[[32], pl.FP32] = pl.load(x, [off], [32])
+                return pl.store(t, [0], tail)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[32], pl.FP32]],
+                tail: pl.Out[pl.Tensor[[32], pl.FP32]],
+                base: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="scaled"):
+                    off: pl.Scalar[pl.INDEX] = base * 8
+                    out = self.produce(x, off, out)
+                tail = self.consume(x, off, tail)
+                return tail
+
+        After = self._outline(Before)
+
+        kernel = self._func(After, "scaled")
+        assert self._scalar_returns(kernel) == 0, python_print(After)
+        assert self._scalar_params(kernel) == 1, python_print(kernel)
+
+    def test_device_computed_scalar_live_out_is_rejected(self):
+        """A scalar read out of a tensor on device has no way back to the caller."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                return pl.store(t, [0], out)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                off: pl.Scalar[pl.INT32],
+                tail: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                t: pl.Tile[[32], pl.FP32] = pl.load(x, [off], [32])
+                return pl.store(t, [0], tail)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                idx: pl.Tensor[[8, 1], pl.INT32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+                tail: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="scaled"):
+                    off: pl.Scalar[pl.INT32] = pl.read(idx, [0, 0])
+                    out = self.produce(x, out)
+                tail = self.consume(x, off, tail)
+                return tail
+
+        with pytest.raises(ValueError, match="cannot return a scalar"):
+            self._outline(Before)
+
+    def test_unused_scalar_local_is_not_exported(self):
+        """A scope-local scalar nobody reads is left alone, not turned into a return."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                off: pl.Scalar[pl.INDEX],
+                out: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                t: pl.Tile[[32], pl.FP32] = pl.load(x, [off], [32])
+                return pl.store(t, [0], out)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="scaled"):
+                    local: pl.Scalar[pl.INDEX] = pl.const(8, pl.INDEX)
+                    out = self.produce(x, local, out)
+                return out
+
+        After = self._outline(Before)
+        assert self._scalar_returns(self._func(After, "scaled")) == 0, python_print(After)
 
 
 if __name__ == "__main__":

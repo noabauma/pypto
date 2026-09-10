@@ -11,6 +11,10 @@ Pass、代码生成到上板执行。
 PYPTO_COMPILE_PROFILING=1 python3 my_program.py
 ```
 
+取消此环境变量（或设为 `0`）后，下一次查询会解除环境变量创建的 profiler 绑定，
+普通 JIT 调用即可恢复缓存复用。显式的 `with CompileProfiler()` 上下文独立于
+此环境变量，仍会持续到作用域结束。
+
 ### 方式 2：`ir.compile()` 参数
 
 ```python
@@ -36,15 +40,12 @@ prof.to_json("profile.json")
 ### 方式 4：`RunConfig`
 
 ```python
-from pypto.runtime import run, RunConfig
+from pypto import ir
+from pypto.runtime import RunConfig
 
-result = run(
-    program=MyProgram,
-    tensor_specs=specs,
-    golden=golden_fn,
-    config=RunConfig(compile_profiling=True),
-)
-# result.profile 包含 profiling 数据（dict 格式）
+config = RunConfig(compile_profiling=True)
+compiled = ir.compile(MyProgram, **config.compile_kwargs())
+# 报告落在 `<compiled.output_dir>/report/` 下。
 ```
 
 ## 输出格式
@@ -89,7 +90,7 @@ Total: 2.847s
 
 ## 阶段层次结构
 
-使用 `runtime.run()` 时，profiler 记录以下阶段：
+下表是 profiler 能记录的全部阶段。单次运行只会报告其入口实际经过的那些：
 
 | 阶段 | 说明 |
 | ---- | ---- |

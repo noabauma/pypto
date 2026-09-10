@@ -10,9 +10,9 @@
 """L2 :class:`ChipWorker` — the single-chip concrete runtime handle.
 
 Inside a ``with ChipWorker(...) as _:`` block, calls to ``CompiledProgram(...)``
-(and :func:`pypto.runtime.run`) reuse the active worker instead of creating a
-fresh one. Outside such a block, behavior is unchanged from one-shot
-construction in :func:`pypto.runtime.device_runner.execute_on_device`.
+reuse the active worker instead of creating a fresh one. Outside such a block,
+behavior is unchanged from one-shot construction in
+:func:`pypto.runtime.device_runner._execute_on_device`.
 
 For explicit dispatch (no ``ContextVar`` discovery), call
 :meth:`ChipWorker.run` directly, or pre-register with :meth:`ChipWorker.register`
@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import contextvars
 import ctypes
+import threading
 import weakref
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
@@ -97,7 +98,7 @@ _ACTIVE_WORKERS: contextvars.ContextVar[tuple[ChipWorker, ...]] = contextvars.Co
 # Default runtime name — matches the runtime that ``pto_backend`` bakes into
 # every generated ``kernel_config.py`` (``RUNTIME_CONFIG["runtime"]``). That is
 # the value ``CompiledProgram.runtime_name`` reports and the one the reuse
-# lookup in ``device_runner.execute_on_device`` searches for, so a
+# lookup in ``device_runner._execute_on_device`` searches for, so a
 # default-constructed ``with ChipWorker():`` bind-matches a freshly compiled
 # program instead of silently falling through to a one-shot worker. Derived from
 # the RuntimeKind enum that compilation selects, so the two cannot drift apart.
@@ -115,6 +116,26 @@ def _close_simpler_worker_best_effort(impl: Any) -> None:
         pass
 
 
+# Serialises device-context opening across threads in one process.
+#
+# ``simpler_init`` levels CANN's process-global dlog and then opens the device
+# context (``rtSetDevice`` inside ``attach_current_thread``), and CANN snapshots
+# that global state at context-open time. Two threads opening contexts at once
+# can therefore each capture the other's half-applied state.
+#
+# Measured on a2a3: four concurrent inits in one process fail
+# non-deterministically -- ``simpler_init failed with code 507018`` (AICPU init
+# stream sync) or ``107000`` (param-invalid), on a different case each time --
+# while four separate *processes* doing the same four inits are clean, because
+# each owns its CANN globals. Serialising the open makes four-way clean over
+# five runs.
+#
+# Only the open is serialised. Registration, dispatch and close stay concurrent,
+# and the open is short enough that concurrency still pays: 19 profiled cases
+# across four cards go from 122s (one at a time) to 35s.
+_device_init_lock = threading.Lock()
+
+
 class ChipWorker(Worker):
     """L2 single-chip execution handle, bound to one ``(platform, device_id, runtime)``.
 
@@ -123,9 +144,9 @@ class ChipWorker(Worker):
     setup. Construction without entering a ``with`` block also works — call
     :meth:`close` manually when done, or re-enter via ``with`` later.
 
-    Inside a ``with`` block, ``CompiledProgram.__call__`` and
-    :func:`pypto.runtime.run` find this worker via a ``ContextVar`` and reuse
-    its initialized device context instead of creating a fresh worker per call.
+    Inside a ``with`` block, ``CompiledProgram.__call__`` finds this worker via
+    a ``ContextVar`` and reuses its initialized device context instead of
+    creating a fresh worker per call.
     Reuse only happens when all four binding fields match and the worker has
     every capability required by the artifact — otherwise the caller either
     falls through to the one-shot path (binding mismatch) or raises (capability
@@ -261,7 +282,8 @@ class ChipWorker(Worker):
         # dispatch asks for. A per-call RunConfig that sizes the rings differently
         # rebuilds once, as before. No-op without a prebuilt arena.
         try:
-            self._impl.init(prewarm_config=_get_simpler_call_config_cls()())
+            with _device_init_lock:
+                self._impl.init(prewarm_config=_get_simpler_call_config_cls()())
         except BaseException:
             # Simpler marks a partially failed startup terminal. Drive its
             # retryable cleanup immediately; if cleanup itself fails, retain
@@ -489,7 +511,7 @@ class ChipWorker(Worker):
     ) -> ChipWorker | None:
         """Return the topmost active ChipWorker matching the binding, or ``None``.
 
-        Used by :func:`pypto.runtime.device_runner.execute_on_device` to
+        Used by :func:`pypto.runtime.device_runner._execute_on_device` to
         decide whether to reuse a user-published ChipWorker or fall through
         to constructing a fresh one-shot worker. A matching worker without a
         required SDMA capability raises instead of opening a second worker on
@@ -510,7 +532,7 @@ class ChipWorker(Worker):
     def _check_binding(self, compiled: CompiledProgram) -> None:
         """Raise on a binding or worker-capability mismatch.
 
-        ``compiled.runtime_name`` triggers ``compile_and_assemble`` lazily,
+        ``compiled.runtime_name`` triggers ``_compile_and_assemble`` lazily,
         which is acceptable because any subsequent dispatch needs it anyway.
         """
         if compiled.platform != self.platform:
@@ -582,17 +604,25 @@ class ChipWorker(Worker):
 
         dfx_dir: Path | None = None
         if rc.any_dfx_enabled():
-            dfx_dir = Path(compiled.output_dir) / "dfx_outputs"
+            from ._artifact_runtime import runtime_output_directory  # noqa: PLC0415
+
+            dfx_dir = runtime_output_directory(compiled) / "dfx_outputs"
             dfx_dir.mkdir(parents=True, exist_ok=True)
 
-        orch_args, coerced, return_style = compiled.build_orch_args(*args, worker=self._impl)
-        cfg = compiled.build_call_config(rc, dfx_dir=dfx_dir)
+        orch_args, coerced, return_style = compiled._build_orch_args(*args, worker=self._impl)
+        cfg = compiled._build_call_config(rc, dfx_dir=dfx_dir)
         self._run_chip(compiled.chip_callable, orch_args, cfg)
 
         if dfx_dir is not None:
-            from .runner import _collect_dfx_artifacts, _DfxOpts  # noqa: PLC0415
+            from .runner import _collect_dfx_artifacts  # noqa: PLC0415
 
-            _collect_dfx_artifacts(dfx_dir, self.platform, _DfxOpts.from_run_config(rc))
+            runtime = vars(compiled).get("_artifact_runtime")
+            if runtime is None:
+                _collect_dfx_artifacts(dfx_dir, self.platform, rc.dfx_options())
+            else:
+                _collect_dfx_artifacts(
+                    dfx_dir, self.platform, rc.dfx_options(), prebuilt_directory=runtime.directory
+                )
 
         if not return_style:
             return None
@@ -602,7 +632,7 @@ class ChipWorker(Worker):
     def register(self, compiled: CompiledProgram) -> RegistrationHandle:
         """Pre-register *compiled* on this ChipWorker. Returns a callable handle.
 
-        Eager registration: triggers ``compile_and_assemble`` on *compiled*
+        Eager registration: triggers ``_compile_and_assemble`` on *compiled*
         and ``simpler.Worker.register`` immediately, so configuration errors
         surface here rather than at first dispatch. The handle reuses the
         ChipWorker's existing cid cache (multiple ``register`` calls for the
@@ -615,7 +645,7 @@ class ChipWorker(Worker):
         """
         self._require_initialized("register")
         self._check_binding(compiled)
-        cc = compiled.chip_callable  # triggers compile_and_assemble lazily
+        cc = compiled.chip_callable  # triggers _compile_and_assemble lazily
         key = id(cc)
         cid = self._cid_cache.get(key)
         if cid is None:

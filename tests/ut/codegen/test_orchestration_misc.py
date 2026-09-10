@@ -68,8 +68,8 @@ class TestTupleLineagePointerKeying:
     propagated onto the other tuple's consumers. In the DeepSeek-V4 KV compressor
     this made the ``kv_state`` / ``score_state`` return aliases reuse the
     externalized ``kv_cache`` / ``kv`` window reshape names, so the generated
-    orchestration C++ declared those names twice (``TaskTensor X = ...`` then
-    ``const TaskTensor& X = ...``) and failed to compile with ``conflicting
+    orchestration C++ declared those names twice (``Tensor X = ...`` then
+    ``const Tensor& X = ...``) and failed to compile with ``conflicting
     declaration``.
     """
 
@@ -112,7 +112,7 @@ class TestTupleLineagePointerKeying:
 
         # No declared name may appear twice (the conflicting-declaration bug).
         declared = re.findall(
-            r"^\s*(?:const\s+TaskTensor&|TaskTensor|TaskId|auto)\s+([A-Za-z_]\w*)\s*=",
+            r"^\s*(?:const\s+Tensor&|Tensor|TaskId|auto)\s+([A-Za-z_]\w*)\s*=",
             code,
             flags=re.MULTILINE,
         )
@@ -121,8 +121,8 @@ class TestTupleLineagePointerKeying:
 
         # Each consumer must reshape from its OWN tuple's element, not a stale /
         # undeclared getitem name. Before the fix, ``fa`` read undeclared ``a0``.
-        assert "TaskTensor fa = rsh0.reshape" in code, code
-        assert "TaskTensor fb = rsh1.reshape" in code, code
+        assert "Tensor fa = rsh0.reshape" in code, code
+        assert "Tensor fb = rsh1.reshape" in code, code
         assert "a0.reshape" not in code and "b0.reshape" not in code, code
 
 
@@ -149,7 +149,7 @@ class TestUnregisteredOpError:
             codegen.generate_orchestration(program, orch_func)
 
     def test_reinterpret_view_has_explicit_orchestration_error(self):
-        """Runtime TaskTensor views cannot change dtype; direct users get an actionable error."""
+        """Runtime Tensor views cannot change dtype; direct users get an actionable error."""
         backend.reset_for_testing()
         backend.set_backend_type(BackendType.Ascend910B)
 
@@ -867,7 +867,7 @@ class TestTupleReturnNameHintCollision:
         # tmp_first and tmp_second share the name_hint "ret__tmp_v0"; the tuple
         # metadata must still attach each call's elements to that call. Each
         # element is the in-place Out arg of its call, so it remaps to that arg
-        # (no ``const TaskTensor& first_a = ...`` alias is minted). The consumer
+        # (no ``const Tensor& first_a = ...`` alias is minted). The consumer
         # reading first_a/second_a/first_b/second_b therefore reads call_a's
         # outs then call_b's outs, in order — not cross-contaminated.
         i_a1 = code.index("// Task 2: kernel_consume")
@@ -879,10 +879,10 @@ class TestTupleReturnNameHintCollision:
         assert a1 < a2 < b1 < b2, code
         # No per-element const-ref alias survives the remap.
         for name in ("first_a", "second_a", "first_b", "second_b"):
-            assert f"const TaskTensor& {name} " not in code, code
+            assert f"const Tensor& {name} " not in code, code
 
         declared_names = re.findall(
-            r"^\s*(?:const\s+TaskTensor&|TaskTensor)\s+([A-Za-z_]\w*)\s*=",
+            r"^\s*(?:const\s+Tensor&|Tensor)\s+([A-Za-z_]\w*)\s*=",
             code,
             flags=re.MULTILINE,
         )
@@ -896,13 +896,13 @@ class TestScalarCarryPhiCodegen:
     """Regression tests for scalar loop carries in orchestration codegen."""
 
     def test_scalar_carry_phi_not_emitted_as_tensor(self):
-        """Regression for #1580: Scalar loop carry must not be aliased as const TaskTensor&.
+        """Regression for #1580: Scalar loop carry must not be aliased as const Tensor&.
 
         When a Scalar variable is defined before a pl.parallel loop and then
         reused (reassigned) inside it, alongside Tensor carries, ConvertToSSA
         promotes the scalar into the parallel-loop carry tuple.  The orchestration
         codegen must emit the Scalar carry phi as ``int64_t = 0`` (untraced scalar
-        default), NOT as ``const TaskTensor& = <carry_var>`` (type mismatch that causes
+        default), NOT as ``const Tensor& = <carry_var>`` (type mismatch that causes
         a C++ compile error).
         """
         backend.reset_for_testing()
@@ -939,11 +939,19 @@ class TestScalarCarryPhiCodegen:
 
                 # The parallel loop carries global_c_idx (Scalar) mixed with
                 # Tensor carries out_b, out_c.  Before the fix, the Scalar carry
-                # phi was emitted as ``const TaskTensor&`` causing a C++ compile error.
+                # phi was emitted as ``const Tensor&`` causing a C++ compile error.
                 for batch_idx in pl.parallel(0, N // TILE):
+                    # Reassigned in the orchestration body, outside the scope: a
+                    # device kernel cannot return a scalar (#631,
+                    # IRProperty.NoScalarKernelReturn), and the #1580 phi this
+                    # test pins is an orchestration-level loop carry either way.
+                    # The new value reads the incoming one, so the carry is live
+                    # on the IterArg end -- a carry neither end reads is dropped
+                    # by Simplify's dead yield-slot prune and would leave this
+                    # test with no phi to pin.
+                    global_c_idx = global_c_idx + batch_idx + 1  # noqa: F841
                     with pl.at(level=pl.Level.CORE_GROUP, name_hint="scope_b"):
                         for inner in pl.range(TILE):
-                            global_c_idx = batch_idx + inner  # noqa: F841
                             out_b, out_c = self.scope_b_kernel(x, out_b, out_c)
 
                 return out_b, out_c
@@ -953,12 +961,12 @@ class TestScalarCarryPhiCodegen:
         code = _generate_orch_code(transformed)
 
         # The Scalar carry phi must be emitted as int64_t = 0 (untraced scalar
-        # default), never as const TaskTensor& = <carry> (type mismatch / #1580).
+        # default), never as const Tensor& = <carry> (type mismatch / #1580).
         assert "int64_t global_c_idx__rv" in code, (
-            "global_c_idx carry phi should be emitted as int64_t, not const TaskTensor&\n" + code
+            "global_c_idx carry phi should be emitted as int64_t, not const Tensor&\n" + code
         )
-        assert "const TaskTensor& global_c_idx" not in code, (
-            "global_c_idx must not be aliased as const TaskTensor& (scalar/tensor type mismatch)\n" + code
+        assert "const Tensor& global_c_idx" not in code, (
+            "global_c_idx must not be aliased as const Tensor& (scalar/tensor type mismatch)\n" + code
         )
 
         # out_b and out_c Tensor carries must each alias to their own carry.
@@ -1069,6 +1077,69 @@ class TestScalarCarryPhiCodegen:
 
         assert "acc" not in code, "trivial literal carry must not declare a carry variable\n" + code
         assert "< 4;" in code, "post-loop use of the trivial carry must emit the literal 4\n" + code
+
+
+class TestScalarScopeOutputCodegen:
+    """A scalar the caller reads after a scope is emitted from its real expression.
+
+    Regression for #631. The runtime has no scalar output channel, so the kernel
+    cannot hand the value back; ``ScopeOutliner`` moves the arithmetic into the
+    orchestration body instead. Codegen then emits it through the ordinary scalar
+    path — never the old ``<ctype> x = 0;`` stop-gap, which compiled but computed
+    the wrong thing.
+    """
+
+    def test_scope_scalar_is_emitted_from_its_expression(self):
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class ScopeScalarProg:
+            @pl.function(type=pl.FunctionType.AIV)
+            def produce(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                t: pl.Tile[[64], pl.FP32] = pl.load(x, [0], [64])
+                return pl.store(t, [0], out)
+
+            @pl.function(type=pl.FunctionType.AIV)
+            def consume(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                off: pl.Scalar[pl.INDEX],
+                tail: pl.Out[pl.Tensor[[32], pl.FP32]],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                t: pl.Tile[[32], pl.FP32] = pl.load(x, [off], [32])
+                return pl.store(t, [0], tail)
+
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(
+                self,
+                x: pl.Tensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+                tail: pl.Out[pl.Tensor[[32], pl.FP32]],
+                base: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[32], pl.FP32]:
+                with pl.at(level=pl.Level.CORE_GROUP, name_hint="scaled"):
+                    off: pl.Scalar[pl.INDEX] = base * 32
+                    out = self.produce(x, out)
+                tail = self.consume(x, off, tail)
+                return tail
+
+        pm = PassManager.get_strategy(OptimizationStrategy.Default)
+        code = _generate_orch_code(pm.run_passes(ScopeScalarProg))
+
+        off_decls = [
+            line.strip() for line in code.splitlines() if re.match(r"int64_t off\w* =", line.strip())
+        ]
+        assert len(off_decls) == 1, "expected one materialized scalar declaration\n" + code
+        assert "= 0;" not in off_decls[0], (
+            "the scalar must be emitted from its own expression, not the removed "
+            "silently-wrong default\n" + code
+        )
+        assert "* 32" in off_decls[0], off_decls[0] + "\n" + code
 
 
 if __name__ == "__main__":

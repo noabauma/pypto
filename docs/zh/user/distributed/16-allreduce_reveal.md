@@ -108,4 +108,5 @@ y = pl.store(recv, [0, 0], y)
 - [01-collectives](01-collectives.md) §AllReduce — 两种模式与信号形状的参考
 - [13-allreduce_mesh](13-allreduce_mesh.md) / [15-allreduce_ring](15-allreduce_ring.md) — 每种模式 lower 成的样子
 - [02-primitives](02-primitives.md) — 内置原语所基于的底层
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[05-tutorials](05-tutorials.md) 中步骤 12-16 覆盖其余集合通信

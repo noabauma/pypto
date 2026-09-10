@@ -181,6 +181,12 @@ class DemandCollector : public IRVisitor {
 
   void RecordInheritInputEdge(const VarPtr& dst, const CallPtr& call) {
     if (!dst) return;
+    // Deliberately the raw `OutputMemoryInheritsInput()` flag, NOT
+    // `op_predicates::IsBufferAliasingViewOp`. This pass propagates the memory
+    // *space*, which is exactly what the flag declares; aliasing the input's
+    // *buffer* is the stricter `inherit && IsInplaceSafe()`. `tile.transpose` is
+    // the case that separates them: it lands in its input's space (so it needs
+    // this edge) while permuting into a fresh buffer (so it is not a view).
     auto& reg = OpRegistry::GetInstance();
     if (!reg.IsRegistered(call->op_->name_)) return;
     if (!reg.GetEntry(call->op_->name_).OutputMemoryInheritsInput()) return;
@@ -473,18 +479,12 @@ class TileMemorySpaceAnalyzer : public IRVisitor {
         // downstream compute ops (matmul etc.) must be reached via a
         // tile.move inserted by Phase 2 MoveCollector. Clamping here keeps
         // the producer's output hardware-valid and preserves the move chain.
-        if (demand == MemorySpace::Vec || demand == MemorySpace::Mat) return demand;
-        // A cube-operand demand still tells us which of {Vec, Mat} to stage
-        // through: L1 is the only buffer a tload can fill that MTE1 can then
-        // move into L0A/L0B, so Mat is the correct staging space and Phase 2
-        // adds the Mat -> L0 move. Falling through to Vec instead would route
-        // the operand GM -> UB -> L1 -> L0 and, worse, put a cube-only operand
-        // on the vector core, which ExpandMixedKernel then reads as a mixed
-        // kernel and splits across AIC/AIV.
-        if (demand == MemorySpace::Left || demand == MemorySpace::Right || demand == MemorySpace::LeftScale ||
-            demand == MemorySpace::RightScale || demand == MemorySpace::Bias) {
-          return MemorySpace::Mat;
-        }
+        //
+        // `StagingSpaceForLoad` holds that clamp, and holds it for the whole
+        // compiler: the `input_reqs` bridge in ConvertTensorToTileOps creates
+        // its loads through the same function, so a bridged load and a load
+        // this pass retargets place the same operand in the same buffer.
+        if (auto staged = StagingSpaceForLoad(demand)) return *staged;
         // A demand for a space with no inbound move edge -- today only Acc,
         // since nothing writes L0C except the MAD unit -- cannot be staged
         // through anywhere. The value has to be *created* where it is needed.
@@ -1037,8 +1037,52 @@ class TileMemorySpaceMutator : public IRMutator {
         required_slayout = TileLayout::none_box;
       }
 
-      InsertMoveStmt(stmts, var, key.second, span, required_blayout, required_slayout);
+      const bool needs_mx_scale_staging =
+          producer_mem_it != var_memory_.end() && producer_mem_it->second == MemorySpace::Vec &&
+          (key.second == MemorySpace::LeftScale || key.second == MemorySpace::RightScale);
+      if (needs_mx_scale_staging) {
+        InsertScaleMxMoveStmt(stmts, var, key.second, span, required_blayout, required_slayout);
+      } else {
+        InsertMoveStmt(stmts, var, key.second, span, required_blayout, required_slayout);
+      }
       changed = true;
+    }
+  }
+
+  void InsertScaleMxMoveStmt(std::vector<StmtPtr>& stmts, const VarPtr& original_var,
+                             MemorySpace scale_target, const Span& span,
+                             std::optional<TileLayout> required_blayout = std::nullopt,
+                             std::optional<TileLayout> required_slayout = std::nullopt) {
+    auto producer_type = As<TileType>(original_var->GetType());
+    INTERNAL_CHECK_SPAN(producer_type, span)
+        << "Internal error: MX scale staging requires a TileType producer";
+
+    MoveKey mat_key = {original_var, MemorySpace::Mat};
+    auto mat_it = created_moves_.find(mat_key);
+    if (mat_it == created_moves_.end()) {
+      const TileView scale_view =
+          tile_view_semantics::GetImplicitTileView(producer_type->shape_, scale_target);
+      InsertMoveStmt(stmts, original_var, MemorySpace::Mat, span, scale_view.blayout, scale_view.slayout);
+      mat_it = created_moves_.find(mat_key);
+    }
+    INTERNAL_CHECK_SPAN(mat_it != created_moves_.end(), span)
+        << "Internal error: failed to create the Mat staging move for an MX scale";
+    auto staged = AsVarLike(mat_it->second);
+    INTERNAL_CHECK_SPAN(staged, span) << "Internal error: the Mat-staged MX scale is not a Var expression";
+
+    MoveKey staged_scale_key = {staged, scale_target};
+    auto scale_it = created_moves_.find(staged_scale_key);
+    if (scale_it == created_moves_.end()) {
+      InsertMoveStmt(stmts, staged, scale_target, span, required_blayout, required_slayout);
+      scale_it = created_moves_.find(staged_scale_key);
+    }
+    INTERNAL_CHECK_SPAN(scale_it != created_moves_.end(), span)
+        << "Internal error: failed to create the final MX scale move";
+
+    MoveKey original_scale_key = {original_var, scale_target};
+    created_moves_[original_scale_key] = scale_it->second;
+    if (!scope_inserted_stack_.empty()) {
+      scope_inserted_stack_.back().push_back(original_scale_key);
     }
   }
 
@@ -1138,7 +1182,7 @@ Pass InferTileMemorySpace() {
     for (const auto& [gvar, func] : program->functions_) {
       // Every InCore *variant*, not just InCore. AIC and AIV are user-writable
       // function types, not only pass-generated ones (ExpandMixedKernel creates
-      // them at pass 21, well after this pass), so a hand-authored AIV kernel
+      // them at pass 24, well after this pass), so a hand-authored AIV kernel
       // must have its tiles placed here too. Gating on InCore alone left those
       // tiles unset, and InitMemRef then defaulted them to DDR -- yielding a
       // vector op reading a DDR operand, which no hardware does.

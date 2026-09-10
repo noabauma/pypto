@@ -49,7 +49,7 @@ PyPTO 将该 prefix 设为 `<work_dir>/dfx_outputs/`，其下的子路径按上�
 写入 `scope_stats/` 子目录，内含 `scope_stats.jsonl`。Simpler 的
 `CallConfig::validate()` 在任一 flag 开启但
 `output_prefix` 为空时拒绝调用；PyPTO 在 Python 侧镜像该契约，
-`execute_on_device` 会**先于** C++ 边界抛 `ValueError`，让 traceback
+`_execute_on_device` 会**先于** C++ 边界抛 `ValueError`，让 traceback
 直接指向调用方代码。
 
 ### L3（分布式）：每次 dispatch 一个子目录
@@ -113,7 +113,7 @@ resident handle 和已 fork 的层级，但进入两个独立的 `Worker.run()` 
 执行程序，且不会在中间恢复可写参数，这与现有 one-shot L3 replay 语义一致。
 
 L2 子进程用两种方式重建编排实参：被 pytest harness 驱动时从 `golden.py` 重新生成
-（确定性输入 → 图忠实），被编译产物 API（`execute_compiled`）驱动时从记录下来的
+（确定性输入 → 图忠实），被编译产物 API（`compiled(...)`）驱动时从记录下来的
 规格重建。任务图可能由张量**值**（而不只是 scalar）路由，例如 paged-attention 的
 `block_tables` / `seq_lens`，所以规格会尽量保留真实数据：host `torch.Tensor`
 原样存盘再加载、scalar 原样保留，只有驻留在设备上、子进程无法访问的 `DeviceTensor`
@@ -125,18 +125,18 @@ L2 子进程用两种方式重建编排实参：被 pytest harness 驱动时从 
 ### 从 Python（`RunConfig`）
 
 ```python
-from pypto.runtime import run, RunConfig
+from pypto import ir
+from pypto.runtime import RunConfig
 
-run(
-    MyProgram, a, b, c,
-    config=RunConfig(
-        platform="a2a3sim",
-        enable_chip_swimlane=4,        # 全量 swimlane -> chip_swimlane_records.json
-                                     # （True 等价于等级 4；需要更轻量时用 1-3）
-        enable_dep_gen=True,         # 生成 deps.json（按需用 deps_viewer 渲染 HTML）
-        enable_pmu=4,                # PMU 事件 = MEMORY
-    ),
+config = RunConfig(
+    platform="a2a3sim",
+    enable_chip_swimlane=4,      # 全量 swimlane -> chip_swimlane_records.json
+                                 # （True 等价于等级 4；需要更轻量时用 1-3）
+    enable_dep_gen=True,         # 生成 deps.json（按需用 deps_viewer 渲染 HTML）
+    enable_pmu=4,                # PMU 事件 = MEMORY
 )
+compiled = ir.compile(MyProgram, **config.compile_kwargs())
+compiled(a, b, c, config=config)
 ```
 
 ### 从 pytest
@@ -294,8 +294,8 @@ python runtime/tools/scope_stats_plot.py \
 | 关注点 | 文件 | 函数 / 成员 |
 | ------ | ---- | ----------- |
 | `RunConfig` 字段定义 | [runner.py](../../../python/pypto/runtime/runner.py) | `RunConfig` dataclass + `any_dfx_enabled()` |
-| `CallConfig` 透传 | [device_runner.py](../../../python/pypto/runtime/device_runner.py) | `execute_on_device(..., enable_*, output_prefix)` |
-| 流水线打包 | [runner.py](../../../python/pypto/runtime/runner.py) | `_DfxOpts` dataclass + `_DfxOpts.from_run_config` |
+| `CallConfig` 透传 | [device_runner.py](../../../python/pypto/runtime/device_runner.py) | `_execute_on_device(..., enable_*, output_prefix)` |
+| 流水线打包 | [runner.py](../../../python/pypto/runtime/runner.py) | `DfxOptions` dataclass + `RunConfig.dfx_options()` |
 | 按 flag 后处理分发 | [runner.py](../../../python/pypto/runtime/runner.py) | `_collect_dfx_artifacts` |
 | kernel 名称映射合成 | [runner.py](../../../python/pypto/runtime/runner.py) | `_write_name_map` |
 | L3 每次 dispatch 的 program 标记 | [distributed_runner.py](../../../python/pypto/runtime/distributed_runner.py) | `_record_dispatch_program` / `_read_dispatch_program` |

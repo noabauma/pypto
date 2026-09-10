@@ -38,7 +38,12 @@ except ImportError:  # pragma: no cover - fallback for older interpreters
 from typing import Any
 
 from pypto._external_source import EXTERNAL_INCLUDE_DIRS_ATTR, decode_external_include_dirs
-from pypto._function_attrs import DUAL_AIV_DISPATCH_ATTR, EXTERNAL_SOURCE_ATTR
+from pypto._function_attrs import (
+    BUILTIN_TEMPLATE_DIR_ATTR,
+    BUILTIN_TEMPLATE_VARS_ATTR,
+    DUAL_AIV_DISPATCH_ATTR,
+    EXTERNAL_SOURCE_ATTR,
+)
 from pypto.backend._ptoas_locate import PTOAS_RELATIVE_PATHS as _PTOAS_RELATIVE_PATHS
 from pypto.backend._ptoas_locate import find_ptoas_binary as _find_ptoas_binary
 from pypto.backend._ptoas_preprocess import preprocess_ptoas_output as _preprocess_ptoas_output
@@ -576,9 +581,7 @@ def _generate_arg_unpacking(func: _ir_core.Function, *, uses_spmd: bool = False)
         assert isinstance(param.type, _ir_core.TensorType)
         c_type = param.type.dtype.to_c_type_string()
         lines.append(f"    // Unpack tensor: {param_name}")
-        lines.append(
-            f"    __gm__ TaskTensor* {param_name}_tensor = reinterpret_cast<__gm__ TaskTensor*>(args[{i}]);"
-        )
+        lines.append(f"    __gm__ Tensor* {param_name}_tensor = reinterpret_cast<__gm__ Tensor*>(args[{i}]);")
         if param_name == "__gm_pipe_buffer" and uses_spmd:
             lines.append("    // SPMD: shard GM pipe workspace by logical block_idx to avoid overlap.")
             lines.append("    int64_t __pypto_gm_block_num = static_cast<int64_t>(__pypto_spmd_block_num);")
@@ -667,6 +670,12 @@ _SPMD_BLOCK_OPS = frozenset(
     {_ir_core.get_op("tile.get_block_idx").name, _ir_core.get_op("tile.get_block_num").name}
 )
 _SUBBLOCK_OPS = frozenset({_ir_core.get_op("tile.get_subblock_idx").name})
+_AIV_FIFO_ENDPOINT_OPS = frozenset(
+    {
+        _ir_core.get_op("tile.tpop_from_aic").name,
+        _ir_core.get_op("tile.tpush_to_aic").name,
+    }
+)
 _SDMA_WORKSPACE_OPS = frozenset({_ir_core.get_op("prefetch.make_context").name})
 _DEFERRED_COMPLETION_OPS = frozenset({_ir_core.get_op("pld.system.defer_wait").name})
 
@@ -701,10 +710,10 @@ def _function_uses_ops(func: _ir_core.Function, op_names: frozenset[str]) -> boo
 def _uses_dynamic_subblock_id(func: _ir_core.Function) -> bool:
     """Return whether the function reads subblock id from the runtime lane context.
 
-    Drives both the runtime-subblock macro bridge and the synthetic
-    ``%__pypto_spmd_subblock_idx`` param forwarded by the kernel wrapper, so it
-    must detect ``tile.get_subblock_idx`` wherever it appears (including nested
-    in larger expressions) to stay consistent with the C++ signature emission.
+    Drives the synthetic ``%__pypto_spmd_subblock_idx`` param forwarded by the
+    kernel wrapper, so it must detect ``tile.get_subblock_idx`` wherever it
+    appears (including nested in larger expressions) to stay consistent with
+    the C++ signature emission.
     """
     return _function_uses_ops(func, _SUBBLOCK_OPS)
 
@@ -738,15 +747,195 @@ def _uses_spmd_block_ops(func: _ir_core.Function) -> bool:
     return _function_uses_ops(func, _SPMD_BLOCK_OPS)
 
 
-def _needs_runtime_subblock_bridge(func: _ir_core.Function) -> bool:
-    """Return whether A2A3 split AIV wrappers must source subblock id from runtime context."""
+def _runtime_split_fifo_endpoint_counts(func: _ir_core.Function) -> tuple[int, int]:
+    """Return split AIV ``(TPUSH, TPOP)`` endpoint counts needing runtime lane identity."""
+
     if not _requires_dual_aiv_dispatch(func):
-        return False
+        return 0, 0
+    if _get_fixed_subblock_id(func) is not None:
+        return 0, 0
     if _codegen_core.infer_function_core_type(func) != _ir_core.CoreType.VECTOR:
-        return False
+        return 0, 0
     if not _backend_core.get_handler().requires_runtime_subblock_bridge():
-        return False
-    return _uses_dynamic_subblock_id(func)
+        return 0, 0
+
+    counts = {"tile.tpush_to_aic": 0, "tile.tpop_from_aic": 0}
+
+    class _EndpointFinder(_ir_core.IRVisitor):
+        def visit_call(self, op: _ir_core.Call) -> None:
+            ir_op = getattr(op, "op", None)
+            name = ir_op.name if isinstance(ir_op, _ir_core.Op) else ""
+            if name in _AIV_FIFO_ENDPOINT_OPS:
+                split = op.kwargs.get("split", 0)
+                if isinstance(split, bool) or not isinstance(split, int):
+                    raise RuntimeError(
+                        f"{func.name}: cross-core split attribute must be an integer, got {split!r}"
+                    )
+                if split != 0:
+                    counts[name] += 1
+            super().visit_call(op)
+
+    finder = _EndpointFinder()
+    finder.visit_stmt(func.body)
+    return counts["tile.tpush_to_aic"], counts["tile.tpop_from_aic"]
+
+
+def _find_matching_delimiter(
+    code: str,
+    start: int,
+    opening: str,
+    closing: str,
+) -> int:
+    """Return the matching delimiter index in generated PTOAS C++."""
+
+    if start < 0 or start >= len(code) or code[start] != opening:
+        return -1
+    depth = 0
+    for index in range(start, len(code)):
+        char = code[index]
+        if char == opening:
+            depth += 1
+        elif char == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _find_ptoas_function(
+    func_name: str,
+    ptoas_code: str,
+) -> tuple[int, int, int, int]:
+    """Locate one named function in preprocessed PTOAS C++."""
+
+    pattern = re.compile(rf"\bstatic\s+__aicore__\s+void\s+{re.escape(func_name)}\s*(\()")
+    matches = list(pattern.finditer(ptoas_code))
+    if len(matches) != 1:
+        raise RuntimeError(f"{func_name}: expected exactly one PTOAS function definition, got {len(matches)}")
+
+    match = matches[0]
+    params_start = match.start(1)
+    params_end = _find_matching_delimiter(ptoas_code, params_start, "(", ")")
+    if params_end < 0:
+        raise RuntimeError(f"{func_name}: malformed PTOAS function parameter list")
+    body_start = ptoas_code.find("{", params_end)
+    if body_start < 0:
+        raise RuntimeError(f"{func_name}: malformed PTOAS function body")
+    body_end = _find_matching_delimiter(ptoas_code, body_start, "{", "}")
+    if body_end < 0:
+        raise RuntimeError(f"{func_name}: unterminated PTOAS function body")
+    return params_start, params_end, body_start, body_end
+
+
+_SPLIT_FIFO_TEMPLATE_MARKERS = (
+    "TileSplitAxis::TILE_UP_DOWN",
+    "TileSplitAxis::TILE_LEFT_RIGHT",
+    "TileSplitAxis::TILE_UP_DOWN_ODD",
+    "TileSplitAxis::TILE_LEFT_RIGHT_ODD",
+)
+
+_RUNTIME_SPLIT_FIFO_LANE_ARG = "PYPTO_SPLIT_RUNTIME_LANE_ARG"
+
+
+def _second_call_argument_end(code: str, args_start: int, args_end: int, func_name: str) -> int:
+    """Return where a runtime lane argument belongs after a FIFO call's tile argument."""
+
+    depths = {"(": 0, "[": 0, "{": 0, "<": 0}
+    closing_to_opening = {")": "(", "]": "[", "}": "{", ">": "<"}
+    top_level_commas = 0
+    for index in range(args_start + 1, args_end):
+        char = code[index]
+        if char in depths:
+            depths[char] += 1
+        elif char in closing_to_opening:
+            opening = closing_to_opening[char]
+            if depths[opening] > 0:
+                depths[opening] -= 1
+        elif char == "," and all(depth == 0 for depth in depths.values()):
+            top_level_commas += 1
+            if top_level_commas == 2:
+                return index
+    if top_level_commas != 1:
+        raise RuntimeError(f"{func_name}: expected split TPUSH/TPOP to have at least pipe and tile arguments")
+    return args_end
+
+
+def _forward_runtime_lane_to_split_fifo_calls(
+    func: _ir_core.Function,
+    ptoas_code: str,
+) -> tuple[str, bool]:
+    """Pass the runtime AIV lane directly to split PTO-ISA TPUSH/TPOP calls.
+
+    The A2A3 runtime dispatch payload has the authoritative lane identity, while
+    PTO-ISA's zero-argument ``get_subblockid()`` can remain zero on both lanes.
+    Its explicit TPUSH/TPOP overloads calculate the per-call byte offset from
+    the actual tile type, so this remains correct when one automatic FIFO carries
+    differently sized transfers at different points in a mixed kernel.
+    """
+
+    expected_pushes, expected_pops = _runtime_split_fifo_endpoint_counts(func)
+    if expected_pushes == 0 and expected_pops == 0:
+        return ptoas_code, False
+
+    params_start, params_end, body_start, body_end = _find_ptoas_function(func.name, ptoas_code)
+    add_runtime_param = not _uses_dynamic_subblock_id(func)
+    if add_runtime_param:
+        subblock_param = "__pypto_runtime_subblock_idx"
+    else:
+        trailing_param = re.search(
+            r"(?:^|,)\s*int32_t\s+([A-Za-z_]\w*)\s*$",
+            ptoas_code[params_start + 1 : params_end],
+        )
+        if trailing_param is None:
+            raise RuntimeError(
+                f"{func.name}: PTOAS function is missing its trailing runtime subblock parameter"
+            )
+        subblock_param = trailing_param.group(1)
+
+    call_pattern = re.compile(r"\b(TPUSH|TPOP)\s*(<)")
+    insertions: list[tuple[int, str]] = []
+    rewritten_counts = {"TPUSH": 0, "TPOP": 0}
+    position = body_start + 1
+    while (match := call_pattern.search(ptoas_code, position, body_end)) is not None:
+        template_start = match.start(2)
+        template_end = _find_matching_delimiter(ptoas_code, template_start, "<", ">")
+        if template_end < 0 or template_end >= body_end:
+            raise RuntimeError(f"{func.name}: malformed {match.group(1)} template argument list")
+        template_args = ptoas_code[template_start + 1 : template_end]
+        position = template_end + 1
+        if not any(marker in template_args for marker in _SPLIT_FIFO_TEMPLATE_MARKERS):
+            continue
+
+        args_start = template_end + 1
+        while args_start < body_end and ptoas_code[args_start].isspace():
+            args_start += 1
+        if args_start >= body_end or ptoas_code[args_start] != "(":
+            raise RuntimeError(f"{func.name}: malformed split {match.group(1)} call")
+        args_end = _find_matching_delimiter(ptoas_code, args_start, "(", ")")
+        if args_end < 0 or args_end >= body_end:
+            raise RuntimeError(f"{func.name}: unterminated split {match.group(1)} call")
+        insertion_at = _second_call_argument_end(ptoas_code, args_start, args_end, func.name)
+        insertions.append((insertion_at, f" {_RUNTIME_SPLIT_FIFO_LANE_ARG}({subblock_param})"))
+        rewritten_counts[match.group(1)] += 1
+        position = args_end + 1
+
+    if (expected_pushes > 0) != (rewritten_counts["TPUSH"] > 0) or (expected_pops > 0) != (
+        rewritten_counts["TPOP"] > 0
+    ):
+        raise RuntimeError(
+            f"{func.name}: split FIFO endpoints do not match PTOAS calls: "
+            f"IR push/pop={expected_pushes}/{expected_pops}, "
+            f"PTOAS push/pop={rewritten_counts['TPUSH']}/{rewritten_counts['TPOP']}"
+        )
+
+    if add_runtime_param:
+        separator = "" if not ptoas_code[params_start + 1 : params_end].strip() else ", "
+        insertions.append((params_end, f"{separator}int32_t {subblock_param}"))
+
+    rewritten = ptoas_code
+    for insertion_at, text in sorted(insertions, reverse=True):
+        rewritten = rewritten[:insertion_at] + text + rewritten[insertion_at:]
+    return rewritten, True
 
 
 def _generate_kernel_header(
@@ -771,25 +960,11 @@ def _generate_kernel_header(
 
             """
         )
-    elif _needs_runtime_subblock_bridge(func):
-        subblock_override = textwrap.dedent(
-            """\
-            #if !defined(__CPU_SIM)
-            #include "intrinsic.h"
 
-            // A2A3 mixed tasks run the same AIV kernel on two vector cores.
-            // Bridge the runtime-provided lane id into PTO-ISA get_subblockid().
-            [[block_local]] static int32_t pypto_runtime_subblock_id;
-            #define get_subblockid() pypto_runtime_subblock_id
-            #endif
-
-            """
-        )
-
-    # Include intrinsic.h when the wrapper needs runtime SPMD identity or the
-    # SDMA workspace. The SPMD values flow into the kernel as trailing
-    # wrapper-passed parameters, so there is no macro shadow, no
-    # [[block_local]] static / thread_local storage, and no __CPU_SIM fork.
+    # Include intrinsic.h when the wrapper needs runtime SPMD or AIV lane
+    # identity, or the SDMA workspace. Identity values flow into the kernel as
+    # trailing wrapper-passed parameters, so there is no macro shadow or
+    # block-local storage.
     if uses_spmd is None:
         uses_spmd = _uses_spmd_block_ops(func)
     if uses_subblock is None:
@@ -828,23 +1003,32 @@ def _generate_kernel_wrapper(
     func_uses_subblock = _uses_dynamic_subblock_id(func)
     func_uses_sdma = _uses_sdma_workspace(func)
     func_uses_deferred_completion = _uses_deferred_completion(func)
+    ptoas_body = _preprocess_ptoas_output(ptoas_code)
+    ptoas_body, fifo_uses_subblock = _forward_runtime_lane_to_split_fifo_calls(func, ptoas_body)
+    wrapper_uses_subblock = func_uses_subblock or fifo_uses_subblock
     header = _generate_kernel_header(
         func,
         uses_spmd=uses_spmd,
-        uses_subblock=func_uses_subblock,
+        uses_subblock=wrapper_uses_subblock,
         uses_sdma=func_uses_sdma,
         uses_deferred_completion=func_uses_deferred_completion,
     )
-    ptoas_body = _preprocess_ptoas_output(ptoas_code)
     unpacking_code, var_names = _generate_arg_unpacking(func, uses_spmd=uses_spmd)
-    runtime_subblock_setup = ""
-    if _needs_runtime_subblock_bridge(func):
-        runtime_subblock_setup = (
-            "#if !defined(__CPU_SIM)\n"
-            "    // Read A2A3 mixed-task subblock id from runtime dispatch context\n"
-            "    pypto_runtime_subblock_id = get_sub_block_id(args);\n"
+
+    fifo_lane_arg_bridge = ""
+    fifo_lane_arg_cleanup = ""
+    if fifo_uses_subblock:
+        # PTO-ISA exposes the explicit runtime-lane TPUSH/TPOP overload only on
+        # A2A3 device code. CPU simulation and the in-core cost model already
+        # model their lane context through the ordinary two-argument endpoint.
+        fifo_lane_arg_bridge = (
+            "#if defined(__CPU_SIM) || defined(__COSTMODEL)\n"
+            f"#define {_RUNTIME_SPLIT_FIFO_LANE_ARG}(subblock_id)\n"
+            "#else\n"
+            f"#define {_RUNTIME_SPLIT_FIFO_LANE_ARG}(subblock_id) , subblock_id\n"
             "#endif\n\n"
         )
+        fifo_lane_arg_cleanup = f"#undef {_RUNTIME_SPLIT_FIFO_LANE_ARG}\n\n"
 
     # Resolve SPMD block identity once from intrinsic.h::get_block_idx(args) /
     # get_block_num(args). Locals are declared whenever any function in the
@@ -864,9 +1048,8 @@ def _generate_kernel_wrapper(
     # stale under the tensormap_and_ringbuffer dispatch (see intrinsic.h). The
     # value is valid under both onboard and __CPU_SIM (the scheduler populates
     # GlobalContext.sub_block_id on every platform), so no __CPU_SIM fork.
-    # (func_uses_subblock is computed once above, before the header call.)
     subblock_arg_setup = ""
-    if func_uses_subblock:
+    if wrapper_uses_subblock:
         subblock_arg_setup = (
             "    // Read SPMD subblock (AIV lane) id from runtime dispatch payload\n"
             "    int32_t __pypto_spmd_subblock_idx = get_sub_block_id(args);\n\n"
@@ -891,7 +1074,7 @@ def _generate_kernel_wrapper(
         call_args_list.append("__pypto_sdma_workspace")
     if func_uses_spmd:
         call_args_list = call_args_list + ["__pypto_spmd_block_idx", "__pypto_spmd_block_num"]
-    if func_uses_subblock:
+    if wrapper_uses_subblock:
         call_args_list = call_args_list + ["__pypto_spmd_subblock_idx"]
     call_args = ", ".join(call_args_list)
 
@@ -904,7 +1087,6 @@ def _generate_kernel_wrapper(
         "    // Reset AI Core atomic mode inherited from a prior kernel.\n"
         "    set_atomic_none();\n"
         "#endif\n\n"
-        f"{runtime_subblock_setup}"
         f"{spmd_args_setup}"
         f"{subblock_arg_setup}"
         f"{unpacking_code}\n"
@@ -916,8 +1098,8 @@ def _generate_kernel_wrapper(
 
     deferred_completion_adapter = _DEFERRED_COMPLETION_ADAPTER if func_uses_deferred_completion else ""
     return (
-        f"{header}\n{deferred_completion_adapter}"
-        f"// --- ptoas-generated code ---\n{ptoas_body}\n{wrapper_func}"
+        f"{header}\n{deferred_completion_adapter}{fifo_lane_arg_bridge}"
+        f"// --- ptoas-generated code ---\n{ptoas_body}\n{fifo_lane_arg_cleanup}{wrapper_func}"
     )
 
 
@@ -1197,6 +1379,56 @@ def _external_include_dirs_of(func: _ir_core.Function) -> tuple[str, ...]:
         return decode_external_include_dirs(dict(func.attrs).get(EXTERNAL_INCLUDE_DIRS_ATTR))
     except ValueError as e:
         raise RuntimeError(f"Invalid external include metadata on function '{func.name}': {e}") from e
+
+
+def _builtin_template_of(func: _ir_core.Function) -> tuple[str, dict[str, str]] | None:
+    """Return ``(template_dir, variables)`` for a builtin-template kernel, else None.
+
+    ``LowerL2TensorCollectives`` synthesizes an AIV function per managed CHIP/L2
+    collective whose implementation is the hand-written builtin kernel the HOST
+    rail also renders — named indirectly by ``builtin_template_dir`` (a
+    package-resource handle) plus a ``key=value`` substitution list. Like an
+    external kernel it gets no PyPTO codegen; unlike one it is *generated*, so
+    the rendered source is written to ``kernels/<ct>/<name>.cpp`` under the
+    artifact dir, which is exactly where the manifest already points.
+    """
+    attrs = dict(func.attrs)
+    template_dir = attrs.get(BUILTIN_TEMPLATE_DIR_ATTR)
+    if template_dir is None:
+        return None
+    variables: dict[str, str] = {}
+    raw = attrs.get(BUILTIN_TEMPLATE_VARS_ATTR, "")
+    for item in filter(None, (part.strip() for part in raw.split(","))):
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise RuntimeError(
+                f"Invalid {BUILTIN_TEMPLATE_VARS_ATTR} entry {item!r} on function '{func.name}': "
+                "expected 'key=value'"
+            )
+        variables[key.strip()] = value.strip()
+    return template_dir, variables
+
+
+def _render_builtin_kernel_sources(program: _ir_core.Program) -> dict[str, str]:
+    """Render every builtin-template kernel in *program* into artifact sources."""
+    rendered: dict[str, str] = {}
+    for func in program.functions.values():
+        spec = _builtin_template_of(func)
+        if spec is None:
+            continue
+        template_dir, variables = spec
+        templates_dir = _resolve_builtin_template_dir(template_dir) / "templates"
+        kernel_template = templates_dir / "kernel.cpp.in"
+        if not kernel_template.is_file():
+            raise FileNotFoundError(
+                f"builtin template_dir {template_dir!r} has no templates/kernel.cpp.in for "
+                f"function '{func.name}'"
+            )
+        core_type = "aic" if func.func_type == _ir_core.FunctionType.AIC else "aiv"
+        rendered[f"kernels/{core_type}/{func.name}.cpp"] = _render_builtin_template(
+            kernel_template, {"template_package": template_dir.lstrip(":"), **variables}
+        )
+    return rendered
 
 
 def _compile_pto_module(
@@ -1882,9 +2114,17 @@ def _generate_single_chip(
 
     groups, ungrouped = _build_group_mapping(transformed_program)
 
+    # Builtin-template kernels are generated from a template rather than by
+    # PyPTO codegen, so they are skipped in the same places external kernels are
+    # — but their source is written into this artifact, not referenced in place.
+    def _skips_pto_codegen(func: _ir_core.Function) -> bool:
+        return _external_source_of(func) is not None or _builtin_template_of(func) is not None
+
+    result_files.update(_render_builtin_kernel_sources(transformed_program))
+
     emitted_incore_funcs = [
-        func for members in groups.values() for func in members if _external_source_of(func) is None
-    ] + [func for func in ungrouped if _external_source_of(func) is None]
+        func for members in groups.values() for func in members if not _skips_pto_codegen(func)
+    ] + [func for func in ungrouped if not _skips_pto_codegen(func)]
 
     # External kernels are referenced at their original path in the manifest
     # (kept beside their sibling sources so relative #include "../..." resolve),
@@ -1943,9 +2183,10 @@ def _generate_single_chip(
 
     for func in ungrouped:
         try:
-            # External kernel: referenced in place (see the manifest map);
-            # skip PyPTO codegen.
-            if _external_source_of(func) is not None:
+            # External kernel: referenced in place (see the manifest map).
+            # Builtin-template kernel: already rendered into this artifact.
+            # Either way, skip PyPTO codegen.
+            if _skips_pto_codegen(func):
                 continue
             peer_names = _extract_peer_function_names(func)
             peer_funcs: list[_ir_core.Function] = []
@@ -1991,12 +2232,13 @@ def _generate_single_chip(
                 f"// Generated by PyPTO IR Compiler\n\n"
                 f"{orch_result.code}"
             )
-            # An all-external graph has no PTOAS phase to skip. It still needs
-            # the manifest so the runtime can compile those sources with CCEC
-            # and assemble the orchestration.
-            all_kernels_external = all(
-                name in func_name_to_external_source for name in orch_result.func_name_to_id
-            )
+            # A graph with no PyPTO-generated kernel has no PTOAS phase to skip.
+            # It still needs the manifest so the runtime can compile those
+            # sources with CCEC and assemble the orchestration.
+            codegen_free_kernels = {
+                f.name for f in transformed_program.functions.values() if _skips_pto_codegen(f)
+            }
+            all_kernels_external = all(name in codegen_free_kernels for name in orch_result.func_name_to_id)
             if not skip_ptoas or all_kernels_external:
                 result_files["kernel_config.py"] = _generate_config_file(
                     orch_func.name,

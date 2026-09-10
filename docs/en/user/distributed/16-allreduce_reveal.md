@@ -118,4 +118,5 @@ you still choose the mode.
 - [01-collectives](01-collectives.md) §AllReduce — the reference for both modes and the signal shapes
 - [13-allreduce_mesh](13-allreduce_mesh.md) / [15-allreduce_ring](15-allreduce_ring.md) — what each mode lowers to
 - [02-primitives](02-primitives.md) — the substrate the builtin is built from
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next: steps 12-16 in [05-tutorials](05-tutorials.md) cover the other collectives

@@ -135,4 +135,5 @@ assert torch.allclose(y, x + torch.arange(N_RANKS).view(N_RANKS, 1, 1), ...)
 - [00-model](../distributed/00-model.md) — 快速入门 + 模型词汇
 - [03-execution](../distributed/03-execution.md) — `DistributedConfig` 与
   worker 生命周期
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[07-programming_model](07-programming_model.md) — 标注的三层模型

@@ -13,8 +13,10 @@ import contextlib
 import ctypes
 import json
 import os
+import pathlib
 import sys
 import types
+import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,16 +39,16 @@ from pypto.runtime import DeviceTensor, RunConfig
 
 @contextlib.contextmanager
 def _fake_compile_and_assemble(return_value):
-    """Stub ``pypto.runtime.device_runner.compile_and_assemble`` via a fake module.
+    """Stub ``pypto.runtime.device_runner._compile_and_assemble`` via a fake module.
 
     The real module imports ``simpler_setup`` (device-only), so it can't be loaded
     on host-only CI. Inserting a fake module into ``sys.modules`` lets the inner
-    ``from pypto.runtime.device_runner import compile_and_assemble`` resolve to the
+    ``from pypto.runtime.device_runner import _compile_and_assemble`` resolve to the
     mock on every platform. Yields the mock for call assertions.
     """
     mock = MagicMock(return_value=return_value)
     fake = types.ModuleType("pypto.runtime.device_runner")
-    setattr(fake, "compile_and_assemble", mock)
+    setattr(fake, "_compile_and_assemble", mock)
     with patch.dict(sys.modules, {"pypto.runtime.device_runner": fake}):
         yield mock
 
@@ -56,7 +58,7 @@ def _fake_call_config(instance):
     """Stub ``pypto.runtime.task_interface.CallConfig`` via a fake module.
 
     ``task_interface`` imports the device-only ``simpler`` package, so it can't
-    load on host CI. Fake it so ``build_call_config``'s inner import binds to a
+    load on host CI. Fake it so ``_build_call_config``'s inner import binds to a
     ``CallConfig`` that returns ``instance``."""
     fake = types.ModuleType("pypto.runtime.task_interface")
     setattr(fake, "CallConfig", MagicMock(return_value=instance))
@@ -336,22 +338,45 @@ class TestCompiledProgramCall:
         prog = _make_program_with_orchestration()
         cp = CompiledProgram(prog, str(tmp_path), platform="a2a3sim")
         args = (torch.zeros(128, 128), torch.zeros(128, 128), torch.zeros(128, 128))
-        config = RunConfig(platform="a2a3", device_id=3, enable_pmu=2, aicpu_thread_num=7)
+        config = RunConfig(
+            platform="a2a3",
+            device_id=3,
+            enable_pmu=2,
+            aicpu_thread_num=7,
+            ring_heap=512 * 1024 * 1024,
+        )
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             cp(*args, config=config)
 
         assert mock_exec.call_args.kwargs["platform"] == "a2a3"
         assert mock_exec.call_args.kwargs["device_id"] == 3
         assert mock_exec.call_args.kwargs["dfx"].enable_pmu == 2
         assert mock_exec.call_args.kwargs["aicpu_thread_num"] == 7
+        assert mock_exec.call_args.kwargs["config"] is config
+
+    def test_dispatch_does_not_emit_the_execute_compiled_deprecation(self, tmp_path):
+        """The artifact path goes to the implementation, not the deprecated wrapper.
+
+        ``pypto.runtime.execute_compiled`` is deprecated and warns. It wraps the
+        same implementation this dispatch uses, so routing back through it would
+        make every supported call emit a deprecation the caller cannot act on.
+        """
+        prog = _make_program_with_orchestration()
+        cp = CompiledProgram(prog, str(tmp_path), platform="a2a3sim")
+        args = (torch.zeros(128, 128), torch.zeros(128, 128), torch.zeros(128, 128))
+
+        with patch("pypto.runtime.runner._execute_compiled"):
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", DeprecationWarning)
+                cp(*args)
 
     def test_no_config_uses_compiled_platform(self, tmp_path):
         prog = _make_program_with_orchestration()
         cp = CompiledProgram(prog, str(tmp_path), platform="a5sim")
         args = (torch.zeros(128, 128), torch.zeros(128, 128), torch.zeros(128, 128))
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             cp(*args)
 
         assert mock_exec.call_args.kwargs["platform"] == "a5sim"
@@ -514,7 +539,7 @@ class TestCompiledProgramScalarCall:
         a = torch.randn(128, 128)
         c = torch.zeros(128, 128)
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             cp(a, 5, c)
 
         coerced_args = mock_exec.call_args.args[1]  # second positional arg is the args list
@@ -532,7 +557,7 @@ class TestCompiledProgramScalarCall:
         c = torch.zeros(128, 128)
         scalar = ctypes.c_int64(42)
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             cp(a, scalar, c)
 
         coerced_args = mock_exec.call_args.args[1]
@@ -575,10 +600,10 @@ class TestCompiledProgramScalarCall:
 
         a = torch.randn(128, 128)
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             result = cp(a, 7)
 
-        # Should have called execute_compiled with 3 args (a, scalar, allocated c)
+        # Should have called _execute_compiled with 3 args (a, scalar, allocated c)
         coerced_args = mock_exec.call_args.args[1]
         assert len(coerced_args) == 3
         assert isinstance(coerced_args[1], ctypes.c_int64)
@@ -591,7 +616,7 @@ class TestCompiledProgramDeviceTensor:
     """Verify __call__ accepts DeviceTensor in tensor parameter slots."""
 
     def test_device_tensor_in_input_slot(self, tmp_path):
-        """A DeviceTensor passed for an In param is forwarded to execute_compiled."""
+        """A DeviceTensor passed for an In param is forwarded to _execute_compiled."""
         prog = _make_program_with_orchestration()  # a (In), b (In), c (Out)
         cp = CompiledProgram(prog, str(tmp_path))
 
@@ -599,7 +624,7 @@ class TestCompiledProgramDeviceTensor:
         b = DeviceTensor(0xB0000, (128, 128), torch.float32)
         c = torch.zeros(128, 128)
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             cp(a, b, c)
 
         coerced_args = mock_exec.call_args.args[1]
@@ -616,7 +641,7 @@ class TestCompiledProgramDeviceTensor:
         b = DeviceTensor(0x2000, (128, 128), torch.float32)
         c = DeviceTensor(0x3000, (128, 128), torch.float32)
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             cp(a, b, c)
 
         coerced_args = mock_exec.call_args.args[1]
@@ -655,14 +680,55 @@ class TestCompiledProgramDeviceTensor:
             cp(a, bad_b, c)
 
 
+class TestParamInfoIsALeaf:
+    """``pypto.ir.param_info`` must not depend on ``pypto.runtime``.
+
+    The parameter metadata used to live in ``compiled_program``, which reaches
+    forward into ``pypto.runtime``. Its consumer
+    ``pypto.runtime.debug.run_script_writer`` imports the metadata back, so the
+    two modules formed a genuine cycle: hoisting that import to module scope
+    failed with ``cannot import name 'ParamInfo' from partially initialized
+    module``. Splitting the metadata into a leaf removed the back edge. Pulling
+    a runtime import into the leaf would restore it.
+    """
+
+    def _imported_modules(self, path):
+        import ast  # noqa: PLC0415
+
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                yield from (alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                yield node.module
+
+    def test_param_info_imports_nothing_from_the_runtime(self):
+        from pypto.ir import param_info  # noqa: PLC0415
+
+        source = pathlib.Path(param_info.__file__)
+        offenders = [m for m in self._imported_modules(source) if m.split(".")[:2] == ["pypto", "runtime"]]
+
+        assert offenders == []
+
+    def test_the_run_script_writer_takes_metadata_from_the_leaf(self):
+        """The consumer that closed the cycle must read the leaf, not the god-module."""
+        from pypto.runtime.debug import run_script_writer  # noqa: PLC0415
+
+        source = pathlib.Path(run_script_writer.__file__)
+        ir_imports = {m for m in self._imported_modules(source) if m.startswith("pypto.ir")}
+
+        assert "pypto.ir.param_info" in ir_imports
+        assert "pypto.ir.compiled_program" not in ir_imports
+
+
 class TestCompiledProgramExtraction:
     """Verify the extraction surface that lets users drive ``simpler.worker.Worker``
     directly: ``chip_callable`` / ``runtime_name`` / ``runtime_config`` properties,
-    ``load()``, ``build_orch_args()``, and ``build_call_config()``.
+    ``load()``, ``_build_orch_args()``, and ``_build_call_config()``.
     """
 
     def _patch_assemble(self, chip_callable_name: str = "fake_chip"):
-        """Patch ``device_runner.compile_and_assemble`` and return the MagicMock.
+        """Patch ``device_runner._compile_and_assemble`` and return the MagicMock.
 
         The patch target is the *source* module — inner-scope ``from ... import``
         statements bind to the patched name at import time.
@@ -701,7 +767,7 @@ class TestCompiledProgramExtraction:
             assert cp.runtime_config == runtime_config
 
     def test_properties_cache_across_calls(self, tmp_path):
-        """All three properties together trigger exactly one compile_and_assemble call."""
+        """All three properties together trigger exactly one _compile_and_assemble call."""
         prog = _make_program_with_orchestration()
         cp = CompiledProgram(prog, str(tmp_path))
 
@@ -744,7 +810,7 @@ class TestCompiledProgramExtraction:
         worker = MagicMock(name="worker")
         with patch("pypto.runtime.runner._coerced_to_orch_args") as oa_helper:
             oa_helper.return_value = "fake_orch_args"
-            orch_args, coerced, return_style = cp.build_orch_args(a, b, c, worker=worker)
+            orch_args, coerced, return_style = cp._build_orch_args(a, b, c, worker=worker)
 
         assert orch_args == "fake_orch_args"
         assert coerced == [a, b, c]
@@ -761,7 +827,7 @@ class TestCompiledProgramExtraction:
         worker = MagicMock(name="worker")
         with patch("pypto.runtime.runner._coerced_to_orch_args") as oa_helper:
             oa_helper.return_value = "fake_orch_args"
-            orch_args, coerced, return_style = cp.build_orch_args(a, b, worker=worker)
+            orch_args, coerced, return_style = cp._build_orch_args(a, b, worker=worker)
 
         assert orch_args == "fake_orch_args"
         assert return_style is True
@@ -776,7 +842,7 @@ class TestCompiledProgramExtraction:
         cp = CompiledProgram(prog, str(tmp_path))
         a = torch.zeros(128, 128)
         with pytest.raises(TypeError, match="expects 3"):
-            cp.build_orch_args(a)
+            cp._build_orch_args(a)
 
     def test_build_call_config_uses_runtime_config_default(self, tmp_path):
         """When config has no overrides, RUNTIME_CONFIG values feed CallConfig."""
@@ -791,7 +857,7 @@ class TestCompiledProgramExtraction:
         ):
             from pypto.runtime import RunConfig  # noqa: PLC0415
 
-            cfg = cp.build_call_config(RunConfig())
+            cfg = cp._build_call_config(RunConfig())
 
         assert cfg is fake_call_config
         assert fake_call_config.aicpu_thread_num == 2  # from runtime_config
@@ -808,7 +874,7 @@ class TestCompiledProgramExtraction:
         ):
             from pypto.runtime import RunConfig  # noqa: PLC0415
 
-            cp.build_call_config(RunConfig(aicpu_thread_num=8), aicpu_thread_num=4)
+            cp._build_call_config(RunConfig(aicpu_thread_num=8), aicpu_thread_num=4)
 
         assert fake_call_config.aicpu_thread_num == 4  # kwarg > RunConfig field > runtime_config
 
@@ -824,7 +890,7 @@ class TestCompiledProgramExtraction:
         ):
             from pypto.runtime import RunConfig  # noqa: PLC0415
 
-            cp.build_call_config(RunConfig(aicpu_thread_num=16))
+            cp._build_call_config(RunConfig(aicpu_thread_num=16))
 
         assert fake_call_config.aicpu_thread_num == 16  # RunConfig wins over runtime_config's 2
 
@@ -840,7 +906,7 @@ class TestCompiledProgramExtraction:
         ):
             from pypto.runtime import RunConfig  # noqa: PLC0415
 
-            cp.build_call_config(
+            cp._build_call_config(
                 RunConfig(
                     enable_chip_swimlane=True,
                     enable_dump_args=True,
@@ -877,7 +943,7 @@ class TestCompiledProgramExtraction:
         ):
             from pypto.runtime import RunConfig  # noqa: PLC0415
 
-            cp.build_call_config(RunConfig())
+            cp._build_call_config(RunConfig())
 
         # spec doesn't include "output_prefix", so any attempted set would fail.
         # Reaching here means _build_call_config correctly skipped it.
@@ -910,7 +976,7 @@ class TestCompiledProgramExtractionMultiOrch:
         b = torch.zeros(128, 128)
         c = torch.zeros(128, 128)
         with pytest.raises(TypeError, match="Multi-orch"):
-            cp.build_orch_args(a, b, c)
+            cp._build_orch_args(a, b, c)
 
 
 class TestSubChipCallableExtraction:
@@ -951,7 +1017,7 @@ class TestSubChipCallableExtraction:
         worker = MagicMock(name="worker")
         with patch("pypto.runtime.runner._coerced_to_orch_args") as oa_helper:
             oa_helper.return_value = "fake_orch_args"
-            orch_args, coerced, return_style = sub.build_orch_args(a, b, c, worker=worker)
+            orch_args, coerced, return_style = sub._build_orch_args(a, b, c, worker=worker)
 
         assert orch_args == "fake_orch_args"
         assert coerced == [a, b, c]
@@ -970,7 +1036,7 @@ class TestSubChipCallableExtraction:
         sub = self._make_subchip(tmp_path)
         args = (torch.zeros(128, 128), torch.zeros(128, 128), torch.zeros(128, 128))
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             sub(*args, config=RunConfig(platform="a2a3"))
 
         assert mock_exec.call_args.kwargs["platform"] == "a2a3"
@@ -979,7 +1045,7 @@ class TestSubChipCallableExtraction:
         sub = self._make_subchip(tmp_path)
         args = (torch.zeros(128, 128), torch.zeros(128, 128), torch.zeros(128, 128))
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             sub(*args)
 
         assert mock_exec.call_args.kwargs["platform"] == "a2a3sim"
@@ -1055,14 +1121,14 @@ class TestCompiledMetaAndFromDir:
         assert param_infos[2].direction == ir.ParamDirection.Out
 
     def test_from_dir_dispatches_via_runner(self, tmp_path):
-        """A reconstructed program is callable and reaches execute_compiled."""
+        """A reconstructed program is callable and reaches _execute_compiled."""
         CompiledProgram(_make_program_with_orchestration(), str(tmp_path), platform="a2a3sim")
         reloaded = CompiledProgram.from_dir(tmp_path)
         a = torch.zeros(128, 128)
         b = torch.zeros(128, 128)
         c = torch.zeros(128, 128)
 
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             reloaded(a, b, c)
 
         mock_exec.assert_called_once()
@@ -1075,7 +1141,7 @@ class TestCompiledMetaAndFromDir:
 
         Regression test for #2344: ``benchmark`` needs ``platform`` /
         ``runtime_name`` / ``runtime_config`` / ``chip_callable`` plus the
-        metadata-derived ``build_orch_args`` / ``build_call_config`` /
+        metadata-derived ``_build_orch_args`` / ``_build_call_config`` /
         ``output_indices``, which previously required a live ``Program``.
         """
         CompiledProgram(_make_program_with_orchestration(), str(tmp_path), platform="a2a3sim")
@@ -1095,10 +1161,10 @@ class TestCompiledMetaAndFromDir:
             assert reloaded.output_indices == [2]
             with patch("pypto.runtime.runner._coerced_to_orch_args") as oa_helper:
                 oa_helper.return_value = "fake_orch_args"
-                orch_args, coerced, return_style = reloaded.build_orch_args(*args, worker=worker)
+                orch_args, coerced, return_style = reloaded._build_orch_args(*args, worker=worker)
                 oa_helper.assert_called_once_with(args, worker)
             with _fake_call_config(call_config):
-                assert reloaded.build_call_config(RunConfig()) is call_config
+                assert reloaded._build_call_config(RunConfig()) is call_config
 
         assert orch_args == "fake_orch_args"
         assert coerced == args
@@ -1283,7 +1349,7 @@ class TestCompiledMetaAndFromDir:
 
         assert reloaded.orchestration_names == []
         args = (torch.zeros(128, 128), torch.zeros(128, 128), torch.zeros(128, 128))
-        with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+        with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
             reloaded(*args)
         assert mock_exec.call_args.args[0] == tmp_path.resolve()
 
@@ -1459,7 +1525,7 @@ class TestCompiledMetaOutputDirReuse:
         assert reloaded.param_names == ["x", "y", "z"]
         args = (torch.zeros(64, 64), torch.zeros(64, 64), torch.zeros(64, 64))
         for compiled in (single, reloaded):
-            with patch("pypto.runtime.runner.execute_compiled") as mock_exec:
+            with patch("pypto.runtime.runner._execute_compiled") as mock_exec:
                 compiled(*args)
             assert mock_exec.call_args.args[0] == work_dir.resolve()
 

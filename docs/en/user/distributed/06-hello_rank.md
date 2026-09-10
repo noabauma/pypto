@@ -144,5 +144,6 @@ differences; use exact equality if you need a strict guarantee.
 - [00-model](../distributed/00-model.md) — quickstart + model vocabulary
 - [03-execution](../distributed/03-execution.md) — `DistributedConfig` and the
   worker lifecycle
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [07-programming_model](07-programming_model.md) — the three-level
   model, labeled

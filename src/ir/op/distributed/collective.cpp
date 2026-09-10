@@ -14,7 +14,7 @@
  * @brief Distributed tensor-level collective ops — pld.tensor.* composites and builtin.tensor.* host
  * dispatches.
  *
- * Composite collective ops that lower through LowerCompositeOps (pass 12)
+ * Composite collective ops that lower through LowerCompositeOps (pass 13)
  * into notify/wait/remote_load/store primitives (InCore path), or through
  * LowerHostTensorCollectives into builtin.tensor.* chip dispatches (HOST path).
  * Each op registers a type deducer and an op description; the actual IR
@@ -167,25 +167,11 @@ TypePtr DeduceBuiltinTensorAllReduceRingType(const std::vector<ExprPtr>& args,
         << " for NR = " << sig_shape1_const->value_;
   }
 
-  // Compile-time validation: the host builtin ring kernel partitions src into
-  // NR contiguous compile-time chunks, so the src shape must be statically
-  // known — a dynamic extent could reach the kernel with a runtime numel that
-  // is not divisible by NR and silently return unreduced data.  A non-divisible
-  // numel would produce a trailing partial chunk the schedule cannot handle.
-  if (sig_shape1_const && sig_shape1_const->value_ > 0) {
-    int64_t src_numel = 1;
-    for (const auto& dim : src_type->shape_) {
-      auto extent = As<ConstInt>(dim);
-      CHECK(extent) << kOpName
-                    << " requires a statically-known src shape (dynamic host-ring extents are not "
-                       "supported; the ring schedule partitions src into NR compile-time chunks)";
-      src_numel *= extent->value_;
-    }
-    const int64_t nr = sig_shape1_const->value_;
-    CHECK(src_numel % nr == 0) << kOpName << " requires the src data size (product of shape = " << src_numel
-                               << ") to be an exact multiple of the rank count (" << nr
-                               << "); got a remainder of " << (src_numel % nr);
-  }
+  // The host builtin ring kernel partitions src into NR balanced, potentially
+  // ragged chunks at runtime (chunk r spans [floor(numel*r/NR), floor(numel*(r+1)/NR)))
+  // and narrows every TPUT transfer to the chunk's exact extent via the staging
+  // tile's valid_shape — no compile-time static-shape or divisibility
+  // requirement remains (issue #2242).
 
   auto op_value = GetRequiredKwarg<int>(kwargs, "op", kOpName);
   auto dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
@@ -567,15 +553,69 @@ REGISTER_OP("pld.tensor.all_to_all")
 
 namespace {
 
+/// Reject an `all_to_all_v` operand view that is *provably* not a packed
+/// row-major buffer.
+///
+/// Every operand is addressed with flat element arithmetic, not through its
+/// declared strides: the payload as `dest * MAX_RECV * SIZE + ...`, and the
+/// control operands as `send_counts_base[dest]`, `signal_base + peer` and
+/// `recv_counts_base + my_rank`. A strided, transposed or partial view would
+/// therefore silently read the wrong count or wait on the wrong signal cell —
+/// so all five are checked, not just the two payload buffers. A view is
+/// rejected only when the mismatch is decidable at compile time: a non-ND
+/// layout, a `valid_shape` statically smaller than the shape, or a static
+/// stride vector that differs from the packed row-major one. Dynamic extents
+/// are left to the runtime contract.
+void CheckStaticContiguousPayload(const TensorTypePtr& type, const char* role) {
+  if (!type->tensor_view_.has_value()) return;  // no view => packed by construction
+  const auto& view = *type->tensor_view_;
+  CHECK(view.layout == TensorLayout::ND)
+      << "pld.tensor.all_to_all_v " << role
+      << " must be a packed row-major (ND) view; a blocked/NZ layout cannot be addressed with the "
+         "flat element arithmetic both lowering rails use";
+  for (size_t i = 0; i < view.valid_shape.size() && i < type->shape_.size(); ++i) {
+    auto valid = As<ConstInt>(view.valid_shape[i]);
+    auto extent = As<ConstInt>(type->shape_[i]);
+    if (!valid || !extent) continue;
+    CHECK(valid->value_ == extent->value_)
+        << "pld.tensor.all_to_all_v " << role << " must be a full, packed view; dim " << i
+        << " has valid_shape " << valid->value_ << " < shape " << extent->value_
+        << ", so the payload is not contiguous";
+  }
+  if (view.stride.empty()) return;
+  if (view.stride.size() != type->shape_.size()) return;
+  // Packed row-major strides, computed right to left. Bail out (rather than
+  // reject) as soon as a dynamic extent makes the expected stride unknown.
+  int64_t expected = 1;
+  for (size_t i = type->shape_.size(); i-- > 0;) {
+    auto actual = As<ConstInt>(view.stride[i]);
+    if (!actual) return;
+    CHECK(actual->value_ == expected)
+        << "pld.tensor.all_to_all_v " << role << " must be a packed row-major contiguous view; dim " << i
+        << " has stride " << actual->value_ << ", expected " << expected;
+    auto extent = As<ConstInt>(type->shape_[i]);
+    if (!extent) return;
+    expected *= extent->value_;
+  }
+}
+
 TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
                                   const std::vector<std::pair<std::string, std::any>>& kwargs) {
-  (void)kwargs;
   CHECK(args.size() == 5) << "pld.tensor.all_to_all_v requires 5 args "
                              "(input, target, signal, send_counts, recv_counts), but got "
                           << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tensor.all_to_all_v positional argument #" << i << " must not be null";
   }
+
+  // core_num is the requested AIV block limit for the managed CHIP/L2 rail.
+  // The InCore composite rail requires 1; LowerCompositeOps enforces that, so
+  // the deducer only rejects a value no rail could honour. Optional with a
+  // default of 1: every rail is single-core unless asked otherwise, so IR built
+  // without the kwarg (hand-built calls, programs deserialized from a .pto
+  // written before it existed) keeps its original meaning.
+  auto core_num = GetKwargOr<int>(kwargs, "core_num", 1);
+  CHECK(core_num > 0) << "pld.tensor.all_to_all_v core_num must be positive, got " << core_num;
 
   // input: flattened send buffer [NR*MAX_RECV, SIZE] — Tensor or DistributedTensor
   // (same Tensor-like contract as symmetric all_to_all / send_counts).
@@ -602,6 +642,39 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
   CHECK(target_type->dtype_ == input_type->dtype_)
       << "pld.tensor.all_to_all_v target dtype " << target_type->dtype_.ToString()
       << " must match input dtype " << input_type->dtype_.ToString();
+
+  // Buffer contract: both payload buffers are addressed by flat element
+  // arithmetic, and `input` is read while `target` is written by incoming
+  // pushes, so a provably strided view is rejected here rather than silently
+  // moving the wrong bytes at runtime.
+  //
+  // The aliasing guard below is deliberately narrow. Deduction runs when the
+  // Call is built, long before MaterializeCommDomainScopes (pass 45) binds
+  // `DistributedTensorType::window_buffer_`, so for a DSL program only the
+  // operand-identity test can fire: it catches `input` and `target` being the
+  // *same expression*, not two `pld.window()` views of one allocation. The
+  // window-buffer comparison after it is a defence for IR whose back-reference
+  // is already bound (hand-built, or rebuilt after that pass).
+  //
+  // Whole-allocation distinctness is a HOST-rail guarantee only:
+  // LowerHostTensorCollectives resolves every operand back to its WindowBuffer
+  // — it can, because the `pld.window(...)` calls live in the same host_orch
+  // body — and runs CheckPairwiseDistinctWindows over all five. The InCore and
+  // CHIP/L2 rails receive the operands as enclosing-function parameters and
+  // have no such provenance, so there the contract is the caller's to keep.
+  CheckStaticContiguousPayload(input_type, "input");
+  CheckStaticContiguousPayload(target_type, "target");
+  CHECK(args[0].get() != args[1].get())
+      << "pld.tensor.all_to_all_v input and target must be two distinct buffers; in-place reuse races "
+         "this rank's outgoing reads against incoming peer pushes";
+  auto input_dist_type = As<DistributedTensorType>(args[0]->GetType());
+  if (input_dist_type && input_dist_type->window_buffer_.has_value() &&
+      target_type->window_buffer_.has_value()) {
+    CHECK(input_dist_type->window_buffer_->get() != target_type->window_buffer_->get())
+        << "pld.tensor.all_to_all_v input and target must be views of two distinct window buffers, got "
+           "two views of '"
+        << (*target_type->window_buffer_)->name_hint_ << "'";
+  }
 
   // signal: DistributedTensor INT32 [NR, 1].  Restricted to the 2-D form because
   // the composite lowering always emits MakeSignalOffsets(rank) → [rank, 0];
@@ -686,6 +759,12 @@ TypePtr DeduceTensorAllToAllVType(const std::vector<ExprPtr>& args,
       << "pld.tensor.all_to_all_v recv_counts dim 0 (" << recv_dim0->value_
       << ") must equal signal dim 0 (NR = " << signal_dim0->value_ << ")";
 
+  // The control operands are indexed just as flatly as the payload, so they
+  // are held to the same packed-view contract.
+  CheckStaticContiguousPayload(signal_type, "signal");
+  CheckStaticContiguousPayload(counts_type, "send_counts");
+  CheckStaticContiguousPayload(recv_type, "recv_counts");
+
   // Window-as-result: return target
   return target_type;
 }
@@ -727,6 +806,7 @@ REGISTER_OP("pld.tensor.all_to_all_v")
     .add_argument("recv_counts",
                   "Window-bound INT32 DistributedTensor [NR, 1] — after the barrier, "
                   "recv_counts[src, 0] holds how many rows src sent to this rank (InOut)")
+    .set_attr<int>("core_num")
     .no_memory_spec()
     // stays read-only.
     // Composite collective — the data destination is overwritten, not updated:
@@ -768,11 +848,10 @@ TypePtr DeduceTensorReduceScatterType(const std::vector<ExprPtr>& args,
       << "pld.tensor.reduce_scatter signal must have INT32 element type, got dtype "
       << signal_type->dtype_.ToString();
 
-  // Validate op kwarg — kSum only for first version (same as allreduce).
+  // Validate op kwarg — all four reduce ops supported (mirror allreduce).
   auto op_value = GetRequiredKwarg<int>(kwargs, "op", "pld.tensor.reduce_scatter");
-  CHECK(op_value == static_cast<int>(ReduceOp::kSum))
-      << "pld.tensor.reduce_scatter op must be ReduceOp.Sum (got int " << op_value
-      << "); Max / Min / Prod lowerings are not yet implemented";
+  CHECK(op_value >= static_cast<int>(ReduceOp::kSum) && op_value <= static_cast<int>(ReduceOp::kProd))
+      << "pld.tensor.reduce_scatter op must be ReduceOp.Sum, Max, Min, or Prod (got int " << op_value << ")";
 
   // Result type: same as target (in-place rebind — rank r's row now holds
   // the reduced chunk r).
@@ -787,7 +866,7 @@ REGISTER_OP("pld.tensor.reduce_scatter")
         "rank receives one reduced chunk. `target` has shape [NR, SIZE] — each rank stages "
         "all NR chunks before the call. After the call, rank r's row [r, 0:SIZE] holds the "
         "reduced value of chunk r. `signal` is a window-bound INT32 matrix for the cross-rank "
-        "barrier. `op` selects the reduction operator (Sum only in first version). "
+        "barrier. `op` selects the reduction operator (Sum, Max, Min, Prod). "
         "InCore path: lowered to a 5-phase decomposition by LowerCompositeOps. "
         "HOST builtin path: lowered to builtin.tensor.reduce_scatter per chip by "
         "LowerHostTensorCollectives.")

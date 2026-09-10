@@ -152,7 +152,7 @@ std::string GenerateIncludes(bool include_optional, bool include_vector = false)
   oss << "#include <tracr_simpler_markers.hpp>\n\n";
   oss << "#include \"orchestration_api.h\"\n";
   // The per-runtime `tensor.h` shim sits first on the orchestration include
-  // path and defines `TaskTensor` as whichever runtime this is built for
+  // path and defines `Tensor` as whichever runtime this is built for
   // (`simpler::tmr::Tensor` / `simpler::hbg::Tensor`). Orchestration works in
   // that type, not in the 72-byte boundary `ChipTensor` (simpler#1974), and
   // `orchestration_api.h` does not reach the shim on its own.
@@ -212,7 +212,7 @@ std::string GenerateMakeTensorExternal(const std::string& var_name, int orch_ind
                                        [[maybe_unused]] const TensorTypePtr& tensor_type,
                                        [[maybe_unused]] const CodegenBase& codegen) {
   std::ostringstream oss;
-  oss << "    const TaskTensor& ext_" << var_name << " = orch_args.tensor(" << orch_index << ").ref();\n";
+  oss << "    const Tensor& ext_" << var_name << " = orch_args.tensor(" << orch_index << ").ref();\n";
   return oss.str();
 }
 
@@ -259,6 +259,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
     bool user_written;
   };
 
+  /// Backing storage of one TaskId array carry — see ``array_carry_vars_``.
+  struct ArrayCarryEntry {
+    std::string array_name;
+    int64_t size;
+  };
+
   explicit OrchestrationStmtCodegen(const ProgramPtr& prog, std::map<std::string, int>* func_ids,
                                     std::map<std::string, CoreType>* core_types,
                                     std::map<std::string, std::vector<std::string>>* func_signatures,
@@ -279,6 +285,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
         packed_fp4_axis_(std::move(packed_fp4_axis)),
         dist_param_to_ctx_param_(std::move(dist_param_to_ctx_param)) {
     declared_var_names_ = param_name_set_;
+    // Function ``Scalar[TASK_ID]`` parameters (and lineage aliases seeded into
+    // ``emit_name_map_`` before construction) are live for the whole body.
+    // Register them in the TaskId binding maps / live-emit set so
+    // ``FindClosedScopeTaskId`` does not treat a branch/loop yield of a
+    // parameter as a producer local from a closed scope.
+    RegisterFunctionTaskIdParams();
     CollectCompilerDepTaskIds(program_);
   }
 
@@ -305,6 +317,26 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// in the same file — legal C++, since they are separate function scopes, but
   /// it makes every generated identifier ambiguous to read and to grep.
   void SetTaskVarPrefix(std::string prefix) { task_var_prefix_ = std::move(prefix); }
+
+  /// Reserve identifiers the emitted C++ function already declares outside the
+  /// body this instance generates, so no body Var can be handed one of them.
+  ///
+  /// The entry gets this for free: its ``param_name_set`` seeds
+  /// ``declared_var_names_``. A Graph function passes an empty set (its
+  /// parameters must not be ``ext_``-rewritten), so without this its
+  /// ``const Tensor& <p> = args.tensor(i).ref();`` prologue names are invisible
+  /// to ``ReserveVarEmitName``. The first body SSA rename of a parameter then
+  /// takes the parameter's own name — shadowing the prologue decl and, when it
+  /// happens inside a ``pl.manual_scope``, recording that name in
+  /// ``manual_local_names_`` as if it were scope-local. ``IsEnclosingScopeValid``
+  /// then reports the *parameter* as unreachable from outside the block, so
+  /// every later writeback mints a block-scoped ``const Tensor& <p>__ssa_vN =
+  /// <p>;`` alias instead of remapping onto the parameter — and a task placed
+  /// after the block references an identifier that has fallen out of C++ scope
+  /// (issue #2605).
+  void ReserveDeclaredNames(const std::set<std::string>& names) {
+    declared_var_names_.insert(names.begin(), names.end());
+  }
 
   void SetEffectiveUses(std::unordered_set<const Var*> uses) { effective_uses_ = std::move(uses); }
   [[nodiscard]] bool NeedsVectorInclude() const { return needs_vector_include_; }
@@ -721,7 +753,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
           carry_plans[i].dynamic_compiler_dep_collection = true;
         }
         // Override is_rebind: ClassifyIterArgCarry only sets it for TASK_ID
-        // iter_args, but TaskTensor-typed iter_args with compiler-dep edges also
+        // iter_args, but Tensor-typed iter_args with compiler-dep edges also
         // need true so the yield handler emits dynamic-collection writes.
         carry_plans[i].is_rebind = true;
       }
@@ -737,7 +769,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // Emit carry declarations for each iter_arg. Three lowering paths:
     //   - array_size > 0  -> TaskId array-carry (TaskId arr[N])
     //   - ArrayType carry  -> C-stack array with in-place-update semantics
-    //   - is_rebind        -> scalar/TaskTensor mutable carry variable
+    //   - is_rebind        -> scalar/Tensor mutable carry variable
     //   - else             -> trivial alias to init's emit name
     for (size_t i = 0; i < for_stmt->iter_args_.size(); ++i) {
       const auto& iter_arg = for_stmt->iter_args_[i];
@@ -868,7 +900,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         RegisterArrayCarry(return_var.get(), carry_name, N);
       } else if (is_rebind) {
         // Scalar (single-name) carry path — only fires for non-TaskId
-        // iter_args (e.g. TaskTensor) or Sequential TaskId iter_args whose
+        // iter_args (e.g. Tensor) or Sequential TaskId iter_args whose
         // yield value isn't an inner array. Parallel TaskId iter_args are
         // guaranteed to use the array-carry path above (the const-trip-count
         // CHECK above would have fired otherwise).
@@ -882,11 +914,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
         // declared names.
         std::string carry_name = ReserveSyntheticEmitName(return_var->name_hint_);
         const std::string cpp_type = GetCppType(return_var->GetType());
-        // A TaskTensor loop carry directly in a ``pl.manual_scope`` body is hoisted to
+        // A Tensor loop carry directly in a ``pl.manual_scope`` body is hoisted to
         // the enclosing scope so a task / method-receiver placed AFTER the block
-        // resolves it (issue #1713; see EmitMutableTensorCarryDecl). Non-TaskTensor
+        // resolves it (issue #1713; see EmitMutableTensorCarryDecl). Non-Tensor
         // (e.g. Sequential TaskId scalar) carries keep their in-block decl.
-        if (cpp_type == "TaskTensor") {
+        if (cpp_type == "Tensor") {
           EmitMutableTensorCarryDecl(carry_name, init_var_name);
         } else {
           EmitIndentedLine(cpp_type + " " + carry_name + " = " + init_var_name + ";");
@@ -896,11 +928,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
         emit_name_map_[return_var.get()] = carry_name;
         emit_name_map_[iter_arg.get()] = carry_name;
         // Sequential TaskId carry: register both endpoints in the task-id
-        // map so EmitManualDeps and yield writes can find the carry name.
+        // map so EmitManualDeps / yield writes / CheckTaskIdSlotValueInScope
+        // can find the live carry name. Must not gate on manual_scope depth:
+        // AUTO-scope loops (and inlined callees that re-publish the incoming
+        // carry into a pl.array) still need the binding, otherwise the
+        // closed-scope store diagnostic false-positives on a legal loop-carried
+        // TaskId (issue #2677).
         auto sty = As<ScalarType>(iter_arg->GetType());
-        if (in_manual_scope_depth_ > 0 && sty && sty->dtype_ == DataType::TASK_ID) {
+        if (sty && sty->dtype_ == DataType::TASK_ID) {
           manual_task_id_map_[iter_arg.get()] = carry_name;
           manual_task_id_map_[return_var.get()] = carry_name;
+          manual_task_id_map_by_key_[TaskIdHoistKey(iter_arg.get())] = carry_name;
+          manual_task_id_map_by_key_[TaskIdHoistKey(return_var.get())] = carry_name;
+          NoteLiveManualTaskIdEmitName(carry_name);
         }
       } else {
         // Trivial yield: preserve the legacy aliasing — both names route to
@@ -1034,7 +1074,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // produced by tasks emitted in the enclosing (auto or outer) scope. Loop /
     // branch carries are registered *before* their body's SIMPLER_SCOPE (outside
     // this frame), so they correctly survive the block.
+    //
+    // ``manual_task_id_map_by_key_`` is snapshotted with the pointer map: UniqueId
+    // entries added inside the block must die with it, or
+    // ``ResolveManualTaskIdBinding`` / ``CheckTaskIdSlotValueInScope`` would treat
+    // a dead loop-carry local as still live after the closing brace.
     auto saved_map = manual_task_id_map_;
+    auto saved_map_by_key = manual_task_id_map_by_key_;
     auto saved_array_carry = array_carry_vars_;
 
     if (!scope->manual_) {
@@ -1056,8 +1102,23 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
       EmitIndentedLine("}");
 
+      // An AUTO scope hoists nothing, so a backing array declared inside the
+      // block dies at its closing brace while one declared further out does
+      // not. Storage counts as enclosing exactly when some pre-entry carry
+      // already named it.
+      // Iteration order does not reach the result: the pointer keys are ignored
+      // and only the names are collected, into an ordered set.
+      std::set<std::string> enclosing_arrays;
+      // NOLINTNEXTLINE(bugprone-nondeterministic-pointer-iteration-order)
+      for (const auto& [_, entry] : saved_array_carry) enclosing_arrays.insert(entry.array_name);
+      PreserveEnclosingArrayCarries(
+          &saved_array_carry, &saved_map, &saved_map_by_key,
+          [&](const std::string& name) { return enclosing_arrays.count(name) == 0; });
+
       manual_task_id_map_ = std::move(saved_map);
+      manual_task_id_map_by_key_ = std::move(saved_map_by_key);
       array_carry_vars_ = std::move(saved_array_carry);
+      RebuildLiveManualTaskIdEmitNames();
       return;
     }
 
@@ -1122,22 +1183,16 @@ class OrchestrationStmtCodegen : public CodegenBase {
     // that names a manual-scope-local C++ identifier (e.g. ``TaskId prev =
     // arr[k];``) dies at the closing brace and must not leak (issue #1577).
     // BUT an array carry registered inside the scope can reuse a backing array
-    // declared in the ENCLOSING scope — e.g. a ``pl.parallel`` TaskId array
-    // carry threaded from an outer sequential loop's backing store. That carry
-    // survives the brace and is referenced by the enclosing loop's yield, which
-    // is emitted AFTER this block; wiping it would drop the loop-carried tids
-    // and trip the scalar-yield branch (issue #1811). Preserve such entries —
-    // identified by backing storage that is NOT this scope's local name set.
-    for (const auto& [var, entry] : array_carry_vars_) {
-      if (saved_array_carry.count(var)) continue;         // outer entry — keep outer value
-      if (local_names.count(entry.array_name)) continue;  // scope-local storage — drop
-      saved_array_carry[var] = entry;                     // enclosing-valid carry — preserve
-      auto tid_it = manual_task_id_map_.find(var);        // keep its per-slot dep names in sync
-      if (tid_it != manual_task_id_map_.end()) saved_map[var] = tid_it->second;
-    }
+    // declared in the ENCLOSING scope (issue #1811) — see
+    // ``PreserveEnclosingArrayCarries``. A manual scope hoists its allocations,
+    // so it knows its own local storage names outright.
+    PreserveEnclosingArrayCarries(&saved_array_carry, &saved_map, &saved_map_by_key,
+                                  [&](const std::string& name) { return local_names.count(name) != 0; });
 
     manual_task_id_map_ = std::move(saved_map);
+    manual_task_id_map_by_key_ = std::move(saved_map_by_key);
     array_carry_vars_ = std::move(saved_array_carry);
+    RebuildLiveManualTaskIdEmitNames();
   }
 
   /// Mark each ArrayType ``IfStmt`` return_var (a phi) as bound-by-yield, so no
@@ -1226,12 +1281,12 @@ class OrchestrationStmtCodegen : public CodegenBase {
   void VisitStmt_(const IfStmtPtr& if_stmt) override {
     std::string cond_expr = GenerateExprString(if_stmt->condition_);
 
-    // A default-constructed ``TaskTensor`` is deliberately uninitialised. Seed
-    // the phi declaration for a TaskTensor return_var from a valid TaskTensor
+    // A default-constructed ``Tensor`` is deliberately uninitialised. Seed
+    // the phi declaration for a Tensor return_var from a valid Tensor
     // that's already in scope instead. Try sources in order:
     //   1. The first tensor function parameter (selected by orch arg index,
     //      not lexical name — picking from ``param_name_set_`` could yield a
-    //      scalar param and emit ``TaskTensor x = <scalar>;`` which won't compile).
+    //      scalar param and emit ``Tensor x = <scalar>;`` which won't compile).
     //   2. A Var yielded by either branch that's already declared at
     //      if-entry (an outer iter_arg, or a prior in-body assignment). This
     //      handles parameterless functions whose branches yield a name
@@ -1283,11 +1338,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
       if (As<ArrayType>(rv->GetType())) continue;
       const std::string emit_name = ReserveVarEmitName(rv.get());
       const std::string cpp_type = GetCppType(rv->GetType());
-      if (cpp_type == "TaskTensor") {
+      if (cpp_type == "Tensor") {
         INTERNAL_CHECK_SPAN(!tensor_phi_init.empty(), if_stmt->span_)
             << "Internal error: IfStmt return_var '" << rv->name_hint_
-            << "' is a TaskTensor but no in-scope TaskTensor was found to use as the "
-            << "valid phi placeholder (a default-constructed ``TaskTensor`` is uninitialised). "
+            << "' is a Tensor but no in-scope Tensor was found to use as the "
+            << "valid phi placeholder (a default-constructed ``Tensor`` is uninitialised). "
             << "Expected either a function parameter or a branch yield value "
             << "to resolve to a Var already declared at if-entry.";
         // Phi placeholder init — overwritten by branch yields. When the IfStmt is
@@ -1297,6 +1352,20 @@ class OrchestrationStmtCodegen : public CodegenBase {
         // merges stay in-block). The phi init (a param or a pre-if Var) must be
         // enclosing-scope-valid, or the decl stays in place (EmitMutableTensorCarryDecl).
         EmitMutableTensorCarryDecl(emit_name, tensor_phi_init);
+      } else if (auto sty = As<ScalarType>(rv->GetType()); sty && sty->dtype_ == DataType::TASK_ID) {
+        // A TaskId phi is declared HERE, outside the branches, and each arm's
+        // yield assigns into it — so unlike a branch-local producer id it is
+        // still live after the ``if`` closes. Seed it with the sentinel (a
+        // default-constructed ``TaskId`` is uninitialised, and an arm may leave
+        // it unassigned) and register it at this enclosing level, mirroring
+        // ``InstallArrayPhiBindings`` below: a registration made inside a branch
+        // body would be dropped by that branch's scope restore. Without it a
+        // downstream ``deps=[phi]`` cannot resolve and an ``arr[i] = phi``
+        // publish looks like a store of a closed-scope local.
+        EmitIndentedLine(cpp_type + " " + emit_name + " = TaskId::invalid();");
+        manual_task_id_map_[rv.get()] = emit_name;
+        manual_task_id_map_by_key_[TaskIdHoistKey(rv.get())] = emit_name;
+        NoteLiveManualTaskIdEmitName(emit_name);
       } else {
         EmitIndentedLine(cpp_type + " " + emit_name + ";");
       }
@@ -1514,7 +1583,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         }
         // Inside a ``pl.manual_scope``, collapse a pure SSA tensor copy ``X = Y``
         // by remapping ``X``'s emit name to ``Y`` instead of emitting a
-        // scope-local ``TaskTensor X = Y;`` decl (issue #1713). ``X`` is a fresh SSA
+        // scope-local ``Tensor X = Y;`` decl (issue #1713). ``X`` is a fresh SSA
         // version of the *same physical tensor* as ``Y`` (e.g. a post-loop
         // rebind ``score = score_rv`` lowering to ``score__ssa_v1 = score``, or a
         // windowed-assemble result rebind). The decl would die at the block's
@@ -1534,11 +1603,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
         // ``X = <hoisted carry>`` at the manual-scope body indent — where the
         // carry is post-loop and stable (the canonical ``score = score_rv``
         // rebind). Inside the loop body (a deeper indent) a copy of the carry
-        // keeps its ``TaskTensor X = carry;`` decl, so a pre-yield snapshot can never
+        // keeps its ``Tensor X = carry;`` decl, so a pre-yield snapshot can never
         // alias the carry's later value.
         const bool carry_collapse_ok =
             hoisted_carry_names_.count(value_expr) == 0 || IsAtManualScopeBodyIndent();
-        if (cpp_type == "TaskTensor" && manual_local_names_ != nullptr && IsEnclosingScopeValid(value_expr) &&
+        if (cpp_type == "Tensor" && manual_local_names_ != nullptr && IsEnclosingScopeValid(value_expr) &&
             !IsMutableTensorNameInCurrentScope(value_expr) && !IsMutableTensorNameInCurrentScope(var_name) &&
             carry_collapse_ok) {
           emit_name_map_[assign->var_.get()] = value_expr;
@@ -1572,6 +1641,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
         continue;
       }
       const auto& rv = current_return_vars_[i];
+      // A carry may be declared outside the loop/branch while its yielded
+      // producer was local to a nested scope that has already closed.
+      if (auto stale_tid = FindClosedScopeTaskId(yield_stmt->value_[i])) {
+        CHECK_SPAN(false, yield_stmt->span_)
+            << "Task id '" << stale_tid->name_hint_
+            << "' is yielded after the `pl.scope()` that produced it has closed, so the yield "
+               "has no runtime value to name. Publish the task id into an array declared outside "
+               "that scope before it closes, then yield a read of that array element.";
+      }
       // ArrayType IfStmt phi: record the backing array this branch yields; the
       // enclosing IfStmt binds it once both branches are emitted. Nothing is
       // emitted — the branch already mutated that array in place.
@@ -1792,10 +1870,10 @@ class OrchestrationStmtCodegen : public CodegenBase {
       if (scalar_type->dtype_ == DataType::TASK_ID) return "TaskId";
       return scalar_type->dtype_.ToCTypeString();
     }
-    // TensorType: use ``TaskTensor`` so default-constructible declarations are
+    // TensorType: use ``Tensor`` so default-constructible declarations are
     // legal (C++ rejects ``auto x;`` without init). Yield/Assign downstream
     // will rebind it.
-    if (AsTensorTypeLike(type)) return "TaskTensor";
+    if (AsTensorTypeLike(type)) return "Tensor";
     if (As<CommCtxType>(type)) return "uint64_t";
     // ArrayType has split declaration syntax (``dtype name[N]``) — there's no
     // single "type expression" that names a C array. No caller should ask for
@@ -1841,9 +1919,9 @@ class OrchestrationStmtCodegen : public CodegenBase {
       case ArgDirection::OutputExisting:
         // The runtime overloads add_output on the argument type:
         //   add_output(TensorCreateInfo&)  -> OUTPUT       (runtime allocates)
-        //   add_output(TaskTensor&)            -> OUTPUT_EXISTING (write-only existing tensor)
+        //   add_output(Tensor&)            -> OUTPUT_EXISTING (write-only existing tensor)
         // The codegen pre-allocates via tensor.create + alloc_tensors, so the emitted
-        // call site always passes a TaskTensor& and the OUTPUT_EXISTING overload is selected.
+        // call site always passes a Tensor& and the OUTPUT_EXISTING overload is selected.
         // We still distinguish the two ArgDirections in the IR to let downstream phases
         // switch to the runtime-allocated form without an IR change.
         return "add_output";
@@ -2513,6 +2591,21 @@ class OrchestrationStmtCodegen : public CodegenBase {
     }
   }
 
+  // Selective device timing (pl.submit(..., timing_slot=N)). The runtime folds
+  // every task tagged with a slot into one device-domain dispatch-to-finish span.
+  // The parser validates the user-facing literal; retain this codegen guard for
+  // hand-built or deserialized IR that bypasses the parser.
+  // Mirrors the runtime's ``NUM_TASK_TIMING_SLOTS`` in ``device_phase.h``.
+  static constexpr int kRuntimeNumTaskTimingSlots = 16;
+
+  void EmitTaskTimingSlot(const std::string& task_var, const CallPtr& call) {
+    if (!call->HasAttr(kAttrTaskTimingSlot)) return;
+    const int slot = call->GetAttr<int>(kAttrTaskTimingSlot);
+    CHECK_SPAN(slot >= 0 && slot < kRuntimeNumTaskTimingSlots, call->span_)
+        << "task_timing_slot must be in 0.." << kRuntimeNumTaskTimingSlots - 1 << ", got " << slot;
+    EmitIndentedLine(task_var + ".set_task_timing_slot(" + std::to_string(slot) + ");");
+  }
+
   // Mirrors the runtime's ``MAX_TENSOR_DIMS`` — the capacity of the fixed
   // ``uint32_t indices[]`` array in ``CorePredicateOperand``.
   static constexpr size_t kRuntimeMaxTensorDims = 5;
@@ -2902,15 +2995,17 @@ class OrchestrationStmtCodegen : public CodegenBase {
         cg.EmitIndentedLine(line);
       }
       if (deps_before_launch) {
-        // Direct-call order: deps -> launch_spec -> early_resolve.
+        // Direct-call order: deps -> launch_spec -> task metadata.
         cg.EmitManualDeps(call, task_var);
         cg.EmitLaunchSpec(task_var, launch_core_num, launch_sync_start);
         cg.EmitEarlyResolveHint(task_var, call);
+        cg.EmitTaskTimingSlot(task_var, call);
         cg.EmitPredicateHint(task_var, call);
       } else {
-        // Wrapper (Spmd/Group/Mixed) order: launch_spec -> early_resolve -> deps.
+        // Wrapper (Spmd/Group/Mixed) order: launch_spec -> task metadata -> deps.
         cg.EmitLaunchSpec(task_var, launch_core_num, launch_sync_start);
         cg.EmitEarlyResolveHint(task_var, call);
+        cg.EmitTaskTimingSlot(task_var, call);
         cg.EmitPredicateHint(task_var, call);
         cg.EmitManualDeps(call, task_var);
       }
@@ -3253,7 +3348,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     EmitIndentedLine(alloc.str());
 
     for (size_t i = 0; i < emit_names.size(); i++) {
-      EmitIndentedLine("const TaskTensor& " + emit_names[i] + " = " + alloc_var + ".get_ref(" +
+      EmitIndentedLine("const Tensor& " + emit_names[i] + " = " + alloc_var + ".get_ref(" +
                        std::to_string(i) + ");");
     }
   }
@@ -3270,12 +3365,15 @@ class OrchestrationStmtCodegen : public CodegenBase {
     for (size_t stmt_idx = 0; stmt_idx < stmts.size(); ++stmt_idx) {
       const auto& stmt = stmts[stmt_idx];
       auto assign = As<AssignStmt>(stmt);
-      if (!assign) {
-        continue;
-      }
-      auto call = As<Call>(assign->value_);
+      auto call = assign ? As<Call>(assign->value_) : nullptr;
       if (!call || !IsOp(call, "tensor.create")) {
-        locally_defined.insert(assign->var_.get());
+        // Track every name this level defines, not just AssignStmt targets: an
+        // IfStmt / ForStmt / WhileStmt return_var is a phi whose C++ declaration
+        // is emitted where the statement sits, so a create sized from one is
+        // hoist-ineligible exactly like a create sized from a plain local.
+        for (const auto* def : var_collectors::CollectStmtDefinedVars(stmt)) {
+          locally_defined.insert(def);
+        }
         continue;
       }
       if (declared_var_ptrs_.count(assign->var_.get()) || param_name_set_.count(GetVarName(assign->var_))) {
@@ -3644,7 +3742,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
 
     // A caller-allocated kernel/submit output aliases an arg it writes in place
     // — it is the *same physical tensor* as that arg. Rather than mint a
-    // ``const TaskTensor& <result> = <source>;`` rename, we remap the result Var's
+    // ``const Tensor& <result> = <source>;`` rename, we remap the result Var's
     // emit name to the source, so every reference resolves directly to the
     // source name. This is the strategy ``tensor.assemble`` already uses
     // (HandleTensorAssembleAssign); applying it uniformly drops the redundant
@@ -3674,7 +3772,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     if (mutable_alias) {
       EmitIndentedLine(alias_name + " = " + out_name + ";");
     } else {
-      EmitIndentedLine("const TaskTensor& " + alias_name + " = " + out_name + ";");
+      EmitIndentedLine("const Tensor& " + alias_name + " = " + out_name + ";");
     }
   }
 
@@ -3699,14 +3797,14 @@ class OrchestrationStmtCodegen : public CodegenBase {
   }
 
   void RegisterMutableTensorName(const std::string& cpp_type, const std::string& emit_name) {
-    if (cpp_type == "TaskTensor") {
+    if (cpp_type == "Tensor") {
       mutable_tensor_name_scopes_.back().insert(emit_name);
     }
   }
 
   /// Register a hoisted loop carry's emit name as mutable in the scope that
   /// ENCLOSES the current (manual-scope body) C++ frame — the frame the hoisted
-  /// ``TaskTensor <carry> = <init>;`` decl lands in (issue #1713). The carry's
+  /// ``Tensor <carry> = <init>;`` decl lands in (issue #1713). The carry's
   /// in-loop ``<carry> = ...;`` reassignments still resolve through that
   /// enclosing frame, and a post-loop ``X = <carry>`` rebind reads the carry as
   /// *not* mutable-in-current-scope (it is mutable one level out), so the rebind
@@ -3717,7 +3815,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     mutable_tensor_name_scopes_[mutable_tensor_name_scopes_.size() - 2].insert(emit_name);
   }
 
-  /// Emit a mutable ``TaskTensor <name> = <init>;`` decl for a loop carry or an
+  /// Emit a mutable ``Tensor <name> = <init>;`` decl for a loop carry or an
   /// IfStmt phi placeholder, hoisting it out of a ``pl.manual_scope`` body into
   /// the enclosing scope when the construct sits directly in that body
   /// (``IsAtManualScopeBodyIndent``) and ``init`` is enclosing-scope-valid
@@ -3726,24 +3824,24 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// ``<name> = ...;`` reassignments (loop yields / branch merges) stay put and
   /// resolve through the enclosing frame. ``init`` is an enclosing-scope value
   /// that does not change between the hoist point and the block, so moving the
-  /// decl one level out is ordering-inert; a default-constructed ``TaskTensor``
+  /// decl one level out is ordering-inert; a default-constructed ``Tensor``
   /// is uninitialised, so the whole decl (init included) is hoisted, not a bare forward
   /// declaration. Registering ``<name>`` mutable in the *enclosing* frame and
   /// tracking it in ``hoisted_carry_names_`` also lets a post-block ``X = <name>``
   /// rebind collapse onto it (see the Var-RHS catch-all in VisitStmt_(AssignStmt)).
-  /// Caller guarantees the decl type is ``TaskTensor``.
+  /// Caller guarantees the decl type is ``Tensor``.
   void EmitMutableTensorCarryDecl(const std::string& name, const std::string& init_expr) {
     if (scope_hoist_sink_ != nullptr && IsAtManualScopeBodyIndent() && IsEnclosingScopeValid(init_expr)) {
-      scope_hoist_sink_->push_back(IndentAtLevel(scope_hoist_indent_level_) + "TaskTensor " + name + " = " +
+      scope_hoist_sink_->push_back(IndentAtLevel(scope_hoist_indent_level_) + "Tensor " + name + " = " +
                                    init_expr + ";\n");
       RegisterMutableTensorNameInEnclosingScope(name);
       hoisted_carry_names_.insert(name);
       if (manual_local_names_ != nullptr) manual_local_names_->erase(name);
       if (enclosing_manual_local_names_ != nullptr) enclosing_manual_local_names_->insert(name);
     } else {
-      EmitIndentedLine("TaskTensor " + name + " = " + init_expr + ";");
+      EmitIndentedLine("Tensor " + name + " = " + init_expr + ";");
 
-      RegisterMutableTensorName("TaskTensor", name);
+      RegisterMutableTensorName("Tensor", name);
     }
   }
 
@@ -3934,15 +4032,19 @@ class OrchestrationStmtCodegen : public CodegenBase {
       }
 
       if (!param_idx_opt) {
-        // Not a param writeback: a leading auxiliary value (e.g. an SPMD loop
-        // iv). They carry no runtime output. If such a scalar is referenced
-        // later, materialize a safe default so generated code stays compilable.
-        if (effective_uses_.count(elem.var)) {
-          std::string elem_name = ReserveVarEmitName(elem.var);
-          if (auto st = As<ScalarType>(elem.var->GetType())) {
-            EmitIndentedLine(st->dtype_.ToCTypeString() + " " + elem_name + " = 0;");
-          }
-        }
+        // Not a param writeback: the position carries no runtime output.
+        //
+        // A Scalar here has no carrier at all -- the runtime returns only
+        // tensors. IRProperty::NoScalarKernelReturn makes that unreachable: the
+        // scope outliner lifts a caller-computable scalar out of the scope body
+        // and rejects the ones it cannot, so no device function reaches codegen
+        // with a Scalar return. The old stop-gap emitted ``<ctype> x = 0;`` to
+        // keep the generated C++ compiling, which traded a compile error for a
+        // silently wrong value (#631) -- do not reinstate it.
+        INTERNAL_CHECK_SPAN(!As<ScalarType>(elem.var->GetType()), call->span_)
+            << "Internal error: tuple return element " << elem_pos << " of '" << call->op_->name_
+            << "' is a Scalar with no param writeback; IRProperty::NoScalarKernelReturn should "
+               "have rejected this callee";
         continue;
       }
 
@@ -3999,7 +4101,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   ///     passed in. The runtime's ``TaskOutputTensors`` stores only
   ///     ``add_output`` entries (see runtime/.../types.h — "Only
   ///     runtime-created outputs are stored here"), so ``add_inout`` /
-  ///     in-args ``add_output(TaskTensor&)`` slots do **not** appear in
+  ///     in-args ``add_output(Tensor&)`` slots do **not** appear in
   ///     ``task_<idx>_outs`` and ``get_ref`` would skip past them or assert.
   ///   - Runtime-allocated (param_idx >= original arg count): alias to
   ///     ``task_<idx>_outs.get_ref(runtime_out_pos)`` where
@@ -4075,15 +4177,13 @@ class OrchestrationStmtCodegen : public CodegenBase {
         if (out_pos < out_indices.size()) param_idx_opt = out_indices[out_pos];
       }
       if (!param_idx_opt) {
-        // Leading aux scalar / untraced position: no runtime output. If it is
-        // referenced later, materialize a safe scalar default so the generated
-        // code stays compilable (mirrors GenerateTupleReturnAliases).
-        if (effective_uses_.count(elem.var)) {
-          std::string elem_name = ReserveVarEmitName(elem.var);
-          if (auto st = As<ScalarType>(elem.var->GetType())) {
-            EmitIndentedLine(st->dtype_.ToCTypeString() + " " + elem_name + " = 0;");
-          }
-        }
+        // Untraced position: no runtime output. A Scalar is unreachable here for
+        // the same reason as in GenerateTupleReturnAliases -- see the comment
+        // there, and IRProperty::NoScalarKernelReturn.
+        INTERNAL_CHECK_SPAN(!As<ScalarType>(elem.var->GetType()), call->span_)
+            << "Internal error: submit return element " << elem_pos << " of '" << call->op_->name_
+            << "' is a Scalar with no param writeback; IRProperty::NoScalarKernelReturn should "
+               "have rejected this callee";
         continue;
       }
       if (!effective_uses_.count(elem.var)) continue;
@@ -4106,7 +4206,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
         if (IsMutableTensorNameInCurrentScope(elem_name)) {
           EmitIndentedLine(elem_name + " = " + source + ";");
         } else {
-          EmitIndentedLine("const TaskTensor& " + elem_name + " = " + source + ";");
+          EmitIndentedLine("const Tensor& " + elem_name + " = " + source + ";");
         }
       }
     }
@@ -4150,6 +4250,44 @@ class OrchestrationStmtCodegen : public CodegenBase {
     emit_name_map_[assign->var_.get()] = target_name;
   }
 
+  /// Return the TaskId producer local if ``value`` names one from a closed
+  /// scope. Both array stores and yields must reject these reads before the
+  /// host compiler encounters an out-of-scope C++ identifier.
+  ///
+  /// A stale value is identified positively: ``emit_name_map_`` still holds the
+  /// name it was bound to (never scope-restored), while ``manual_task_id_map_``
+  /// does not (restored at each closing brace — see
+  /// ``VisitStmt_(RuntimeScopeStmtPtr)``). Function ``Scalar[TASK_ID]``
+  /// parameters are registered at construction (``RegisterFunctionTaskIdParams``)
+  /// so yielding / storing them is not mistaken for a closed-scope producer. A
+  /// TaskId this codegen never bound to a local has no entry in either map and
+  /// is left alone.
+  VarPtr FindClosedScopeTaskId(const ExprPtr& value) const {
+    auto value_var = AsVarLike(value);
+    if (!value_var) return nullptr;
+    auto scalar_ty = As<ScalarType>(value_var->GetType());
+    if (!scalar_ty || scalar_ty->dtype_ != DataType::TASK_ID) return nullptr;
+    // Resolve through pointer and UniqueId maps (both scope-restored together).
+    // A live sequential / phi carry or function parameter stays registered; a
+    // producer local from a closed scope does not (issue #2677 / #2659).
+    if (ResolveManualTaskIdBinding(value_var.get())) return nullptr;
+    auto emit_it = emit_name_map_.find(value_var.get());
+    if (emit_it == emit_name_map_.end()) return nullptr;
+    // Emit-name alias of a still-registered live carry (SSA rename after inline).
+    if (live_manual_task_id_emit_names_.count(emit_it->second)) return nullptr;
+    return value_var;
+  }
+
+  void CheckTaskIdSlotValueInScope(const CallPtr& call, const std::string& array_name) {
+    auto value_var = FindClosedScopeTaskId(call->args_[2]);
+    if (!value_var) return;
+    CHECK_SPAN(false, call->span_)
+        << "Task id '" << value_var->name_hint_ << "' is stored into array '" << array_name
+        << "' after the `pl.scope()` that produced it has closed, so the store has no runtime "
+           "value to name. Move the store inside that `pl.scope()`, where the task id is still "
+           "live.";
+  }
+
   void HandleArrayUpdateElementAssign(const AssignStmtPtr& assign, const CallPtr& call) {
     // array.update_element(array, index, value) -> ArrayType.
     // The SSA-functional return value shares storage with the first arg; alias
@@ -4157,6 +4295,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
     INTERNAL_CHECK_SPAN(call->args_.size() == 3, call->span_)
         << "Internal error: array.update_element expects 3 arguments";
     std::string array_name = GenerateExprString(call->args_[0]);
+    CheckTaskIdSlotValueInScope(call, array_name);
     emit_name_map_[assign->var_.get()] = array_name;
     // Propagate ``array_carry_vars_`` and ``manual_task_id_map_`` from the
     // input array to the LHS: they share storage, so a downstream
@@ -4247,6 +4386,69 @@ class OrchestrationStmtCodegen : public CodegenBase {
     return emit_name;
   }
 
+  /// Keep the array carries a just-closed scope minted over storage that
+  /// outlives it, when restoring the entry snapshot.
+  ///
+  /// ``array.update_element`` is SSA-functional: it aliases its LHS onto the
+  /// input array's storage (``HandleArrayUpdateElementAssign``) and emits the
+  /// C++ slot write in place, at the statement's own position. The *carry* it
+  /// registers is read later though — by the enclosing loop's yield, emitted
+  /// after this block's closing brace. Restoring the snapshot wholesale drops
+  /// that carry, and the yield then misreads an Array value as a scalar TaskId
+  /// (issue #1811 for a manual scope; the same for an AUTO ``pl.scope()``).
+  ///
+  /// Only carries whose backing storage outlives the block may be kept, so each
+  /// scope kind supplies its own ``is_scope_local`` test over the array's emit
+  /// name — a manual scope hoists its allocations and knows its local names
+  /// outright; an AUTO scope hoists nothing, so storage is enclosing exactly
+  /// when a pre-entry carry already named it.
+  template <typename IsScopeLocal>
+  void PreserveEnclosingArrayCarries(std::unordered_map<const Var*, ArrayCarryEntry>* saved_array_carry,
+                                     std::unordered_map<const Var*, ManualTaskIdBinding>* saved_map,
+                                     std::unordered_map<uint64_t, ManualTaskIdBinding>* saved_map_by_key,
+                                     const IsScopeLocal& is_scope_local) {
+    for (const auto& [var, entry] : array_carry_vars_) {
+      if (saved_array_carry->count(var)) continue;     // outer entry — keep outer value
+      if (is_scope_local(entry.array_name)) continue;  // scope-local storage — drop
+      (*saved_array_carry)[var] = entry;               // enclosing-valid carry — preserve
+      auto tid_it = manual_task_id_map_.find(var);     // keep its per-slot dep names in sync
+      if (tid_it != manual_task_id_map_.end()) {
+        (*saved_map)[var] = tid_it->second;
+        (*saved_map_by_key)[TaskIdHoistKey(var)] = tid_it->second;
+      }
+    }
+  }
+
+  /// Rebuild the O(1) reverse index of live scalar TaskId emit names from the
+  /// current pointer / UniqueId maps (call after every scope restore).
+  void RebuildLiveManualTaskIdEmitNames() {
+    live_manual_task_id_emit_names_.clear();
+    auto note = [&](const ManualTaskIdBinding& binding) {
+      if (const auto* name = std::get_if<std::string>(&binding)) {
+        live_manual_task_id_emit_names_.insert(*name);
+      }
+    };
+    for (const auto& [_, binding] : manual_task_id_map_) note(binding);
+    for (const auto& [_, binding] : manual_task_id_map_by_key_) note(binding);
+  }
+
+  /// Note a scalar TaskId emit name as live (kept in sync with map inserts).
+  void NoteLiveManualTaskIdEmitName(const std::string& name) { live_manual_task_id_emit_names_.insert(name); }
+
+  /// Bind every ``Scalar[TASK_ID]`` already present in ``emit_name_map_`` (function
+  /// parameters and their lineage aliases seeded before construction) as a live
+  /// TaskId for the whole orchestration / Graph body.
+  void RegisterFunctionTaskIdParams() {
+    for (const auto& [var, emit_name] : emit_name_map_) {
+      if (!var) continue;
+      auto scalar_ty = As<ScalarType>(var->GetType());
+      if (!scalar_ty || scalar_ty->dtype_ != DataType::TASK_ID) continue;
+      manual_task_id_map_[var] = emit_name;
+      manual_task_id_map_by_key_[TaskIdHoistKey(var)] = emit_name;
+      NoteLiveManualTaskIdEmitName(emit_name);
+    }
+  }
+
   /// Register ``var`` as backed by ``array_name[size]``; also populates the
   /// ``manual_task_id_map_`` with the per-slot expressions so EmitManualDeps
   /// emits one ``add_dep`` per slot when this Var appears as a deps source.
@@ -4309,6 +4511,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// inner block — are discarded once the manual scope exits.
   std::unordered_map<const Var*, ManualTaskIdBinding> manual_task_id_map_;
   std::unordered_map<uint64_t, ManualTaskIdBinding> manual_task_id_map_by_key_;
+  /// Reverse index of scalar ``TaskId`` emit names currently present in
+  /// ``manual_task_id_map_`` / ``manual_task_id_map_by_key_``. Kept in sync on
+  /// registration and rebuilt after every scope restore so
+  /// ``CheckTaskIdSlotValueInScope`` can test emit-name aliases in O(1).
+  std::unordered_set<std::string> live_manual_task_id_emit_names_;
   /// Records the C++ array allocation backing a TaskId carry that holds an
   /// array of task ids (not a scalar). Used by ``YieldStmt`` to decide how
   /// to write into the carry:
@@ -4319,10 +4526,6 @@ class OrchestrationStmtCodegen : public CodegenBase {
   /// a ``ForStmt`` return_var (when used as a yield target). For each key the
   /// recorded ``array_name`` is the C++ identifier of the underlying
   /// ``TaskId[N]`` array and ``size`` is the slot count ``N``.
-  struct ArrayCarryEntry {
-    std::string array_name;
-    int64_t size;
-  };
   std::unordered_map<const Var*, ArrayCarryEntry> array_carry_vars_;
   /// In-flight ArrayType ``IfStmt`` return_vars (phis). An ArrayType SSA value
   /// names one backing C-stack array rather than a copyable value, so a phi is
@@ -4338,11 +4541,11 @@ class OrchestrationStmtCodegen : public CodegenBase {
   std::unordered_map<const Var*, ArrayPhiBinding> pending_array_phis_;
   std::unordered_map<const Var*, DynamicTaskIdCollection> dynamic_task_id_collections_;
   bool needs_vector_include_ = false;
-  /// Names of mutable TaskTensor values declared in each generated C++ block.
+  /// Names of mutable Tensor values declared in each generated C++ block.
   /// Tuple-output alias emission must avoid redeclaring names already declared
   /// in the same block, but must not treat outer-block declarations as aliases:
   /// C++ shadowing is valid and sometimes required to avoid rebinding an outer
-  /// loop-carried TaskTensor too early.
+  /// loop-carried Tensor too early.
   std::vector<std::unordered_set<std::string>> mutable_tensor_name_scopes_{{}};
   /// Manual-scope cross-scope tensor handling (issue #1697). While a
   /// ``pl.manual_scope`` block body is being buffered, EmitBatchedAllocTensors
@@ -4362,7 +4565,7 @@ class OrchestrationStmtCodegen : public CodegenBase {
   int scope_hoist_indent_level_ = 0;
   std::set<std::string>* manual_local_names_ = nullptr;
   std::set<std::string>* enclosing_manual_local_names_ = nullptr;
-  /// Emit names of loop carries whose ``TaskTensor carry = init;`` decl was hoisted
+  /// Emit names of loop carries whose ``Tensor carry = init;`` decl was hoisted
   /// out of a manual-scope body (issue #1713). Such a carry is mutable in an
   /// *enclosing* C++ frame, so ``IsMutableTensorNameInCurrentScope`` (which only
   /// scans the back frame) does not see it. The Var-RHS collapse uses this set to
@@ -4493,7 +4696,10 @@ std::string GenerateDynamicDimDefs(const std::vector<VarPtr>& params, const std:
 /// * ``param_name_set`` is empty. `GetExternalTensorName` rewrites any name in
 ///   that set to ``ext_<name>``, which is right for the entry (whose parameters
 ///   arrive through ``orch_args``) and wrong here, where they are ordinary
-///   function parameters bound at the top of the body.
+///   function parameters bound at the top of the body. The parameter names are
+///   still handed to `ReserveDeclaredNames`, which is the other half of what
+///   ``param_name_set`` does for the entry: it keeps a body Var from taking a
+///   name the prologue already declares (issue #2605).
 /// * A task-var prefix, because this instance's counters restart at 0.
 ///
 /// Boundary scalars are bound as ``const uint64_t&``, never by value. The
@@ -4524,14 +4730,21 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
     // the two disagree the body would reference a symbol the header never
     // declared. Seeding makes them agree by construction.
     std::unordered_map<const Var*, std::string> emit_name_map;
+    std::set<std::string> param_emit_names;
     for (const auto& param : graph_func->params_) {
-      emit_name_map[param.get()] = auto_name::GetCompatibleBaseName(param->name_hint_);
+      std::string name = auto_name::GetCompatibleBaseName(param->name_hint_);
+      emit_name_map[param.get()] = name;
+      param_emit_names.insert(std::move(name));
     }
     OrchestrationStmtCodegen body_codegen(program, func_name_to_id, func_name_to_core_type,
                                           func_name_to_signature, next_func_id, std::move(emit_name_map),
                                           /*param_name_set=*/{}, /*param_name_to_orch_index=*/{},
                                           /*packed_fp4_axis=*/{}, /*dist_param_to_ctx_param=*/{});
     body_codegen.SetTaskVarPrefix("g" + std::to_string(graph_index) + "_");
+    // The prologue below declares one C++ name per parameter. They are not in
+    // ``param_name_set``, so reserve them explicitly or a body SSA rename will
+    // shadow one (issue #2605; see ReserveDeclaredNames).
+    body_codegen.ReserveDeclaredNames(param_emit_names);
     body_codegen.SetCallTupleElements(graph_info.call_tuple_elements);
     body_codegen.SetTupleVarToKey(graph_info.tuple_var_to_key);
     body_codegen.SetEffectiveUses(std::move(use_collector.var_uses));
@@ -4548,7 +4761,7 @@ std::string GenerateGraphFunctions(const ProgramPtr& program, const FunctionPtr&
     for (const auto& param : graph_func->params_) {
       const std::string name = auto_name::GetCompatibleBaseName(param->name_hint_);
       if (AsTensorTypeLike(param->GetType())) {
-        oss << "    const TaskTensor& " << name << " = args.tensor(" << tensor_index << ").ref();\n";
+        oss << "    const Tensor& " << name << " = args.tensor(" << tensor_index << ").ref();\n";
         ++tensor_index;
         continue;
       }

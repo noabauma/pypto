@@ -118,4 +118,5 @@ golden `y == x * (r+1)` 检查每个 rank 用*自己的*索引缩放*自己的*�
 - [05-tutorials](05-tutorials.md) — 教程总览（本步骤 = 第 02 行）
 - [00-model](../distributed/00-model.md) — 模型词汇，L2 与 L3
 - [03-execution](../distributed/03-execution.md) — 每层级的 worker 生命周期
+- [04-debugging](04-debugging.md) — 分布式程序的规范故障目录
 - 下一步：[08-window_buffer](08-window_buffer.md) — 内存基座

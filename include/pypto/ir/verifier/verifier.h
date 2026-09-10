@@ -123,6 +123,26 @@ PropertyVerifierPtr CreateAccCompactValidPropertyVerifier();
 PropertyVerifierPtr CreateAtomicAddDtypeValidPropertyVerifier();
 
 /**
+ * @brief Factory for the device-kernel scalar-return property verifier
+ *
+ * Rejects a ``ScalarType`` anywhere in the ``return_types_`` of any device
+ * function (``InCore`` / ``AIC`` / ``AIV`` / ``Group`` / ``Spmd``) -- those
+ * types mean "a dispatchable task". The search descends into ``TupleType``,
+ * since a ``-> pl.Tuple[...]`` annotation is one ``return_types_`` entry and a
+ * tuple element has no more of a carrier than a bare return does. The runtime
+ * has no scalar output channel:
+ * ``Arg::add_scalar`` passes a scalar *in* by value and ``TaskOutputTensors``
+ * returns only tensors, so orchestration codegen has no carrier to bind such a
+ * return to (#631). ``Scalar[TASK_ID]`` is exempt (a scheduler handle, not
+ * data), and a device-side scalar helper belongs in a ``FunctionType::Inline``
+ * function, which ``InlineFunctions`` splices away. Listed in
+ * ``GetStructuralProperties()``, so it is verified at every pass boundary --
+ * catching both user-written signatures and any pass that synthesises one.
+ * @return Shared pointer to NoScalarKernelReturn PropertyVerifier
+ */
+PropertyVerifierPtr CreateNoScalarKernelReturnPropertyVerifier();
+
+/**
  * @brief Factory for the InParamWritten warning verifier.
  *
  * Reports a parameter declared `In` that its own function body writes, where
@@ -139,6 +159,23 @@ PropertyVerifierPtr CreateAtomicAddDtypeValidPropertyVerifier();
  * @return Shared pointer to the warning verifier
  */
 PropertyVerifierPtr CreateInParamWrittenWarningVerifier();
+
+/**
+ * @brief Factory for the final accumulator/store phase-pairing verifier
+ *
+ * Checks the bidirectional unit-flag contract between ``tile.gemv``,
+ * ``tile.gemv_acc`` and ``tile.gemv_bias`` calls carrying
+ * ``acc_phase=pl.AccPhase.Final`` and
+ * ``tile.store(..., st_phase=pl.STPhase.Final)``. A final producer must be
+ * consumed exactly once, using that exact SSA value (or a plain SSA alias), in
+ * the same straight-line control-flow region; a final store must have a live
+ * matching producer. Produced by ``InlineFunctions``, so an Inline helper that
+ * returns a final accumulator value is expanded before the producer/store pair
+ * is verified.
+ *
+ * @return Shared pointer to AccStorePhaseValid PropertyVerifier
+ */
+PropertyVerifierPtr CreateAccStorePhaseValidPropertyVerifier();
 
 /**
  * @brief Factory function for creating NormalizedStmtStructure property verifier
@@ -172,6 +209,12 @@ PropertyVerifierPtr CreateClusterOutlinedPropertyVerifier();
  * @return Shared pointer to HierarchyOutlined PropertyVerifier
  */
 PropertyVerifierPtr CreateHierarchyOutlinedPropertyVerifier();
+
+/**
+ * @brief Factory function for creating GraphOutlined property verifier
+ * @return Shared pointer to GraphOutlined PropertyVerifier
+ */
+PropertyVerifierPtr CreateGraphOutlinedPropertyVerifier();
 
 /**
  * @brief Factory function for creating HasMemRefs property verifier
@@ -230,6 +273,9 @@ PropertyVerifierPtr CreateMixedKernelExpandedPropertyVerifier();
  * @return Shared pointer to AivSplitValid PropertyVerifier
  */
 PropertyVerifierPtr CreateAivSplitValidPropertyVerifier();
+
+/// Verify the post-LowerAutoVectorSplit region/flat compatibility contract.
+PropertyVerifierPtr CreateAivSplitLoweredValidPropertyVerifier();
 
 /**
  * @brief Factory function for creating AllocatedMemoryAddr property verifier

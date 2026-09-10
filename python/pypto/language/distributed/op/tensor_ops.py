@@ -671,7 +671,7 @@ def allreduce(
     counts do not read or store past the end.
 
     See ``docs/en/dev/distributed_ops.md`` and
-    ``docs/en/dev/passes/12-lower_composite_ops.md`` for the mesh partial-valid /
+    ``docs/en/dev/passes/13-lower_composite_ops.md`` for the mesh partial-valid /
     symbolic-extent target constraints (unchanged by this PR).
 
     **Barrier protocol (self-clearing credit barrier):** every call's
@@ -923,8 +923,9 @@ def reduce_scatter(
             ``[world_size, 1]``.  Reusable across calls (2 credits per
             call — ready + post-reduce) — see :func:`allreduce` for the
             shared barrier protocol.
-        op: :class:`pld.ReduceOp` (keyword-only).  ``Sum`` only in
-            first version; ``Max`` / ``Min`` / ``Prod`` reserved.
+        op: :class:`pld.ReduceOp` (keyword-only).  ``Sum``, ``Max``, ``Min``,
+            or ``Prod`` on the InCore rail; the HOST builtin rail lowers
+            ``Sum`` only.
 
     Returns:
         The rebound :class:`pld.DistributedTensor` — rank r's row
@@ -989,6 +990,8 @@ def all_to_all_v(
     signal: DistributedTensor,
     send_counts: Tensor | DistributedTensor,
     recv_counts: DistributedTensor,
+    *,
+    core_num: int = 1,
 ) -> DistributedTensor:
     """All-to-all: variable-size personalized exchange (push-based, window-as-result).
 
@@ -1061,6 +1064,13 @@ def all_to_all_v(
             call, ``recv_counts[src, 0]`` holds how many rows ``src`` actually
             sent here, and how many were transferred — the count is clamped
             to ``[0, MAX_RECV]``, so a negative input publishes ``0`` (InOut).
+        core_num: Requested AIV block limit for the managed CHIP/L2 rail.
+            Called from a CHIP :class:`pl.FunctionType.Orchestration` function,
+            the call lowers to one local builtin AIV task
+            (``LowerL2TensorCollectives``); the first version accepts only
+            ``core_num=1``.  Called from an InCore function, the composite rail
+            expands the exchange into point-to-point primitives and requires
+            ``core_num=1``.
 
     Returns:
         The ``target`` :class:`pld.DistributedTensor` with received chunks.
@@ -1073,7 +1083,9 @@ def all_to_all_v(
     )
     input_expr = _unwrap(input)
     counts_expr = _unwrap(send_counts)
-    call = _ir_tensor.all_to_all_v(input_expr, target_expr, signal_expr, counts_expr, recv_expr)
+    call = _ir_tensor.all_to_all_v(
+        input_expr, target_expr, signal_expr, counts_expr, recv_expr, core_num=core_num
+    )
     return DistributedTensor(expr=call)
 
 

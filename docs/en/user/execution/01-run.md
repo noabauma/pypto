@@ -74,7 +74,6 @@ both H2D and D2H for that argument.
 | `param_names` / `output_indices` / `has_return` | The call shape, for a harness binding arguments itself |
 | `program` | The `Program` that was handed to `compile` — usually pre-pass, and `None` after `from_dir` |
 | `chip_callable` / `runtime_name` / `runtime_config` | The runtime-side handles |
-| `build_orch_args` / `build_call_config` | The two builders explicit dispatch needs |
 | `validate_ir` | Per-pass semantic comparison ([Precision](../precision/00-workflow.md)) |
 | `from_dir` / `load` | Rebuild a handle from a saved artifact directory |
 
@@ -131,11 +130,12 @@ launch. `close()` releases the registrations and any `DeviceTensor` the caller f
 | `aicpu_thread_num` | AICPU thread count override |
 
 **Some `RunConfig` fields belong to the harness, not to dispatch.** `rtol` / `atol`,
-`golden_data_dir`, `save_kernels` / `save_kernels_dir` and `codegen_only` are read by
-`pypto.runtime.run()`, which compiles, generates a golden and compares. Going through
-`compiled(...)`, `worker.run(...)` or a registration handle, they do nothing — in
-particular **`codegen_only=True` does not stop a dispatch on this path**, so do not rely on
-it to avoid a launch.
+`golden_data_dir`, `save_kernels` and `codegen_only` are read by the system-test harness,
+which compiles, generates a golden and compares. Going through `compiled(...)`,
+`worker.run(...)` or a registration handle, they do nothing — in particular
+**`codegen_only=True` does not stop a dispatch on this path**, so do not rely on it to
+avoid a launch. (`save_kernels_dir` is the exception: `RunConfig.compile_kwargs()`
+forwards it as `ir.compile`'s `output_dir`.)
 
 ## Edge Cases
 

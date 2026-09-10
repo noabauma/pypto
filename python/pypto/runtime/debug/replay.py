@@ -12,8 +12,9 @@
 Debug-only entry point for the "I edited a kernel cpp by hand, now re-run
 with DFX (PMU / swimlane / args_dump / dep_gen / scope_stats) enabled" workflow.
 
-Reuses :func:`pypto.runtime.runner.execute_compiled`, so the device-side
-execution path is identical to the normal :func:`pypto.runtime.run` flow.
+An L2 build reuses the implementation behind a normal ``compiled(...)``
+dispatch, so its device-side execution path is identical; an L3 build
+reconstructs a ``DistributedCompiledProgram`` and calls it.
 The added value is:
 
 1. A friendlier signature for the replay use case
@@ -21,7 +22,7 @@ The added value is:
    needed.
 2. Pre-flight invalidation of cached kernel/orchestration binaries so a
    hand-edited cpp is actually picked up on the next call. Without this,
-   ``compile_and_assemble`` would silently load a stale ``.so``/``.bin``
+   ``_compile_and_assemble`` would silently load a stale ``.so``/``.bin``
    built from the previous version of the cpp.
 
 CLI::
@@ -59,8 +60,7 @@ from pypto.runtime.runner import (
     _SWIMLANE_FULL_LEVEL,
     _SWIMLANE_MAX_LEVEL,
     RunConfig,
-    _DfxOpts,
-    execute_compiled,
+    _execute_compiled,
 )
 
 __all__ = ["replay", "invalidate_binary_cache"]
@@ -71,7 +71,7 @@ def invalidate_binary_cache(work_dir: Path | str) -> None:
 
     Both ``cache/*.bin`` (the pre-build cache written by ``prebuild_binaries``)
     and the sibling ``.so`` / ``.o`` files next to each cpp are deleted. CPP
-    sources are untouched, so the next ``compile_and_assemble`` rebuilds from
+    sources are untouched, so the next ``_compile_and_assemble`` rebuilds from
     source and picks up hand-edits.
 
     Handles both layouts: a single-chip / L2 build keeps ``cache/`` +
@@ -116,7 +116,8 @@ def replay(
             contains ``kernel_config.py``, ``orchestration/`` and ``kernels/``.
             An L3 distributed build (``orchestration/host_orch.py`` +
             ``next_levels/{rank}/`` + ``distributed_meta.json``) is detected
-            automatically and dispatched via ``execute_distributed_compiled``.
+            automatically and dispatched via
+            :meth:`~pypto.ir.DistributedCompiledProgram.from_dir`.
         *tensors: Positional ``torch.Tensor`` (host), :class:`DeviceTensor`,
             or ctypes scalar arguments matching the orchestration entry's
             parameter order. Outputs are written in-place into the
@@ -157,7 +158,7 @@ def replay(
     work_dir = Path(work_dir)
     # L3 distributed builds have no top-level ``kernel_config.py`` (per-rank
     # configs live under ``next_levels/{rank}/``); they are identified by the
-    # generated HOST orchestrator and dispatched via ``execute_distributed_compiled``.
+    # generated HOST orchestrator and dispatched through DistributedCompiledProgram.
     is_l3 = (
         not (work_dir / "kernel_config.py").exists()
         and (work_dir / "orchestration" / "host_orch.py").exists()
@@ -203,18 +204,20 @@ def replay(
         # L3: reconstruct the distributed program from the build dir and dispatch
         # via simpler Worker(level=3); per-dispatch ring and DFX settings are
         # forwarded through its CallConfig.
-        from pypto.runtime.distributed_runner import (  # noqa: PLC0415
-            execute_distributed_compiled,
+        from pypto.ir.distributed_compiled_program import (  # noqa: PLC0415
+            DistributedCompiledProgram,
         )
 
-        execute_distributed_compiled(work_dir, list(tensors), config=config, platform=config.platform)
+        compiled = DistributedCompiledProgram.from_dir(work_dir, platform=config.platform)
+        compiled(*tensors, config=config)
     else:
-        execute_compiled(
+        _execute_compiled(
             work_dir,
             list(tensors),
             platform=config.platform,
             device_id=config.device_id,
-            dfx=_DfxOpts.from_run_config(config),
+            dfx=config.dfx_options(),
+            config=config,
         )
 
     if named_tensors is not None:

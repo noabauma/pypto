@@ -37,6 +37,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/comm.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
@@ -45,6 +46,7 @@
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/memref.h"
 #include "pypto/ir/op_registry.h"
+#include "pypto/ir/phase.h"
 #include "pypto/ir/pipe.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
@@ -342,6 +344,7 @@ class IRPythonPrinter : public IRVisitor {
   void VisitStmt_(const SplitAivScopeStmtPtr& op) override;
   void VisitStmt_(const RuntimeScopeStmtPtr& op) override;
   void VisitStmt_(const CommDomainScopeStmtPtr& op) override;
+  void VisitStmt_(const GraphScopeStmtPtr& op) override;
   void VisitStmt_(const SeqStmtsPtr& op) override;
   void VisitStmt_(const EvalStmtPtr& op) override;
   void VisitStmt_(const BreakStmtPtr& op) override;
@@ -491,7 +494,8 @@ class IRPythonPrinter : public IRVisitor {
   // PrintScopeAllowEarlyResolveAttr — the outliner reads the predicate off the
   // scope and threads it onto the synthesised ``Submit``, so it must survive a
   // print/reparse roundtrip while the scope still exists. The comparison Expr
-  // prints itself, so there is no bespoke syntax.
+  // prints itself, so there is no bespoke syntax. Shared by the ``pl.spmd``
+  // scope printers and the ``pl.at`` (InCore / Hierarchy) ones.
   bool PrintScopePredicateAttr(const ScopeStmtPtr& op);
 
   // Emit ``windowize=True`` for an explicitly opted-in InCore scope.
@@ -1420,6 +1424,11 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
         stream_ << prefix_ << ".PipeType." << PipeTypeToString(static_cast<PipeType>(int_val));
       } else if (key == "mode") {
         stream_ << "'" << CastModeToString(int_val) << "'";
+      } else if (key == "saturation_mode") {
+        // Print the DSL spelling ('off'/'on') rather than the raw code, the
+        // same way `mode` is restored, so a printed cast reparses as the call
+        // the author would have written.
+        stream_ << "'" << SaturationModeToName(int_val) << "'";
       } else if (key == "atomic") {
         // Stored as int (the DSL casts AtomicType -> int before stashing on
         // kwargs_; nb::isinstance<AtomicType> in bindings does the same). The
@@ -1427,6 +1436,10 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
         // form on print to keep the output type-correct for static checkers
         // and round-trippable through the parser (pl.AtomicType is exposed).
         stream_ << prefix_ << ".AtomicType." << AtomicTypeToString(static_cast<AtomicType>(int_val));
+      } else if (key == "acc_phase") {
+        stream_ << prefix_ << ".AccPhase." << AccPhaseToString(static_cast<AccPhase>(int_val));
+      } else if (key == "st_phase") {
+        stream_ << prefix_ << ".STPhase." << STPhaseToString(static_cast<STPhase>(int_val));
       } else {
         stream_ << int_val;
       }
@@ -2189,6 +2202,11 @@ void IRPythonPrinter::VisitStmt_(const HierarchyScopeStmtPtr& op) {
   PrintScopeNoDepsAttr(op);
   PrintScopeDumpAttr(op);
   PrintScopeAllowEarlyResolveAttr(op);
+  // The parser rejects ``pl.at(level != CORE_GROUP, predicate=...)`` and
+  // ScopeOutliner asserts the same for hand-built IR, so a Hierarchy scope
+  // should never carry one. Print it anyway rather than silently dropping
+  // state from a mid-pipeline dump of such IR.
+  PrintScopePredicateAttr(op);
   PrintScopeWindowizeAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
@@ -2213,6 +2231,7 @@ void IRPythonPrinter::VisitStmt_(const InCoreScopeStmtPtr& op) {
   PrintScopeNoDepsAttr(op);
   PrintScopeDumpAttr(op);
   PrintScopeAllowEarlyResolveAttr(op);
+  PrintScopePredicateAttr(op);
   PrintScopeWindowizeAttr(op);
   stream_ << ")";
   PrintScopeTaskIdVarSuffix(op);
@@ -2229,6 +2248,15 @@ void IRPythonPrinter::VisitStmt_(const ClusterScopeStmtPtr& op) {
     stream_ << "name_hint=\"" << op->name_hint_ << "\"";
   }
   stream_ << "):\n";
+  IncreaseIndent();
+  PrintStmtBlock(op->body_);
+  DecreaseIndent();
+}
+
+void IRPythonPrinter::VisitStmt_(const GraphScopeStmtPtr& op) {
+  // ``name_hint_`` is the region name the user wrote; the parser requires it,
+  // so it is printed positionally rather than as an optional keyword.
+  stream_ << "with " << prefix_ << ".graph(\"" << op->name_hint_ << "\"):\n";
   IncreaseIndent();
   PrintStmtBlock(op->body_);
   DecreaseIndent();
@@ -2318,6 +2346,10 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
     if (incore) {
       PrintScopeOptimizations(incore->split_, incore);
     }
+    // ``deps=`` needs no ``as tid``: the Spmd outliner synthesises the TaskId Var
+    // it needs to emit a Submit, so the for-form carries edges too and must print
+    // them or the round-trip drops the dependency.
+    PrintScopeDepsAttr(op);
     PrintScopeAllowEarlyResolveAttr(op);
     PrintScopePredicateAttr(op);
     stream_ << "):\n";
@@ -2355,6 +2387,9 @@ void IRPythonPrinter::VisitStmt_(const SpmdScopeStmtPtr& op) {
   if (!op->name_hint_.empty()) {
     stream_ << ", name_hint=\"" << op->name_hint_ << "\"";
   }
+  // Same as the for-form above: a plain ``with pl.spmd(...):`` may carry
+  // ``manual_dep_edges`` without a captured TaskId.
+  PrintScopeDepsAttr(op);
   PrintScopeAllowEarlyResolveAttr(op);
   PrintScopePredicateAttr(op);
   stream_ << "):\n";
@@ -2993,7 +3028,10 @@ static std::unordered_map<const Var*, std::string> CollectDynVarMapping(const Pr
   };
 
   std::function<void(const TypePtr&)> collect_from_type = [&](const TypePtr& type) {
-    if (auto tensor_type = As<TensorType>(type)) {
+    // AsTensorTypeLike, not As<TensorType>: DistributedTensorType has its own
+    // ObjectKind, so the exact-match As<TensorType> misses it and the symbols a
+    // pld.DistributedTensor annotation declares never reach dyn_var_rename_map_.
+    if (auto tensor_type = AsTensorTypeLike(type)) {
       for (const auto& dim : tensor_type->shape_) {
         collect_vars_from_expr(dim);
       }

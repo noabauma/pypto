@@ -10,22 +10,31 @@
 """
 PyPTO runtime runner.
 
-Provides :func:`run`, the main entry point for compiling a ``@pl.program``
-and executing it on an Ascend NPU (or simulator).
+Provides :class:`RunConfig` — the settings that drive a run — and the
+dispatch implementation that puts an already-compiled artifact directory
+onto an Ascend NPU (or simulator). The supported way in is
+:meth:`pypto.ir.CompiledProgram.from_dir`; the module-level
+:func:`execute_compiled` is a deprecated wrapper over the same code.
 
-Typical usage::
+Compilation is :func:`pypto.ir.compile`'s job; nothing here compiles for you.
+:meth:`RunConfig.compile_kwargs` carries the compile-side settings across::
 
     import torch
-    from pypto.runtime import run, RunConfig
+    from pypto import ir
+    from pypto.runtime import RunConfig
+
+    config = RunConfig(platform="a2a3sim")
+    compiled = ir.compile(MyProgram, **config.compile_kwargs())
 
     a = torch.full((128, 128), 2.0)
     b = torch.full((128, 128), 3.0)
     c = torch.zeros(128, 128)
-    compiled = run(MyProgram, a, b, c, config=RunConfig(platform="a2a3sim"))
+    compiled(a, b, c, config=config)
 """
 
 import functools
 import importlib.util
+import inspect
 import json
 import shlex
 import subprocess
@@ -36,6 +45,7 @@ from collections.abc import Callable
 from ctypes import _SimpleCData
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from enum import Enum, auto
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -106,6 +116,64 @@ _SWIMLANE_CLI_HELP = (
 )
 
 
+class ExecutionMode(Enum):
+    """Whether a run reaches real silicon or the simulator.
+
+    One of the two axes a ``platform`` string packs. It decides how kernels are
+    assembled (``.so`` for the simulator, ``.o`` plus a text-section extract for
+    silicon) and whether the two-pass swimlane capture applies; it never reaches
+    codegen, which sees only the architecture.
+    """
+
+    ONBOARD = auto()
+    SIM = auto()
+
+
+_ARCHES: tuple[BackendType, ...] = (BackendType.Ascend910B, BackendType.Ascend950)
+
+
+def _arch_name(arch: BackendType) -> str:
+    """Return the wire name of an architecture (``"a2a3"`` / ``"a5"``).
+
+    Asks the backend handler rather than mapping it here: the C++ side already
+    owns this string — it is what codegen stamps as ``pto.target_arch`` — and a
+    second copy in Python is a second thing to keep in step.
+    """
+    return _backend_core.get_backend_instance(arch).get_handler().get_pto_target_arch()
+
+
+def _platform_string(arch: BackendType, execution_mode: ExecutionMode) -> str:
+    """Join the two axes into the wire spelling the runtime and CLI take."""
+    return f"{_arch_name(arch)}{'sim' if execution_mode is ExecutionMode.SIM else ''}"
+
+
+def _parse_platform(platform: str) -> tuple[BackendType, ExecutionMode]:
+    """Split a wire platform string back into its two axes.
+
+    The single place that sniffs the string. Everything else asks the axes.
+    """
+    for arch in _ARCHES:
+        name = _arch_name(arch)
+        if platform == name:
+            return arch, ExecutionMode.ONBOARD
+        if platform == f"{name}sim":
+            return arch, ExecutionMode.SIM
+    expected = ", ".join(f"{_arch_name(a)!r}, {_arch_name(a) + 'sim'!r}" for a in _ARCHES)
+    raise ValueError(f"Invalid platform {platform!r}. Expected {expected}.")
+
+
+def _backend_type_for_platform(platform: str) -> BackendType:
+    """Return the codegen backend a runtime platform string selects."""
+    return _parse_platform(platform)[0]
+
+
+_BACKEND_TYPE_DEPRECATION = (
+    "RunConfig(backend_type=...) is deprecated and has never taken effect: the backend is "
+    "derived from platform, which wins. Drop the argument, or pass the platform that implies "
+    "the backend you want. Reading RunConfig.backend_type still reports what platform selected."
+)
+
+
 _SWIMLANE_ALIAS_DEPRECATION = (
     "RunConfig.enable_l2_swimlane is deprecated; use enable_chip_swimlane instead. "
     "Same values and semantics — Simpler renamed the L2 layer to 'chip', and the "
@@ -151,9 +219,13 @@ def _normalize_swimlane_level(value: int | bool, source: str) -> int:
     return value
 
 
-@dataclass
+@dataclass(kw_only=True)
 class RunConfig:
-    """Configuration for a :func:`run` invocation or harness test execution.
+    """Configuration for compiling and dispatching a program.
+
+    Carries both halves: :meth:`compile_kwargs` extracts the compile-side
+    fields for :func:`pypto.ir.compile`, and the rest is read at dispatch by
+    :meth:`~pypto.ir.CompiledProgram.__call__` / :meth:`Worker.run`.
 
     When passed to :meth:`pypto.jit.decorator.JITFunction.lower`, only
     ``platform``, ``strategy``, diagnostics, dependency analysis, and
@@ -163,13 +235,19 @@ class RunConfig:
     does not execute or write compilation artifacts.
 
     Attributes:
-        platform: Target execution platform — ``"a2a3sim"`` / ``"a2a3"``
-            (Ascend 910B) or ``"a5sim"`` / ``"a5"`` (Ascend 950).
+        arch: Target architecture, as the codegen backend that names it —
+            ``BackendType.Ascend910B`` (a2a3) or ``BackendType.Ascend950`` (a5).
+        execution_mode: :class:`ExecutionMode.SIM` or ``ONBOARD``.
+        platform: **Not a field** — the wire spelling of the two axes above
+            (``"a2a3sim"`` / ``"a2a3"`` / ``"a5sim"`` / ``"a5"``), derived on
+            read. Accepted as a constructor keyword, where it sets both axes.
         device_id: Hardware device index (ignored for simulator).
+        backend_type: **Not a field** — a read-only property derived from
+            ``platform``. Accepted as a deprecated constructor keyword, which
+            warns and is discarded when it contradicts the platform.
         rtol: Relative tolerance for result comparison.
         atol: Absolute tolerance for result comparison.
         strategy: PyPTO optimisation strategy applied during compilation.
-        backend_type: Code-generation backend (:attr:`BackendType.Ascend910B` by default).
         dump_passes: Per-pass IR dump control. A :class:`~pypto.ir.PassDumpLevel`
             (``NONE`` / ``CONCISE`` / ``EXPLICIT``) or a ``bool``
             (``True`` -> ``CONCISE``, ``False`` -> ``NONE``). ``EXPLICIT`` resolves
@@ -298,15 +376,14 @@ class RunConfig:
             to the runtime's compile-time default.
         distributed_config: Optional L3 distributed-execution config, consumed
             only on the ``@pl.jit`` path. When set, it is forwarded to
-            ``ir.compile()`` (via :func:`~pypto.jit.decorator._run_config_compile_kwargs`)
+            ``ir.compile()`` (via :meth:`RunConfig.compile_kwargs`)
             so a HOST-level ``@pl.jit.host`` kernel compiles to a
             :class:`~pypto.ir.distributed_compiled_program.DistributedCompiledProgram`
             and dispatches per-rank. ``None`` (default) compiles a regular
-            single-chip :class:`~pypto.ir.compiled_program.CompiledProgram`. The
-            ``@pl.program`` :func:`run` entry point does not read this field; it
-            forwards no compile-side overrides, so distributed ``@pl.program``
-            execution is driven by ``ir.compile(..., distributed_config=...)``
-            directly rather than through ``RunConfig``.
+            single-chip :class:`~pypto.ir.compiled_program.CompiledProgram`.
+            :meth:`compile_kwargs` forwards it too, so a ``@pl.program``
+            compiled via ``ir.compile(prog, **config.compile_kwargs())`` picks
+            up the same distributed target.
         analyze_auto_scopes_for_deps: If ``True``, enable compiler-derived task
             dependency analysis for AUTO runtime scopes during compilation.
             Defaults to ``False`` so existing runs keep using TensorMap fallback
@@ -325,12 +402,12 @@ class RunConfig:
 
     __test__ = False  # Not a pytest test class
 
-    platform: str = "a2a3sim"
+    arch: BackendType = field(default_factory=lambda: BackendType.Ascend910B)
+    execution_mode: ExecutionMode = ExecutionMode.SIM
     device_id: int = 0
     rtol: float = 1e-5
     atol: float = 1e-5
     strategy: OptimizationStrategy = field(default_factory=lambda: OptimizationStrategy.Default)
-    backend_type: BackendType = field(default_factory=lambda: BackendType.Ascend910B)
     dump_passes: bool | PassDumpLevel = False
     save_kernels: bool = False
     save_kernels_dir: str | None = None
@@ -362,24 +439,24 @@ class RunConfig:
     dump_ptoas_passes: bool = False
 
     def __post_init__(self) -> None:
-        if self.platform not in ("a2a3sim", "a2a3", "a5sim", "a5"):
-            raise ValueError(
-                f"Invalid platform {self.platform!r}. Expected 'a2a3sim', 'a2a3', 'a5sim', or 'a5'."
+        # The two axes replace what used to be a membership test on the packed
+        # platform string. They make a *disagreeing* platform unrepresentable,
+        # but not a nonsensical one: ``execution_mode="sim"`` is not
+        # ``ExecutionMode.SIM``, and silently reading it as ONBOARD would turn a
+        # simulator request into a hardware run. Reject it here, where the value
+        # is still attached to the name the caller typed.
+        if not isinstance(self.arch, BackendType):
+            raise TypeError(
+                f"RunConfig.arch must be a BackendType, got {type(self.arch).__name__} "
+                f"({self.arch!r}). Pass BackendType.Ascend910B / Ascend950, or use "
+                f"platform='a2a3sim' to set both axes from the wire spelling."
             )
-        # A caller-provided platform is the public source of truth for runtime
-        # toolchain selection. Keep backend_type synchronized with it so codegen
-        # and execution target the same architecture, rather than silently
-        # rewriting the requested platform back to the default backend.
-        if self.platform.startswith("a5"):
-            self.backend_type = BackendType.Ascend950
-        else:
-            self.backend_type = BackendType.Ascend910B
-
-        backend = _backend_core.get_backend_instance(self.backend_type)
-        expected_arch = backend.get_handler().get_pto_target_arch()
-        if not self.platform.startswith(expected_arch):
-            sim_suffix = "sim" if self.platform.endswith("sim") else ""
-            self.platform = f"{expected_arch}{sim_suffix}"
+        if not isinstance(self.execution_mode, ExecutionMode):
+            raise TypeError(
+                f"RunConfig.execution_mode must be an ExecutionMode, got "
+                f"{type(self.execution_mode).__name__} ({self.execution_mode!r}). Pass "
+                f"ExecutionMode.SIM / ONBOARD, or use platform='a2a3sim' to set both axes."
+            )
 
         # Chip swimlane is levelled; normalize ``bool``/int to an explicit
         # level before ``any_dfx_enabled()`` and the CLI round-trip read it.
@@ -460,13 +537,106 @@ class RunConfig:
         chip swimlane, argument dump, PMU, dep_gen and scope_stats. They are
         independent toggles that share an output directory.
         """
-        return (
-            self.enable_chip_swimlane > 0
-            or self.enable_dump_args > 0
-            or self.enable_pmu > 0
-            or self.enable_dep_gen
-            or self.enable_scope_stats
+        return self.dfx_options().any()
+
+    def compile_kwargs(self) -> dict[str, Any]:
+        """Return the compile-side fields as ``ir.compile()`` keyword arguments.
+
+        A :class:`RunConfig` carries both compile-time and dispatch-time
+        settings. This method extracts the compile-time half so a caller can
+        drive the two phases separately without restating the mapping::
+
+            compiled = ir.compile(program, **config.compile_kwargs())
+            compiled(*tensors, config=config)
+
+        It is the only mapping onto ``ir.compile``'s parameters: the ``@pl.jit``
+        path calls it too, so a knob added here reaches both. (``lower()`` keeps
+        its own narrower mapping — it stops before codegen and targets the pass
+        pipeline rather than ``ir.compile``.)
+
+        Dispatch-only fields (``device_id``, the DFX toggles, the ring-sizing
+        overrides) are not compile inputs and are consumed by
+        :meth:`~pypto.ir.CompiledProgram.__call__` instead. ``rtol`` / ``atol``
+        and ``golden_data_dir`` reach neither phase: only the system-test
+        harness reads them, to compare a dispatch against its golden.
+
+        ``output_dir``, ``distributed_config`` and ``memory_planner`` are
+        forwarded only when set, so an unset value defers to ``ir.compile()``'s
+        own default. That matters for ``memory_planner`` in particular:
+        ``ir.compile()`` rejects an explicit planner while a ``PassContext`` is
+        active, and an unset value must defer to that context.
+
+        Returns:
+            Keyword arguments accepted by :func:`pypto.ir.compile`.
+        """
+        return self.compile_options().as_compile_kwargs()
+
+    def compile_options(self) -> "CompileOptions":
+        """Return the compile-side half as a :class:`CompileOptions`.
+
+        The field renames are the compiler's own vocabulary:
+        ``save_kernels_dir`` is ``ir.compile``'s ``output_dir`` and
+        ``compile_profiling`` is its ``profiling``.
+        """
+        return CompileOptions(
+            platform=self.platform,
+            strategy=self.strategy,
+            dump_passes=self.dump_passes,
+            dump_ptoas_passes=self.dump_ptoas_passes,
+            profiling=self.compile_profiling,
+            diagnostic_phase=self.diagnostic_phase,
+            disabled_diagnostics=self.disabled_diagnostics,
+            analyze_auto_scopes_for_deps=self.analyze_auto_scopes_for_deps,
+            output_dir=self.save_kernels_dir,
+            memory_planner=self.memory_planner,
+            distributed_config=self.distributed_config,
         )
+
+    def run_options(self) -> "RunOptions":
+        """Return the dispatch-side half as a :class:`RunOptions`."""
+        return RunOptions(
+            platform=self.platform,
+            device_id=self.device_id,
+            aicpu_thread_num=self.aicpu_thread_num,
+            ring_task_window=self.ring_task_window,
+            ring_heap=self.ring_heap,
+            ring_dep_pool=self.ring_dep_pool,
+            dfx=self.dfx_options(),
+        )
+
+    def dfx_options(self) -> "DfxOptions":
+        """Return the diagnostic toggles as a :class:`DfxOptions`.
+
+        Shorthand for ``run_options().dfx`` — the runtime asks for the
+        diagnostics alone far more often than for the whole dispatch half.
+        """
+        return DfxOptions(
+            enable_chip_swimlane=self.enable_chip_swimlane,
+            enable_dump_args=self.enable_dump_args,
+            enable_pmu=self.enable_pmu,
+            enable_dep_gen=self.enable_dep_gen,
+            enable_scope_stats=self.enable_scope_stats,
+        )
+
+    @property
+    def platform(self) -> str:
+        """The wire spelling of :attr:`arch` + :attr:`execution_mode`.
+
+        Derived, never stored. It is what the simpler ``Worker``, the artifact
+        sidecars and ``--platform`` all take, so it stays a plain ``str`` — but
+        it is a serialization of the two axes rather than a field anything can
+        set out of step with them.
+        """
+        return _platform_string(self.arch, self.execution_mode)
+
+    @property
+    def backend_type(self) -> BackendType:
+        """The codegen backend, which is :attr:`arch` under the compiler's name.
+
+        Kept as a read accessor because the artifact metadata and downstream
+        callers read it; :attr:`arch` is the field to set.
+        """
+        return self.arch
 
     @property
     def enable_l2_swimlane(self) -> int:
@@ -486,7 +656,7 @@ class RunConfig:
 
 
 # ---------------------------------------------------------------------------
-# Deprecated ``enable_l2_swimlane`` spelling
+# Deprecated constructor keywords: ``enable_l2_swimlane`` and ``backend_type``
 # ---------------------------------------------------------------------------
 # Simpler's Worker/Chip/Core naming migration renamed the L2 layer to "chip"
 # (``L2Swimlane*`` -> ``ChipSwimlane*``, ``l2_swimlane_records.json`` ->
@@ -502,13 +672,38 @@ class RunConfig:
 # silently overridden by the stale alias. Keeping the alias off the field list
 # leaves ``replace``, ``fields()``, ``asdict()`` and ``repr()`` clean, and routes
 # the old name through an ``__init__`` wrapper plus a property instead.
+#
+# ``backend_type`` is off the field list for the same reason, plus one of its
+# own. It is derived from ``platform``, so a caller-supplied value has never
+# taken effect. As a field it would come back through ``replace()``:
+# ``replace(cfg, platform="a5")`` re-supplies the *old* platform's backend, and
+# nothing can tell that echo from a caller who typed a contradicting value —
+# so a plain platform switch would warn, and fail outright under
+# warnings-as-errors.
 
 _RUN_CONFIG_INIT = RunConfig.__init__
 
 
 @functools.wraps(_RUN_CONFIG_INIT)
 def _run_config_init(self: RunConfig, *args: Any, **kwargs: Any) -> None:
-    """``RunConfig.__init__`` that also accepts the deprecated alias."""
+    """``RunConfig.__init__`` that also accepts ``platform=`` and the deprecated keywords."""
+    if "platform" in kwargs:
+        # ``platform=`` is the wire spelling of the two axes, and setting it
+        # sets both. It deliberately wins over an ``arch=`` / ``execution_mode=``
+        # in the same call rather than reporting a conflict -- the class is
+        # ``kw_only`` so an axis can only arrive as a keyword, and this rewrite
+        # therefore reaches every spelling of it: ``replace(cfg,
+        # platform=...)`` re-supplies both axes from the existing instance, and
+        # nothing can tell that echo from a caller who typed a contradicting
+        # value -- the same ambiguity documented for the deprecated keywords
+        # below. Rejecting the pair would break every ``replace`` by platform.
+        kwargs["arch"], kwargs["execution_mode"] = _parse_platform(kwargs.pop("platform"))
+
+    if "backend_type" in kwargs:
+        supplied = kwargs.pop("backend_type")
+        if supplied is not None and supplied != kwargs.get("arch", BackendType.Ascend910B):
+            warnings.warn(_BACKEND_TYPE_DEPRECATION, DeprecationWarning, stacklevel=2)
+
     alias = kwargs.pop("enable_l2_swimlane", None)
     if alias is not None:
         warnings.warn(_SWIMLANE_ALIAS_DEPRECATION, DeprecationWarning, stacklevel=2)
@@ -523,6 +718,25 @@ def _run_config_init(self: RunConfig, *args: Any, **kwargs: Any) -> None:
 
 RunConfig.__init__ = _run_config_init  # type: ignore[method-assign]
 
+# ``functools.wraps`` copies the dataclass-generated signature, which lists the
+# two axes but not the ``platform=`` spelling the wrapper accepts -- so
+# ``inspect.signature(RunConfig)``, and every doc tool and IDE reading it, would
+# report a keyword the overwhelming majority of call sites use as unsupported.
+# Advertise it. The deprecated keywords stay out on purpose: they are accepted
+# for compatibility, not offered.
+_RUN_CONFIG_SIGNATURE = inspect.signature(_RUN_CONFIG_INIT)
+RunConfig.__signature__ = _RUN_CONFIG_SIGNATURE.replace(  # type: ignore[attr-defined]
+    parameters=[
+        *(p for name, p in _RUN_CONFIG_SIGNATURE.parameters.items() if name != "self"),
+        inspect.Parameter(
+            "platform",
+            inspect.Parameter.KEYWORD_ONLY,
+            default=None,
+            annotation="str | None",
+        ),
+    ]
+)
+
 
 @dataclass
 class RunResult:
@@ -532,7 +746,7 @@ class RunResult:
         passed: ``True`` if the program executed and results matched the golden
             reference within the configured tolerances.
         test_name: Optional test case name.  Set by the harness when running
-            a named test case; ``None`` for direct :func:`run` calls.
+            a named test case; ``None`` outside the harness.
         error: Human-readable error message when ``passed`` is ``False``.
         execution_time: Python wall-clock time in seconds for the full run
             (compile + execute + validate). This mixes host-side compile/golden
@@ -565,128 +779,19 @@ class RunResult:
         return msg + time_str
 
 
-def compile_program(  # noqa: PLR0913
-    program: Any,
-    work_dir: Path,
-    *,
-    strategy: OptimizationStrategy,
-    backend_type: BackendType,
-    dump_passes: bool | PassDumpLevel = False,
-    dump_ptoas_passes: bool = False,
-    diagnostic_phase: DiagnosticPhase | None = None,
-    disabled_diagnostics: DiagnosticCheckSet | None = None,
-    profiling: bool = False,
-    analyze_auto_scopes_for_deps: bool = False,
-    memory_planner: MemoryPlanner | None = None,
-    enable_pypto_l0c_double_buffer: bool | None = None,
-) -> None:
-    """Compile *program* to *work_dir* and patch orchestration headers.
-
-    Runs :func:`ir.compile` then inserts ``runtime.h`` / ``<iostream>`` includes
-    into the generated orchestration C++ files (required by Simpler's CodeRunner).
-
-    Args:
-        program: A ``@pl.program`` decorated class or an ``ir.Program`` object.
-        work_dir: Output directory for generated artefacts.
-        strategy: PyPTO optimisation strategy applied during compilation.
-        backend_type: Code-generation backend.
-        dump_passes: Per-pass IR dump control — a :class:`~pypto.ir.PassDumpLevel`
-            or a ``bool`` (``True`` -> ``CONCISE``, ``False`` -> ``NONE``).
-        dump_ptoas_passes: If ``True``, dump intermediate IR after every ptoas
-            pass under ``<work_dir>/ptoas_passes/<codegen-unit>/``.
-        diagnostic_phase: Override the diagnostic phase gate for compilation.
-        disabled_diagnostics: Set of diagnostic checks to disable.
-        profiling: If ``True``, enable compile profiling.
-        analyze_auto_scopes_for_deps: If ``True``, enable compiler-derived task
-            dependency analysis for AUTO runtime scopes.
-        memory_planner: On-chip memory planner forwarded to :func:`ir.compile`.
-        enable_pypto_l0c_double_buffer: Opt the legacy ``PYPTO`` planner in to
-            chooser-emitted dbC=2. Ignored under ``DSA_RP`` and ``PTOAS``, where
-            chooser dbC is automatic.
-    """
-    from pypto import ir  # noqa: PLC0415
-
-    ir.compile(
-        program,
-        output_dir=str(work_dir),
-        strategy=strategy,
-        dump_passes=dump_passes,
-        dump_ptoas_passes=dump_ptoas_passes,
-        backend_type=backend_type,
-        diagnostic_phase=diagnostic_phase,
-        disabled_diagnostics=disabled_diagnostics,
-        profiling=profiling,
-        analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
-        memory_planner=memory_planner,
-        enable_pypto_l0c_double_buffer=enable_pypto_l0c_double_buffer,
-    )
-    _patch_orchestration_headers(work_dir)
-
-
-def run(
-    program: Any,
-    *tensors: torch.Tensor,
-    config: RunConfig | None = None,
-) -> Any:
-    """Compile *program* and execute it with *tensors* on device.
-
-    This is the user-facing entry point for the compile-and-run workflow.
-    No golden function, no TensorSpec — just define, compile, call.
-
-    Args:
-        program: A ``@pl.program`` decorated class or an ``ir.Program``.
-        *tensors: Positional ``torch.Tensor`` arguments matching the
-            orchestration function's parameter order.  Pass no tensors
-            for compile-only.
-        config: Run configuration (platform, device, profiling, etc.).
-            Uses default :class:`RunConfig` if ``None``.
-
-    Returns:
-        A :class:`~pypto.ir.compiled_program.CompiledProgram` that can
-        be called again with new tensors.
-
-    Example:
-        >>> from pypto.runtime import run, RunConfig
-        >>> a = torch.full((128, 128), 2.0)
-        >>> b = torch.full((128, 128), 3.0)
-        >>> c = torch.zeros(128, 128)
-        >>> compiled = run(MyProgram, a, b, c, config=RunConfig(platform="a2a3sim"))
-        >>> # Re-run with different inputs:
-        >>> compiled(a2, b2, c2)
-    """
-    if config is None:
-        config = RunConfig()
-
-    from pypto import ir  # noqa: PLC0415
-
-    compiled = ir.compile(
-        program,
-        output_dir=config.save_kernels_dir,
-        strategy=config.strategy,
-        backend_type=config.backend_type,
-        dump_passes=config.dump_passes,
-        dump_ptoas_passes=config.dump_ptoas_passes,
-        diagnostic_phase=config.diagnostic_phase,
-        disabled_diagnostics=config.disabled_diagnostics,
-        platform=config.platform,
-        profiling=config.compile_profiling,
-        analyze_auto_scopes_for_deps=config.analyze_auto_scopes_for_deps,
-        memory_planner=config.memory_planner,
-    )
-
-    if tensors and not config.codegen_only:
-        compiled(*tensors, config=config)
-
-    return compiled
-
-
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Option objects
+#
+# The three concerns :class:`RunConfig` aggregates, each as a value of its own:
+# what compilation reads, what a dispatch reads, and which diagnostics a
+# dispatch collects. ``RunConfig`` keeps every field and every caller — these
+# are the vocabulary underneath it, and what code that only needs one half
+# should take. See ``docs/en/dev/08-entry-points.md``.
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
-class _DfxOpts:
+class DfxOptions:
     """Bundle of runtime DFX toggles passed through the execute pipeline.
 
     Each field maps to a ``CallConfig`` member on the runtime side. The public
@@ -721,21 +826,107 @@ class _DfxOpts:
             or self.enable_scope_stats
         )
 
-    @classmethod
-    def from_run_config(cls, cfg: "RunConfig") -> "_DfxOpts":
-        return cls(
-            enable_chip_swimlane=cfg.enable_chip_swimlane,
-            enable_dump_args=cfg.enable_dump_args,
-            enable_pmu=cfg.enable_pmu,
-            enable_dep_gen=cfg.enable_dep_gen,
-            enable_scope_stats=cfg.enable_scope_stats,
-        )
+
+@dataclass(frozen=True)
+class RunOptions:
+    """What a dispatch reads: where it runs, how big its rings are, what it collects.
+
+    Everything here is per-launch. Nothing here reaches compilation — an
+    artifact compiled once can be dispatched under any number of these.
+
+    ``platform`` appears in both halves because it is genuinely two decisions
+    that must agree: the target codegen builds for, and the device the worker
+    opens. A worker rejects an artifact whose platform differs from its own.
+
+    **Not exported from** ``pypto.runtime``, and deliberately so: no dispatch
+    entry point accepts one yet. ``CompiledProgram.__call__``,
+    ``ChipWorker.run`` and their distributed counterparts all take a
+    :class:`RunConfig`, and reach it through ``run_options()``. Until those
+    signatures widen, this is the internal shape the dispatch plumbing reads,
+    not a configuration a caller can hand in — exporting it would advertise an
+    entry point that does not exist.
+    """
+
+    platform: str = "a2a3sim"
+    device_id: int = 0
+    aicpu_thread_num: int | None = None
+    # Scalar (broadcast to every scope-depth ring) or a list of ``_RING_DEPTH``
+    # ints sizing rings 0..3; a 0 entry leaves that ring at its default.
+    ring_task_window: int | list[int] | tuple[int, ...] | None = None
+    ring_heap: int | list[int] | tuple[int, ...] | None = None
+    ring_dep_pool: int | list[int] | tuple[int, ...] | None = None
+    dfx: DfxOptions = DfxOptions()
+
+
+@dataclass(frozen=True)
+class CompileOptions:
+    """What compilation reads, in ``ir.compile``'s own vocabulary.
+
+    The typed form of :meth:`RunConfig.compile_kwargs`. A caller that only
+    compiles needs this and not a :class:`RunConfig`::
+
+        from pypto import ir
+        from pypto.runtime import CompileOptions
+
+        compiled = ir.compile(program, **CompileOptions(platform="a2a3").as_compile_kwargs())
+
+    Field names are ``ir.compile``'s, not ``RunConfig``'s: what ``RunConfig``
+    spells ``save_kernels_dir`` and ``compile_profiling`` are ``output_dir`` and
+    ``profiling`` here, because this object exists to name the compile side as
+    the compiler names it.
+
+    ``platform`` is the only way to name the target. ``ir.compile`` also takes a
+    ``backend_type``, but derives it from ``platform`` whenever one is given, so
+    carrying both here would offer a pairing that cannot take effect: set them
+    to disagree and the platform silently wins. ``ir.compile`` keeps its
+    parameter for callers that pass no platform at all; this object always
+    passes one.
+    """
+
+    platform: str = "a2a3sim"
+    strategy: OptimizationStrategy = field(default_factory=lambda: OptimizationStrategy.Default)
+    dump_passes: bool | PassDumpLevel = False
+    dump_ptoas_passes: bool = False
+    profiling: bool = False
+    diagnostic_phase: DiagnosticPhase | None = None
+    disabled_diagnostics: DiagnosticCheckSet | None = None
+    analyze_auto_scopes_for_deps: bool = False
+    # Absent rather than ``None`` in ``as_compile_kwargs`` when unset, so
+    # ``ir.compile``'s own default applies. That is load-bearing for
+    # ``memory_planner``: an explicit one is rejected while a ``PassContext`` is
+    # active, so an unset planner has to defer to that context.
+    output_dir: str | None = None
+    memory_planner: MemoryPlanner | None = None
+    distributed_config: "DistributedConfig | None" = None
+
+    def as_compile_kwargs(self) -> dict[str, Any]:
+        """Return these options as :func:`pypto.ir.compile` keyword arguments."""
+        kwargs: dict[str, Any] = {
+            "platform": self.platform,
+            "strategy": self.strategy,
+            "dump_passes": self.dump_passes,
+            "dump_ptoas_passes": self.dump_ptoas_passes,
+            "profiling": self.profiling,
+            "diagnostic_phase": self.diagnostic_phase,
+            "disabled_diagnostics": self.disabled_diagnostics,
+            "analyze_auto_scopes_for_deps": self.analyze_auto_scopes_for_deps,
+        }
+        for name in ("output_dir", "memory_planner", "distributed_config"):
+            value = getattr(self, name)
+            if value is not None:
+                kwargs[name] = value
+        return kwargs
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
 def _execute_dfx_passes(
-    run_pass: Callable[["_DfxOpts"], None],
+    run_pass: Callable[["DfxOptions"], None],
     capture_deps: Callable[[], None],
-    dfx: "_DfxOpts",
+    dfx: "DfxOptions",
     platform: str,
 ) -> None:
     """Drive device execution, splitting into two passes when swimlane is on.
@@ -799,7 +990,7 @@ def _execute_dfx_passes(
 def _load_golden_module(golden_path: "Path", module_name: str = "_golden") -> Any:
     """Import a generated ``golden.py`` from *golden_path* as a fresh module.
 
-    Shared by :func:`_execute_on_device` and the dep_gen subprocess so the load
+    Shared by :func:`_execute_golden_case` and the dep_gen subprocess so the load
     semantics (and the error message) stay in one place.
     """
     spec = importlib.util.spec_from_file_location(module_name, str(golden_path))
@@ -913,8 +1104,8 @@ def _coerced_to_orch_args(
     L2 boundary. Tensors and scalars are added in separate passes because
     codegen addresses them from independent pools.
 
-    Used by both :func:`execute_compiled` and the extraction path on
-    :class:`pypto.ir.CompiledProgram` (``build_orch_args``).
+    Used by both :func:`_execute_compiled` and the extraction path on
+    :class:`pypto.ir.CompiledProgram` (``_build_orch_args``).
     """
     from .task_interface import (  # noqa: PLC0415
         TaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
@@ -954,26 +1145,27 @@ def _coerced_to_orch_args(
     return orch_args
 
 
-def _apply_ring_overrides(call_config: Any, run_config: "RunConfig") -> None:
-    """Overlay a :class:`RunConfig`'s per-task ring sizing onto a ``CallConfig``.
+def _apply_ring_overrides(call_config: Any, run_config: "RunConfig | RunOptions") -> None:
+    """Overlay per-task ring sizing onto a ``CallConfig``.
 
     Each ``runtime_env`` field is left at its ``0`` default when the matching
-    ``RunConfig`` override is ``None``, so the runtime applies its own
-    compile-time default. Shared by the L2
-    (:func:`_build_call_config`) and L3
+    override is ``None``, so the runtime applies its own compile-time default.
+    Shared by the L2 (:func:`_build_call_config`) and L3
     (:func:`pypto.runtime.distributed_runner._make_call_config`) dispatch paths
     so both transcribe ring sizing identically.
 
     Args:
         call_config: A simpler ``CallConfig`` (mutated in place).
-        run_config: The :class:`RunConfig` whose ``ring_*`` overrides are copied.
+        run_config: A :class:`RunOptions`, or a :class:`RunConfig` to read one
+            from. The three ``ring_*`` fields are spelled the same on both.
     """
-    if run_config.ring_task_window is not None:
-        call_config.runtime_env.ring_task_window = run_config.ring_task_window
-    if run_config.ring_heap is not None:
-        call_config.runtime_env.ring_heap = run_config.ring_heap
-    if run_config.ring_dep_pool is not None:
-        call_config.runtime_env.ring_dep_pool = run_config.ring_dep_pool
+    options = run_config.run_options() if isinstance(run_config, RunConfig) else run_config
+    if options.ring_task_window is not None:
+        call_config.runtime_env.ring_task_window = options.ring_task_window
+    if options.ring_heap is not None:
+        call_config.runtime_env.ring_heap = options.ring_heap
+    if options.ring_dep_pool is not None:
+        call_config.runtime_env.ring_dep_pool = options.ring_dep_pool
 
 
 def _build_call_config(
@@ -1000,54 +1192,56 @@ def _build_call_config(
     )
 
     cfg = CallConfig()
+    options = run_config.run_options()
 
-    at = aicpu_thread_num_override if aicpu_thread_num_override is not None else run_config.aicpu_thread_num
+    at = aicpu_thread_num_override if aicpu_thread_num_override is not None else options.aicpu_thread_num
     at = at if at is not None else runtime_config.get("aicpu_thread_num")
     if at is not None:
         cfg.aicpu_thread_num = at
 
     # Already a normalized collection level (0-4), so it lands on the runtime's
     # ``int32_t`` field verbatim rather than through the setter's bool shortcut.
-    cfg.enable_chip_swimlane = run_config.enable_chip_swimlane
-    cfg.enable_dump_args = run_config.enable_dump_args
-    cfg.enable_pmu = run_config.enable_pmu
-    cfg.enable_dep_gen = run_config.enable_dep_gen
-    cfg.enable_scope_stats = run_config.enable_scope_stats
+    dfx = options.dfx
+    cfg.enable_chip_swimlane = dfx.enable_chip_swimlane
+    cfg.enable_dump_args = dfx.enable_dump_args
+    cfg.enable_pmu = dfx.enable_pmu
+    cfg.enable_dep_gen = dfx.enable_dep_gen
+    cfg.enable_scope_stats = dfx.enable_scope_stats
 
     # Per-task ring sizing: leave the runtime_env field at its 0 default when
     # unset so the runtime applies its own compile-time default.
-    _apply_ring_overrides(cfg, run_config)
+    _apply_ring_overrides(cfg, options)
 
     if dfx_dir is not None:
         cfg.output_prefix = str(dfx_dir)
     return cfg
 
 
-def _execute_on_device(
+def _execute_golden_case(
     work_dir: Path,
     golden_path: Path,
     chip_callable: Any,
     runtime_name: str,
     platform: str,
     device_id: int,
-    dfx: _DfxOpts = _DfxOpts(),
+    dfx: DfxOptions = DfxOptions(),
     validate: bool = True,
     actual_out_dir: "Path | None" = None,
     enable_sdma: bool = False,
 ) -> None:
     """Load inputs, execute on device, and validate against golden.
 
-    Shared execution logic used by both :func:`run` and the test harness
+    Shared execution logic used by both :func:`_execute_compiled` and the test harness
     (``test_runner.py``).  The caller is responsible for compiling binaries
-    via ``compile_and_assemble`` and passing the result here.
+    via ``_compile_and_assemble`` and passing the result here.
 
     Tolerances (``RTOL``, ``ATOL``) are read from the generated ``golden.py``.
 
     Args:
         work_dir: Root output directory containing ``data/``, ``golden.py``, etc.
         golden_path: Path to the generated ``golden.py`` file.
-        chip_callable: Pre-compiled ``ChipCallable`` from ``compile_and_assemble``.
-        runtime_name: Runtime name from ``compile_and_assemble``.
+        chip_callable: Pre-compiled ``ChipCallable`` from ``_compile_and_assemble``.
+        runtime_name: Runtime name from ``_compile_and_assemble``.
         platform: Target execution platform.
         device_id: Hardware device index.
         enable_sdma: Whether execution requires an SDMA-capable worker.
@@ -1057,8 +1251,8 @@ def _execute_on_device(
             post-run converter is invoked.
     """
     from .device_runner import (  # noqa: PLC0415
+        _execute_on_device,
         build_orch_args_from_inputs,
-        execute_on_device,
         validate_golden,
     )
 
@@ -1086,8 +1280,8 @@ def _execute_on_device(
         dfx_dir = work_dir / "dfx_outputs"
         dfx_dir.mkdir(parents=True, exist_ok=True)
 
-    def _run_pass(pass_dfx: "_DfxOpts") -> None:
-        execute_on_device(
+    def _run_pass(pass_dfx: "DfxOptions") -> None:
+        _execute_on_device(
             chip_callable,
             orch_args,
             platform,
@@ -1152,7 +1346,7 @@ def _execute_on_device(
 def validate_persisted_outputs(work_dir: Path, rtol: float, atol: float) -> None:
     """Validate persisted device outputs against the golden with a given tolerance.
 
-    The counterpart to ``_execute_on_device(..., validate=False,
+    The counterpart to ``_execute_golden_case(..., validate=False,
     actual_out_dir=...)``: the device run (tolerance-independent) persisted the
     actual outputs under ``data/actual/``; this compares them against the
     pre-computed golden under ``data/out/`` using *rtol*/*atol* — letting the
@@ -1181,7 +1375,9 @@ def validate_persisted_outputs(work_dir: Path, rtol: float, atol: float) -> None
 def _collect_dfx_artifacts(
     dfx_dir: Path,
     platform: str,
-    dfx: "_DfxOpts",
+    dfx: "DfxOptions",
+    *,
+    prebuilt_directory: Path | None = None,
 ) -> None:
     """Dispatch post-run DFX converters per enabled flag.
 
@@ -1200,7 +1396,10 @@ def _collect_dfx_artifacts(
     # consumers); harmless no-op when no kernel names are available.
     name_map_path: Path | None = None
     if dfx.enable_chip_swimlane or dfx.enable_dep_gen:
-        name_map_path = _write_name_map(dfx_dir.parent, dfx_dir)
+        if prebuilt_directory is None:
+            name_map_path = _write_name_map(dfx_dir.parent, dfx_dir)
+        else:
+            name_map_path = _write_name_map(prebuilt_directory, dfx_dir, prebuilt=True)
 
     chip_swimlane_records = dfx_dir / _CHIP_SWIMLANE_RECORDS_NAME
     if dfx.enable_chip_swimlane and chip_swimlane_records.exists():
@@ -1263,7 +1462,7 @@ def _collect_dfx_artifacts(
         )
 
 
-def _write_name_map(work_dir: Path, dfx_dir: Path) -> Path | None:
+def _write_name_map(work_dir: Path, dfx_dir: Path, *, prebuilt: bool = False) -> Path | None:
     """Synthesise a ``name_map_*.json`` in *dfx_dir* from ``kernel_config.py``.
 
     The profiling tools render human-readable kernel names (``QK(rXtY)``
@@ -1287,11 +1486,16 @@ def _write_name_map(work_dir: Path, dfx_dir: Path) -> Path | None:
     if not kernel_config_path.exists():
         return None
     try:
-        from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-            load_kernel_config,
-        )
+        if prebuilt:
+            from ._prebuilt import kernel_name_map  # noqa: PLC0415
 
-        func_id_to_name = load_kernel_config(str(kernel_config_path))
+            func_id_to_name = kernel_name_map(work_dir)
+        else:
+            from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+                load_kernel_config,
+            )
+
+            func_id_to_name = load_kernel_config(str(kernel_config_path))
     except Exception as e:  # noqa: BLE001 - best-effort diagnostics, never fatal
         print(f"Skipping name_map generation ({type(e).__name__}: {e})")
         return None
@@ -1316,6 +1520,7 @@ def _generate_swimlane(
     swimlane_dir: Path,
     perf_file: Path | None,
     func_names: Path | None = None,
+    deps_json: Path | None = None,
 ) -> None:
     """Run ``python -m simpler_setup.tools.swimlane_converter`` to generate ``merged_swimlane_*.json``.
 
@@ -1332,6 +1537,13 @@ def _generate_swimlane(
         func_names: Optional ``name_map_*.json`` (see :func:`_write_name_map`)
             passed to the converter via ``--func-names``. Takes precedence over
             the ``-k kernel_config.py`` fallback for label resolution.
+        deps_json: Optional ``deps.json`` passed to the converter via
+            ``--deps-json``. Only needed when the task graph does not sit beside
+            the records — the converter's own default is the sibling file — which
+            is the L3 two-pass case, where the graph and timing passes are
+            separate captures in separate directories (see
+            :func:`~pypto.runtime.distributed_runner._collect_l3_swimlane`).
+            Without it the swimlane renders with no dependency edges.
     """
     converter_module = "simpler_setup.tools.swimlane_converter"
     try:
@@ -1368,6 +1580,10 @@ def _generate_swimlane(
     # for label resolution; ``-k`` stays as the fallback when no map was written.
     if func_names is not None:
         cmd += ["--func-names", str(func_names)]
+    # The converter defaults to the records' sibling ``deps.json``; pass the
+    # path only when the caller located the graph elsewhere.
+    if deps_json is not None:
+        cmd += ["--deps-json", str(deps_json)]
 
     try:
         subprocess.run(cmd, check=True)
@@ -1379,81 +1595,29 @@ def _generate_swimlane(
         )
 
 
-def _patch_orchestration_headers(work_dir: Path) -> None:
-    """Add ``runtime.h`` and ``<iostream>`` includes to orchestration C++ files.
-
-    Simpler's CodeRunner requires these headers in the orchestration translation
-    unit.  They are added here rather than in the code generator so that the
-    compiler back-end remains unaware of runtime-specific requirements.
-
-    Args:
-        work_dir: Root output directory produced by :func:`ir.compile`.
-    """
-    orch_dir = work_dir / "orchestration"
-    if not orch_dir.exists():
-        return
-    for cpp_file in orch_dir.glob("*.cpp"):
-        _add_headers_to_file(cpp_file)
-
-
-def _add_headers_to_file(cpp_file: Path) -> None:
-    """Insert missing ``runtime.h`` / ``<iostream>`` headers into *cpp_file*.
-
-    Args:
-        cpp_file: Path to a C++ source file that may be missing the headers.
-    """
-    content = cpp_file.read_text(encoding="utf-8")
-
-    has_runtime_h = '#include "runtime.h"' in content
-    has_iostream = "#include <iostream>" in content
-
-    if has_runtime_h and has_iostream:
-        return  # Nothing to do
-
-    headers: list[str] = []
-    if not has_runtime_h:
-        headers.append('#include "runtime.h"')
-    if not has_iostream:
-        headers.append("#include <iostream>")
-
-    # Find the first non-comment, non-blank line as the insertion point.
-    lines = content.splitlines(keepends=True)
-    insert_pos = 0
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped and not stripped.startswith(("//", "/*", "*")):
-            insert_pos = i
-            break
-
-    header_block = "\n".join(headers) + "\n"
-    if insert_pos > 0:
-        header_block += "\n"
-
-    lines.insert(insert_pos, header_block)
-    cpp_file.write_text("".join(lines), encoding="utf-8")
-
-
 # ---------------------------------------------------------------------------
 # Compiled program execution (callable API)
 # ---------------------------------------------------------------------------
 
 
-def execute_compiled(  # noqa: PLR0913
+def _execute_compiled(  # noqa: PLR0913
     work_dir: str | Path,
     args: list[torch.Tensor | DeviceTensor | _SimpleCData],
     *,
     platform: str,
     device_id: int,
-    dfx: _DfxOpts = _DfxOpts(),
+    dfx: DfxOptions = DfxOptions(),
     level: int = 2,
     aicpu_thread_num: int | None = None,
     analyze_auto_scopes_for_deps: bool = False,
+    config: RunConfig | None = None,
+    artifact_runtime: Any = None,
 ) -> None:
     """Execute a pre-compiled program with user-provided tensors and scalars.
 
-    Reuses :func:`device_runner.compile_and_assemble` for binary compilation
+    Reuses :func:`device_runner._compile_and_assemble` for binary compilation
     (with caching and parallel kernel compilation) and
-    :func:`device_runner.execute_on_device` for device dispatch.  Host
+    :func:`device_runner._execute_on_device` for device dispatch.  Host
     ``torch.Tensor`` outputs in *args* are modified in-place with device
     results; :class:`DeviceTensor` arguments retain their owning simpler
     ``Buffer`` and are packed into address-free ``TaskArgs`` (no H2D upload,
@@ -1471,7 +1635,7 @@ def execute_compiled(  # noqa: PLR0913
         dfx: Runtime DFX toggles. When any flag is enabled the artefacts
             land under ``<work_dir>/dfx_outputs/`` and the matching
             post-run converter is invoked.
-        level: Hierarchy level. Forwarded to :func:`execute_on_device`,
+        level: Hierarchy level. Forwarded to :func:`_execute_on_device`,
             which currently only supports ``2``.
         aicpu_thread_num: Optional override of the AICPU thread count.
             When ``None`` (default), the value baked into
@@ -1482,6 +1646,11 @@ def execute_compiled(  # noqa: PLR0913
             Accepted here so callers that reuse one config dictionary for
             compile and execute can pass it through safely. It has no effect
             after the program has already been compiled.
+        config: Optional per-dispatch :class:`RunConfig`. Its ring-sizing
+            fields are forwarded to ``CallConfig.runtime_env``. The existing
+            explicit ``platform``, ``device_id``, ``dfx``, and
+            ``aicpu_thread_num`` arguments keep their current behavior and
+            precedence.
 
     Device results are written back into the host tensors in *args* in
     place; per-run timing is no longer returned — read it from the runtime's
@@ -1491,15 +1660,26 @@ def execute_compiled(  # noqa: PLR0913
 
     work_dir = Path(work_dir)
 
-    # Ensure orchestration headers are patched (idempotent)
-    _patch_orchestration_headers(work_dir)
+    # ``ir.compile`` stamps these when it writes the artifact. Re-apply here
+    # (idempotent) so a directory produced before that change, or one whose
+    # orchestration cpp was hand-edited for a replay, still builds.
+    from pypto.ir.compile import _ensure_orchestration_headers  # noqa: PLC0415
+
+    if artifact_runtime is None:
+        _ensure_orchestration_headers(str(work_dir))
 
     from .device_runner import (  # noqa: PLC0415
-        compile_and_assemble,
-        execute_on_device,
+        _compile_and_assemble,
+        _execute_on_device,
     )
 
-    chip_callable, runtime_name, runtime_config = compile_and_assemble(work_dir, platform)
+    if artifact_runtime is None:
+        chip_callable, runtime_name, runtime_config = _compile_and_assemble(work_dir, platform)
+    else:
+        if platform != artifact_runtime.platform:
+            raise ValueError("Cannot override the platform of an immutable runtime artifact")
+        chip_callable, runtime_name, runtime_config = artifact_runtime.load()["."]
+        work_dir = artifact_runtime.run_directory
     enable_sdma = bool(runtime_config.get("enable_sdma", False))
 
     # Caller-supplied values take precedence over the RUNTIME_CONFIG baked
@@ -1515,8 +1695,8 @@ def execute_compiled(  # noqa: PLR0913
         dfx_dir = work_dir / "dfx_outputs"
         dfx_dir.mkdir(parents=True, exist_ok=True)
 
-    def _run_pass(pass_dfx: "_DfxOpts") -> None:
-        execute_on_device(
+    def _run_pass(pass_dfx: "DfxOptions") -> None:
+        _execute_on_device(
             chip_callable,
             args,
             platform,
@@ -1531,6 +1711,7 @@ def execute_compiled(  # noqa: PLR0913
             enable_pmu=pass_dfx.enable_pmu,
             enable_dep_gen=pass_dfx.enable_dep_gen,
             enable_scope_stats=pass_dfx.enable_scope_stats,
+            config=config,
         )
 
     def _capture_deps() -> None:
@@ -1542,6 +1723,7 @@ def execute_compiled(  # noqa: PLR0913
         _capture_deps_subprocess(
             {
                 "mode": "argspec",
+                **({"prebuilt": str(artifact_runtime.directory)} if artifact_runtime is not None else {}),
                 "args": _build_args_spec(args, dfx_dir, run_id),
                 "work_dir": str(work_dir),
                 "platform": platform,
@@ -1549,6 +1731,11 @@ def execute_compiled(  # noqa: PLR0913
                 "dfx_dir": str(dfx_dir),
                 "level": level,
                 "aicpu_thread_num": effective_aicpu_thread_num,
+                "ring_overrides": {
+                    "ring_task_window": config.ring_task_window if config is not None else None,
+                    "ring_heap": config.ring_heap if config is not None else None,
+                    "ring_dep_pool": config.ring_dep_pool if config is not None else None,
+                },
             },
             dfx_dir,
             run_id,
@@ -1562,4 +1749,70 @@ def execute_compiled(  # noqa: PLR0913
     # Original ``dfx`` drives collection so swimlane conversion auto-joins
     # ``deps.json`` and the deps-render hint fires only on explicit dep_gen.
     if dfx_dir is not None:
-        _collect_dfx_artifacts(dfx_dir, platform, dfx)
+        if artifact_runtime is None:
+            _collect_dfx_artifacts(dfx_dir, platform, dfx)
+        else:
+            _collect_dfx_artifacts(dfx_dir, platform, dfx, prebuilt_directory=artifact_runtime.directory)
+
+
+_EXECUTE_COMPILED_DEPRECATION = (
+    "pypto.runtime.execute_compiled is deprecated; reconstruct the artifact and "
+    "call it: ir.CompiledProgram.from_dir(work_dir)(*args, config=cfg). Fold this "
+    "call's explicit platform / device_id / dfx / aicpu_thread_num into cfg first "
+    "-- on the artifact path a supplied config is the sole source of all four. "
+    "The directory-driven function will be removed in a future release."
+)
+
+
+def execute_compiled(  # noqa: PLR0913
+    work_dir: str | Path,
+    args: list[torch.Tensor | DeviceTensor | _SimpleCData],
+    *,
+    platform: str,
+    device_id: int,
+    dfx: DfxOptions = DfxOptions(),
+    level: int = 2,
+    aicpu_thread_num: int | None = None,
+    analyze_auto_scopes_for_deps: bool = False,
+    config: RunConfig | None = None,
+) -> None:
+    """Deprecated. Dispatch a build directory without recompiling.
+
+    :meth:`pypto.ir.CompiledProgram.from_dir` rebuilds the same handle from the
+    same directory and dispatches it through the same code path. **The two
+    disagree on precedence, so the migration is not a plain rename.** Here, an
+    explicit ``platform`` / ``device_id`` / ``dfx`` / ``aicpu_thread_num`` wins
+    and ``config`` supplies only the ring overrides. On the artifact path a
+    supplied ``config`` is the sole source of all four — including ``platform``,
+    which then shadows ``from_dir(platform=...)``. Since ``RunConfig.platform``
+    defaults to ``"a2a3sim"``, dropping the explicit arguments would silently
+    move the run to the simulator. Fold them into the config instead::
+
+        # before -- explicit args win; ``cfg`` was read for ring sizing only
+        execute_compiled(work_dir, args, platform="a2a3", device_id=0, config=cfg)
+
+        # after -- ``cfg`` carries every execution setting
+        cfg = dataclasses.replace(cfg, platform="a2a3", device_id=0)
+        ir.CompiledProgram.from_dir(work_dir)(*args, config=cfg)
+
+    ``dfx`` and ``aicpu_thread_num`` have no separate spelling on that path:
+    the DFX toggles and ``aicpu_thread_num`` are already ``RunConfig`` fields,
+    read fresh on every dispatch. ``from_dir(platform=...)`` still decides the
+    platform for a call made *without* a config.
+
+    Emits a :class:`DeprecationWarning` and forwards to the same implementation
+    the artifact path uses. Behaviour of this function is unchanged; only the
+    name is going away.
+    """
+    warnings.warn(_EXECUTE_COMPILED_DEPRECATION, DeprecationWarning, stacklevel=2)
+    _execute_compiled(
+        work_dir,
+        args,
+        platform=platform,
+        device_id=device_id,
+        dfx=dfx,
+        level=level,
+        aicpu_thread_num=aicpu_thread_num,
+        analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
+        config=config,
+    )

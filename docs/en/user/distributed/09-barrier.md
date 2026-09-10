@@ -154,4 +154,5 @@ holds only because the barrier ordered them. The same
   NotifyOp and WaitCmp — the full signal API
 - [01-collectives](../distributed/01-collectives.md) §Barrier — where the
   barrier sits in the collective zoo
+- [04-debugging](04-debugging.md) — the canonical failure catalog for distributed programs
 - Next step: [10-remote_load_store](10-remote_load_store.md) — move a slice

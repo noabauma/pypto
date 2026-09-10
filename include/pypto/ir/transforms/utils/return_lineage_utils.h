@@ -91,10 +91,25 @@ std::optional<size_t> ExplicitReturnedParamIndex(const FunctionPtr& func);
 /// fast path would pick the trailing one, a pre-order walk the nested one.
 ReturnStmtPtr FindFirstReturn(const StmtPtr& body);
 
+/// Trace multiple Vars in @p body back to @p params for scope outlining.
+///
+/// The body is indexed once and parameter positions are shared across all Vars.
+/// With @p trace_if_merges, this additionally follows tensor IfStmt merges
+/// when every branch resolves to the same param. Conflicting or untraceable
+/// branches remain nullopt; this branch consensus is intentionally local to
+/// generated InCore functions and does not change ReturnedParamIndices.
+///
+/// @return one entry per Var containing its matching param index, or nullopt.
+std::vector<std::optional<size_t>> TraceToParamIndicesForOutlining(const std::vector<VarPtr>& vars,
+                                                                   const StmtPtr& body,
+                                                                   const std::vector<VarPtr>& params,
+                                                                   const ProgramPtr& program,
+                                                                   bool trace_if_merges);
+
 /// Trace @p var defined in @p body back to one of @p params (pointer identity).
 ///
 /// Same lineage rules as ReturnedParamIndex but scoped to an arbitrary
-/// body/param-set (used by the scope outliner before the Function exists).
+/// body/param-set. Use TraceToParamIndicesForOutlining for multiple Vars.
 ///
 /// @return the matching param, or nullptr when untraceable.
 VarPtr TraceToParam(const VarPtr& var, const StmtPtr& body, const std::vector<VarPtr>& params,

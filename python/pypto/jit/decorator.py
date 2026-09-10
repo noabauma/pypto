@@ -33,6 +33,11 @@ Public API
             with pl.at(level=pl.Level.CORE_GROUP):          # loops + pl.at scopes
                 ...
 
+    @pl.jit.graph
+    def layer(a: pl.Tensor, c: pl.InOut[pl.Tensor]):        # FunctionType.Graph
+        with pl.at(level=pl.Level.CORE_GROUP):              # recorded once,
+            ...                                             # replayed after
+
     @pl.jit
     def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
         c = sub_kernel(a, c)   # dep discovered automatically (any of incore/inline/opaque)
@@ -40,13 +45,14 @@ Public API
 
 JITFunction.__call__ flow
 -------------------------
-1. Lazily discover deps (incore/inline/opaque) from entry's globals (once).
+1. Capture namespaces and refresh deps when referenced JIT bindings change.
 2. Classify args: tensor vs scalar.
 3. Extract TensorMeta from torch.Tensor arguments.
 4. Scan entry + dep ASTs for bind_dynamic declarations.
-5. Build CacheKey (dynamic dims → None in shape tuple).
-6. Cache hit  → execute cached CompiledProgram on device → return result.
-7. Cache miss → specialize (entry + deps) → pl.parse() → ir.compile() → cache → execute → return.
+5. Resolve compile options; bypass caching for diagnostics or explicit output requests.
+6. Build CacheKey including referenced constants (dynamic dims → None in shape tuple).
+7. Cache hit  → execute cached CompiledProgram on device → return result.
+8. Cache miss → specialize (entry + deps) → pl.parse() → ir.compile() → cache → execute → return.
 """
 
 from __future__ import annotations
@@ -55,18 +61,26 @@ import ast
 import copy
 import functools
 import inspect
+import json
 import os
 import re
+import tempfile
 import textwrap
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from pypto._external_source import external_source_digest
 from pypto.backend._ptoas_locate import find_ptoas_binary
+from pypto.backend.pto_backend import emit_source_loc_default
+from pypto.compile_profiling import get_active_profiler
+from pypto.ir.compile import _validate_pass_context_conflicts
+from pypto.ir.pass_manager import PassDumpLevel, coerce_dump_level
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir
 from pypto.pypto_core import passes as _passes
 
+from ._source import cache_in_snapshot, capture_namespaces
 from .cache import CacheKey, compute_source_hash, make_cache_key
 from .specializer import (
     DynDim,
@@ -78,6 +92,7 @@ from .specializer import (
     _collect_annotation_dynamic_dims,
     _collect_dynvar_names,
     build_specialize_context,
+    free_name_source,
     func_name_lookup,
 )
 
@@ -284,7 +299,7 @@ def _extract_tensor_meta(
     return _build_tensor_meta(extents, dtype, dyn_dims, layout)
 
 
-def _resolve_annotation(annotation: Any, ann_ns: dict[str, Any] | None) -> Any:
+def _resolve_annotation(annotation: Any, ann_ns: Mapping[str, Any] | None) -> Any:
     """Resolve one parameter annotation, evaluating the string form if needed.
 
     ``from __future__ import annotations`` in the *user's* module leaves every
@@ -304,12 +319,12 @@ def _resolve_annotation(annotation: Any, ann_ns: dict[str, Any] | None) -> Any:
     try:
         # Trusted input: the kernel's own annotation source, evaluated in its
         # own globals+closure namespace (same as Python would).
-        return eval(annotation, ann_ns)  # noqa: S307
+        return eval(annotation, dict(ann_ns))  # noqa: S307
     except Exception:  # noqa: BLE001 - leave as string; callers treat it as "cannot infer"
         return annotation
 
 
-def _annotation_namespace(func: Any, sig: inspect.Signature) -> dict[str, Any] | None:
+def _annotation_namespace(func: Any, sig: inspect.Signature) -> Mapping[str, Any] | None:
     """Namespace for resolving ``func``'s string annotations, or None if unneeded."""
     if any(isinstance(p.annotation, str) for n, p in sig.parameters.items() if n != "self"):
         return func_name_lookup(func)
@@ -492,8 +507,9 @@ def _get_func_def(func: Any) -> ast.FunctionDef:
     return func_def
 
 
-def _collect_all_called_names(func_def: ast.FunctionDef) -> list[str]:
-    """Return names used as bare (non-method) function calls in func_def body."""
+@functools.lru_cache(maxsize=512)
+def _collect_all_called_names(func_def: ast.FunctionDef) -> tuple[str, ...]:
+    """Cache call names from the immutable AST; resolve their bindings per call."""
     names: list[str] = []
     seen: set[str] = set()
     for node in ast.walk(func_def):
@@ -502,7 +518,7 @@ def _collect_all_called_names(func_def: ast.FunctionDef) -> list[str]:
             if name not in seen:
                 names.append(name)
                 seen.add(name)
-    return names
+    return tuple(names)
 
 
 def _collect_bind_dynamic_bindings(
@@ -596,7 +612,7 @@ def _compute_per_func_dyndim_maps(
     entry_func: Any,
     entry_param_names: list[str],
     deps: list[Any],
-    callers_by_dep_id: dict[int, list[Any]],
+    callers_by_dep_id: dict[int, list[tuple[Any, str]]],
     call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
 ) -> dict[int, dict[str, dict[int, DynDim]]]:
     """Per JIT function in the dep graph, return ``param → dim_idx → DynDim``.
@@ -629,8 +645,8 @@ def _compute_per_func_dyndim_maps(
         dep_map = out[id(dep._func)]
         if not dep_map:
             continue
-        for caller_func in callers_by_dep_id.get(id(dep._func), ()):
-            call_args = call_args_cache.get((id(caller_func), dep.__name__))
+        for caller_func, call_name in callers_by_dep_id.get(id(dep._func), ()):
+            call_args = call_args_cache.get((id(caller_func), call_name))
             if call_args is None:
                 continue
             param_mapping = _build_param_mapping(dep._param_names(), call_args)
@@ -682,15 +698,72 @@ def _build_dynvar_anchor_index(
     return anchors
 
 
+class _DepBinding(NamedTuple):
+    """A JIT dep together with the name its caller's source calls it by.
+
+    The two differ whenever the caller reaches the dep through a rebinding —
+    ``from mod import kernel as kern``, or a module-level ``kern = kernel``.
+    Anything that has to *find the call site* (argument extraction, ``Out``
+    param propagation, the ``self.<dep>(...)`` rewrite) must key on
+    ``call_name``; anything that names the *function* (the generated
+    ``@pl.function``, diagnostics, the source hash) keys on ``dep.__name__``.
+    """
+
+    call_name: str
+    dep: JITFunction
+
+
+@functools.lru_cache(maxsize=512)
+def _constant_dependency_names(func: Any) -> tuple[str, ...]:
+    """Find names that can supply folded constants, excluding body locals.
+
+    Match the specializer's parameter/Store-target shadowing rules. Annotation
+    names resolve in the defining namespace independently of body locals.
+    Decorators and defaults are already evaluated when the function is defined.
+    """
+    definition = _get_func_def(func)
+    local_names = {arg.arg for arg in ast.walk(definition.args) if isinstance(arg, ast.arg)}
+    local_names.update(
+        node.id
+        for node in ast.walk(definition)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    )
+    names = {
+        node.id
+        for statement in definition.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in local_names
+    }
+    annotations = [arg.annotation for arg in ast.walk(definition.args) if isinstance(arg, ast.arg)]
+    annotations.append(definition.returns)
+    for annotation in annotations:
+        if annotation is None:
+            continue
+        if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+            try:
+                annotation = ast.parse(annotation.value, mode="eval")
+            except SyntaxError:
+                continue
+        names.update(node.id for node in ast.walk(annotation) if isinstance(node, ast.Name))
+    return tuple(sorted(names))
+
+
 def _scan_dep_io(
     func: Any, caller_func_type: str = "orchestration"
 ) -> dict[str, tuple[list[str], list[str]]]:
-    """Return ``dep_name → (param_names, output_param_names)`` for every @pl.jit
+    """Return ``call_name → (param_names, output_param_names)`` for every @pl.jit
     dep called from ``func``'s body.
+
+    Keyed by the name the body *calls* the dep by, so an aliased import
+    (``from mod import kernel as kern``) still matches the ``ast.Name`` at the
+    call site.
 
     Used by ``_extract_local_tensor_metas`` to propagate metas through
     ``v1, ..., vk = dep(args)`` assignments (each ``vi`` inherits the meta of
-    the caller arg bound to the i-th output-like parameter).
+    the caller arg bound to the i-th output-like parameter). A dep with no
+    output-like params is still recorded: ``_dep_return_metas`` needs
+    ``param_names`` to bind the call site's args when it descends into the
+    callee's body.
 
     ``output_param_names`` covers both ``pl.Out[...]`` and ``pl.InOut[...]``
     params — a caller can capture either from ``v = dep(...)`` — and is kept in
@@ -701,7 +774,7 @@ def _scan_dep_io(
     orchestrator also admits ``orchestration`` deps (its chip orchestrators).
     """
     out: dict[str, tuple[list[str], list[str]]] = {}
-    for dep in _discover_deps(func, caller_func_type):
+    for call_name, dep in _discover_dep_bindings(func, caller_func_type):
         try:
             out_params, inout_params, _, _, _ = _classify_params(_get_func_def(dep._func))
         except OSError:
@@ -709,15 +782,58 @@ def _scan_dep_io(
         param_names = dep._param_names()
         output_set = set(out_params) | set(inout_params)
         output_params = [p for p in param_names if p in output_set]
-        out[dep.__name__] = (param_names, output_params)
+        out[call_name] = (param_names, output_params)
     return out
+
+
+class _DepScan(NamedTuple):
+    """Everything the local-meta walk needs to know about one caller's deps.
+
+    ``io`` and ``funcs`` are both keyed by the name the caller's *source*
+    calls the dep by (see :class:`_DepBinding`). ``seen`` holds the ``id()`` of
+    every Python function already on the extraction stack, so the recursive
+    descent :func:`_dep_return_metas` performs cannot loop.
+    """
+
+    io: dict[str, tuple[list[str], list[str]]]
+    funcs: dict[str, JITFunction]
+    seen: frozenset[int]
+
+
+def _target_names(target: ast.expr) -> list[str]:
+    """Return the bound names of ``v = ...`` / ``v1, ..., vk = ...``.
+
+    Empty for any other target shape (a subscript, an attribute, a nested
+    unpack) — those are not local tensor rebindings this extractor models.
+    """
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, ast.Tuple) and all(isinstance(e, ast.Name) for e in target.elts):
+        return [e.id for e in target.elts if isinstance(e, ast.Name)]
+    return []
+
+
+def _return_element_names(func_def: ast.FunctionDef) -> list[str]:
+    """Return the names a function's first value-carrying ``return`` hands back.
+
+    ``return a, b`` → ``["a", "b"]``; ``return a`` → ``["a"]``. An element that
+    is not a bare ``Name`` (a call, a subscript, a literal) yields ``""`` so the
+    positional alignment with the caller's targets survives — the empty name
+    simply resolves to no meta.
+    """
+    for node in ast.walk(func_def):
+        if not (isinstance(node, ast.Return) and node.value is not None):
+            continue
+        elts = node.value.elts if isinstance(node.value, ast.Tuple) else [node.value]
+        return [e.id if isinstance(e, ast.Name) else "" for e in elts]
+    return []
 
 
 def _dep_out_metas(
     call: ast.Call,
     dep_name: str,
     target: ast.expr,
-    dep_io: dict[str, tuple[list[str], list[str]]],
+    deps: _DepScan,
     local: dict[str, TensorMeta],
 ) -> dict[str, TensorMeta]:
     """For ``v1, ..., vk = dep(args)`` where ``dep`` has ``k`` ``Out`` params,
@@ -725,16 +841,12 @@ def _dep_out_metas(
     parameter.
 
     Mapping handles both positional and keyword args. No-op when the dep has
-    no ``Out`` params or when target/arity don't match.
+    no ``Out`` params or when target/arity don't match — ``_dep_return_metas``
+    then covers the callee-allocated case.
     """
-    dep_params, out_params = dep_io[dep_name]
-    if isinstance(target, ast.Name):
-        names = [target.id]
-    elif isinstance(target, ast.Tuple) and all(isinstance(e, ast.Name) for e in target.elts):
-        names = [e.id for e in target.elts if isinstance(e, ast.Name)]
-    else:
-        return {}
-    if not out_params or len(names) != len(out_params):
+    dep_params, out_params = deps.io[dep_name]
+    names = _target_names(target)
+    if not names or not out_params or len(names) != len(out_params):
         return {}
     mapping: dict[str, str | None] = {}
     for i, arg in enumerate(call.args):
@@ -749,6 +861,119 @@ def _dep_out_metas(
         if caller_arg is not None and caller_arg in local:
             result[vname] = local[caller_arg]
     return result
+
+
+class _DepReturn(NamedTuple):
+    """What descending into a callee's ``return`` statement established.
+
+    ``metas`` are the targets the descent typed. ``stale`` are the targets it
+    proved it *cannot* type: the callee returns a named local its own extractor
+    declined, so whatever the caller knew about that name before the call no
+    longer describes it. Both are empty when the descent did not happen at all,
+    which leaves the caller's pre-call fallback in charge.
+    """
+
+    metas: dict[str, TensorMeta]
+    stale: frozenset[str]
+
+
+_DEP_RETURN_DECLINED = _DepReturn({}, frozenset())
+
+
+def _dep_return_metas(
+    call: ast.Call,
+    dep_name: str,
+    target: ast.expr,
+    deps: _DepScan,
+    local: dict[str, TensorMeta],
+    scalars: Mapping[str, int | float | bool],
+) -> _DepReturn:
+    """For ``v1, ..., vk = dep(args)`` where ``dep`` returns tensors it created
+    itself, resolve each ``vi`` from the callee's own ``return`` statement.
+
+    ``_dep_out_metas`` covers the in-place convention, where every returned
+    tensor is also an ``Out`` parameter the *caller* allocated, so its meta is
+    already in the caller's pool. A helper may instead ``pl.create_tensor`` its
+    results and hand them back — the classic ``a, b = make_pair(x)`` inline
+    preparation step — and then the shape and dtype exist only inside the
+    callee. Re-run the extractor over the callee's body, seeded with the params
+    this call site binds, and read the returned names' metas off that.
+
+    A returned element that is a *named* callee local the descent could not type
+    comes back in ``stale`` rather than silently absent. The caller would
+    otherwise keep the meta the target carried before the call — demonstrably
+    the wrong tensor, since the callee rebinds it — and hand that shape to the
+    next dep. An element that is not a bare ``Name`` (a call, a literal)
+    establishes nothing either way and is simply left out.
+
+    Returns :data:`_DEP_RETURN_DECLINED` when the callee's source is
+    unavailable, its return arity doesn't match the target, or it is already on
+    the extraction stack.
+    """
+    dep = deps.funcs.get(dep_name)
+    names = _target_names(target)
+    if dep is None or not names or id(dep._func) in deps.seen:
+        return _DEP_RETURN_DECLINED
+    try:
+        ret_names = _return_element_names(_get_func_def(dep._func))
+    except OSError:
+        return _DEP_RETURN_DECLINED
+    if len(ret_names) != len(names):
+        return _DEP_RETURN_DECLINED
+    dep_params, _ = deps.io[dep_name]
+    seed_meta: dict[str, TensorMeta] = {}
+    seed_scalars: dict[str, int | float | bool] = {}
+    for dep_param, caller_arg in _build_param_mapping(dep_params, _call_arg_refs(call)).items():
+        # A ``_SlicedArg`` (``chip_orch(x[r], ...)``) seeds nothing: that
+        # per-rank dispatch form returns through ``Out`` params, so the
+        # descent below never needs the sliced param's meta.
+        if not isinstance(caller_arg, str):
+            continue
+        if caller_arg in local:
+            seed_meta[dep_param] = local[caller_arg]
+        elif caller_arg in scalars:
+            seed_scalars[dep_param] = scalars[caller_arg]
+    callee_metas = _extract_local_tensor_metas(
+        dep._func,
+        seed_meta=seed_meta,
+        seed_scalars=seed_scalars,
+        caller_func_type=dep._func_type,
+        dep_seen=deps.seen,
+    )
+    resolved = {v: callee_metas[r] for v, r in zip(names, ret_names, strict=True) if r in callee_metas}
+    stale = {v for v, r in zip(names, ret_names, strict=True) if r and r not in callee_metas}
+    return _DepReturn(resolved, frozenset(stale))
+
+
+def _dep_out_metas_or_return(
+    call: ast.Call,
+    dep_name: str,
+    target: ast.expr,
+    deps: _DepScan,
+    local: dict[str, TensorMeta],
+    scalars: Mapping[str, int | float | bool],
+) -> _DepReturn:
+    """Resolve one ``v1, ..., vk = dep(args)`` target, ``Out`` convention first.
+
+    The ``Out`` rule needs nothing but the caller's own pool, and where both
+    rules apply they agree — a returned ``Out`` param resolves to the same
+    caller buffer either way — so it wins and never marks a target stale.
+    """
+    out_metas = _dep_out_metas(call, dep_name, target, deps, local)
+    if out_metas:
+        return _DepReturn(out_metas, frozenset())
+    return _dep_return_metas(call, dep_name, target, deps, local, scalars)
+
+
+def _apply_dep_return(local: dict[str, TensorMeta], dep_return: _DepReturn) -> None:
+    """Fold one dep-call target's resolution into the source-ordered pool.
+
+    Resolved names land; names the descent proved stale are dropped, so the
+    caller's pre-call fallback cannot hand a replaced tensor's shape onward.
+    """
+    local.update(dep_return.metas)
+    for name in dep_return.stale:
+        local.pop(name, None)
 
 
 def _fold_int_arith(op: ast.operator, lhs: int, rhs: int) -> int | None:
@@ -876,9 +1101,10 @@ def _update_local_tensor_meta(
     stmt: ast.stmt,
     local: dict[str, TensorMeta],
     dim_aliases: dict[str, tuple[str, int]],
-    dep_io: dict[str, tuple[list[str], list[str]]],
+    deps: _DepScan,
     resolve_int: Callable[[ast.expr], int | None],
     pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
+    scalars: Mapping[str, int | float | bool],
 ) -> None:
     """Apply one assignment's metadata effects to the source-ordered state."""
     parts = _assignment_parts(stmt)
@@ -889,7 +1115,7 @@ def _update_local_tensor_meta(
     has_named_target = named_target is not None
     meta: TensorMeta | None = None
     preserve_existing = False
-    dep_target_metas: list[dict[str, TensorMeta]] = [{} for _ in targets]
+    dep_returns: list[_DepReturn] = [_DEP_RETURN_DECLINED for _ in targets]
 
     # Python evaluates the RHS once before assigning any target. Infer all RHS
     # effects from the same pre-assignment state so a self-referential chained
@@ -911,18 +1137,23 @@ def _update_local_tensor_meta(
                 # result metadata this extractor does not model (for example,
                 # same-shaped pl.assemble rebindings).
                 preserve_existing = True
-        elif isinstance(fn, ast.Name) and fn.id in dep_io:
-            dep_target_metas = [_dep_out_metas(value, fn.id, target, dep_io, local) for target in targets]
-            # Preserve the existing dependency-result behavior when the
-            # callee has no explicit Out/InOut metadata: an already-known
-            # target keeps its metadata until a later supported rebinding can
-            # refine it. This is how bare inline helpers propagate same-shaped
-            # results today.
+        elif isinstance(fn, ast.Name) and fn.id in deps.io:
+            # The in-place ``Out``-param convention first; a callee that
+            # allocates its own results falls through to its return statement.
+            dep_returns = [
+                _dep_out_metas_or_return(value, fn.id, target, deps, local, scalars) for target in targets
+            ]
+            # Preserve the existing dependency-result behavior when neither
+            # rule resolves the callee's results: an already-known target keeps
+            # its metadata until a later supported rebinding can refine it.
+            # This is how bare inline helpers propagate same-shaped results
+            # today. A target the return descent proved stale is exempt — see
+            # ``_dep_return_metas``.
             preserve_existing = True
 
     alias = _extract_dim_alias(value)
-    for target, target_metas in zip(targets, dep_target_metas, strict=True):
-        local.update(target_metas)
+    for target, dep_return in zip(targets, dep_returns, strict=True):
+        _apply_dep_return(local, dep_return)
         named = target if isinstance(target, ast.Name) else None
 
         if named is None:
@@ -946,15 +1177,16 @@ def _walk_local_tensor_meta_stmts(
     stop_at_dep: str | None,
     local: dict[str, TensorMeta],
     dim_aliases: dict[str, tuple[str, int]],
-    dep_io: dict[str, tuple[list[str], list[str]]],
+    deps: _DepScan,
     resolve_int: Callable[[ast.expr], int | None],
     pl_attr_handlers: dict[str, Callable[[ast.Call, str | None], TensorMeta | None]],
+    scalars: Mapping[str, int | float | bool],
 ) -> bool:
     """Walk supported DSL scopes in source order until the selected call."""
     for stmt in stmts:
         if _stmt_calls_dep(stmt, stop_at_dep):
             return True
-        _update_local_tensor_meta(stmt, local, dim_aliases, dep_io, resolve_int, pl_attr_handlers)
+        _update_local_tensor_meta(stmt, local, dim_aliases, deps, resolve_int, pl_attr_handlers, scalars)
         for attr in ("body", "orelse", "finalbody"):
             nested = getattr(stmt, attr, None)
             if isinstance(nested, list) and _walk_local_tensor_meta_stmts(
@@ -962,9 +1194,10 @@ def _walk_local_tensor_meta_stmts(
                 stop_at_dep,
                 local,
                 dim_aliases,
-                dep_io,
+                deps,
                 resolve_int,
                 pl_attr_handlers,
+                scalars,
             ):
                 return True
     return False
@@ -976,6 +1209,7 @@ def _extract_local_tensor_metas(
     seed_scalars: dict[str, int | float | bool] | None = None,
     caller_func_type: str = "orchestration",
     stop_at_dep: str | None = None,
+    dep_seen: frozenset[int] = frozenset(),
 ) -> dict[str, TensorMeta]:
     """Infer ``TensorMeta`` for the local tensor variables in ``func``'s body.
 
@@ -1007,6 +1241,12 @@ def _extract_local_tensor_metas(
        argument bound to the i-th ``Out`` parameter (the in-place-output
        convention every such kernel follows, and the same heuristic
        ``_infer_return_type`` uses on the callee side).
+    4. ``v1, ..., vk = jit_dep(args)`` where ``jit_dep`` instead allocates its
+       own results (``a = pl.create_tensor(...); ...; return a, b``) — the
+       extractor descends into the callee's body, seeded with the params this
+       call site binds, and each ``vi`` takes the meta of the i-th returned
+       name (see :func:`_dep_return_metas`). ``dep_seen`` carries the ``id()``
+       of every function already on that stack so the descent cannot loop.
 
     ``seed_meta`` pre-populates the table with the caller's parameter metas
     (including any ``DynDim`` entries those carry) so a ``pl.slice`` of a
@@ -1207,7 +1447,11 @@ def _extract_local_tensor_metas(
             dims.append(v if v is not None else parent_dim)
         return TensorMeta(shape=tuple(dims), dtype=src_meta.dtype, layout=src_meta.layout)
 
-    dep_io = _scan_dep_io(func, caller_func_type)
+    deps = _DepScan(
+        io=_scan_dep_io(func, caller_func_type),
+        funcs={b.call_name: b.dep for b in _discover_dep_bindings(func, caller_func_type)},
+        seen=dep_seen | {id(func)},
+    )
 
     # Dispatch table: pl.<attr>(...) → meta extraction function.
     # Replaces sequential if-chains, reducing branch and statement counts.
@@ -1223,9 +1467,10 @@ def _extract_local_tensor_metas(
         stop_at_dep,
         local,
         dim_aliases,
-        dep_io,
+        deps,
         _resolve_int,
         _pl_attr_handlers,
+        scalars,
     )
     return local
 
@@ -1299,13 +1544,19 @@ def _extract_call_args_for_dep(
     ]
     if not calls:
         return None
-    node = min(calls, key=lambda call: (call.lineno, call.col_offset))
+    return _call_arg_refs(min(calls, key=lambda call: (call.lineno, call.col_offset)))
+
+
+def _call_arg_refs(node: ast.Call) -> list[tuple[str | None, str | _SlicedArg | None]]:
+    """Unify one call node's positional and keyword args into ``(param, ref)`` pairs.
+
+    ``param`` is ``None`` for a positional argument (paired with the callee's
+    parameter list by index in :func:`_build_param_mapping`) and the keyword
+    name otherwise. ``**kwargs`` splats are skipped — they carry no name to
+    bind against.
+    """
     result: list[tuple[str | None, str | _SlicedArg | None]] = [(None, _arg_ref(arg)) for arg in node.args]
-    result.extend(
-        (kw.arg, _arg_ref(kw.value))
-        for kw in node.keywords
-        if kw.arg is not None  # skip **kwargs splats
-    )
+    result.extend((kw.arg, _arg_ref(kw.value)) for kw in node.keywords if kw.arg is not None)
     return result
 
 
@@ -1342,6 +1593,7 @@ def _resolve_dep_call_metadata(
     caller_scalar_dtypes: dict[str, DataType],
     dep_dyn_map: dict[str, dict[int, DynDim]],
     caller_func_type: str = "orchestration",
+    dep_call_name: str | None = None,
 ) -> tuple[
     dict[str, TensorMeta],
     dict[str, int | float | bool],
@@ -1361,15 +1613,21 @@ def _resolve_dep_call_metadata(
     ``caller_func_type`` is forwarded to ``_extract_local_tensor_metas``
     so a host orchestrator's body can also recognise chip-orchestrator deps
     when walking ``v = chip_orch(...)`` return-capture assignments.
+
+    ``dep_call_name`` is the name ``caller_func``'s source calls the dep by;
+    it differs from ``dep.__name__`` under an aliased import or any other
+    rebinding. Defaults to ``dep.__name__`` for callers that resolve a dep
+    reached under its own name.
     """
     dep_param_names = dep._param_names()
-    call_args = _extract_call_args_for_dep(caller_func, dep.__name__)
+    call_name = dep_call_name or dep.__name__
+    call_args = _extract_call_args_for_dep(caller_func, call_name)
     intermediate_metas = _extract_local_tensor_metas(
         caller_func,
         seed_meta=caller_tensor_meta,
         seed_scalars=caller_scalar_values,
         caller_func_type=caller_func_type,
-        stop_at_dep=dep.__name__ if call_args is not None else None,
+        stop_at_dep=call_name if call_args is not None else None,
     )
     # The extractor starts from caller_tensor_meta, then applies source-ordered
     # rebindings. Its result is therefore the authoritative state at the call.
@@ -1482,57 +1740,13 @@ def _overlay_dep_declared_layouts(dep: JITFunction, dep_tensor_meta: dict[str, T
 
 
 # ---------------------------------------------------------------------------
-# RunConfig -> ir.compile() keyword forwarding
+# RunConfig -> pass-pipeline keyword forwarding
+#
+# The compile-side half has no counterpart here: ``RunConfig.compile_kwargs()``
+# is the single mapping onto ``ir.compile()``'s parameters, and the JIT path
+# calls it directly. ``lower()`` stops before codegen, so it needs its own
+# narrower mapping onto ``_run_pass_pipeline``.
 # ---------------------------------------------------------------------------
-
-
-def _run_config_compile_kwargs(run_config: Any) -> dict[str, Any]:
-    """Extract ``ir.compile()`` keyword arguments from a ``pypto.runtime.RunConfig``.
-
-    Maps the compile-side fields of ``RunConfig`` onto the parameters
-    ``ir.compile()`` accepts, so a ``@pl.jit`` kernel invoked with
-    ``config=RunConfig(...)`` honours the same compile knobs that
-    ``ir.compile(program, ...)`` does. Runtime-only fields (``device_id``,
-    ``rtol`` / ``atol``, DFX toggles, ...) are not compile inputs and are
-    consumed by ``CompiledProgram.__call__`` instead.
-
-    ``backend_type`` is intentionally omitted: ``ir.compile()`` derives the
-    codegen backend from ``platform``, which the JIT path already forwards;
-    passing ``backend_type`` as well would be redundant and could conflict.
-
-    ``output_dir`` is forwarded only when set, so an unset value defers to
-    ``ir.compile()``'s own default.
-
-    ``distributed_config`` is likewise forwarded only when set. When supplied it
-    makes ``ir.compile()`` emit a ``DistributedCompiledProgram`` (HOST-level
-    ``@pl.jit.host`` kernels), which ``__call__`` then dispatches per-rank. An
-    unset value defers to ``ir.compile()``'s default (a single-chip
-    ``CompiledProgram``) and keeps it out of the cache key for non-distributed
-    callers.
-
-    ``analyze_auto_scopes_for_deps`` is forwarded because it changes the pass
-    pipeline's dependency derivation and therefore the generated orchestration.
-
-    ``memory_planner`` is forwarded only when set: ``ir.compile()`` rejects an
-    explicit planner while a ``PassContext`` is active, and an unset value must
-    defer to that context (or to the ``PYPTO`` default when there is none).
-    """
-    kwargs: dict[str, Any] = {
-        "strategy": run_config.strategy,
-        "dump_passes": run_config.dump_passes,
-        "dump_ptoas_passes": run_config.dump_ptoas_passes,
-        "profiling": run_config.compile_profiling,
-        "diagnostic_phase": run_config.diagnostic_phase,
-        "disabled_diagnostics": run_config.disabled_diagnostics,
-        "analyze_auto_scopes_for_deps": run_config.analyze_auto_scopes_for_deps,
-    }
-    if run_config.save_kernels_dir is not None:
-        kwargs["output_dir"] = run_config.save_kernels_dir
-    if run_config.distributed_config is not None:
-        kwargs["distributed_config"] = run_config.distributed_config
-    if run_config.memory_planner is not None:
-        kwargs["memory_planner"] = run_config.memory_planner
-    return kwargs
 
 
 def _run_config_lower_kwargs(run_config: Any) -> dict[str, Any]:
@@ -1593,7 +1807,103 @@ def _resolve_runtime() -> _passes.RuntimeKind:
     return ctx.get_runtime() if ctx is not None else _passes.RuntimeKind.TENSORMAP_AND_RINGBUFFER
 
 
+def _resolve_compile_request(run_config: Any) -> tuple[dict[str, Any], bool]:
+    """Resolve compiler arguments and whether this call requires fresh compilation.
+
+    RunConfig's compile mapping is the source for both codegen and cache keys.
+    Diagnostics are requests to run the compiler, so decide bypass before any
+    cache lookup (including source-key construction). Tool discovery remains
+    on the compile path and adds no filesystem probes to ordinary cache hits.
+    """
+    if run_config is None:
+        from pypto.runtime import CompileOptions  # noqa: PLC0415
+
+        kwargs = CompileOptions().as_compile_kwargs()
+    else:
+        kwargs = run_config.compile_kwargs()
+    kwargs["dump_passes"] = coerce_dump_level(kwargs["dump_passes"])
+    kwargs["emit_source_loc"] = emit_source_loc_default()
+    outer = _validate_pass_context_conflicts(
+        operation="compile",
+        verification_level=kwargs.get("verification_level"),
+        diagnostic_phase=kwargs.get("diagnostic_phase"),
+        memory_planner=kwargs.get("memory_planner"),
+        runtime=kwargs.get("runtime"),
+    )
+    bypass = (
+        kwargs["dump_passes"] is not PassDumpLevel.NONE
+        or kwargs["dump_ptoas_passes"]
+        or kwargs["profiling"]
+        or get_active_profiler() is not None
+        or kwargs.get("output_dir") is not None
+        or bool(os.environ.get("PYPTO_PROG_BUILD_DIR"))
+        or kwargs.get("verification_level") is not None
+        or kwargs["diagnostic_phase"] is not None
+        or kwargs["disabled_diagnostics"] is not None
+    )
+    if not bypass and outer is not None:
+        # Match the pipeline defaults: ordinary planner/runtime contexts can
+        # reuse artifacts, but instruments and custom checks must actually run.
+        default_disabled = _passes.DiagnosticCheckSet()
+        default_disabled.insert(_passes.DiagnosticCheck.UnusedControlFlowResult)
+        bypass = (
+            bool(outer.get_instruments())
+            or outer.get_verification_level() != _passes.get_default_verification_level()
+            or outer.get_diagnostic_phase() != _passes.get_default_diagnostic_phase()
+            or outer.get_disabled_diagnostics() != default_disabled
+        )
+    return kwargs, bypass
+
+
 # ---------------------------------------------------------------------------
+
+
+class _DepGraph(NamedTuple):
+    """Dependency graph published as one state and treated as read-only."""
+
+    deps: list[JITFunction]
+    callers: dict[int, list[tuple[Any, str]]]
+    callees: dict[int, list[str]]
+    call_args: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None]
+
+
+class _CachedLayouts(NamedTuple):
+    """Resolved layouts and the annotation bindings used to derive them."""
+
+    bindings: tuple[Any, ...]
+    layouts: tuple[tuple[str, str, str], ...]
+
+
+@dataclass
+class _CachedDepGraph:
+    """Read-only graph data with an atomically replaced layout cache."""
+
+    graph: _DepGraph
+    bindings: tuple[tuple[_DepBinding, ...], ...]
+    source_hash: str | None
+    layout_dependencies: tuple[tuple[Any, tuple[str, ...]], ...]
+    layouts: _CachedLayouts | None = None
+
+
+@functools.lru_cache(maxsize=512)
+def _layout_dependency_names(func: Any) -> tuple[str, ...]:
+    """Capture roots read by postponed parameter annotations once per function."""
+    names: set[str] = set()
+    for name, param in inspect.signature(func).parameters.items():
+        if name == "self" or not isinstance(param.annotation, str):
+            continue
+        try:
+            annotation = ast.parse(param.annotation, mode="eval")
+        except SyntaxError:
+            continue
+        names.update(node.id for node in ast.walk(annotation) if isinstance(node, ast.Name))
+    return tuple(sorted(names))
+
+
+@functools.lru_cache(maxsize=512)
+def _python_source(func: Any) -> str:
+    """Cache immutable Python source without caching mutable dependency state."""
+    return inspect.getsource(func)
 
 
 class JITFunction:
@@ -1610,7 +1920,7 @@ class JITFunction:
             ``device=`` dispatch loop. End-to-end runtime dispatch works when
             the caller supplies ``config=RunConfig(distributed_config=...)``:
             the config is forwarded through ``_compile`` → ``ir.compile()``
-            (see ``_run_config_compile_kwargs``), which yields a
+            (see ``RunConfig.compile_kwargs``), which yields a
             ``DistributedCompiledProgram`` that ``__call__`` dispatches
             per-rank.
         _level: pl.Level or None.
@@ -1623,12 +1933,9 @@ class JITFunction:
             pass splices the body, hand-placed scopes land in the caller.
             ``incore`` / ``opaque`` kinds reject it (they outline into
             separate kernels, so scopes never land in the caller).
-        _dep_graph: Lazily-computed transitive JIT dep graph rooted here —
-            ``(deps_topo, callers_by_dep_id, callees_by_func_id,
-            call_args_cache)``.  ``None`` until first ``_get_dep_graph()``
-            call.  See that method for the tuple's structure.
+        _dep_graph_state: Last resolved graph and its validating bindings,
+            published together. Each call pins its own validated graph.
         _cache: L1 in-memory cache: CacheKey → CompiledProgram (post-pass ir.Program wrapped).
-        _source_hash: Lazily-computed hash of func source + all dep sources.
     """
 
     def __init__(
@@ -1654,18 +1961,8 @@ class JITFunction:
         self._external_aiv_source = external_aiv_source
         self._external_dual_aiv_dispatch = external_dual_aiv_dispatch
         self._external_include_dirs = external_include_dirs
-        self._dep_graph: (
-            tuple[
-                list[JITFunction],
-                dict[int, list[Any]],
-                dict[int, list[str]],
-                dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
-            ]
-            | None
-        ) = None
+        self._dep_graph_state: _CachedDepGraph | None = None
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
-        self._source_hash: str | None = None
-        self._dep_layouts: tuple[tuple[str, str, str], ...] | None = None
 
         # Preserve function metadata
         self.__name__ = func.__name__
@@ -1688,6 +1985,7 @@ class JITFunction:
     # Lazy dep discovery
     # ------------------------------------------------------------------
 
+    @cache_in_snapshot
     def _dep_declared_layouts(self) -> tuple[tuple[str, str, str], ...]:
         """Layouts every reachable dep declares on its own parameters.
 
@@ -1699,86 +1997,60 @@ class JITFunction:
         them in the key, rebinding ``L`` would hand the second call the first
         one's artifact.
 
-        Computed once and memoized: the key is rebuilt on every call including
-        cache hits, and re-deriving it runs ``inspect.signature`` (plus ``eval``
-        for postponed annotations) per dep. A dep's declarations cannot change
-        over this ``JITFunction``'s lifetime, so the cost is paid once — same
-        reasoning as ``_get_dep_graph`` / ``_get_source_hash``.
+        Reused across calls while the graph and roots referenced by postponed
+        annotations are unchanged. Retain the bindings themselves and compare
+        identity, avoiding overloaded equality and recycled object IDs.
+
+        Keyed by the *generated* name, not ``dep.__name__``: the triples are
+        sorted, so position is not carried, and two same-named deps swapping
+        layouts (``helper`` from two modules going ``NZ``/``ND`` -> ``ND``/``NZ``)
+        would otherwise produce the same sorted set and hand the second call the
+        first one's artifact. The generated name is the disambiguator the
+        emitted signatures already carry.
 
         Returns:
-            Sorted ``(dep name, parameter, layout)`` triples — a stable,
-            hashable component for the cache key
+            Sorted ``(generated dep name, parameter, layout)`` triples for the
+            cache key.
         """
-        if self._dep_layouts is None:
-            deps, _, _, _ = self._get_dep_graph()
-            self._dep_layouts = tuple(
-                sorted(
-                    (dep.__name__, param, str(layout))
-                    for dep in deps
-                    for param, layout in _param_layouts(dep._func, dep.__name__).items()
-                )
+        state = self._get_dep_graph_state()
+        bindings = tuple(
+            func_name_lookup(func).get(name) for func, names in state.layout_dependencies for name in names
+        )
+        cached = state.layouts
+        if cached is not None and all(a is b for a, b in zip(bindings, cached.bindings, strict=True)):
+            return cached.layouts
+        # Same list ``_build_contexts`` allocates from, so the names agree with
+        # the ones the generated program actually uses.
+        gen_names = _allocate_generated_names(self, state.graph.deps)
+        layouts = tuple(
+            sorted(
+                (gen_names[id(dep._func)], param, str(layout))
+                for dep in state.graph.deps
+                # ``dep.__name__`` here is the diagnostic name only — a layout
+                # error should name the user's own function.
+                for param, layout in _param_layouts(dep._func, dep.__name__).items()
             )
-        return self._dep_layouts
+        )
+        state.layouts = _CachedLayouts(bindings, layouts)
+        return layouts
 
-    def _folded_closure_constants(self) -> tuple[tuple[str, str, str], ...]:
-        """Closure constants that fold into the generated source, for the cache key.
-
-        The body transformer inlines a free ``int`` / ``float`` / ``bool`` as a
-        literal, so its value is baked into the artifact — but it lives in
-        ``__closure__``, not in the function text. Rebinding the cell
-        (``nonlocal rows``) therefore leaves ``source_hash`` identical, and
-        without this component the next call would be handed the previous
-        value's artifact. Same shape of problem as ``_dep_declared_layouts``.
-
-        Deliberately **not** memoized, unlike ``_dep_declared_layouts`` and
-        ``_get_source_hash``: a closure cell can be rebound over this
-        ``JITFunction``'s lifetime, which is exactly the case this guards.
-
-        Every foldable free variable is reported, not only those the body
-        actually references. That is a superset, so it can split the cache more
-        finely than strictly required — the safe direction — and it avoids
-        re-deriving which names survive folding.
-
-        Returns:
-            Sorted ``(function name, free variable, repr of value)`` triples
-        """
-        collected: list[tuple[str, str, str]] = []
-        for func_obj in (self._func, *(dep._func for dep in self._get_deps())):
-            func_name = getattr(func_obj, "__name__", "<unknown>")
-            co_freevars = getattr(getattr(func_obj, "__code__", None), "co_freevars", ())
-            closure = getattr(func_obj, "__closure__", None) or ()
-            for fv_name, cell in zip(co_freevars, closure, strict=True):
-                try:
-                    value = cell.cell_contents
-                except ValueError:
-                    # Unbound cell — nothing folds, so nothing to key on.
-                    continue
-                # Mirror the folder's own test so the key covers exactly what
-                # gets inlined (see _BodyTransformer.visit_Name).
-                if isinstance(value, (int, float, bool)) and not isinstance(value, type):
-                    collected.append((func_name, fv_name, repr(value)))
-        return tuple(sorted(collected))
-
-    def _get_dep_graph(
-        self,
-    ) -> tuple[
-        list[JITFunction],
-        dict[int, list[Any]],
-        dict[int, list[str]],
-        dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None],
-    ]:
+    def _get_dep_graph(self) -> _DepGraph:
         """Return the transitive JIT dep graph rooted at this function.
 
-        The graph is computed lazily on first access and cached for the
-        lifetime of this ``JITFunction``. Returns:
+        The graph is computed lazily and reused while its direct dependency
+        bindings remain unchanged. Each request pins its validated graph;
+        another request can publish a new graph without changing this one.
+        Published graphs are never modified. Returns:
 
         - ``deps_topo``: every reachable dep in leaf-first topological order
           (deduplicated by underlying Python function identity). The entry
           function is NOT included.
-        - ``callers_by_dep_id``: for each dep, the list of Python functions
-          whose bodies contain a call site to it. Recorded in DFS-discovery
-          order; deduplicated within each list. The entry has no caller and
-          does not appear as a key.
+        - ``callers_by_dep_id``: for each dep, the list of
+          ``(caller_func, call_name)`` pairs whose bodies contain a call site
+          to it — ``call_name`` being the name that caller's source calls it
+          by, which differs from ``dep.__name__`` under an aliased import.
+          Recorded in DFS-discovery order; deduplicated within each list. The
+          entry has no caller and does not appear as a key.
 
           Tensor / scalar metadata for a shared dep is still resolved
           through the first-recorded caller — call sites in other branches
@@ -1786,103 +2058,154 @@ class JITFunction:
           have to differ from another, which the one-context-per-function
           design doesn't support).
         - ``callees_by_func_id``: for each function (entry + every reached
-          dep), the names of JIT deps it directly calls. Used to set each
-          context's ``dep_names`` so the body transformer rewrites nested
-          dep calls into the ``self.<dep>(...)`` form required by
+          dep), the *call names* of the JIT deps it directly calls. Used to
+          set each context's ``dep_names`` so the body transformer rewrites
+          nested dep calls into the ``self.<dep>(...)`` form required by
           multi-function ``@pl.program``.
-        - ``call_args_cache``: ``(id(caller_func), dep_name)`` → unified
+        - ``call_args_cache``: ``(id(caller_func), call_name)`` → unified
           call-site arg list (see ``_extract_call_args_for_dep``) or
           ``None`` if the call site isn't found. Cached so metadata
           resolution doesn't re-walk caller ASTs on every JIT call.
         """
-        if self._dep_graph is None:
-            deps_topo: list[JITFunction] = []
-            seen: set[int] = set()
-            callers_by_dep_id: dict[int, list[Any]] = {}
-            callees_by_func_id: dict[int, list[str]] = {}
-            call_args_cache: dict[
-                tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None
-            ] = {}
+        return self._get_dep_graph_state().graph
 
-            def visit(func: Any, caller_func_type: str) -> None:
-                direct = _discover_deps(func, caller_func_type)
-                callees_by_func_id[id(func)] = [d.__name__ for d in direct]
-                for dep in direct:
-                    # Key everything off ``id(dep._func)`` (the underlying
-                    # Python function) — same key the downstream helpers
-                    # use, and stable across multiple wrapper objects for
-                    # the same source function.
-                    callers = callers_by_dep_id.setdefault(id(dep._func), [])
-                    if func not in callers:
-                        callers.append(func)
-                    # Memoise per-(caller, dep) call-site args once.
-                    cache_key = (id(func), dep.__name__)
-                    if cache_key not in call_args_cache:
-                        call_args_cache[cache_key] = _extract_call_args_for_dep(func, dep.__name__)
-                    if id(dep._func) in seen:
-                        continue
-                    # Mark before recursing — this also serves as a cycle
-                    # guard (a self-recursive JIT function is unsupported
-                    # but won't loop forever here).
-                    seen.add(id(dep._func))
-                    visit(dep._func, dep._func_type)
-                    deps_topo.append(dep)
-
-            visit(self._func, self._func_type)
-            self._dep_graph = (
-                deps_topo,
-                callers_by_dep_id,
-                callees_by_func_id,
-                call_args_cache,
+    @cache_in_snapshot
+    def _get_dep_graph_state(self) -> _CachedDepGraph:
+        """Pin a graph and its derived caches to the current request."""
+        cached = self._dep_graph_state
+        if cached is not None:
+            bindings = tuple(
+                tuple(_discover_dep_bindings(fn._func, fn._func_type)) for fn in [self, *cached.graph.deps]
             )
-        return self._dep_graph
+            if bindings == cached.bindings:
+                return cached
+        deps_topo: list[JITFunction] = []
+        seen: set[int] = set()
+        callers_by_dep_id: dict[int, list[Any]] = {}
+        callees_by_func_id: dict[int, list[str]] = {}
+        call_args_cache: dict[tuple[int, str], list[tuple[str | None, str | _SlicedArg | None]] | None] = {}
+
+        def visit(func: Any, caller_func_type: str) -> None:
+            direct = _discover_dep_bindings(func, caller_func_type)
+            # Call names, not ``__name__``: these become ``ctx.dep_names``,
+            # which the body transformer matches against the ``ast.Name``
+            # the source actually calls.
+            callees_by_func_id[id(func)] = [b.call_name for b in direct]
+            for call_name, dep in direct:
+                # Key everything off ``id(dep._func)`` (the underlying
+                # Python function) — same key the downstream helpers
+                # use, and stable across multiple wrapper objects for
+                # the same source function.
+                callers = callers_by_dep_id.setdefault(id(dep._func), [])
+                if (func, call_name) not in callers:
+                    callers.append((func, call_name))
+                # Memoise per-(caller, call name) call-site args once.
+                cache_key = (id(func), call_name)
+                if cache_key not in call_args_cache:
+                    call_args_cache[cache_key] = _extract_call_args_for_dep(func, call_name)
+                if id(dep._func) in seen:
+                    continue
+                # Mark before recursing — this also serves as a cycle
+                # guard (a self-recursive JIT function is unsupported
+                # but won't loop forever here).
+                seen.add(id(dep._func))
+                visit(dep._func, dep._func_type)
+                deps_topo.append(dep)
+
+        visit(self._func, self._func_type)
+        graph = _DepGraph(
+            deps_topo,
+            callers_by_dep_id,
+            callees_by_func_id,
+            call_args_cache,
+        )
+        bindings = tuple(tuple(_discover_dep_bindings(fn._func, fn._func_type)) for fn in [self, *deps_topo])
+        source_hash = (
+            None
+            if any(fn._func_type == "extern" for fn in [self, *deps_topo])
+            else self._compute_static_source_hash(deps_topo)
+        )
+        layout_dependencies = tuple(
+            (dep._func, names) for dep in deps_topo if (names := _layout_dependency_names(dep._func))
+        )
+        state = _CachedDepGraph(graph, bindings, source_hash, layout_dependencies)
+        self._dep_graph_state = state
+        return state
 
     def _get_deps(self) -> list[JITFunction]:
         """Return all transitively-reachable JIT deps in leaf-first order."""
         return self._get_dep_graph()[0]
 
     # ------------------------------------------------------------------
-    # Source hash (includes all dep sources; lazily computed after deps found)
+    # Source hash (derived from the request's pinned dependency graph)
     # ------------------------------------------------------------------
 
     def _external_source_paths(self) -> list[str]:
         """Absolute paths of the C++ source(s) backing an external kernel dep."""
         return [p for p in (self._external_aic_source, self._external_aiv_source) if p is not None]
 
+    @capture_namespaces()
     def _get_source_hash(self) -> str:
+        """Hash source structure and the current values of referenced constants.
+
+        Each referenced name contributes the exact text the specializer will fold
+        it into, straight from ``free_name_source``. Reading the emitted form —
+        rather than re-deciding here which types count — is what keeps the key in
+        step with the folding rule: a constant that changes the generated source
+        changes this hash by construction, and one that does not fold (an opaque
+        object, a JIT dep, ``pl`` itself) contributes nothing because it leaves
+        the source unchanged.
+        """
+        source_hash = self._get_static_source_hash()
+        records = []
+        for index, jit_func in enumerate([self, *self._get_deps()]):
+            func = jit_func._func
+            namespace = func_name_lookup(func)
+            for name in _constant_dependency_names(func):
+                folded = free_name_source(name, namespace)
+                if folded is None:
+                    continue
+                records.append((index, func.__module__, func.__qualname__, name, folded))
+        return compute_source_hash([source_hash, json.dumps(records, separators=(",", ":"))])
+
+    @cache_in_snapshot
+    def _get_static_source_hash(self) -> str:
+        """Hash source and compilation attributes from the request's graph."""
         deps = self._get_deps()
-        # External kernel .cpp files are mutable on disk, unlike the (fixed once
-        # loaded) Python source. When any extern dep is present, recompute the
-        # hash on every lookup so an edited kernel is picked up even within a
-        # long-lived process; otherwise cache it.
-        has_extern = any(d._func_type == "extern" for d in deps)
-        if self._source_hash is not None and not has_extern:
-            return self._source_hash
-        sources = [inspect.getsource(self._func)]
-        for dep in deps:
-            if dep._func_type == "extern":
-                # The implementation and launch ABI both affect the artifact.
-                # Include the quoted-include closure so editing a sibling .cce
-                # invalidates the cache even when the entry .cpp is unchanged.
+        state = self._get_dep_graph_state()
+        if state.source_hash is not None:
+            return state.source_hash
+        return self._compute_static_source_hash(deps)
+
+    def _compute_static_source_hash(self, deps: list[JITFunction]) -> str:
+        """Compute source structure on graph changes or external-source lookups."""
+        sources = []
+        for jit_func in [self, *deps]:
+            sources.append(
+                json.dumps(
+                    (jit_func.__name__, jit_func._func_type, str(jit_func._level), jit_func._auto_scope),
+                    separators=(",", ":"),
+                )
+            )
+            if jit_func._func_type == "extern":
+                # External sources and quoted includes can change between
+                # requests. Recompute their digest even when the graph is reused.
                 sources.append(
                     external_source_digest(
-                        dep._external_source_paths(),
+                        jit_func._external_source_paths(),
                         metadata=(
-                            inspect.getsource(dep._func),
-                            dep.__name__,
-                            dep._external_core_type or "",
-                            str(dep._external_dual_aiv_dispatch),
-                            *(f"include_dir:{path}" for path in dep._external_include_dirs),
+                            _python_source(jit_func._func),
+                            jit_func.__name__,
+                            jit_func._external_core_type or "",
+                            str(jit_func._external_dual_aiv_dispatch),
+                            *(f"include_dir:{path}" for path in jit_func._external_include_dirs),
                         ),
-                        include_dirs=dep._external_include_dirs,
+                        include_dirs=jit_func._external_include_dirs,
                     )
                 )
             else:
-                sources.append(inspect.getsource(dep._func))
-        source_hash = compute_source_hash(sources)
-        if not has_extern:
-            self._source_hash = source_hash
-        return source_hash
+                sources.append(_python_source(jit_func._func))
+        return compute_source_hash(sources)
 
     # ------------------------------------------------------------------
     # Parameter introspection
@@ -2009,7 +2332,7 @@ class JITFunction:
         # annotation directly rather than via ``typing.get_type_hints`` because the
         # latter runs ``_type_check`` on the result, which rejects our custom
         # ``Tensor`` / ``Scalar`` instance annotations on Python 3.10.
-        ann_ns: dict[str, Any] | None = None
+        ann_ns: Mapping[str, Any] | None = None
         if any(isinstance(p.annotation, str) for n, p in sig.parameters.items() if n != "self"):
             ann_ns = func_name_lookup(self._func)
 
@@ -2030,7 +2353,7 @@ class JITFunction:
                 try:
                     # Trusted input: the kernel's own annotation source, evaluated
                     # in its own globals+closure namespace (same as Python would).
-                    annotation = eval(annotation, ann_ns)  # noqa: S307
+                    annotation = eval(annotation, dict(ann_ns))  # noqa: S307
                 except Exception:  # noqa: BLE001 - leave as string; handled below as "cannot infer"
                     pass
 
@@ -2145,6 +2468,7 @@ class JITFunction:
             run_config,
         )
 
+    @capture_namespaces()
     def _resolve_compiled(
         self,
         args: tuple[Any, ...],
@@ -2169,32 +2493,21 @@ class JITFunction:
             allow_signature_mode=allow_signature_mode,
         )
 
-        # Compile-side knobs (strategy, dump_passes, ...) come from the
-        # RunConfig. Forwarding them lets a @pl.jit kernel honour the same
-        # compile options as a direct ir.compile(program, ...) call.
-        compile_kwargs = _run_config_compile_kwargs(run_config) if run_config is not None else {}
+        compile_kwargs, bypass_cache = _resolve_compile_request(run_config)
+        ordered_args = [
+            specialization.arguments[n] for n in specialization.param_names if n in specialization.arguments
+        ]
+        if bypass_cache:
+            compiled = self._compile(
+                specialization.tensor_meta,
+                specialization.scalar_values,
+                specialization.scalar_dtypes,
+                specialization.per_func_dyn,
+                pl,
+                **compile_kwargs,
+            )
+            return compiled, ordered_args, run_config
 
-        # Build cache key. Platform and strategy are included so artifacts
-        # compiled for different targets or optimization strategies never
-        # collide in the same cache. With no RunConfig the strategy is
-        # normalized to ir.compile()'s own default so the key holds the
-        # effective strategy rather than a None sentinel.
-        from pypto.ir.pass_manager import OptimizationStrategy  # noqa: PLC0415
-
-        platform = run_config.platform if run_config is not None else None
-        strategy = run_config.strategy if run_config is not None else OptimizationStrategy.Default
-        # distributed_config is baked into the DistributedCompiledProgram and
-        # drives per-rank dispatch, so it must split the cache: two @pl.jit.host
-        # calls with different device_ids compile to distinct artifacts.
-        distributed_config = run_config.distributed_config if run_config is not None else None
-        analyze_auto_scopes_for_deps = (
-            run_config.analyze_auto_scopes_for_deps if run_config is not None else False
-        )
-        dump_ptoas_passes = run_config.dump_ptoas_passes if run_config is not None else False
-        # The planner decides whether physical addresses are baked into the
-        # artifact, so it must split the cache: compiling one kernel under both
-        # planners must not hand the second call the first one's artifact.
-        memory_planner = _resolve_memory_planner(run_config)
         key = make_cache_key(
             source_hash=self._get_source_hash(),
             param_names=specialization.param_names,
@@ -2202,17 +2515,16 @@ class JITFunction:
             tensor_dtypes={n: m.dtype for n, m in specialization.tensor_meta.items()},
             tensor_layouts={n: m.layout for n, m in specialization.tensor_meta.items()},
             dep_layouts=self._dep_declared_layouts(),
-            closure_constants=self._folded_closure_constants(),
             dynamic_dims={
                 (n, i) for n, m in specialization.tensor_meta.items() for i in m.dynamic_dim_indices()
             },
             scalar_values=specialization.scalar_values,
-            platform=platform,
-            strategy=strategy,
-            distributed_config=distributed_config,
-            analyze_auto_scopes_for_deps=analyze_auto_scopes_for_deps,
-            dump_ptoas_passes=dump_ptoas_passes,
-            memory_planner=memory_planner,
+            platform=compile_kwargs["platform"],
+            strategy=compile_kwargs["strategy"],
+            distributed_config=compile_kwargs.get("distributed_config"),
+            analyze_auto_scopes_for_deps=compile_kwargs["analyze_auto_scopes_for_deps"],
+            emit_source_loc=compile_kwargs["emit_source_loc"],
+            memory_planner=compile_kwargs.get("memory_planner", _resolve_memory_planner(None)),
             enable_pypto_l0c_double_buffer=_resolve_enable_pypto_l0c_double_buffer(),
             runtime=_resolve_runtime(),
         )
@@ -2225,18 +2537,10 @@ class JITFunction:
                 specialization.scalar_dtypes,
                 specialization.per_func_dyn,
                 pl,
-                platform=platform,
                 **compile_kwargs,
             )
 
-        # Use bound.arguments (in signature order) so keyword-style calls
-        # like kernel(a=x, b=y) are routed correctly regardless of how the
-        # caller passed them.
-        compiled = self._cache[key]
-        ordered_args = [
-            specialization.arguments[n] for n in specialization.param_names if n in specialization.arguments
-        ]
-        return compiled, ordered_args, run_config
+        return self._cache[key], ordered_args, run_config
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Specialize, compile (or serve from cache), and execute on device.
@@ -2245,7 +2549,8 @@ class JITFunction:
         specialized into ``@pl.program`` source, parsed, and compiled via
         ``ir.compile()`` (passes + codegen).  The resulting ``CompiledProgram``
         is stored in the L1 in-memory cache so subsequent calls with the same
-        specialization key skip compilation entirely.
+        specialization key skip compilation entirely. Diagnostic and explicit
+        output requests bypass both cache lookup and insertion on every call.
 
         The compiled kernel is then executed on the NPU device with the given
         torch tensor arguments (Triton-like API).
@@ -2253,7 +2558,7 @@ class JITFunction:
         A ``config=RunConfig(...)`` keyword argument is consumed here rather
         than passed to the decorated function: its compile-side fields
         (``strategy``, ``dump_passes``, diagnostics, ...) are forwarded to
-        ``ir.compile()`` via ``_run_config_compile_kwargs``, and its
+        ``ir.compile()`` via ``RunConfig.compile_kwargs``, and its
         runtime fields drive on-device execution.  ``strategy`` also takes
         part in the cache key so artifacts compiled under different strategy
         values never share a cache entry.
@@ -2288,8 +2593,6 @@ class JITFunction:
           for explicit L2 dispatch.
         - ``CompiledProgram.chip_callable`` / ``runtime_name`` / ``runtime_config``
           to drive a hand-constructed ``simpler.worker.Worker``.
-        - ``CompiledProgram.build_orch_args`` / ``build_call_config`` to
-          assemble the simpler dispatch tuple yourself.
 
         ``config=RunConfig(...)`` is still consumed (and its compile-side
         knobs forwarded to ``ir.compile()``) so the returned
@@ -2300,7 +2603,10 @@ class JITFunction:
 
         Subsequent calls (either ``__call__`` or [`compile`][pypto.language.JITFunction.compile]) with the
         same specialization key hit the L1 cache and return the same
-        ``CompiledProgram`` instance.
+        ``CompiledProgram`` instance. Dump, compile-profiling, explicit output,
+        and custom pass-diagnostic requests always compile afresh, preserving
+        ordinary cached entries. Omitting ``config`` uses ``RunConfig`` defaults,
+        including disabled dumps.
 
         **Compiling without tensors.** When called with **no tensor
         arguments** — neither positional nor keyword — the shape/dtype contract
@@ -2368,6 +2674,79 @@ class JITFunction:
         compiled, _ordered_args, _run_config = self._resolve_compiled(args, kwargs, allow_signature_mode=True)
         return compiled
 
+    @capture_namespaces()
+    def specialize(self, *args: Any, **kwargs: Any) -> _ir.Program:
+        """Specialize this JIT function and return its **pre-pass** IR.
+
+        The step [`lower`][pypto.language.JITFunction.lower] takes before it
+        runs the pass pipeline: entry and every transitive dep are specialized
+        into ``@pl.program`` source and parsed, and the parsed program is
+        returned untransformed. No passes, no code generation, no ``ptoas``, no
+        device, and the compiled-program cache is neither read nor written.
+
+        Use this to hand a JIT kernel to a consumer that wants to drive the
+        pass pipeline itself — most notably ``ir.compile(program,
+        output_dir=...)``, which runs passes *and* code generation and so must
+        be given the program before any pass has touched it. Passing
+        ``lower()``'s result there would run the pipeline a second time.
+
+        Two JIT kernels that specialize to the same program compare equal
+        *after* passes, not before: the specializer renames SSA-rebound locals
+        (``out`` becomes ``out_v1``), which canonicalization removes. Compare
+        ``lower()`` output when asserting equivalence against a hand-written
+        ``@pl.program``.
+
+        Args:
+            *args: Positional sample arguments matching the decorated function.
+                Omit tensor samples to specialize from the annotations, which
+                then must carry full shapes.
+            **kwargs: Keyword sample arguments. Unlike ``lower()`` there is no
+                ``config``: the pass pipeline never runs here, so a
+                ``RunConfig`` would have nothing to configure.
+
+        Returns:
+            The parsed ``ir.Program``, before any pass has run.
+
+        Raises:
+            TypeError: ``config=`` was passed. Accepting it silently would let
+                a caller believe a strategy or diagnostics setting shaped the
+                returned IR, when no pass ran to read it.
+        """
+        import pypto.language as pl  # noqa: PLC0415
+
+        if "config" in kwargs:
+            raise TypeError(
+                f"@pl.jit function '{self.__name__}': specialize() does not accept config=. "
+                "No pass runs here, so a RunConfig would have nothing to configure. Use "
+                "lower(config=...) for post-pass IR, or compile(config=...) to build an artifact."
+            )
+        specialization, _ = self._resolve_specialization(args, kwargs, allow_signature_mode=True)
+        return self._compile_to_program(
+            specialization.tensor_meta,
+            specialization.scalar_values,
+            specialization.scalar_dtypes,
+            specialization.per_func_dyn,
+            pl,
+        )
+
+    @property
+    def param_names(self) -> tuple[str, ...]:
+        """Declared parameter names, in signature order (``self`` excluded)."""
+        return tuple(self._param_names())
+
+    @property
+    def output_param_names(self) -> tuple[str, ...]:
+        """Parameters the kernel writes — ``pl.Out[...]`` and ``pl.InOut[...]``.
+
+        In declaration order, so the tuple stays aligned with the callee's
+        return order. A caller that materialises tensors for this kernel uses
+        it to decide which of them are results to validate.
+        """
+        out_params, inout_params, _, _, _ = _classify_params(_get_func_def(self._func))
+        written = set(out_params) | set(inout_params)
+        return tuple(p for p in self._param_names() if p in written)
+
+    @capture_namespaces()
     def lower(self, *args: Any, **kwargs: Any) -> _ir.Program:
         """Specialize this JIT function and return its post-pass IR.
 
@@ -2429,7 +2808,6 @@ class JITFunction:
         scalar_dtypes: dict[str, DataType],
         per_func_dyn: dict[int, dict[str, dict[int, DynDim]]],
         pl: Any,
-        platform: str | None = None,
         **ir_compile_kwargs: Any,
     ) -> Any:
         """Specialize entry + deps into @pl.program source, parse, and compile.
@@ -2444,9 +2822,11 @@ class JITFunction:
         doesn't re-walk the dep graph on every cache miss.
 
         ``ir_compile_kwargs`` are forwarded verbatim to ``ir.compile()`` —
-        compile-side knobs (``strategy``, ``dump_passes``, ``output_dir``,
-        ``profiling``, diagnostics, ...) that the JIT caller derives from a
-        ``RunConfig`` via ``_run_config_compile_kwargs``.
+        compile-side knobs (``platform``, ``strategy``, ``dump_passes``,
+        ``output_dir``, ``profiling``, diagnostics, ...) that the JIT caller
+        derives from a ``RunConfig`` via ``RunConfig.compile_kwargs``.
+        If no output directory is supplied, allocate one for this compilation
+        so a fresh diagnostic request cannot overwrite a cached artifact.
         """
         from pypto.ir.compile import compile as ir_compile  # noqa: PLC0415
 
@@ -2458,7 +2838,11 @@ class JITFunction:
         try:
             parsed = pl.parse(source, filename=self._diagnostic_filename, source_map=specializer.source_map)
             skip_ptoas = not _ptoas_available()
-            return ir_compile(parsed, skip_ptoas=skip_ptoas, platform=platform, **ir_compile_kwargs)
+            if ir_compile_kwargs.get("output_dir") is None:
+                output_root = os.environ.get("PYPTO_PROG_BUILD_DIR") or "build_output"
+                os.makedirs(output_root, exist_ok=True)
+                ir_compile_kwargs["output_dir"] = tempfile.mkdtemp(prefix=f"{parsed.name}_", dir=output_root)
+            return ir_compile(parsed, skip_ptoas=skip_ptoas, **ir_compile_kwargs)
         except Exception as exc:
             rewritten = _rewrite_jit_error(exc, rename_map)
             if rewritten is exc:
@@ -2523,9 +2907,12 @@ class JITFunction:
           entry. DynDim entries inside the metas propagate naturally as
           metas are forwarded into deps via ``_resolve_dep_call_metadata``.
         - Each context's ``dep_names`` is the set of JIT deps that the
-          context's function *directly* calls. The body transformer uses
-          this to rewrite nested ``dep(args)`` calls into the
-          ``self.dep(args)`` form required by multi-function ``@pl.program``.
+          context's function *directly* calls, named as its source calls
+          them. The body transformer uses this — plus ``dep_func_names``,
+          which maps those call names onto the generated function names they
+          differ from under an aliased import — to rewrite nested
+          ``dep(args)`` calls into the ``self.dep(args)`` form required by
+          multi-function ``@pl.program``.
 
         The returned list is in leaf-first order (deps before their
         callers) so the generated source defines callees before callers.
@@ -2551,17 +2938,33 @@ class JITFunction:
             ],
         ] = {id(self._func): (tensor_meta, scalar_values, scalar_dtypes)}
 
+        # One generated ``@pl.function`` name per JIT function, unique across
+        # the program. Two distinct deps may share a ``__name__`` (two modules
+        # each defining ``helper``, or two kernels from the same factory);
+        # emitting both as ``def helper`` made the parser reject the program
+        # with a bare ``Duplicate function name "helper"``.
+        gen_names = _allocate_generated_names(self, deps_topo)
+
         # Walk caller-first (reverse of leaf-first topo order) so each dep's
         # caller metadata is already resolved when we get to it; collect
         # contexts caller-first, then reverse to restore leaf-first emit
         # order.
+        # Per caller, ``call name → generated function name``. They differ
+        # under an aliased import (the body calls ``kern(...)`` while the
+        # generated ``@pl.function`` is named after ``dep.__name__``) and
+        # under a uniquified name (``helper`` → ``helper__2``).
+        dep_func_names_by_caller: dict[int, dict[str, str]] = {}
+        for dep in deps_topo:
+            for caller_func, call_name in callers_by_id.get(id(dep._func), ()):
+                dep_func_names_by_caller.setdefault(id(caller_func), {})[call_name] = gen_names[id(dep._func)]
+
         dep_contexts: list[SpecializeContext] = []
         for dep in reversed(deps_topo):
             # For metadata resolution we use the first-recorded caller. In a
             # diamond ``entry -> {A, B} -> shared`` only one specialization
             # of ``shared`` is emitted, so the call sites in other branches
             # must agree on shapes/dtypes anyway.
-            caller_func = callers_by_id[id(dep._func)][0]
+            caller_func, dep_call_name = callers_by_id[id(dep._func)][0]
             c_meta, c_sv, c_sd = resolved[id(caller_func)]
             caller_ftype = func_type_by_id.get(id(caller_func), "orchestration")
             dep_meta, dep_sv, dep_sd = _resolve_dep_call_metadata(
@@ -2572,18 +2975,20 @@ class JITFunction:
                 c_sd,
                 per_func_dyn.get(id(dep._func), empty_dyn),
                 caller_func_type=caller_ftype,
+                dep_call_name=dep_call_name,
             )
             resolved[id(dep._func)] = (dep_meta, dep_sv, dep_sd)
             dep_contexts.append(
                 build_specialize_context(
                     func=dep._func,
-                    func_name=dep.__name__,
+                    func_name=gen_names[id(dep._func)],
                     func_type=dep._func_type,
                     level=dep._level,
                     tensor_meta=dep_meta,
                     scalar_values=dep_sv,
                     scalar_dtypes=dep_sd,
                     dep_names=callees_by_id[id(dep._func)],
+                    dep_func_names=dep_func_names_by_caller.get(id(dep._func), {}),
                     auto_scope=dep._auto_scope,
                     external_core_type=dep._external_core_type,
                     external_aic_source=dep._external_aic_source,
@@ -2596,13 +3001,14 @@ class JITFunction:
 
         entry_ctx = build_specialize_context(
             func=self._func,
-            func_name=self.__name__,
+            func_name=gen_names[id(self._func)],
             func_type=self._func_type,
             level=self._level,
             tensor_meta=tensor_meta,
             scalar_values=scalar_values,
             scalar_dtypes=scalar_dtypes,
             dep_names=callees_by_id[id(self._func)],
+            dep_func_names=dep_func_names_by_caller.get(id(self._func), {}),
             auto_scope=self._auto_scope,
         )
         return dep_contexts + [entry_ctx]
@@ -2616,8 +3022,8 @@ class JITFunction:
 # ---------------------------------------------------------------------------
 
 
-def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[JITFunction]:
-    """Discover JIT dep functions called by ``func``.
+def _discover_dep_bindings(func: Any, caller_func_type: str = "orchestration") -> list[_DepBinding]:
+    """Discover JIT dep functions called by ``func``, with their call names.
 
     Scans the function's AST for bare function calls, then resolves each name
     against both module globals and closure variables (for deps defined in an
@@ -2641,33 +3047,77 @@ def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[J
 
     called_names = _collect_all_called_names(func_def)
 
-    # Module-level globals
-    func_globals = getattr(func, "__globals__", {})
+    all_vars = func_name_lookup(func)
 
-    # Closure variables (covers deps defined in an enclosing scope)
-    closure_vars: dict[str, Any] = {}
-    co_freevars = getattr(getattr(func, "__code__", None), "co_freevars", ())
-    closure = getattr(func, "__closure__", None) or ()
-    for name, cell in zip(co_freevars, closure):
-        try:
-            closure_vars[name] = cell.cell_contents
-        except ValueError:
-            pass
-
-    all_vars = {**func_globals, **closure_vars}
-
-    allowed_dep_types: set[str] = {"incore", "inline", "opaque", "extern"}
+    allowed_dep_types: set[str] = {"incore", "inline", "opaque", "extern", "graph"}
     if caller_func_type == "host":
         allowed_dep_types.add("orchestration")
 
-    deps: list[JITFunction] = []
+    deps: list[_DepBinding] = []
     seen: set[str] = set()
     for name in called_names:
         obj = all_vars.get(name)
         if isinstance(obj, JITFunction) and obj._func_type in allowed_dep_types and name not in seen:
-            deps.append(obj)
+            deps.append(_DepBinding(call_name=name, dep=obj))
             seen.add(name)
     return deps
+
+
+def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[JITFunction]:
+    """Discover JIT dep functions called by ``func``, dropping their call names.
+
+    Thin view over :func:`_discover_dep_bindings` for callers that only need
+    the functions themselves. Anything that has to find the call site in the
+    caller's source must use the bindings instead — see ``_DepBinding``.
+    """
+    return [binding.dep for binding in _discover_dep_bindings(func, caller_func_type)]
+
+
+def _generated_names_for(jit_func: JITFunction, base: str) -> tuple[str, ...]:
+    """Every generated ``@pl.function`` name ``jit_func`` would occupy as ``base``.
+
+    A single method for everything except an ``@pl.jit.extern`` mixed kernel,
+    which the specializer renders as an AIC member, an AIV member, and a Group
+    wrapper — three names derived from the same base.
+    """
+    if jit_func._func_type == "extern" and jit_func._external_core_type == "mixed":
+        return (base, f"{base}_aic", f"{base}_aiv")
+    return (base,)
+
+
+def _allocate_generated_names(entry: JITFunction, deps: list[JITFunction]) -> dict[int, str]:
+    """Map ``id(jit_func._func)`` → the unique name its ``@pl.function`` gets.
+
+    A generated ``@pl.program`` holds one method per JIT function, so their
+    names must be distinct — but two distinct deps may legitimately share a
+    ``__name__`` (two modules each defining ``helper``, or two kernels built by
+    the same factory). A clash is resolved by suffixing the later claimant
+    ``__2``, ``__3``, … so both specializations survive instead of the parser
+    rejecting the program with ``Duplicate function name "helper"``.
+
+    The entry is named first, so a clash never moves the name the user called;
+    deps follow in ``deps`` order, which is derived from source order, so the
+    same call graph always yields the same names.
+    """
+    used: set[str] = set()
+    names: dict[int, str] = {}
+    # Highest suffix already handed out per base name, so N functions sharing a
+    # base cost O(N) probes overall rather than rescanning from 2 each time.
+    next_suffix: dict[str, int] = {}
+    for jit_func in [entry, *deps]:
+        key = id(jit_func._func)
+        if key in names:
+            continue
+        base = jit_func.__name__
+        candidate = base
+        suffix = next_suffix.get(base, 2)
+        while not used.isdisjoint(_generated_names_for(jit_func, candidate)):
+            candidate = f"{base}__{suffix}"
+            suffix += 1
+        next_suffix[base] = suffix
+        names[key] = candidate
+        used.update(_generated_names_for(jit_func, candidate))
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -2697,6 +3147,11 @@ class _SubFunctionDecorator:
         ``InlineFunctions`` IR pass).
       - ``opaque``  → ``FunctionType.Opaque`` (separate IR function; may wrap
         orchestration loops and ``pl.at`` scopes).
+      - ``graph``   → ``FunctionType.Graph`` (a recordable orchestration
+        fragment; the host_build_graph runtime records its task topology on the
+        first call and replays it after, so N calls cost one graph build rather
+        than N). Requires ``RuntimeKind.HOST_BUILD_GRAPH`` — compile under a
+        ``PassContext(runtime=...)``, or ``LegalizeGraphBoundary`` rejects it.
     """
 
     def __init__(self, func_type: str, *, allow_level: bool, allow_auto_scope: bool = False) -> None:
@@ -2870,6 +3325,7 @@ class _JITDecorator:
         self.incore = _SubFunctionDecorator("incore", allow_level=True)
         self.inline = _SubFunctionDecorator("inline", allow_level=False, allow_auto_scope=True)
         self.opaque = _SubFunctionDecorator("opaque", allow_level=False)
+        self.graph = _SubFunctionDecorator("graph", allow_level=False)
         self.extern = _ExternKernelDecorator()
 
     def __call__(self, func: Any = None, *, auto_scope: bool = True) -> Any:

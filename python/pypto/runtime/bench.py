@@ -12,8 +12,8 @@
 Mirrors simpler's ``scene_test --rounds`` mode through pypto's public Worker:
 register the compiled program once, dispatch ``rounds`` cheap launches via
 :meth:`pypto.runtime.RegistrationHandle.__call__`, and aggregate per-launch
-``device_wall_us``. This avoids the one-shot ``execute_compiled`` /
-``CompiledProgram.__call__`` path, which re-pays ``compile_and_assemble`` +
+``device_wall_us``. This avoids the one-shot ``CompiledProgram.__call__``
+path, which re-pays ``_compile_and_assemble`` +
 register/load every call (hundreds of ms of host overhead that swamps the
 ~1 ms device time).
 
@@ -1307,7 +1307,7 @@ def benchmark(
         compiled: A single-orchestration
             :class:`~pypto.ir.CompiledProgram` (L2) or a
             :class:`~pypto.ir.distributed_compiled_program.DistributedCompiledProgram`
-            (L3) from ``ir.compile`` / ``compile_program``. Multi-orch L2
+            (L3) from ``ir.compile``. Multi-orch L2
             programs must pass ``compiled[<name>]``.
         args: Positional dispatch args, same as ``compiled(*args)``. **L3
             requires shared-memory host** ``torch.Tensor`` **args** (allocated

@@ -43,7 +43,6 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
-#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/core_side_ops.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
@@ -66,6 +65,8 @@ namespace ir {
 
 namespace {
 
+constexpr const char* kMxScaleV2CPushAttr = "__mx_scale_v2c_push";
+
 using core_affinity::ClassifyCallAffinity;
 using core_affinity::ClassifyMoveDirection;
 using core_affinity::CombineAffinity;
@@ -86,6 +87,122 @@ using tpop_tfree::FinalizeTpopTfrees;
 
 // Use the shared utility; local alias preserves call sites.
 const auto& FlattenBody = transform_utils::FlattenToStmts;
+
+using AivPlacement = std::unordered_set<const Call*>;
+
+class SplitRegionFinder : public IRVisitor {
+ public:
+  bool found = false;
+  void VisitStmt(const StmtPtr& stmt) override {
+    if (!found) IRVisitor::VisitStmt(stmt);
+  }
+  void VisitStmt_(const SplitAivScopeStmtPtr&) override { found = true; }
+};
+
+// Shallow-copy only the statement receiving an erased wrapper's comments.
+// Descendants and variable identities stay shared; input metadata stays intact.
+class StatementCommentPrepender : public IRMutator {
+ public:
+  explicit StatementCommentPrepender(std::vector<std::string> comments) : comments_(std::move(comments)) {}
+
+ protected:
+#define COPY_COMMENTED_STMT(Type)                                                                            \
+  StmtPtr VisitStmt_(const Type##Ptr& op) override {                                                         \
+    auto result = MutableCopy(op);                                                                           \
+    result->leading_comments_.insert(result->leading_comments_.begin(), comments_.begin(), comments_.end()); \
+    return result;                                                                                           \
+  }
+  COPY_COMMENTED_STMT(AssignStmt)
+  COPY_COMMENTED_STMT(IfStmt)
+  COPY_COMMENTED_STMT(YieldStmt)
+  COPY_COMMENTED_STMT(ReturnStmt)
+  COPY_COMMENTED_STMT(ForStmt)
+  COPY_COMMENTED_STMT(WhileStmt)
+  COPY_COMMENTED_STMT(InCoreScopeStmt)
+  COPY_COMMENTED_STMT(ClusterScopeStmt)
+  COPY_COMMENTED_STMT(GraphScopeStmt)
+  COPY_COMMENTED_STMT(HierarchyScopeStmt)
+  COPY_COMMENTED_STMT(SpmdScopeStmt)
+  COPY_COMMENTED_STMT(RuntimeScopeStmt)
+  COPY_COMMENTED_STMT(CommDomainScopeStmt)
+  COPY_COMMENTED_STMT(EvalStmt)
+  COPY_COMMENTED_STMT(BreakStmt)
+  COPY_COMMENTED_STMT(ContinueStmt)
+  COPY_COMMENTED_STMT(InlineStmt)
+#undef COPY_COMMENTED_STMT
+
+ private:
+  std::vector<std::string> comments_;
+};
+
+// Consume the lexical contract once. All later analyses use this same body and
+// placement map; neither is serialized or shared between pass invocations.
+class SplitRegionConsumer : public IRMutator {
+ public:
+  AivPlacement aiv_only_calls;
+  bool had_regions = false;
+
+ protected:
+  StmtPtr VisitStmt_(const SplitAivScopeStmtPtr& op) override {
+    std::vector<StmtPtr> body;
+    AppendConsumed(op, body);
+    return MakeBody(body, op->span_);
+  }
+
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    std::vector<StmtPtr> body;
+    AppendConsumed(op, body);
+    auto result = MutableCopy(op);
+    result->stmts_ = std::move(body);
+    return result;
+  }
+
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto result = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(result);
+    if (region_depth_ > 0 && call && !core_affinity::HasStatedLane(call) &&
+        core_affinity::ClassifyCallAffinity(call) == CoreAffinity::SHARED &&
+        core_affinity::IsNoDuplicateCall(call)) {
+      aiv_only_calls.insert(call.get());
+    }
+    return result;
+  }
+
+ private:
+  // Append straight-line contents directly into their enclosing statement list.
+  // Nested wrappers therefore do not repeatedly copy the same descendants.
+  void AppendConsumed(const StmtPtr& stmt, std::vector<StmtPtr>& body) {
+    if (auto region = As<SplitAivScopeStmt>(stmt)) {
+      had_regions = true;
+      if (region->split_ != SplitMode::None) {
+        auto hazard =
+            split_axis::FindTransposeSplitHazard(region->body_, split_axis::SplitDimension(region->split_));
+        CHECK_SPAN(!hazard.call, region->span_)
+            << "ExpandMixedKernel: a pl.split_aiv region contains a transpose that swaps its split axis";
+      }
+      pending_comments_.insert(pending_comments_.end(), region->leading_comments_.begin(),
+                               region->leading_comments_.end());
+      ++region_depth_;
+      AppendConsumed(region->body_, body);
+      --region_depth_;
+    } else if (auto seq = As<SeqStmts>(stmt)) {
+      for (const auto& child : seq->stmts_) AppendConsumed(child, body);
+    } else {
+      auto comments = std::move(pending_comments_);
+      pending_comments_.clear();
+      auto visited = VisitStmt(stmt);
+      if (!comments.empty()) visited = StatementCommentPrepender(std::move(comments)).VisitStmt(visited);
+      body.push_back(visited);
+    }
+  }
+
+  int region_depth_ = 0;
+  std::vector<std::string> pending_comments_;
+};
+
+CoreAffinity ClassifyPlacedCall(const CallPtr& call, const AivPlacement& placement) {
+  return placement.count(call.get()) ? CoreAffinity::VECTOR : ClassifyCallAffinity(call);
+}
 
 /// Validate that a deferred waiter is reached only through the task-level
 /// orchestration dispatch shape produced by ScopeOutliner. The marker is
@@ -284,28 +401,29 @@ TpopDefs CollectTpopDefs(const std::vector<StmtPtr>& stmts) {
 // Forward declare
 CoreAffinity AnalyzeStmtAffinity(const StmtPtr& stmt, std::unordered_map<const Stmt*, CoreAffinity>& stmt_map,
                                  std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-                                 const TpopDefs& tpop_defs);
+                                 const TpopDefs& tpop_defs, const AivPlacement& placement);
 
 CoreAffinity AnalyzeStmtsAffinity(const std::vector<StmtPtr>& stmts,
                                   std::unordered_map<const Stmt*, CoreAffinity>& stmt_map,
                                   std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-                                  const TpopDefs& tpop_defs = {}) {
+                                  const TpopDefs& tpop_defs = {}, const AivPlacement& placement = {}) {
   CoreAffinity combined = CoreAffinity::SHARED;
   for (const auto& stmt : stmts) {
-    combined = CombineAffinity(combined, AnalyzeStmtAffinity(stmt, stmt_map, var_affinity, tpop_defs));
+    combined =
+        CombineAffinity(combined, AnalyzeStmtAffinity(stmt, stmt_map, var_affinity, tpop_defs, placement));
   }
   return combined;
 }
 
 CoreAffinity AnalyzeStmtAffinity(const StmtPtr& stmt, std::unordered_map<const Stmt*, CoreAffinity>& stmt_map,
                                  std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-                                 const TpopDefs& tpop_defs) {
+                                 const TpopDefs& tpop_defs, const AivPlacement& placement) {
   CoreAffinity result = CoreAffinity::SHARED;
 
   if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
     auto call = std::dynamic_pointer_cast<const Call>(assign->value_);
     if (call) {
-      result = ClassifyCallAffinity(call);
+      result = ClassifyPlacedCall(call, placement);
       // tile.move from a tpop result is not a cross-core boundary: the data already
       // arrived via tpop, so the move is just internal data placement on the consuming
       // core. ClassifyCallAffinity returns MIXED for *any* C/V-crossing tile.move,
@@ -328,20 +446,22 @@ CoreAffinity AnalyzeStmtAffinity(const StmtPtr& stmt, std::unordered_map<const S
     var_affinity[assign->var_.get()] = result;
   } else if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
     auto call = std::dynamic_pointer_cast<const Call>(eval->expr_);
-    if (call) result = ClassifyCallAffinity(call);
+    if (call) result = ClassifyPlacedCall(call, placement);
   } else if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
-    result = AnalyzeStmtsAffinity(FlattenBody(for_stmt->body_), stmt_map, var_affinity, tpop_defs);
+    result = AnalyzeStmtsAffinity(FlattenBody(for_stmt->body_), stmt_map, var_affinity, tpop_defs, placement);
   } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
-    result = AnalyzeStmtsAffinity(FlattenBody(if_stmt->then_body_), stmt_map, var_affinity, tpop_defs);
+    result =
+        AnalyzeStmtsAffinity(FlattenBody(if_stmt->then_body_), stmt_map, var_affinity, tpop_defs, placement);
     const auto& else_body = if_stmt->else_body_;
     if (else_body.has_value()) {
-      result = CombineAffinity(
-          result, AnalyzeStmtsAffinity(FlattenBody(*else_body), stmt_map, var_affinity, tpop_defs));
+      result = CombineAffinity(result, AnalyzeStmtsAffinity(FlattenBody(*else_body), stmt_map, var_affinity,
+                                                            tpop_defs, placement));
     }
   } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
-    result = AnalyzeStmtsAffinity(FlattenBody(while_stmt->body_), stmt_map, var_affinity, tpop_defs);
+    result =
+        AnalyzeStmtsAffinity(FlattenBody(while_stmt->body_), stmt_map, var_affinity, tpop_defs, placement);
   } else if (auto seq = std::dynamic_pointer_cast<const SeqStmts>(stmt)) {
-    result = AnalyzeStmtsAffinity(seq->stmts_, stmt_map, var_affinity, tpop_defs);
+    result = AnalyzeStmtsAffinity(seq->stmts_, stmt_map, var_affinity, tpop_defs, placement);
   }
 
   stmt_map[stmt.get()] = result;
@@ -433,7 +553,8 @@ std::optional<CoreAffinity> BoundaryResultLane(const CallPtr& call) {
 /// diagnostic.
 std::optional<CoreAffinity> OperandDefiningLane(
     const ExprPtr& operand, const std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-    const std::unordered_map<const Var*, StmtPtr>& def_map, CallPtr* producer_call) {
+    const std::unordered_map<const Var*, StmtPtr>& def_map, const AivPlacement& placement,
+    CallPtr* producer_call) {
   // An operand written inline rather than bound to a name — `aiv_shard(full(...))`
   // — has no defining statement to filter out of a lane, so nothing dangles; it is
   // instead EMITTED inside the tpush, asking the pushing lane to run the op itself
@@ -442,7 +563,7 @@ std::optional<CoreAffinity> OperandDefiningLane(
   // (a nested crossing) and SHARED have no one producing lane here.
   if (auto call = transform_utils::AsCallOrSubmitView(operand)) {
     *producer_call = call;
-    const CoreAffinity affinity = ClassifyCallAffinity(call);
+    const CoreAffinity affinity = ClassifyPlacedCall(call, placement);
     if (affinity == CoreAffinity::CUBE || affinity == CoreAffinity::VECTOR) return affinity;
     return std::nullopt;
   }
@@ -504,13 +625,14 @@ std::optional<CoreAffinity> OperandDefiningLane(
 void CheckOpDrivenBoundaryOperands(const std::vector<StmtPtr>& stmts,
                                    const std::map<const Stmt*, CVBoundaryMove>& boundary_moves,
                                    const std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-                                   const std::unordered_map<const Var*, StmtPtr>& def_map) {
+                                   const std::unordered_map<const Var*, StmtPtr>& def_map,
+                                   const AivPlacement& placement) {
   for (const auto& stmt : stmts) {
     if (auto bm_it = boundary_moves.find(stmt.get()); bm_it != boundary_moves.end()) {
       const auto& bm = bm_it->second;
       if (bm.op_driven) {
         CallPtr producer_call;
-        auto lane = OperandDefiningLane(bm.source_tile, var_affinity, def_map, &producer_call);
+        auto lane = OperandDefiningLane(bm.source_tile, var_affinity, def_map, placement, &producer_call);
         const bool cube_to_vector = (bm.direction == CVDirection::CUBE_TO_VECTOR);
         const CoreAffinity pushing = cube_to_vector ? CoreAffinity::CUBE : CoreAffinity::VECTOR;
         if (lane.has_value() && *lane != pushing) {
@@ -544,17 +666,20 @@ void CheckOpDrivenBoundaryOperands(const std::vector<StmtPtr>& stmts,
     }
 
     if (auto for_stmt = As<ForStmt>(stmt)) {
-      CheckOpDrivenBoundaryOperands(FlattenBody(for_stmt->body_), boundary_moves, var_affinity, def_map);
+      CheckOpDrivenBoundaryOperands(FlattenBody(for_stmt->body_), boundary_moves, var_affinity, def_map,
+                                    placement);
     } else if (auto if_stmt = As<IfStmt>(stmt)) {
-      CheckOpDrivenBoundaryOperands(FlattenBody(if_stmt->then_body_), boundary_moves, var_affinity, def_map);
+      CheckOpDrivenBoundaryOperands(FlattenBody(if_stmt->then_body_), boundary_moves, var_affinity, def_map,
+                                    placement);
       if (if_stmt->else_body_.has_value()) {
         CheckOpDrivenBoundaryOperands(FlattenBody(*if_stmt->else_body_), boundary_moves, var_affinity,
-                                      def_map);
+                                      def_map, placement);
       }
     } else if (auto while_stmt = As<WhileStmt>(stmt)) {
-      CheckOpDrivenBoundaryOperands(FlattenBody(while_stmt->body_), boundary_moves, var_affinity, def_map);
+      CheckOpDrivenBoundaryOperands(FlattenBody(while_stmt->body_), boundary_moves, var_affinity, def_map,
+                                    placement);
     } else if (auto seq = As<SeqStmts>(stmt)) {
-      CheckOpDrivenBoundaryOperands(seq->stmts_, boundary_moves, var_affinity, def_map);
+      CheckOpDrivenBoundaryOperands(seq->stmts_, boundary_moves, var_affinity, def_map, placement);
     }
   }
 }
@@ -599,8 +724,13 @@ int BoundaryTransportSplitCode(const CVBoundaryMove& bm, const Span& span) {
 }
 
 CallPtr CreateTpush(const std::string& op_name, const ExprPtr& tile, const Span& span, int split = 0,
-                    int lane_stride = 0) {
-  return OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride), span);
+                    int lane_stride = 0, bool mx_scale_v2c = false) {
+  auto call = OpRegistry::GetInstance().Create(op_name, {tile}, MakeSplitKwargs(split, lane_stride), span);
+  if (!mx_scale_v2c) return call;
+  return std::make_shared<Call>(
+      call->op_, call->args_, call->kwargs_,
+      std::vector<std::pair<std::string, std::any>>{{kMxScaleV2CPushAttr, std::any(true)}}, call->GetType(),
+      call->span_);
 }
 
 CallPtr CreateTpop(const std::string& op_name, const TypePtr& result_type, const Span& span,
@@ -623,6 +753,43 @@ CallPtr CreateMove(const ExprPtr& tile, MemorySpace target_memory, const TypePtr
   return std::make_shared<Call>(op, std::vector<ExprPtr>{tile}, std::move(kwargs), result_type, span);
 }
 
+CallPtr CreateTransposeView(const ExprPtr& tile, const Span& span) {
+  return OpRegistry::GetInstance().Create("tile.transpose_view", {tile}, {}, span);
+}
+
+bool IsCompleteMxScaleTile(const TileType& type) {
+  if (type.dtype_ != DataType::FP8E8M0) return false;
+  const TileView view = tile_view_semantics::GetEffectiveTileView(type);
+  return view.fractal == tile_view_semantics::kMXScaleFractal && view.blayout == view.slayout &&
+         (view.blayout == TileLayout::row_major || view.blayout == TileLayout::col_major);
+}
+
+void CheckMxScaleNdPushHasFullValidColumns(const ExprPtr& source, const Span& span) {
+  auto type = As<TileType>(source->GetType());
+  INTERNAL_CHECK_SPAN(type, span) << "Internal error: MX-scale V2C push source must have TileType";
+  const TileView view = tile_view_semantics::GetEffectiveTileView(*type);
+  INTERNAL_CHECK_SPAN(!type->shape_.empty() && view.valid_shape.size() == type->shape_.size(), span)
+      << "Internal error: MX-scale V2C push requires matching non-empty shape and valid_shape ranks";
+  INTERNAL_CHECK_SPAN(AreExprsEqual(view.valid_shape.back(), type->shape_.back()), span)
+      << "Internal error: automatic MX-scale V2C ND transport requires a full-valid final dimension";
+}
+
+bool IsAutomaticMxScaleBoundary(const CVBoundaryMove& boundary) {
+  if (boundary.op_driven || boundary.direction != CVDirection::VECTOR_TO_CUBE) return false;
+  auto source_type = As<TileType>(boundary.source_tile->GetType());
+  auto dest_type = As<TileType>(boundary.dest_var->GetType());
+  if (!source_type || !dest_type ||
+      (source_type->memory_space_.has_value() && source_type->memory_space_ != MemorySpace::Vec) ||
+      dest_type->memory_space_ != MemorySpace::Mat) {
+    return false;
+  }
+
+  const TileView source_view = tile_view_semantics::GetEffectiveTileView(*source_type);
+  const TileView dest_view = tile_view_semantics::GetEffectiveTileView(*dest_type);
+  return IsCompleteMxScaleTile(*source_type) && IsCompleteMxScaleTile(*dest_type) &&
+         source_view.blayout == dest_view.blayout;
+}
+
 MemorySpace GetBoundaryTpopMemory(CoreSide side) {
   return (side == CoreSide::AIC) ? MemorySpace::Mat : MemorySpace::Vec;
 }
@@ -631,8 +798,8 @@ MemorySpace GetBoundaryTpopMemory(CoreSide side) {
 // Hand-written cross-core pipe: V->C push layout adaptation
 // ============================================================================
 
-/// Give a hand-written `pl.tpush_to_aic` the same fractal adapter the compiler
-/// inserts for the pipes it builds itself.
+/// Finalize V->C pushes that were authored directly rather than synthesized
+/// from a boundary move.
 ///
 /// The boundary-move path below adapts every V->C push on a backend whose
 /// cross-core boundary carries fractal layout (BackendHandler::
@@ -647,11 +814,13 @@ MemorySpace GetBoundaryTpopMemory(CoreSide side) {
 /// Ascend910B (which needs no adapter: push/pop goes ub -> gm -> mat and takes
 /// ND directly).
 ///
-/// The target view does not depend on where the consumer pops to -- the handler
-/// maps Mat, Left and Right alike onto one fractal view -- so keying off Mat,
-/// the cube-side transfer memory the op-driven branch below already uses, is
-/// exact rather than a guess, and needs no cross-function analysis to find the
-/// matching tpop.
+/// The legacy adapter below assumes the Mat/NZ carrier used by existing manual
+/// data-tile pipes; it does not locate the matching tpop or derive its view.
+/// FP8E8M0 MX-scale tiles invalidate that assumption because their consumer may
+/// require row/row/32 or col/col/32. Such hand-written pushes are rejected
+/// until pipe-id-based producer/consumer view pairing is available. Compiler-
+/// generated MX pushes carry a temporary marker and arrive here with their
+/// carrier already planned, so this phase only strips that marker.
 class AdaptManualVtoCPush : public IRMutator {
  protected:
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
@@ -659,9 +828,23 @@ class AdaptManualVtoCPush : public IRMutator {
     if (!call || !IsOp(call, "tile.tpush_to_aic") || call->args_.size() != 1) {
       return IRMutator::VisitStmt_(op);
     }
+    for (const auto& attr : call->attrs_) {
+      if (attr.first != kMxScaleV2CPushAttr) continue;
+      std::vector<std::pair<std::string, std::any>> attrs;
+      attrs.reserve(call->attrs_.size() - 1);
+      for (const auto& attr : call->attrs_) {
+        if (attr.first != kMxScaleV2CPushAttr) attrs.push_back(attr);
+      }
+      auto clean_push = std::make_shared<Call>(call->op_, call->args_, call->kwargs_, std::move(attrs),
+                                               call->GetType(), call->span_);
+      return std::make_shared<EvalStmt>(clean_push, op->span_);
+    }
     const ExprPtr& source = call->args_[0];
     auto src_type = As<TileType>(source->GetType());
     INTERNAL_CHECK_SPAN(src_type, op->span_) << "Internal error: tile.tpush_to_aic source must be a TileType";
+    CHECK_SPAN(src_type->dtype_ != DataType::FP8E8M0, op->span_)
+        << "Hand-written tile.tpush_to_aic does not support FP8E8M0 MX-scale tiles; "
+           "use an automatic mixed-kernel boundary or stage the scale through GM";
 
     // Backend gate lives here, not around the caller's loop: a program with no
     // hand-written push must not require a configured backend to walk this phase.
@@ -1020,6 +1203,7 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
     // MIXED here, but we handle it specially before the generic MIXED arm below.
     auto bm_it = boundary_moves.find(stmt.get());
     if (bm_it != boundary_moves.end()) {
+      const size_t first_emitted = result.size();
       {
         const auto& bm = bm_it->second;
         // The cross-core transfer memory FOR THIS SIDE: AIC drains into Mat,
@@ -1040,6 +1224,13 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
         // transport carries the stride.
         const int op_lane_stride =
             (bm.op_driven && bm.direction == CVDirection::CUBE_TO_VECTOR) ? bm.lane_stride : 0;
+        const bool is_mx_scale_boundary = IsAutomaticMxScaleBoundary(bm);
+        if (is_mx_scale_boundary) {
+          CHECK_SPAN(handler->GetPtoTargetArch() == "a5", stmt->span_)
+              << "Automatic quant_mx-to-matmul_mx scale transport requires the Ascend950 ('a5') "
+                 "backend, but got '"
+              << handler->GetPtoTargetArch() << "'";
+        }
         if (bm.direction == push_direction) {
           ExprPtr push_source = bm.source_tile;
           // AIV V->C push: insert tile.move (tmov) to adapt the source into
@@ -1050,7 +1241,19 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           // Mat -> Right tile.move, one step past this boundary.
           // On Ascend910B: don't need to adapt layout! push/pop will be ub -> gm -> mat, ub -> gm can
           // directly use nd
-          if (side == CoreSide::AIV && handler->RequiresVtoCFractalAdapt()) {
+          if (side == CoreSide::AIV && is_mx_scale_boundary) {
+            auto src_type = As<TileType>(push_source->GetType());
+            INTERNAL_CHECK_SPAN(src_type, stmt->span_) << "MX-scale V2C source must have TileType";
+            const TileView source_view = tile_view_semantics::GetEffectiveTileView(*src_type);
+            if (source_view.blayout == TileLayout::col_major) {
+              auto transpose_call = CreateTransposeView(push_source, stmt->span_);
+              auto transpose_var =
+                  std::make_shared<Var>("mx_scale_v2c_view", transpose_call->GetType(), stmt->span_);
+              result.push_back(std::make_shared<AssignStmt>(transpose_var, transpose_call, stmt->span_));
+              push_source = transpose_var;
+            }
+            CheckMxScaleNdPushHasFullValidColumns(push_source, stmt->span_);
+          } else if (side == CoreSide::AIV && handler->RequiresVtoCFractalAdapt()) {
             auto src_type = std::dynamic_pointer_cast<const TileType>(bm.source_tile->GetType());
             INTERNAL_CHECK_SPAN(src_type, stmt->span_) << "V->C tpush source must have TileType";
             // For op-driven boundaries the cube-side transfer memory is Mat
@@ -1085,7 +1288,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             push_source = tmov_var;
           }
           result.push_back(std::make_shared<EvalStmt>(
-              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride), stmt->span_));
+              CreateTpush(push_op, push_source, stmt->span_, op_split, op_lane_stride, is_mx_scale_boundary),
+              stmt->span_));
         } else {
           // Op-driven pop: the half/full shape comes from the op result type and
           // the memory from this side's transfer memory; the explicit follow-on
@@ -1122,7 +1326,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           } else {
             boundary_view = tile_view_semantics::GetEffectiveTileView(*shape_tt);
           }
-          auto fractal_view = BuildCrossCoreTransferView(view_ms, boundary_view);
+          auto fractal_view = is_mx_scale_boundary ? tile_view_semantics::GetEffectiveTileView(*shape_tt)
+                                                   : BuildCrossCoreTransferView(view_ms, boundary_view);
           std::string tpop_name = needs_post_move ? BuildBoundaryTpopName(side, bm.dest_var->name_hint_)
                                                   : bm.dest_var->name_hint_;
           auto tt = std::dynamic_pointer_cast<const TileType>(tpop_type);
@@ -1155,6 +1360,10 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
                 bm.dest_var, CreateMove(tpop_var, *target_memory, bm.dest_var->GetType(), stmt->span_),
                 stmt->span_));
           }
+        }
+        if (!stmt->leading_comments_.empty() && result.size() > first_emitted) {
+          result[first_emitted] =
+              StatementCommentPrepender(stmt->leading_comments_).VisitStmt(result[first_emitted]);
         }
         continue;
       }
@@ -1413,19 +1622,20 @@ struct ExpandedKernel {
   std::optional<FunctionPtr> group_func;  // nullopt when existing Group caller will be rewritten
 };
 
-ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = true) {
+ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group, const AivPlacement& placement,
+                                   bool had_regions) {
   // A tile.transpose that swaps the split axis cannot be split correctly:
   // SplitVectorKernel halves the original split axis, but the transpose moves
   // that data to the other dimension, mis-typing the result. Reject the split
   // request with an actionable error rather than silently miscompiling — the
   // user controls this perf decision (drop the split, or remove the transpose).
   //
-  // Explicit ``pl.split_aiv`` regions are validated per-region by
-  // LowerAutoVectorSplit (pass 20), where each region's mode is unambiguous; skip
+  // SplitRegionConsumer already validated each lexical region using its own
+  // mode; skip
   // the single-func-mode check for them. A multi-mode function carries no single
   // ``func->GetSplitMode()`` and this whole-function check would mis-check the
-  // other region's axis (critique #2).
-  if (!func->HasAttr(kAttrSplitAivRegionValidated)) {
+  // other region's axis.
+  if (!had_regions) {
     if (auto mode = func->GetSplitMode(); mode.has_value() && *mode != SplitMode::None) {
       int split_dim = (*mode == SplitMode::UpDown) ? 0 : 1;
       auto hazard = split_axis::FindTransposeSplitHazard(func->body_, split_dim);
@@ -1460,7 +1670,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // Recursive affinity analysis (descends into ForStmt/IfStmt/WhileStmt)
   std::unordered_map<const Stmt*, CoreAffinity> stmt_map;
   std::unordered_map<const Var*, CoreAffinity> var_affinity;
-  AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs);
+  AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs, placement);
 
   std::map<const Stmt*, CVBoundaryMove> boundary_moves;
   CollectCVBoundaryMoves(stmts, boundary_moves, tpop_defs);
@@ -1479,7 +1689,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // produced, or the pushing lane's body would reference a value it never
   // defines. Checked before either body is built, so the failure names the
   // user's boundary op instead of surfacing in codegen.
-  CheckOpDrivenBoundaryOperands(stmts, boundary_moves, var_affinity, original_def_map);
+  CheckOpDrivenBoundaryOperands(stmts, boundary_moves, var_affinity, original_def_map, placement);
 
   // Boundary-generated tpops never reuse the source-tpop Var (CollectCVBoundaryMoves
   // skips moves whose source comes from a tpop), so no original-tpop statements need
@@ -2173,32 +2383,6 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
   return {std::move(result)};
 }
 
-// Removes the pl.split_aiv region placement stamp LowerAutoVectorSplit left on
-// each region call once this pass has consumed it (see the Phase 5 comment in
-// ExpandMixedKernel, and kCorePlacementAttr in attrs.h for the full lifecycle).
-//
-// Returns the input Call unchanged when the attr is absent, so a program with
-// no regions in it walks through at the cost of the traversal alone.
-class CorePlacementStripper : public IRMutator {
- protected:
-  ExprPtr VisitExpr_(const CallPtr& op) override {
-    auto mutated = IRMutator::VisitExpr_(op);
-    auto call = As<Call>(mutated);
-    if (!call || !call->HasAttr(kCorePlacementAttr)) return mutated;
-    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_,
-                                  StripAttr(call->attrs_, kCorePlacementAttr), call->GetType(), call->span_);
-  }
-};
-
-FunctionPtr StripCorePlacement(const FunctionPtr& func) {
-  if (!func || !func->body_) return func;
-  auto new_body = CorePlacementStripper().VisitStmt(func->body_);
-  if (new_body.get() == func->body_.get()) return func;
-  auto stripped = MutableCopy(func);
-  stripped->body_ = new_body;
-  return stripped;
-}
-
 }  // namespace
 
 namespace pass {
@@ -2280,18 +2464,30 @@ Pass ExpandMixedKernel() {
     std::unordered_map<std::string, RewriteInfo> rewrite_map;
     std::vector<FunctionPtr> new_functions;
 
-    for (const auto& [gvar, func] : program->functions_) {
+    for (const auto& [gvar, original_func] : program->functions_) {
+      auto func = original_func;
       if (func->func_type_ != FunctionType::InCore) {
         new_functions.push_back(func);
         continue;
       }
+
+      SplitRegionConsumer consumer;
+      SplitRegionFinder finder;
+      finder.VisitStmt(func->body_);
+      if (finder.found) {
+        auto body = consumer.VisitStmt(func->body_);
+        auto consumed = MutableCopy(func);
+        consumed->body_ = std::move(body);
+        func = consumed;
+      }
+      const auto& placement = consumer.aiv_only_calls;
 
       // Check if function is mixed (recursive analysis detects ops inside loops/conditionals)
       auto stmts = FlattenBody(func->body_);
       auto tpop_defs = CollectTpopDefs(stmts);
       std::unordered_map<const Stmt*, CoreAffinity> stmt_map;
       std::unordered_map<const Var*, CoreAffinity> var_affinity;
-      auto combined = AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs);
+      auto combined = AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs, placement);
 
       const bool is_deferred_waiter = deferred_waiter_names.count(func->name_) != 0;
 
@@ -2328,7 +2524,8 @@ Pass ExpandMixedKernel() {
       // original function name to resolve to a callable wrapper.
       bool has_group_caller = incore_with_group_caller.count(func->name_) > 0;
       bool needs_preserved_name = incore_with_preserved_name_caller.count(func->name_) > 0;
-      auto expanded = ExpandMixedFunction(func, /*create_group=*/needs_preserved_name || !has_group_caller);
+      auto expanded = ExpandMixedFunction(func, /*create_group=*/needs_preserved_name || !has_group_caller,
+                                          placement, consumer.had_regions);
 
       new_functions.push_back(expanded.aic_func);
       new_functions.push_back(expanded.aiv_func);
@@ -2357,26 +2554,7 @@ Pass ExpandMixedKernel() {
     auto rewritten_program = std::make_shared<Program>(new_functions, program->name_, program->span_);
     new_functions = NormalizeHandWrittenGroupAbis(rewritten_program, new_functions).functions;
 
-    // Phase 5: the region placement stamp is consumed — drop it.
-    //
-    // ``core_placement`` exists solely to carry pl.split_aiv region membership
-    // across the wrapper erasure in LowerAutoVectorSplit, and every reader of
-    // it (ClassifyCallAffinity, via the affinity roll-up above) has now run. It
-    // is stripped rather than left in place because Call::attrs_ is a
-    // reflection UsualField and the python printer serialises attrs open-world:
-    // an un-stripped stamp would show up in every downstream pass dump, in the
-    // print -> parse round-trip, and in every ir.assert_structural_equal a
-    // later pass's tests make — noise that describes a region that no longer
-    // exists. Same lifecycle as ``pipeline_stages`` (set by LowerPipelineLoops,
-    // stripped by CanonicalizeIOOrder).
-    //
-    // The sweep covers EVERY emitted function, not just the split pair: a
-    // region in a function that turned out not to be mixed (converted straight
-    // to AIV, or left alone because it was not InCore) carries the same stamp
-    // and must not keep it either.
-    for (auto& func : new_functions) func = StripCorePlacement(func);
-
-    // Phase 6: give every hand-written V->C push the boundary's fractal layout.
+    // Phase 6: finalize V->C pushes in every emitted AIV function.
     //
     // The sweep covers EVERY emitted AIV function rather than only the ones
     // that were already typed AIV on entry. `tile.tpush_to_aic` declares
@@ -2386,9 +2564,12 @@ Pass ExpandMixedKernel() {
     // AIV function after the per-function loop, so a hook there would leave
     // exactly the bare ND push this adapter exists to prevent.
     //
-    // Running last also makes the boundary-move path's own adapters harmless:
-    // AdaptManualVtoCPush leaves a push whose source already carries the
-    // boundary view alone, so the pushes that path staged are not touched twice.
+    // Compiler-generated MX pushes carry a temporary marker: their carrier was
+    // already planned from the boundary destination, so the sweep strips the
+    // marker and leaves the source unchanged. An unmarked FP8E8M0 MX-scale push
+    // is hand-written (or was produced without the required contract) and
+    // is rejected instead of being silently rewritten to NZ. Other manual V->C
+    // pushes retain the legacy fractal adapter above.
     // The backend is consulted inside the mutator, on the first V->C push it
     // meets, rather than as a guard around this loop: a program with no
     // hand-written push must not require a configured backend just to walk past
