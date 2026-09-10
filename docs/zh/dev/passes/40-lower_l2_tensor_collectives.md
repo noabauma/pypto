@@ -36,7 +36,7 @@ L3 -> L2  consume task                             └── consume       (AIV 
 pass 把合成 kernel 的参数方向转换成排序 `compute -> collective -> consume` 的
 TensorMap 依赖边。放在它们之后改写，会让该 collective task 失去顺序约束。
 
-它同样运行在 [`MaterializeDistTensorCtx`](48-materialize_dist_tensor_ctx.md)
+它同样运行在 [`MaterializeDistTensorCtx`](47-materialize_dist_tensor_ctx.md)
 之前 —— 后者会补上 kernel 需要的 `CommCtx` 实参（见下文 *ABI*）。
 
 ## 行为

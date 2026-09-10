@@ -293,8 +293,8 @@ function attr is the single carrier, until
 `cache` kwarg on each `tile.load` and erases it. Param indices are only valid
 across that window — later passes both append to
 ([`InjectGMPipeBuffer`](25-inject_gm_pipe_buffer.md),
-[`MaterializeDistTensorCtx`](48-materialize_dist_tensor_ctx.md)) and prepend onto
-([`MaterializeValidShapeSymbols`](53-materialize_valid_shape_symbols.md)) param
+[`MaterializeDistTensorCtx`](47-materialize_dist_tensor_ctx.md)) and prepend onto
+([`MaterializeValidShapeSymbols`](52-materialize_valid_shape_symbols.md)) param
 lists. Two user errors are rejected here with `CHECK_SPAN`: a declaration naming
 a tensor the scope body does not capture (it is neither read nor written, so no parameter
 carries the policy), and `BYPASS` on a parameter `InferParamDirections` resolved
@@ -433,7 +433,7 @@ Rules the carry follows:
 
 **Codegen is unchanged.** The yielded value is the call's result on a parameter
 the callee returns, so
-[`ClassifyIterArgCarry`](51-classify_iter_arg_carry.md) puts it in the iter_arg's
+[`ClassifyIterArgCarry`](50-classify_iter_arg_carry.md) puts it in the iter_arg's
 alias class (its written-arg and `TupleGetItemExpr` rules) and marks the carry
 **trivial**: iter_arg and return_var both emit as the init value's name. The carry
 is SSA bookkeeping, not a new buffer. Nothing miscompiled without it either --

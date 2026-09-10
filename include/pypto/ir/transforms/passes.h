@@ -265,20 +265,6 @@ Pass LowerHostTensorCollectives();
 Pass LowerL2TensorCollectives();
 
 /**
- * @brief Inject the ``__tracr_buffer`` GM parameter into kernels that communicate.
- *
- * Gives generated comm kernels somewhere to write TraCR trace records: a plain
- * GM region of 16-byte payloads that the host serializes as a ``.bts`` lane.
- * A function needs it when it issues ``pld.system.notify`` / ``pld.system.wait``;
- * the parameter propagates upward through callers, and Orchestration functions
- * materialize one per call site instead of taking it.
- *
- * A program that never communicates is left byte-identical, which is the pass's
- * only gate — no backend flag, no configuration.
- */
-Pass InjectTracrBuffer();
-
-/**
  * @brief Materialize one CommCtx parameter/argument per DistributedTensor parameter.
  */
 Pass MaterializeDistTensorCtx();

@@ -263,14 +263,6 @@ class PassManager:
             passes.synthesize_allreduce_signals,
             passes.materialize_comm_domain_scopes,
             passes.lower_host_tensor_collectives,
-            # Give every comm-bearing kernel a GM buffer for TraCR records.
-            # Deliberately after AutoDeriveTaskDependencies: a trace buffer
-            # written by several tasks would otherwise become a dependency edge
-            # between them, and the profiler would serialize the schedule it is
-            # measuring. Must precede materialize_dist_tensor_ctx, which appends
-            # CommCtx parameters as a trailing suffix and relies on being last.
-            # A program with no notify/wait passes through untouched.
-            passes.inject_tracr_buffer,
             passes.materialize_dist_tensor_ctx,
             passes.simplify,
             # Hoist each boundary scalar a Graph body derives out to its call

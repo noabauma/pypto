@@ -343,13 +343,12 @@ nav:
           - en/dev/passes/44-synthesize_allreduce_signals.md
           - en/dev/passes/45-materialize_comm_domain_scopes.md
           - en/dev/passes/46-lower_host_tensor_collectives.md
-          - en/dev/passes/47-inject_tracr_buffer.md
-          - en/dev/passes/48-materialize_dist_tensor_ctx.md
-          - en/dev/passes/49-legalize_graph_boundary.md
-          - en/dev/passes/50-materialize_runtime_scopes.md
-          - en/dev/passes/51-classify_iter_arg_carry.md
-          - en/dev/passes/52-insert_comm_fence.md
-          - en/dev/passes/53-materialize_valid_shape_symbols.md
+          - en/dev/passes/47-materialize_dist_tensor_ctx.md
+          - en/dev/passes/48-legalize_graph_boundary.md
+          - en/dev/passes/49-materialize_runtime_scopes.md
+          - en/dev/passes/50-classify_iter_arg_carry.md
+          - en/dev/passes/51-insert_comm_fence.md
+          - en/dev/passes/52-materialize_valid_shape_symbols.md
           - en/dev/passes/91-utility_passes.md
           - en/dev/passes/92-diagnostics.md
           - en/dev/passes/99-verifier.md

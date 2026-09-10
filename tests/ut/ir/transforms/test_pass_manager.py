@@ -66,7 +66,6 @@ TENSOR_OPTIMIZATION_PASSES = [
     "SynthesizeAllReduceSignals",
     "MaterializeCommDomainScopes",
     "LowerHostTensorCollectives",
-    "InjectTracrBuffer",
     "MaterializeDistTensorCtx",
     "Simplify",
     "LegalizeGraphBoundary",

@@ -249,7 +249,6 @@ set(PYPTO_SOURCES
     src/ir/transforms/python_printer.cpp
     src/ir/transforms/simplify_pass.cpp
     src/ir/transforms/inject_gm_pipe_buffer_pass.cpp
-    src/ir/transforms/inject_tracr_buffer_pass.cpp
     src/ir/transforms/unroll_loops_pass.cpp
     src/ir/transforms/skew_cross_core_pipeline_pass.cpp
     src/ir/transforms/lower_pipeline_loops_pass.cpp
@@ -257,7 +256,6 @@ set(PYPTO_SOURCES
     src/ir/transforms/canonicalize_io_order_pass.cpp
     src/ir/transforms/structural_equal.cpp
     src/ir/transforms/structural_hash.cpp
-    src/ir/transforms/utils/inject_gm_buffer.cpp
     src/ir/transforms/utils/acc_init_builder.cpp
     src/ir/transforms/utils/narrow_loop_carry.cpp
     src/ir/transforms/utils/buffer_root_collector.cpp
