@@ -608,6 +608,12 @@ void BindPass(nb::module_& m) {
              "into functions containing cross-core initialize_pipe ops, propagating the parameter\n"
              "through callers (Orchestration functions materialize the buffer locally instead).\n"
              "No-op on backends that don't require GM-backed pipe slots.");
+  passes.def("inject_tracr_buffer", &pass::InjectTracrBuffer,
+             "Create a pass that injects the __tracr_buffer GM parameter into every kernel\n"
+             "issuing pld.system.notify / pld.system.wait, so codegen has somewhere to write\n"
+             "AICore TraCR trace records. Propagates through callers; Orchestration functions\n"
+             "materialize one buffer per call site instead. A program with no communication is\n"
+             "left byte-identical, which is the pass's only gate.");
   passes.def("split_vector_kernel", &pass::SplitVectorKernel,
              "Create a pass that splits vector kernels based on SplitMode "
              "(adjusts tpush/tpop split, halves tpop shapes, adjusts store offsets)");

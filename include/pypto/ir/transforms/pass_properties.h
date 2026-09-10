@@ -72,6 +72,16 @@ inline const PassProperties kLowerHostTensorCollectivesProperties{
 //    explicit ReturnStmt, so no property is required, produced or invalidated.
 inline const PassProperties kLowerL2TensorCollectivesProperties{};
 
+// -- InjectTracrBuffer pass (runs immediately before MaterializeDistTensorCtx) -
+//    Adds the `__tracr_buffer` Out parameter to every kernel issuing
+//    `pld.system.notify` / `pld.system.wait`, so codegen has a GM region for
+//    TraCR records. It only widens signatures and call argument lists, so it
+//    establishes nothing new; it declares what it must not break, which is
+//    exactly what MaterializeDistTensorCtx reads next.
+inline const PassProperties kInjectTracrBufferProperties{
+    .required = {IRProperty::CommDomainScopesMaterialized, IRProperty::ReturnParamsExplicit},
+    .produced = {IRProperty::CommDomainScopesMaterialized, IRProperty::ReturnParamsExplicit}};
+
 // Resolves a returned DistributedTensor to the parameter it writes back via
 // return_lineage::ExplicitReturnedParamIndices, which is a pointer-identity read
 // of the ReturnStmt and only meaningful once NormalizeReturnOrder has

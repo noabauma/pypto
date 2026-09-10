@@ -660,6 +660,20 @@ def lower_auto_vector_split() -> Pass:
     ``split_aiv`` functions.
     """
 
+def inject_tracr_buffer() -> Pass:
+    """Create a pass that injects ``__tracr_buffer`` into kernels that communicate.
+
+    Adds a ``__tracr_buffer`` Out-tensor parameter to every function issuing
+    ``pld.system.notify`` / ``pld.system.wait``, giving generated comm kernels a GM
+    region for AICore TraCR trace records, and propagates it through callers.
+    Orchestration functions materialize one per call site via ``tensor.create``
+    instead of receiving it as a parameter.
+
+    A program that never communicates is left byte-identical — that presence check is
+    the pass's only gate, so non-distributed models see no signature change.
+    """
+    ...
+
 def inject_gm_pipe_buffer() -> Pass:
     """Create a backend-gated pass that injects ``__gm_pipe_buffer`` for cross-core pipes.
 
@@ -1082,6 +1096,7 @@ __all__ = [
     "expand_mixed_kernel",
     "lower_auto_vector_split",
     "inject_gm_pipe_buffer",
+    "inject_tracr_buffer",
     "split_vector_kernel",
     "simplify",
     "lower_composite_ops",
