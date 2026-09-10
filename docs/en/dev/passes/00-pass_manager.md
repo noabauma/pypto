@@ -513,13 +513,13 @@ The PTO-oriented tile stage of `Default` is:
 32. [`SynthesizeAllReduceSignals`](44-synthesize_allreduce_signals.md) (distributed: host allreduce optional signal -> explicit internal signal IR)
 33. [`MaterializeCommDomainScopes`](45-materialize_comm_domain_scopes.md) (distributed: WindowBuffer + CommDomainScopeStmt wrappers in each host_orch body; no-op for comm-less programs)
 34. [`LowerHostTensorCollectives`](46-lower_host_tensor_collectives.md) (host-level tensor collectives -> internal builtin chip dispatches)
-35. [`MaterializeDistTensorCtx`](47-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
+35. [`MaterializeDistTensorCtx`](48-materialize_dist_tensor_ctx.md) (explicit CommCtx params/args for DistributedTensor params)
 36. `Simplify`
-37. [`LegalizeGraphBoundary`](48-legalize_graph_boundary.md) (hoists values a Graph body derives from its boundary scalars to the call sites, and rejects the boundaries the host_build_graph runtime cannot record; no-op for programs with no Graph function)
-38. [`MaterializeRuntimeScopes`](49-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits SIMPLER_SCOPE 1:1)
-39. [`ClassifyIterArgCarry`](50-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
-40. [`InsertCommFence`](51-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs after every statement-reordering pass so the inserted ops stay adjacent to their notify through codegen)
-41. [`MaterializeValidShapeSymbols`](52-materialize_valid_shape_symbols.md) (runs dead last; turns each device-kernel valid_shape symbol the kernel cannot bind into a leading Scalar[INDEX] param fed from the call site's actual valid extent)
+37. [`LegalizeGraphBoundary`](49-legalize_graph_boundary.md) (hoists values a Graph body derives from its boundary scalars to the call sites, and rejects the boundaries the host_build_graph runtime cannot record; no-op for programs with no Graph function)
+38. [`MaterializeRuntimeScopes`](50-materialize_runtime_scopes.md) (inserts AUTO RuntimeScopeStmt so orchestration codegen emits SIMPLER_SCOPE 1:1)
+39. [`ClassifyIterArgCarry`](51-classify_iter_arg_carry.md) (stamps each ForStmt iter_arg as trivial alias / rebind carry, and sizes manual-scope TaskId fence arrays)
+40. [`InsertCommFence`](52-insert_comm_fence.md) (inserts a whole-tensor system.cacheinvalid + GM system.fence between each publishing write and the pld.system.notify that releases it; runs after every statement-reordering pass so the inserted ops stay adjacent to their notify through codegen)
+41. [`MaterializeValidShapeSymbols`](53-materialize_valid_shape_symbols.md) (runs dead last; turns each device-kernel valid_shape symbol the kernel cannot bind into a leading Scalar[INDEX] param fed from the call site's actual valid extent)
 
 [`ResolveBackendOpLayouts`](22-resolve_backend_op_layouts.md) repairs
 backend-constrained elementwise tile ops using registered layout metadata.

@@ -61,12 +61,13 @@ pass；`91` 及以后保留给"在多个位置运行的 pass"以及"根本不是
 | 44 | [SynthesizeAllReduceSignals](44-synthesize_allreduce_signals.md) | 把 host allreduce 的可选 signal 转为显式的内部 signal IR |
 | 45 | [MaterializeCommDomainScopes](45-materialize_comm_domain_scopes.md) | 在每个 host 编排函数体内装配 `WindowBuffer` 与 `CommDomainScopeStmt` 包装 |
 | 46 | [LowerHostTensorCollectives](46-lower_host_tensor_collectives.md) | 把 host 级 tensor 集合通信改写为内部 builtin chip 派发 |
-| 47 | [MaterializeDistTensorCtx](47-materialize_dist_tensor_ctx.md) | 为每个 `DistributedTensor` 物化显式的 `CommCtx` 参数与实参 |
-| 48 | [LegalizeGraphBoundary](48-legalize_graph_boundary.md) | 把 `Graph` 函数体内派生的边界标量外提到调用点，并拒绝 `host_build_graph` runtime 无法录制的边界 |
-| 49 | [MaterializeRuntimeScopes](49-materialize_runtime_scopes.md) | 插入 AUTO `RuntimeScopeStmt` 使编排 codegen 能 1:1 发射 `SIMPLER_SCOPE` |
-| 50 | [ClassifyIterArgCarry](50-classify_iter_arg_carry.md) | 把编排层 `ForStmt` 的每个 iter_arg 分类为平凡别名或需物化的重绑定携带 |
-| 51 | [InsertCommFence](51-insert_comm_fence.md) | 为每个发布性写入打标记（本地：region `system.cacheinvalid` + `system.fence`；远端写：仅 fence；opaque 写：whole-GM），并为每个 wait 插入 whole-GM `system.cacheinvalid`；notify 本身不加任何标记 |
-| 52 | [MaterializeValidShapeSymbols](52-materialize_valid_shape_symbols.md) | 将设备 kernel 中无法绑定的 `valid_shape` 符号转换为前置的 `Scalar[INDEX]` 参数，并传入调用方的实际有效范围 |
+| 47 | [InjectTracrBuffer](47-inject_tracr_buffer.md) | 为每个发出 `pld.system.notify` / `pld.system.wait` 的 kernel 追加 `__tracr_buffer` Out 参数，使 codegen 有一块 GM 区域写 AICore TraCR 记录；不含通信的程序保持逐字节不变 |
+| 48 | [MaterializeDistTensorCtx](48-materialize_dist_tensor_ctx.md) | 为每个 `DistributedTensor` 物化显式的 `CommCtx` 参数与实参 |
+| 49 | [LegalizeGraphBoundary](49-legalize_graph_boundary.md) | 把 `Graph` 函数体内派生的边界标量外提到调用点，并拒绝 `host_build_graph` runtime 无法录制的边界 |
+| 50 | [MaterializeRuntimeScopes](50-materialize_runtime_scopes.md) | 插入 AUTO `RuntimeScopeStmt` 使编排 codegen 能 1:1 发射 `SIMPLER_SCOPE` |
+| 51 | [ClassifyIterArgCarry](51-classify_iter_arg_carry.md) | 把编排层 `ForStmt` 的每个 iter_arg 分类为平凡别名或需物化的重绑定携带 |
+| 52 | [InsertCommFence](52-insert_comm_fence.md) | 为每个发布性写入打标记（本地：region `system.cacheinvalid` + `system.fence`；远端写：仅 fence；opaque 写：whole-GM），并为每个 wait 插入 whole-GM `system.cacheinvalid`；notify 本身不加任何标记 |
+| 53 | [MaterializeValidShapeSymbols](53-materialize_valid_shape_symbols.md) | 将设备 kernel 中无法绑定的 `valid_shape` 符号转换为前置的 `Scalar[INDEX]` 参数，并传入调用方的实际有效范围 |
 
 ## 默认流水线之外
 

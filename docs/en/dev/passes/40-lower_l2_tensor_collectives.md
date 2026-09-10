@@ -40,7 +40,7 @@ parameter directions into the TensorMap edges that order
 the collective task unordered.
 
 It also runs before
-[`MaterializeDistTensorCtx`](47-materialize_dist_tensor_ctx.md), which appends
+[`MaterializeDistTensorCtx`](48-materialize_dist_tensor_ctx.md), which appends
 the `CommCtx` arguments the kernel needs (see *ABI* below).
 
 ## Behavior

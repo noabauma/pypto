@@ -278,7 +278,7 @@ c_1` —— 返回的是重绑定而不是形参本身，所以 Graph 一直依�
 ## 在流水线中的位置
 
 跑在最后一个 `Simplify` 之后、
-[`MaterializeRuntimeScopes`](49-materialize_runtime_scopes.md) 之前。
+[`MaterializeRuntimeScopes`](50-materialize_runtime_scopes.md) 之前。
 
 这个位置是两边夹出来的。`DeriveCallDirections` 和 `AutoDeriveTaskDependencies`
 必须已经跑完，这样实参方向与跨任务边才是已知的；而 `MaterializeRuntimeScopes`
@@ -311,4 +311,4 @@ verifier 拒绝本 pass 刚刚产出的 IR。
 ## 另见
 
 - [Pass Manager](00-pass_manager.md) —— 完整流水线顺序
-- [MaterializeRuntimeScopes](49-materialize_runtime_scopes.md) —— 紧随其后运行
+- [MaterializeRuntimeScopes](50-materialize_runtime_scopes.md) —— 紧随其后运行

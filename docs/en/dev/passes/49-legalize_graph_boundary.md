@@ -324,7 +324,7 @@ the map is all-nullopt and the hoists silently do nothing.
 ## Position in the pipeline
 
 Runs after the final `Simplify` and immediately before
-[`MaterializeRuntimeScopes`](49-materialize_runtime_scopes.md).
+[`MaterializeRuntimeScopes`](50-materialize_runtime_scopes.md).
 
 That position is forced from both sides. `DeriveCallDirections` and
 `AutoDeriveTaskDependencies` must already have run, so argument directions and
@@ -364,4 +364,4 @@ instead of the graph heap, which is independent of where the caller puts it.
 ## See also
 
 - [Pass Manager](00-pass_manager.md) — full pipeline order
-- [MaterializeRuntimeScopes](49-materialize_runtime_scopes.md) — runs immediately after
+- [MaterializeRuntimeScopes](50-materialize_runtime_scopes.md) — runs immediately after

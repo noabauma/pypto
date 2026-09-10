@@ -64,12 +64,13 @@ a pipeline pass at all.
 | 44 | [SynthesizeAllReduceSignals](44-synthesize_allreduce_signals.md) | Turns a host allreduce's optional signal into explicit internal signal IR |
 | 45 | [MaterializeCommDomainScopes](45-materialize_comm_domain_scopes.md) | Assembles `WindowBuffer` and `CommDomainScopeStmt` wrappers in each host orchestration body |
 | 46 | [LowerHostTensorCollectives](46-lower_host_tensor_collectives.md) | Rewrites host-level tensor collectives into internal builtin chip dispatches |
-| 47 | [MaterializeDistTensorCtx](47-materialize_dist_tensor_ctx.md) | Materializes an explicit `CommCtx` parameter and argument per `DistributedTensor` |
-| 48 | [LegalizeGraphBoundary](48-legalize_graph_boundary.md) | Hoists the boundary scalars a `Graph` body derives out to its call sites, and rejects boundaries the `host_build_graph` runtime could not record |
-| 49 | [MaterializeRuntimeScopes](49-materialize_runtime_scopes.md) | Inserts AUTO `RuntimeScopeStmt` nodes so orchestration codegen emits `SIMPLER_SCOPE` 1:1 |
-| 50 | [ClassifyIterArgCarry](50-classify_iter_arg_carry.md) | Classifies each orchestration `ForStmt` iter_arg as a trivial alias or a materialised rebind carry |
-| 51 | [InsertCommFence](51-insert_comm_fence.md) | Marks each publishing write (region `system.cacheinvalid` + `system.fence` locally, fence only for a remote write, whole-GM for an opaque one) and each wait (whole-GM `system.cacheinvalid`); the notify itself gets no marker |
-| 52 | [MaterializeValidShapeSymbols](52-materialize_valid_shape_symbols.md) | Turns each device-kernel `valid_shape` symbol the kernel cannot bind into a leading `Scalar[INDEX]` parameter, fed the caller's actual valid extent |
+| 47 | [InjectTracrBuffer](47-inject_tracr_buffer.md) | Adds the `__tracr_buffer` Out parameter to every kernel issuing `pld.system.notify` / `pld.system.wait`, so codegen has a GM region for AICore TraCR records; a program with no communication is left byte-identical |
+| 48 | [MaterializeDistTensorCtx](48-materialize_dist_tensor_ctx.md) | Materializes an explicit `CommCtx` parameter and argument per `DistributedTensor` |
+| 49 | [LegalizeGraphBoundary](49-legalize_graph_boundary.md) | Hoists the boundary scalars a `Graph` body derives out to its call sites, and rejects boundaries the `host_build_graph` runtime could not record |
+| 50 | [MaterializeRuntimeScopes](50-materialize_runtime_scopes.md) | Inserts AUTO `RuntimeScopeStmt` nodes so orchestration codegen emits `SIMPLER_SCOPE` 1:1 |
+| 51 | [ClassifyIterArgCarry](51-classify_iter_arg_carry.md) | Classifies each orchestration `ForStmt` iter_arg as a trivial alias or a materialised rebind carry |
+| 52 | [InsertCommFence](52-insert_comm_fence.md) | Marks each publishing write (region `system.cacheinvalid` + `system.fence` locally, fence only for a remote write, whole-GM for an opaque one) and each wait (whole-GM `system.cacheinvalid`); the notify itself gets no marker |
+| 53 | [MaterializeValidShapeSymbols](53-materialize_valid_shape_symbols.md) | Turns each device-kernel `valid_shape` symbol the kernel cannot bind into a leading `Scalar[INDEX]` parameter, fed the caller's actual valid extent |
 
 ## Outside the default pipeline
 
