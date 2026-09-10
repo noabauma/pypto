@@ -687,6 +687,7 @@ std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr,
   fs_.body_section.clear();
   gm_slot_buffer_offsets_.clear();
   needs_deferred_completion_adapter_ = false;
+  needs_tracr_comm_markers_ = false;
   PrepareGMSlotBufferLayout(program);
 
   const std::string target_arch = backend_->GetHandler()->GetPtoTargetArch();
@@ -708,6 +709,7 @@ std::string PTOCodegen::Generate(const ProgramPtr& program, bool emit_tile_addr,
   }
 
   EmitDeferredCompletionAdapterDeclaration();
+  EmitTracrCommMarkerDeclarations();
 
   stream_ << "}\n";
   return stream_.str();
@@ -843,6 +845,17 @@ std::string PTOCodegen::EmitCommRemoteOffsetInline(const std::string& ctx_ssa, c
 std::string PTOCodegen::RegisterDeferredCompletionAdapter() {
   needs_deferred_completion_adapter_ = true;
   return kDeferredCompletionAdapterName;
+}
+
+void PTOCodegen::RegisterTracrCommMarkers() { needs_tracr_comm_markers_ = true; }
+
+void PTOCodegen::EmitTracrCommMarkerDeclarations() {
+  if (!needs_tracr_comm_markers_) return;
+  // Declaration-only: ptoas emits `extern "C" AICORE void tracr_mark_set(...)`
+  // and leaves resolution to the C++ compiler, which finds the definition in
+  // the prologue PyPTO writes above ptoas's output.
+  stream_ << "  func.func private @tracr_mark_set(i32, i32, i32)\n";
+  stream_ << "  func.func private @tracr_mark_reset(i32)\n";
 }
 
 void PTOCodegen::EmitDeferredCompletionAdapterDeclaration() {

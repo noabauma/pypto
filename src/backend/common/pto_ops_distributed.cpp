@@ -451,6 +451,39 @@ static std::string MakeRemoteStoreCodegenPTO(const CallPtr& op, codegen::Codegen
   return "";
 }
 
+/// TraCR marker ids for communication spans.
+///
+/// These are positions in `MARKER_TYPES` in the runtime's
+/// `tools/tracr_simpler_markers.hpp`: a marker's index *is* its wire id, so the
+/// two lists must move together and entries may only be appended. The host
+/// re-verifies the names against the metadata every run, so a drift here fails
+/// loudly rather than mislabelling a lane.
+constexpr int kTracrEventCommNotify = 19;
+constexpr int kTracrEventCommWait = 20;
+
+/// Channel placeholder. The kernel cannot know its lane index -- the channel
+/// table is sized by the run's core count -- so it writes 0 and the host stamps
+/// the resolved index when it serializes. Same contract as the D1 AICore lane.
+constexpr int kTracrChannelPlaceholder = 0;
+
+/// Open a TraCR span around the comm op about to be emitted.
+void EmitTracrCommMarkSet(codegen::PTOCodegen &codegen, int event_id) {
+  codegen.RegisterTracrCommMarkers();
+  const std::string chan = codegen.GetOrEmitConstant(static_cast<int64_t>(kTracrChannelPlaceholder),
+                                                     DataType::INT32);
+  const std::string ev = codegen.GetOrEmitConstant(static_cast<int64_t>(event_id), DataType::INT32);
+  const std::string extra = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INT32);
+  codegen.Emit("func.call @tracr_mark_set(" + chan + ", " + ev + ", " + extra + ") : (i32, i32, i32) -> ()");
+}
+
+/// Close it. Must follow the op, so the span covers the wait rather than ending
+/// before it -- the whole point is measuring how long the wait took.
+void EmitTracrCommMarkReset(codegen::PTOCodegen &codegen) {
+  const std::string chan = codegen.GetOrEmitConstant(static_cast<int64_t>(kTracrChannelPlaceholder),
+                                                     DataType::INT32);
+  codegen.Emit("func.call @tracr_mark_reset(" + chan + ") : (i32) -> ()");
+}
+
 // pld.system.notify(target, peer, offsets, value, *, op) — atomically signal a
 // peer rank's slot in a DistributedTensor signal matrix.
 //   delems = <inline CommContext peer-offset arithmetic> : index
@@ -513,7 +546,9 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
   std::ostringstream tnotify;
   tnotify << "pto.comm.tnotify(" << partition_view << ", " << value_ssa << " : " << partition_type << ", "
           << value_type << ") {notifyOp = #pto<notify_op " << notify_attr << ">}";
+  EmitTracrCommMarkSet(codegen, kTracrEventCommNotify);
   codegen.Emit(tnotify.str());
+  EmitTracrCommMarkReset(codegen);
   return "";
 }
 
@@ -574,7 +609,9 @@ static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
   std::ostringstream twait;
   twait << "pto.comm.twait(" << partition_view << ", " << expected_ssa << " : " << partition_type << ", "
         << expected_type << ") {cmp = #pto<wait_cmp " << cmp_attr << ">}";
+  EmitTracrCommMarkSet(codegen, kTracrEventCommWait);
   codegen.Emit(twait.str());
+  EmitTracrCommMarkReset(codegen);
   return "";
 }
 

@@ -1732,6 +1732,26 @@ class TestGenerateKernelWrapper:
         assert "#include <pto/pto-inst.hpp>" in wrapper
         assert '#include "tensor.h"' in wrapper
 
+    def test_comm_kernel_prologue_defines_the_tracr_marker_entry_points(self):
+        """A kernel with comm ops gets the emitter header; one without does not.
+
+        This is the last link in C1's chain. PTOCodegen emits `func.call
+        @tracr_mark_set`, ptoas turns that into an `extern "C" AICORE`
+        declaration, and the definition has to come from somewhere or the C++
+        compile fails on an unresolved symbol. The prologue is the only part of
+        the generated file PyPTO controls, so it is where the include goes.
+
+        The header's entry points compile to nothing without -DENABLE_TRACR, so
+        including it is free in a production build.
+        """
+        comm_func = _make_func("comm_kernel", [("sig", "tensor"), ("peer", "scalar")])
+        wrapper = _generate_kernel_wrapper(comm_func, SAMPLE_PTOAS_OUTPUT, uses_tracr_comm_markers=True)
+        assert '#include "aicore/tracr_aicore_emit.h"' in wrapper, wrapper
+
+        plain = _make_func("plain_kernel", [("a", "tensor"), ("out", "tensor")])
+        wrapper = _generate_kernel_wrapper(plain, SAMPLE_PTOAS_OUTPUT, uses_tracr_comm_markers=False)
+        assert "tracr" not in wrapper, wrapper
+
     def test_clears_atomic_mode_before_argument_unpacking(self):
         func = _make_func("my_kernel", [("a", "tensor"), ("s", "scalar"), ("out", "tensor")])
         wrapper = _generate_kernel_wrapper(func, SAMPLE_PTOAS_OUTPUT)

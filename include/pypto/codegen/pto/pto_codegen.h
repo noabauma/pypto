@@ -577,6 +577,19 @@ class PTOCodegen : public CodegenBase {
   std::string RegisterDeferredCompletionAdapter();
 
   /**
+   * @brief Register the module-level TraCR comm marker declarations.
+   *
+   * Called by the ``pld.system.notify`` / ``pld.system.wait`` lowering when it
+   * wraps the op in a marker pair. The declarations are emitted once at module
+   * scope; ptoas passes an externally-declared function straight through as an
+   * ``extern "C" AICORE`` call, and the definitions come from the runtime's
+   * `aicore/tracr_aicore_emit.h`, which the generated kernel's prologue includes.
+   * Those definitions compile to nothing without -DENABLE_TRACR, so the emitted
+   * calls are free in a production build.
+   */
+  void RegisterTracrCommMarkers();
+
+  /**
    * @brief SSA name of the synthetic SPMD block_idx param.
    *
    * When the current function uses tile.get_block_idx / tile.get_block_num,
@@ -798,6 +811,7 @@ class PTOCodegen : public CodegenBase {
 
   /// Emit the external declaration implemented by the generated kernel wrapper.
   void EmitDeferredCompletionAdapterDeclaration();
+  void EmitTracrCommMarkerDeclarations();
 
   /**
    * @brief Build variable identity to MemRef mapping from function body
@@ -1148,6 +1162,8 @@ class PTOCodegen : public CodegenBase {
 
   /// True when the module needs the wrapper-defined counter-completion adapter.
   bool needs_deferred_completion_adapter_ = false;
+  /// True when this module emitted TraCR comm markers and needs their declarations.
+  bool needs_tracr_comm_markers_{false};
 
   const backend::Backend* backend_;  ///< Backend instance for querying op info
 

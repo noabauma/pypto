@@ -263,10 +263,19 @@ _KERNEL_HEADER = """\
 {subblock_override}#include <pto/pto-inst.hpp>
 #include "tensor.h"
 {deferred_completion_include}
-{spmd_override}
+{tracr_marker_include}{spmd_override}
 
 using namespace pto;
 
+"""
+
+_TRACR_MARKER_INCLUDE = """\
+// --- TraCR communication markers ---
+// Defines the extern "C" entry points ptoas declared for the marker calls
+// PTOCodegen emitted around each notify/wait. Every one of them compiles to
+// nothing without -DENABLE_TRACR, so this include costs a production build
+// exactly nothing -- the same contract orchestration codegen relies on.
+#include "aicore/tracr_aicore_emit.h"
 """
 
 _DEFERRED_COMPLETION_ADAPTER = """\
@@ -679,6 +688,14 @@ _AIV_FIFO_ENDPOINT_OPS = frozenset(
 _SDMA_WORKSPACE_OPS = frozenset({_ir_core.get_op("prefetch.make_context").name})
 _DEFERRED_COMPLETION_OPS = frozenset({_ir_core.get_op("pld.system.defer_wait").name})
 
+# The two ops PTOCodegen wraps in TraCR marker pairs. Kept in step with
+# `EmitTracrCommMarkSet` call sites in src/backend/common/pto_ops_distributed.cpp:
+# if codegen emits a marker, the prologue must supply its definition or ptoas's
+# `extern "C"` declaration has nothing to resolve against.
+_TRACR_COMM_OPS = frozenset(
+    {_ir_core.get_op("pld.system.notify").name, _ir_core.get_op("pld.system.wait").name}
+)
+
 
 def _function_uses_ops(func: _ir_core.Function, op_names: frozenset[str]) -> bool:
     """Return whether the function body invokes any op in ``op_names``.
@@ -726,6 +743,11 @@ def _uses_sdma_workspace(func: _ir_core.Function) -> bool:
 def _uses_deferred_completion(func: _ir_core.Function) -> bool:
     """Return whether the wrapper must expose the scheduler AsyncCtx."""
     return _function_uses_ops(func, _DEFERRED_COMPLETION_OPS)
+
+
+def _uses_tracr_comm_markers(func: _ir_core.Function) -> bool:
+    """Return whether this kernel's prologue must define the TraCR marker entry points."""
+    return _function_uses_ops(func, _TRACR_COMM_OPS)
 
 
 def _requires_dual_aiv_dispatch(func: _ir_core.Function) -> bool:
@@ -945,6 +967,7 @@ def _generate_kernel_header(
     uses_subblock: bool | None = None,
     uses_sdma: bool | None = None,
     uses_deferred_completion: bool | None = None,
+    uses_tracr_comm_markers: bool | None = None,
 ) -> str:
     """Generate the wrapper header, including split lane overrides when needed."""
     fixed_subblock_id = _get_fixed_subblock_id(func)
@@ -973,14 +996,18 @@ def _generate_kernel_header(
         uses_sdma = _uses_sdma_workspace(func)
     if uses_deferred_completion is None:
         uses_deferred_completion = _uses_deferred_completion(func)
+    if uses_tracr_comm_markers is None:
+        uses_tracr_comm_markers = _uses_tracr_comm_markers(func)
     needs_intrinsic = uses_spmd or uses_subblock or uses_sdma
     spmd_override = '#include "intrinsic.h"\n' if needs_intrinsic else ""
     deferred_completion_include = _DEFERRED_COMPLETION_INCLUDE if uses_deferred_completion else ""
+    tracr_marker_include = _TRACR_MARKER_INCLUDE if uses_tracr_comm_markers else ""
 
     return _KERNEL_HEADER.format(
         func_name=func.name,
         subblock_override=subblock_override,
         deferred_completion_include=deferred_completion_include,
+        tracr_marker_include=tracr_marker_include,
         spmd_override=spmd_override,
     )
 
@@ -990,6 +1017,7 @@ def _generate_kernel_wrapper(
     ptoas_code: str,
     *,
     group_uses_spmd: bool = False,
+    uses_tracr_comm_markers: bool | None = None,
 ) -> str:
     """Generate a complete kernel wrapper file for one InCore function.
 
@@ -1003,6 +1031,8 @@ def _generate_kernel_wrapper(
     func_uses_subblock = _uses_dynamic_subblock_id(func)
     func_uses_sdma = _uses_sdma_workspace(func)
     func_uses_deferred_completion = _uses_deferred_completion(func)
+    if uses_tracr_comm_markers is None:
+        uses_tracr_comm_markers = _uses_tracr_comm_markers(func)
     ptoas_body = _preprocess_ptoas_output(ptoas_code)
     ptoas_body, fifo_uses_subblock = _forward_runtime_lane_to_split_fifo_calls(func, ptoas_body)
     wrapper_uses_subblock = func_uses_subblock or fifo_uses_subblock
@@ -1011,6 +1041,7 @@ def _generate_kernel_wrapper(
         uses_spmd=uses_spmd,
         uses_subblock=wrapper_uses_subblock,
         uses_sdma=func_uses_sdma,
+        uses_tracr_comm_markers=uses_tracr_comm_markers,
         uses_deferred_completion=func_uses_deferred_completion,
     )
     unpacking_code, var_names = _generate_arg_unpacking(func, uses_spmd=uses_spmd)

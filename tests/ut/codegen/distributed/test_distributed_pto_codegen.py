@@ -89,6 +89,74 @@ def _generate_outlined_waiter_mlir(program_cls) -> str:
     return codegen.PTOCodegen().generate(ir.Program(incore, incore[0].name, optimized.span))
 
 
+def test_comm_ops_are_wrapped_in_tracr_marker_pairs():
+    """Every lowered notify and wait carries a TraCR span, with zero user markers.
+
+    This is C1's deliverable: a compiled model gets communication spans on the
+    AICore lane without anyone hand-placing a marker.
+
+    The marker is reached from PTO IR as a declaration-only ``func.func
+    private``, which ptoas passes through as an ``extern "C" AICORE`` call and
+    leaves the C++ compiler to resolve against the definition in the prologue
+    PyPTO writes. That is why the call takes no buffer: it fetches the per-core
+    slice from the accessor the AICore kernel entry published, and why the ids
+    below are integers rather than names --- the emitter cannot see simpler's
+    MarkerType enum.
+
+    The ids are positions in ``MARKER_TYPES``
+    (``runtime/tools/tracr_simpler_markers.hpp``); the host re-verifies the names
+    against each run's metadata, so drift fails loudly rather than mislabelling.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            signal: pld.DistributedTensor[[16, 16], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            pld.system.notify(target=signal, peer=peer, offsets=[0, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            pld.system.wait(signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Eq)
+
+    mlir = _generate_mlir(P)
+
+    # Declared once at module scope, with no body -- a body would strand its
+    # return outside the per-lane guard in a mixed kernel.
+    assert mlir.count("func.func private @tracr_mark_set(i32, i32, i32)") == 1, mlir
+    assert mlir.count("func.func private @tracr_mark_reset(i32)") == 1, mlir
+
+    # One pair per comm op: notify and wait.
+    assert mlir.count("func.call @tracr_mark_set(") == 2, mlir
+    assert mlir.count("func.call @tracr_mark_reset(") == 2, mlir
+
+    # CommNotify == 19 and CommWait == 20 in MARKER_TYPES.
+    assert "arith.constant 19 : i32" in mlir, mlir
+    assert "arith.constant 20 : i32" in mlir, mlir
+
+    # The set must precede its op and the reset follow it, or the span would
+    # close before the wait it exists to measure.
+    lines = [line.strip() for line in mlir.splitlines()]
+    wait_at = next(i for i, line in enumerate(lines) if line.startswith("pto.comm.twait("))
+    before = [i for i, line in enumerate(lines) if "@tracr_mark_set(" in line and i < wait_at]
+    after = [i for i, line in enumerate(lines) if "@tracr_mark_reset(" in line and i > wait_at]
+    assert before and after, mlir
+
+
+def test_program_without_comm_emits_no_tracr_markers():
+    """No communication, no markers, no declarations."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, inp: pl.Tensor[[16, 32], pl.FP16], out: pl.Tensor[[16, 32], pl.FP16]):
+            t = pl.load(inp, [0, 0], [16, 32])
+            pl.store(t, [0, 0], out)
+
+    mlir = _generate_mlir(P)
+    assert "tracr_mark" not in mlir, mlir
+
+
 def test_ctx_arg_materialized_per_distributed_tensor():
     """One explicit ``!pto.ptr<i64>`` arg is emitted per DistributedTensor param."""
 
@@ -1983,7 +2051,17 @@ def test_mixed_cube_vector_kernel_emits_no_module_level_offset_helper():
     funcs = _split_module(mlir)
     assert not any(name.startswith("CommRemoteOffset") for name in funcs), sorted(funcs)
     assert "CommRemoteOffset" not in mlir, mlir
-    assert "func.call" not in mlir, mlir
+    # `func.call` was a sufficient proxy for "module-level helper" while the
+    # offset helper was the only thing emitting one. TraCR's comm markers now
+    # emit calls too, and they are NOT this hazard: their `func.func private`
+    # carries no body, so ptoas emits only an `extern "C" AICORE` declaration at
+    # module scope and puts each call inside its own lane's guard --- verified on
+    # ptoas 0.60 against a two-kernel_kind module, `#if defined(__DAV_VEC__)` and
+    # `#if defined(__DAV_CUBE__)` respectively. What must stay absent is a
+    # module-level helper with a value-returning body, which is what strands a
+    # `return` outside the guard.
+    foreign_calls = [line for line in mlir.splitlines() if "func.call" in line and "@tracr_" not in line]
+    assert not foreign_calls, foreign_calls
     # The comm ops are still lowered — a vacuous pass would satisfy the above.
     assert "pto.comm.tput(" in mlir, mlir
     assert "pto.comm.tnotify(" in mlir, mlir
