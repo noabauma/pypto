@@ -784,6 +784,24 @@ void PTOCodegen::PrepareGMSlotBufferLayout(const ProgramPtr& program) {
 // Distributed N6: inline peer-offset (CommContext) arithmetic
 // ========================================================================
 
+std::string PTOCodegen::EmitCommRankId(const std::string& ctx_ssa) {
+  auto cached = fs_.comm_rank_id_ssa.find(ctx_ssa);
+  if (cached != fs_.comm_rank_id_ssa.end()) return cached->second;
+
+  namespace cl = codegen::distributed::comm_layout;
+  // One pto.load_scalar step is one u64 slot; the offset is pinned by
+  // static_assert in comm_layout.h, so a runtime ABI shift fails the PyPTO
+  // compile rather than silently reading the wrong field.
+  const int64_t k_rank_idx = static_cast<int64_t>(cl::kRankIdOffset / cl::kWindowSlotStride);
+  const std::string c_r = GetOrEmitConstant(k_rank_idx, DataType::INDEX);
+  const std::string rk_pair = NewTemp();
+  Emit(rk_pair + " = pto.load_scalar " + ctx_ssa + "[" + c_r + "] : !pto.ptr<i64> -> i64");
+  const std::string rk_i32 = NewTemp();
+  Emit(rk_i32 + " = arith.trunci " + rk_pair + " : i64 to i32");
+  fs_.comm_rank_id_ssa.emplace(ctx_ssa, rk_i32);
+  return rk_i32;
+}
+
 std::string PTOCodegen::EmitCommRemoteOffsetInline(const std::string& ctx_ssa, const std::string& peer_ssa,
                                                    const DataType& dtype) {
   // Sub-byte dtypes (bool / 4-bit) have no whole-byte element stride, so the
@@ -800,21 +818,16 @@ std::string PTOCodegen::EmitCommRemoteOffsetInline(const std::string& ctx_ssa, c
   // step = one slot). Pinned via static_assert in
   // include/pypto/codegen/distributed/comm_layout.h so a runtime ABI shift
   // fails PyPTO compilation rather than silently emitting wrong addresses.
-  const int64_t k_rank_idx = static_cast<int64_t>(cl::kRankIdOffset / cl::kWindowSlotStride);
   const int64_t k_win_idx = static_cast<int64_t>(cl::kWindowsInOffset / cl::kWindowSlotStride);
 
   // Every value below gets a fresh SSA name (constants are deduplicated into
   // the function's constants section), so a function may hold any number of
   // remote ops without name collisions.
-  const std::string c_r = GetOrEmitConstant(k_rank_idx, DataType::INDEX);
   const std::string c_w = GetOrEmitConstant(k_win_idx, DataType::INDEX);
 
   // Read rankId (the low 32 bits of the (rankId, rankNum) 8-byte slot at
   // u64 index k_rank_idx).
-  const std::string rk_pair = NewTemp();
-  Emit(rk_pair + " = pto.load_scalar " + ctx_ssa + "[" + c_r + "] : !pto.ptr<i64> -> i64");
-  const std::string rk_i32 = NewTemp();
-  Emit(rk_i32 + " = arith.trunci " + rk_pair + " : i64 to i32");
+  const std::string rk_i32 = EmitCommRankId(ctx_ssa);
   const std::string rk_idx = NewTemp();
   Emit(rk_idx + " = arith.index_cast " + rk_i32 + " : i32 to index");
 
@@ -856,6 +869,7 @@ void PTOCodegen::EmitTracrCommMarkerDeclarations() {
   // the prologue PyPTO writes above ptoas's output.
   stream_ << "  func.func private @tracr_mark_set(i32, i32, i32)\n";
   stream_ << "  func.func private @tracr_mark_reset(i32)\n";
+  stream_ << "  func.func private @tracr_flow_start(i32, i32, i32, i32)\n";
 }
 
 void PTOCodegen::EmitDeferredCompletionAdapterDeclaration() {

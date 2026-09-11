@@ -590,6 +590,15 @@ class PTOCodegen : public CodegenBase {
   void RegisterTracrCommMarkers();
 
   /**
+   * @brief Emit the read of this rank's id from a CommContext, as i32.
+   *
+   * Shared by the remote-offset lowering (which needs it to index windowsIn)
+   * and the TraCR arrow tail (which needs it as the arrow's source). The slot
+   * index comes from comm_layout.h rather than a literal.
+   */
+  std::string EmitCommRankId(const std::string& ctx_ssa);
+
+  /**
    * @brief SSA name of the synthetic SPMD block_idx param.
    *
    * When the current function uses tile.get_block_idx / tile.get_block_num,
@@ -983,6 +992,12 @@ class PTOCodegen : public CodegenBase {
     std::string constants_indent;  ///< Fixed indent for constants_section (set once per function)
 
     std::map<const ir::Var*, std::string> var_to_mlir;
+    /// Memoized `rankId` read per CommContext SSA, so a function with several
+    /// comm ops loads it once. The value is loop-invariant and a GM scalar load
+    /// sits on the critical path of the communication being measured, which
+    /// matters most for the TraCR arrow tail: a profiler must not add traffic to
+    /// the thing it observes.
+    std::map<std::string, std::string> comm_rank_id_ssa;
     /// Symbols that appear ONLY in a tensor parameter's valid_shape, mapped to
     /// that parameter's name. Such a symbol is bound at the call site, so a
     /// precompiled kernel never receives it — read on the GetVarName failure
@@ -1093,6 +1108,7 @@ class PTOCodegen : public CodegenBase {
     std::vector<std::string> yield_buffer;
 
     void Reset() {
+      comm_rank_id_ssa.clear();
       constants_section.str("");
       constants_section.clear();
       body_section.str("");

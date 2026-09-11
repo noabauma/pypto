@@ -143,6 +143,67 @@ def test_comm_ops_are_wrapped_in_tracr_marker_pairs():
     assert before and after, mlir
 
 
+def test_notify_emits_an_arrow_tail_inside_its_span():
+    """C3: every notify carries a flow tail, and it sits *inside* the span.
+
+    A flow endpoint attaches to whatever span is open on its channel at that
+    instant, so a tail emitted after the mark_reset would attach to nothing and
+    the trace would render an arrow-less span with no error anywhere. That
+    ordering is the property most worth pinning.
+
+    The tail needs no analysis: `peer` is an explicit operand of
+    `pld.system.notify`, and the source rank is a CommContext read. That is why
+    tails land before heads in the plan --- a head has to work out *which* wait
+    matches, which is the hard part.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            signal: pld.DistributedTensor[[16, 16], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            pld.system.notify(target=signal, peer=peer, offsets=[0, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+
+    mlir = _generate_mlir(P)
+
+    assert mlir.count("func.func private @tracr_flow_start(i32, i32, i32, i32)") == 1, mlir
+    assert mlir.count("func.call @tracr_flow_start(") == 1, mlir
+
+    lines = [line.strip() for line in mlir.splitlines()]
+    set_at = next(i for i, line in enumerate(lines) if "@tracr_mark_set(" in line)
+    tail_at = next(i for i, line in enumerate(lines) if "@tracr_flow_start(" in line)
+    reset_at = next(i for i, line in enumerate(lines) if "@tracr_mark_reset(" in line)
+    assert set_at < tail_at < reset_at, (set_at, tail_at, reset_at, mlir)
+
+    # The tail is emitted after the notify it describes, so the arrow leaves at
+    # the point the signal actually went out.
+    notify_at = next(i for i, line in enumerate(lines) if line.startswith("pto.comm.tnotify("))
+    assert notify_at < tail_at, mlir
+
+
+def test_wait_emits_no_arrow_tail():
+    """Only notify produces a tail. Heads are C4, and they need signal analysis."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, signal: pld.DistributedTensor[[16, 16], pl.INT32]):
+            pld.system.wait(signal, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Eq)
+
+    mlir = _generate_mlir(P)
+    assert "@tracr_mark_set(" in mlir, mlir
+    # No *call*. The declaration block is emitted as a unit once any marker is
+    # used, so `func.func private @tracr_flow_start` is present and unused here.
+    # That is deliberate and harmless: ptoas turns an unreferenced declaration
+    # into an unreferenced `extern "C"` prototype, and the prologue defines it
+    # either way. Splitting the declarations per entry point would buy nothing.
+    assert "func.call @tracr_flow_start(" not in mlir, mlir
+    assert "func.call @tracr_flow_end(" not in mlir, mlir
+
+
 def test_program_without_comm_emits_no_tracr_markers():
     """No communication, no markers, no declarations."""
 

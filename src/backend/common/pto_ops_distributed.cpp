@@ -484,6 +484,28 @@ void EmitTracrCommMarkReset(codegen::PTOCodegen &codegen) {
   codegen.Emit("func.call @tracr_mark_reset(" + chan + ") : (i32) -> ()");
 }
 
+/// Emit the tail of a causal arrow at a notify.
+///
+/// The peer is an explicit operand of `pld.system.notify`, and the source rank
+/// is a CommContext read, so a tail needs no analysis at all -- which is why C3
+/// lands before the head. `seq` is 0 until C5 derives it, so several messages
+/// between one pair currently share an id; `tracr_process` pairs starts to ends
+/// by index within an id, so that is only correct while a pair exchanges one
+/// message per run.
+void EmitTracrFlowTail(const CallPtr &op, const DistTensorBinding &binding, codegen::PTOCodegen &codegen) {
+  codegen.RegisterTracrCommMarkers();
+  const std::string chan =
+      codegen.GetOrEmitConstant(static_cast<int64_t>(kTracrChannelPlaceholder), DataType::INT32);
+  const std::string src = codegen.EmitCommRankId(binding.ctx_ssa);
+  std::string dst = codegen.GetExprAsCode(op->args_[1]);
+  dst = codegen.EmitCastToI32(op->args_[1], dst);
+  const std::string seq = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INT32);
+  codegen.Emit(
+      "func.call @tracr_flow_start(" + chan + ", " + src + ", " + dst + ", " + seq +
+      ") : (i32, i32, i32, i32) -> ()"
+  );
+}
+
 // pld.system.notify(target, peer, offsets, value, *, op) — atomically signal a
 // peer rank's slot in a DistributedTensor signal matrix.
 //   delems = <inline CommContext peer-offset arithmetic> : index
@@ -548,6 +570,9 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
           << value_type << ") {notifyOp = #pto<notify_op " << notify_attr << ">}";
   EmitTracrCommMarkSet(codegen, kTracrEventCommNotify);
   codegen.Emit(tnotify.str());
+  // Inside the span: a flow endpoint attaches to whatever span is open on its
+  // channel, so a tail emitted after the reset would attach to nothing.
+  EmitTracrFlowTail(op, binding, codegen);
   EmitTracrCommMarkReset(codegen);
   return "";
 }
