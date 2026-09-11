@@ -492,7 +492,14 @@ void EmitTracrCommMarkReset(codegen::PTOCodegen &codegen) {
 /// between one pair currently share an id; `tracr_process` pairs starts to ends
 /// by index within an id, so that is only correct while a pair exchanges one
 /// message per run.
+///
+/// A **self-notify** gets no tail. `pld.system.notify(peer=my_rank, ...)` is a
+/// rank signalling its own slot to order two of its own kernels; nothing
+/// crosses a device boundary, so an arrow would be a drawing of a transfer that
+/// never happened. Observed on `alltoallv_gmm.py`, where the self-notify's tail
+/// paired with an unrelated wait and rendered a 1->1 arrow.
 void EmitTracrFlowTail(const CallPtr &op, const DistTensorBinding &binding, codegen::PTOCodegen &codegen) {
+  if (codegen.IsCommRankRead(op->args_[1])) return;
   codegen.RegisterTracrCommMarkers();
   const std::string chan =
       codegen.GetOrEmitConstant(static_cast<int64_t>(kTracrChannelPlaceholder), DataType::INT32);

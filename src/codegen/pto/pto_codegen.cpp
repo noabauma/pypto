@@ -785,9 +785,17 @@ void PTOCodegen::PrepareGMSlotBufferLayout(const ProgramPtr& program) {
 // ========================================================================
 
 std::string PTOCodegen::EmitCommRankId(const std::string& ctx_ssa) {
-  auto cached = fs_.comm_rank_id_ssa.find(ctx_ssa);
-  if (cached != fs_.comm_rank_id_ssa.end()) return cached->second;
-
+  // Deliberately NOT memoized across the function. The read is emitted into
+  // whatever region the caller is in, and a comm op typically sits inside an
+  // `scf.for` + `scf.if`. Reusing an SSA name from a sibling region is out of
+  // scope, and ptoas rejects the module with "use of undeclared SSA value
+  // name" -- which is what an earlier per-function memo did to
+  // test_l3_remote_store_window_raw, whose notify and wait live in two
+  // separate loops.
+  //
+  // The cost is one extra GM scalar load per comm op, on the path being
+  // measured. Removing it again needs the read hoisted somewhere that
+  // dominates every use, not a cache.
   namespace cl = codegen::distributed::comm_layout;
   // One pto.load_scalar step is one u64 slot; the offset is pinned by
   // static_assert in comm_layout.h, so a runtime ABI shift fails the PyPTO
@@ -798,7 +806,6 @@ std::string PTOCodegen::EmitCommRankId(const std::string& ctx_ssa) {
   Emit(rk_pair + " = pto.load_scalar " + ctx_ssa + "[" + c_r + "] : !pto.ptr<i64> -> i64");
   const std::string rk_i32 = NewTemp();
   Emit(rk_i32 + " = arith.trunci " + rk_pair + " : i64 to i32");
-  fs_.comm_rank_id_ssa.emplace(ctx_ssa, rk_i32);
   return rk_i32;
 }
 
@@ -864,9 +871,12 @@ void PTOCodegen::RegisterTracrCommMarkers() { needs_tracr_comm_markers_ = true; 
 
 void PTOCodegen::EmitTracrCommMarkerDeclarations() {
   if (!needs_tracr_comm_markers_) return;
-  // Declaration-only: ptoas emits `extern "C" AICORE void tracr_mark_set(...)`
-  // and leaves resolution to the C++ compiler, which finds the definition in
-  // the prologue PyPTO writes above ptoas's output.
+  // Declaration-only: ptoas re-declares each of these as
+  // `static __aicore__ void tracr_mark_set(...)` at the top of the generated
+  // kernel and leaves resolution to the C++ compiler, which finds the
+  // definition in the prologue PyPTO writes above ptoas's output. That
+  // definition is therefore `static` too -- see
+  // runtime/src/common/platform/include/aicore/tracr_aicore_emit.h.
   stream_ << "  func.func private @tracr_mark_set(i32, i32, i32)\n";
   stream_ << "  func.func private @tracr_mark_reset(i32)\n";
   stream_ << "  func.func private @tracr_flow_start(i32, i32, i32, i32)\n";
@@ -940,6 +950,7 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
   }
 
   BuildVarToMemRefMapping(func);
+  BuildVarDefMapping(func);
 
   // One body walk: collects MemRefs and detects hidden runtime parameters.
   // The SDMA workspace and SPMD identity params are injected at codegen time
@@ -1257,6 +1268,46 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
 
   indent_level_--;
   stream_ << "  }\n";
+}
+
+void PTOCodegen::BuildVarDefMapping(const FunctionPtr& func) {
+  class VarDefCollector : public ir::IRVisitor {
+   public:
+    std::map<const ir::Var*, ir::ExprPtr>& defs;
+    explicit VarDefCollector(std::map<const ir::Var*, ir::ExprPtr>& d) : defs(d) {}
+
+    void VisitStmt_(const AssignStmtPtr& op) override {
+      // The body is in SSA form, so a Var is bound once and the first binding
+      // is the only one. Guard anyway: on a non-SSA body the earliest binding
+      // is the one an operand textually below it would have seen.
+      defs.emplace(op->var_.get(), op->value_);
+      ir::IRVisitor::VisitStmt_(op);
+    }
+  };
+
+  VarDefCollector collector(fs_.var_defs);
+  if (func->body_) {
+    collector.VisitStmt(func->body_);
+  }
+}
+
+bool PTOCodegen::IsCommRankRead(const ExprPtr& expr) const {
+  // Look through SSA temps: user code writes `my_rank = pld.rank(ctx)` and then
+  // passes `my_rank`, so the operand reaching a comm op is a Var, not the call.
+  // Bounded by the number of bindings, since each step moves to a Var defined
+  // strictly earlier in an SSA body.
+  ExprPtr cur = expr;
+  for (size_t hops = 0; cur && hops <= fs_.var_defs.size(); ++hops) {
+    if (auto call = As<ir::Call>(cur)) {
+      return ir::IsOp(call, "pld.system.rank");
+    }
+    auto var = AsVarLike(cur);
+    if (!var) return false;
+    auto it = fs_.var_defs.find(var.get());
+    if (it == fs_.var_defs.end()) return false;
+    cur = it->second;
+  }
+  return false;
 }
 
 void PTOCodegen::BuildVarToMemRefMapping(const FunctionPtr& func) {

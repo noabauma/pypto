@@ -271,11 +271,47 @@ using namespace pto;
 
 _TRACR_MARKER_INCLUDE = """\
 // --- TraCR communication markers ---
-// Defines the extern "C" entry points ptoas declared for the marker calls
+// Defines the static entry points ptoas re-declared for the marker calls
 // PTOCodegen emitted around each notify/wait. Every one of them compiles to
 // nothing without -DENABLE_TRACR, so this include costs a production build
 // exactly nothing -- the same contract orchestration codegen relies on.
+#include "intrinsic.h"
 #include "aicore/tracr_aicore_emit.h"
+
+#ifdef ENABLE_TRACR
+// The marker entry points take no buffer -- ptoas calls them with exactly the
+// operands the IR named -- so they read one through get_tracr_aicore_buffer().
+// The platform defines that accessor over storage its own kernel entry seeds,
+// but this kernel is linked into a self-contained AICore image and resolves
+// against nothing, so it carries its own. kernel_entry seeds it from the slice
+// the scheduler put in GlobalContext, which is the same slice the platform's
+// entry published this core's identity word into.
+//
+// Storage is per core: one loaded image runs on all of them at once. Onboard
+// that is block-local; under the simulator, where each core is a thread and
+// [[block_local]] does not exist, it is thread-local.
+//
+// The accessor is always_inline, and must stay that way. An out-of-line
+// [aicore] function in this image makes the kernel produce wrong results --
+// tests/st/distributed/test_l3_remote_store_window_raw.py fails its RAW-edge
+// assertion with one present and passes with it inlined, whether or not the
+// function is ever called. elf_parser.py checks only that kernel_entry sits at
+// .text offset 0, which it still does, so nothing rejects the payload: the
+// image simply misbehaves. Anything added here emits no out-of-line code.
+#if defined(__CPU_SIM)
+static thread_local __gm__ int64_t* pypto_tracr_slice;
+#else
+[[block_local]] static __gm__ int64_t* pypto_tracr_slice;
+#endif
+__aicore__ __attribute__((always_inline)) inline
+__gm__ int64_t* get_tracr_aicore_buffer() { return pypto_tracr_slice; }
+#endif
+"""
+
+_TRACR_MARKER_ENTRY_SETUP = """\
+#ifdef ENABLE_TRACR
+    pypto_tracr_slice = get_tracr_aicore_slice(args);
+#endif
 """
 
 _DEFERRED_COMPLETION_ADAPTER = """\
@@ -690,8 +726,8 @@ _DEFERRED_COMPLETION_OPS = frozenset({_ir_core.get_op("pld.system.defer_wait").n
 
 # The two ops PTOCodegen wraps in TraCR marker pairs. Kept in step with
 # `EmitTracrCommMarkSet` call sites in src/backend/common/pto_ops_distributed.cpp:
-# if codegen emits a marker, the prologue must supply its definition or ptoas's
-# `extern "C"` declaration has nothing to resolve against.
+# if codegen emits a marker, the prologue must supply its definition or the
+# `static` declaration ptoas writes for it has nothing to resolve against.
 _TRACR_COMM_OPS = frozenset(
     {_ir_core.get_op("pld.system.notify").name, _ir_core.get_op("pld.system.wait").name}
 )
@@ -1044,6 +1080,7 @@ def _generate_kernel_wrapper(
         uses_tracr_comm_markers=uses_tracr_comm_markers,
         uses_deferred_completion=func_uses_deferred_completion,
     )
+    tracr_marker_entry_setup = _TRACR_MARKER_ENTRY_SETUP if uses_tracr_comm_markers else ""
     unpacking_code, var_names = _generate_arg_unpacking(func, uses_spmd=uses_spmd)
 
     fifo_lane_arg_bridge = ""
@@ -1118,6 +1155,7 @@ def _generate_kernel_wrapper(
         "    // Reset AI Core atomic mode inherited from a prior kernel.\n"
         "    set_atomic_none();\n"
         "#endif\n\n"
+        f"{tracr_marker_entry_setup}"
         f"{spmd_args_setup}"
         f"{subblock_arg_setup}"
         f"{unpacking_code}\n"

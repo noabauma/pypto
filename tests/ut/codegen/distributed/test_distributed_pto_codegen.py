@@ -227,13 +227,91 @@ def test_wait_emits_an_arrow_head_when_the_sender_is_derivable():
     tail_chan, tail_src, tail_dst, tail_seq = operands(tail)
     head_chan, head_src, head_dst, head_seq = operands(head)
 
+    def rank_slot_read(ssa):
+        """The CommContext rank-slot load an i32 rank operand was truncated from."""
+        trunc = next(
+            line for line in mlir.splitlines() if line.strip().startswith(f"{ssa} = arith.trunci")
+        )
+        i64 = trunc.split("arith.trunci")[1].split(":")[0].strip()
+        load = next(
+            line for line in mlir.splitlines() if line.strip().startswith(f"{i64} = pto.load_scalar")
+        )
+        # Drop the result name and the loc: what identifies the slot is the
+        # operand form, and the two loads carry the notify's and the wait's
+        # own source locations.
+        return strip_loc(load).strip().split("=", 1)[1].strip()
+
     # The tail leaves this rank for the peer; the head arrives here from the
-    # sender. So the rank SSA appears as the tail's source and the head's
-    # destination --- and it is the same SSA, because the read is memoized.
-    assert tail_src == head_dst, (tail, head)
+    # sender. So the rank reaches the tail as its source and the head as its
+    # destination, read from the same CommContext slot both times. They are
+    # separate SSA values on purpose: EmitCommRankId re-reads the rank at every
+    # call site, because memoizing it once cached a read made inside one scf.if
+    # region and reused it from a sibling, which ptoas rejects with "use of
+    # undeclared SSA value name". Compare the defining load, not the SSA name.
+    assert rank_slot_read(tail_src) == rank_slot_read(head_dst), (tail, head)
     # The head's source is the varying offset, i.e. the sender's row.
     assert head_src != head_dst, (tail, head)
     assert tail_chan == head_chan and tail_seq == head_seq, (tail, head)
+
+
+def test_self_notify_gets_no_arrow_tail():
+    """peer is this rank: nothing crosses a device boundary, so no tail.
+
+    Mirrors alltoallv_gmm.py's local completion signal
+    (``notify(peer=my_rank, offsets=[task, 0])``), where the tile index in the
+    offsets is not a rank at all. Before this rule the notify emitted a tail
+    whose source and destination were both this rank, and it paired with an
+    unrelated wait to render a 1->1 arrow on a two-rank run.
+
+    The CommNotify span is still emitted -- the notify happens, and its cost is
+    worth showing. Only the arrow is withheld.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            tile_done: pld.DistributedTensor[[8, 1], pl.INT32],
+            task: pl.Scalar[pl.INT32],
+        ):
+            ctx = pld.get_comm_ctx(tile_done)
+            my_rank = pld.rank(ctx)
+            pld.system.notify(
+                target=tile_done, peer=my_rank, offsets=[task, 0], value=1, op=pld.NotifyOp.AtomicAdd
+            )
+
+    mlir = _generate_mlir(P)
+    assert "pto.comm.tnotify" in mlir
+    assert "func.call @tracr_mark_set" in mlir, "the CommNotify span still belongs on the lane"
+    assert "func.call @tracr_flow_start" not in mlir, mlir
+
+
+def test_notify_to_a_computed_peer_still_gets_a_tail():
+    """The rule keys on `peer is this rank's id`, not on any use of the rank.
+
+    A ring neighbour is derived *from* the rank, so the peer expression reaches
+    the notify through arithmetic rather than as the rank read itself, and the
+    transfer is a real one. Guards against a predicate that looked through the
+    arithmetic and suppressed every rank-derived peer.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            signal: pld.DistributedTensor[[8, 1], pl.INT32],
+            task: pl.Scalar[pl.INT32],
+        ):
+            ctx = pld.get_comm_ctx(signal)
+            right = pld.rank(ctx) + 1
+            pld.system.notify(
+                target=signal, peer=right, offsets=[task, 0], value=1, op=pld.NotifyOp.AtomicAdd
+            )
+
+    mlir = _generate_mlir(P)
+    assert "func.call @tracr_flow_start" in mlir, mlir
 
 
 def test_aggregate_signal_gets_no_arrow_head():
