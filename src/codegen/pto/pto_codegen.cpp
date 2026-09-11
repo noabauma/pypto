@@ -870,6 +870,7 @@ void PTOCodegen::EmitTracrCommMarkerDeclarations() {
   stream_ << "  func.func private @tracr_mark_set(i32, i32, i32)\n";
   stream_ << "  func.func private @tracr_mark_reset(i32)\n";
   stream_ << "  func.func private @tracr_flow_start(i32, i32, i32, i32)\n";
+  stream_ << "  func.func private @tracr_flow_end(i32, i32, i32, i32)\n";
 }
 
 void PTOCodegen::EmitDeferredCompletionAdapterDeclaration() {

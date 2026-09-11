@@ -184,6 +184,102 @@ def test_notify_emits_an_arrow_tail_inside_its_span():
     assert notify_at < tail_at, mlir
 
 
+def test_wait_emits_an_arrow_head_when_the_sender_is_derivable():
+    """C4: a head whose id matches the tail the sender emitted.
+
+    The shape is the arrow-able one from
+    tests/st/distributed/test_l3_remote_store_window_raw.py: the notify writes
+    MY row in the peer's signal, and the wait reads the SENDER's row. So the
+    offset that varies IS the other rank, at both ends.
+
+    Rank A notifying B emits (A, B); rank B waiting on row A emits (A, B). The
+    ids agreeing is the whole requirement, and it holds because the same axis
+    carries the sender at both ends.
+
+    Note the tail's source is the CommContext rankId, not whatever the caller
+    passed as a `my_rank` parameter. That makes the tail authoritative, and it
+    assumes what doc 08's rule already assumes: that a sender indexes the signal
+    with its true rank.
+    """
+    n_ranks = 4
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            done: pld.DistributedTensor[[n_ranks, 1], pl.INT32],
+            p: pl.Scalar[pl.INT32],
+            s: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            pld.system.notify(target=done, peer=p, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            pld.system.wait(signal=done, offsets=[s, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+    mlir = _generate_mlir(P)
+    tail = next(line for line in mlir.splitlines() if "func.call @tracr_flow_start(" in line)
+    head = next(line for line in mlir.splitlines() if "func.call @tracr_flow_end(" in line)
+
+    def operands(call_line):
+        inner = call_line[call_line.index("(") + 1 : call_line.index(")")]
+        return [tok.strip() for tok in inner.split(",")]
+
+    tail_chan, tail_src, tail_dst, tail_seq = operands(tail)
+    head_chan, head_src, head_dst, head_seq = operands(head)
+
+    # The tail leaves this rank for the peer; the head arrives here from the
+    # sender. So the rank SSA appears as the tail's source and the head's
+    # destination --- and it is the same SSA, because the read is memoized.
+    assert tail_src == head_dst, (tail, head)
+    # The head's source is the varying offset, i.e. the sender's row.
+    assert head_src != head_dst, (tail, head)
+    assert tail_chan == head_chan and tail_seq == head_seq, (tail, head)
+
+
+def test_aggregate_signal_gets_no_arrow_head():
+    """All-constant offsets: the sender is unknowable, so no head is emitted.
+
+    A tail is still emitted and will go unmatched; tracr_process drops an
+    unmatched endpoint with a warning rather than rendering a wrong arrow.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(self, sig: pld.DistributedTensor[[1, 1], pl.INT32], peer: pl.Scalar[pl.INT32]):
+            pld.system.notify(target=sig, peer=peer, offsets=[0, 0], value=1, op=pld.NotifyOp.AtomicAdd)
+            pld.system.wait(signal=sig, offsets=[0, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+    mlir = _generate_mlir(P)
+    assert "func.call @tracr_flow_start(" in mlir, mlir
+    assert "func.call @tracr_flow_end(" not in mlir, mlir
+
+
+def test_ambiguous_offsets_get_no_arrow_head():
+    """Two varying offsets: which one is the rank cannot be told from the IR.
+
+    A ring indexes `[round, rank]`, and distinguishing the two needs the world
+    size, which the IR does not carry. Bailing to a span is the conservative
+    answer --- no arrow beats a wrong one.
+    """
+    n_ranks = 4
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            sig: pld.DistributedTensor[[n_ranks, n_ranks], pl.INT32],
+            rnd: pl.Scalar[pl.INT32],
+            src: pl.Scalar[pl.INT32],
+        ):
+            pld.system.wait(signal=sig, offsets=[rnd, src], expected=1, cmp=pld.WaitCmp.Ge)
+
+    mlir = _generate_mlir(P)
+    assert "@tracr_mark_set(" in mlir, mlir
+    assert "func.call @tracr_flow_end(" not in mlir, mlir
+
+
 def test_wait_emits_no_arrow_tail():
     """Only notify produces a tail. Heads are C4, and they need signal analysis."""
 
