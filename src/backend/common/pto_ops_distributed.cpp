@@ -484,6 +484,39 @@ void EmitTracrCommMarkReset(codegen::PTOCodegen &codegen) {
   codegen.Emit("func.call @tracr_mark_reset(" + chan + ") : (i32) -> ()");
 }
 
+/// The sequence component of a TraCR flow id: which *slot* of the signal this
+/// message uses.
+///
+/// Both endpoints must arrive at the same number without talking to each other,
+/// so it can only be built from what both of them name identically. In a
+/// notify/wait pair exactly one offset component varies -- the rank (`my_rank`
+/// on the notify, the sender on the wait) -- and that one is already carried as
+/// the arrow's src/dst. Every *constant* component is the fixed coordinate of
+/// the signal slot and is written the same way on both sides:
+///
+///     barrier A   notify offsets=[0, my_rank]   wait offsets=[0, src]
+///     barrier B   notify offsets=[1, my_rank]   wait offsets=[1, src]
+///
+/// so folding the constants yields 0 for A and 1 for B on sender and receiver
+/// alike, and the two barriers stop sharing one flow id.
+///
+/// Each constant occupies four bits of the 16-bit seq field, keyed by position,
+/// with the high bit of the nibble marking "a constant lives here" so that a
+/// literal 0 at position 0 differs from no constant at all. Positions past the
+/// fourth, and values past 7, wrap. A wrap makes two slots share an id, which
+/// is exactly the pre-C5 behaviour -- it never mis-pairs, because both sides
+/// compute the identical function.
+int64_t TracrSeqFromSlotConstants(const ir::MakeTuplePtr &offsets) {
+  uint32_t seq = 0;
+  for (size_t i = 0; i < offsets->elements_.size(); ++i) {
+    auto konst = As<ir::ConstInt>(offsets->elements_[i]);
+    if (!konst) continue;
+    const uint32_t nibble = 0x8u | (static_cast<uint32_t>(konst->value_) & 0x7u);
+    seq |= nibble << (4u * (i % 4u));
+  }
+  return static_cast<int64_t>(seq & 0xFFFFu);
+}
+
 /// Emit the tail of a causal arrow at a notify.
 ///
 /// The peer is an explicit operand of `pld.system.notify`, and the source rank
@@ -506,7 +539,10 @@ void EmitTracrFlowTail(const CallPtr &op, const DistTensorBinding &binding, code
   const std::string src = codegen.EmitCommRankId(binding.ctx_ssa);
   std::string dst = codegen.GetExprAsCode(op->args_[1]);
   dst = codegen.EmitCastToI32(op->args_[1], dst);
-  const std::string seq = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INT32);
+  auto notify_offsets = As<ir::MakeTuple>(op->args_[2]);
+  INTERNAL_CHECK_SPAN(notify_offsets, op->span_) << "pld.system.notify offsets must be MakeTuple";
+  const std::string seq =
+      codegen.GetOrEmitConstant(TracrSeqFromSlotConstants(notify_offsets), DataType::INT32);
   codegen.Emit(
       "func.call @tracr_flow_start(" + chan + ", " + src + ", " + dst + ", " + seq +
       ") : (i32, i32, i32, i32) -> ()"
@@ -622,7 +658,10 @@ void EmitTracrFlowHead(
   src = codegen.EmitCastToI32(src_expr, src);
   // This rank is the destination: the arrow ends where the wait is.
   const std::string dst = codegen.EmitCommRankId(ctx_ssa);
-  const std::string seq = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INT32);
+  // Same fold as the tail, over the same constants: the sender wrote them into
+  // its notify offsets and this wait reads them back out of its own.
+  const std::string seq =
+      codegen.GetOrEmitConstant(TracrSeqFromSlotConstants(offsets), DataType::INT32);
   codegen.Emit(
       "func.call @tracr_flow_end(" + chan + ", " + src + ", " + dst + ", " + seq +
       ") : (i32, i32, i32, i32) -> ()"

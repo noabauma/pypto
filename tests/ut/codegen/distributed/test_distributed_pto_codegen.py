@@ -254,6 +254,81 @@ def test_wait_emits_an_arrow_head_when_the_sender_is_derivable():
     assert tail_chan == head_chan and tail_seq == head_seq, (tail, head)
 
 
+def test_two_barriers_on_different_slots_get_different_seq():
+    """C5: two barriers between the same pair must not share one flow id.
+
+    Mirrors 09_allreduce_two_phase, whose barrier A signals row 0 and barrier B
+    row 1. With seq=0 both barriers collapsed onto the single id (src,dst,0) --
+    measured as 24 messages on 12 ids across 4 ranks. The row is a *constant*
+    offset, written identically by the notify and by the wait, so both ends fold
+    it into the same seq without communicating.
+    """
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            signal: pld.DistributedTensor[[2, 4], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+            src: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            pld.system.notify(
+                target=signal, peer=peer, offsets=[0, my_rank], value=1, op=pld.NotifyOp.AtomicAdd
+            )
+            pld.system.wait(signal=signal, offsets=[0, src], expected=1, cmp=pld.WaitCmp.Ge)
+            pld.system.notify(
+                target=signal, peer=peer, offsets=[1, my_rank], value=1, op=pld.NotifyOp.AtomicAdd
+            )
+            pld.system.wait(signal=signal, offsets=[1, src], expected=1, cmp=pld.WaitCmp.Ge)
+
+    mlir = _generate_mlir(P)
+
+    def seq_of(call_line):
+        inner = call_line[call_line.index("(") + 1 : call_line.index(")")]
+        return [t.strip() for t in inner.split(",")][3]
+
+    tails = [l for l in mlir.splitlines() if "func.call @tracr_flow_start(" in l]
+    heads = [l for l in mlir.splitlines() if "func.call @tracr_flow_end(" in l]
+    assert len(tails) == 2 and len(heads) == 2, mlir
+
+    # Each barrier's two ends agree, and the two barriers disagree.
+    assert seq_of(tails[0]) == seq_of(heads[0]), (tails, heads)
+    assert seq_of(tails[1]) == seq_of(heads[1]), (tails, heads)
+    assert seq_of(tails[0]) != seq_of(tails[1]), (tails, heads)
+
+
+def test_matching_notify_and_wait_agree_on_seq():
+    """The mesh shape: the constant sits at a different position, but on both
+    sides, so the pair still shares one seq and the arrow still matches."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            done: pld.DistributedTensor[[4, 1], pl.INT32],
+            peer: pl.Scalar[pl.INT32],
+            src: pl.Scalar[pl.INT32],
+            my_rank: pl.Scalar[pl.INT32],
+        ):
+            pld.system.notify(
+                target=done, peer=peer, offsets=[my_rank, 0], value=1, op=pld.NotifyOp.AtomicAdd
+            )
+            pld.system.wait(signal=done, offsets=[src, 0], expected=1, cmp=pld.WaitCmp.Ge)
+
+    mlir = _generate_mlir(P)
+
+    def seq_of(call_line):
+        inner = call_line[call_line.index("(") + 1 : call_line.index(")")]
+        return [t.strip() for t in inner.split(",")][3]
+
+    tail = next(l for l in mlir.splitlines() if "func.call @tracr_flow_start(" in l)
+    head = next(l for l in mlir.splitlines() if "func.call @tracr_flow_end(" in l)
+    assert seq_of(tail) == seq_of(head), (tail, head)
+
+
 def test_self_notify_gets_no_arrow_tail():
     """peer is this rank: nothing crosses a device boundary, so no tail.
 
